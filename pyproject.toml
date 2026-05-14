@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-squared"
+version = "0.1.0"
+description = "MCP server exposing long-running Claude Code CLI sub-sessions as addressable pairs"
+requires-python = ">=3.10"
+authors = [{name = "Alvar"}]
+dependencies = [
+    "fastmcp>=2.0",
+    "filelock>=3.13",
+    "pydantic>=2.5",
+]
+
+[project.scripts]
+claude-squared = "claude_squared.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

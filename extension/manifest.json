@@ -1,0 +1,124 @@
+{
+  "manifest_version": "0.3",
+  "name": "claude-squared",
+  "display_name": "Claude Squared",
+  "version": "0.9.0",
+  "description": "Long-running, addressable Claude Code CLI sub-sessions as MCP tools \u2014 pairs that can recurse, persist context, and use native /compact and /skill commands via stream-json.",
+  "long_description": "Spawn named long-running Claude Code CLI sub-sessions ('pairs') that the calling Claude session can address by name. Each pair runs `claude --print --resume <uuid>` under the hood, giving it true recursion (it can spawn its own Agent sub-tasks), persistent context across turns, per-pair specialization (system prompt, allowed tools, MCP scope pinned at create), native /compact and /context via stream-json, and FIFO-queued sends.\n\n**Why use a pair vs the built-in Agent tool?**\n- Pairs survive across many of your turns; sub-agents are one-shot.\n- A pair can recurse \u2014 it has the full Agent tool by default, so it can spawn its own scouts.\n- Specialized config persists: `system_prompt_append`, `allowed_tools`, MCP scope are pinned at create.\n- Multiple pairs in parallel give you addressable fan-out; the sync `pair_send` is FIFO-queued per pair.\n\n**Key tools** (17 total, all prefixed `pair_`):\n- Lifecycle: `pair_create`, `pair_adopt`, `pair_forget`\n- Communication: `pair_send` (sync), `pair_send_async` + `pair_poll`\n- Inspection: `pair_list`, `pair_info`, `pair_transcript`, `pair_actions`, `pair_context`\n- Mutation: `pair_update`, `pair_clear`, `pair_compact`\n- Skills: `pair_invoke`\n- Custom agents: `pair_agent_define`, `pair_agent_list`\n\n**State on disk** lives in `~/.claude/pairs/` (registry + profiles + archive + async tasks) and `~/.claude/agents/` (custom agent definitions, visible globally).",
+  "author": {
+    "name": "Alvar"
+  },
+  "icon": "icon.png",
+  "server": {
+    "type": "python",
+    "entry_point": "server/main.py",
+    "mcp_config": {
+      "command": "python",
+      "args": [
+        "${__dirname}/server/main.py"
+      ],
+      "env": {
+        "PYTHONPATH": "${__dirname}/server/lib;${__dirname}/src",
+        "PYTHONIOENCODING": "utf-8"
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "pair_create",
+      "description": "Spawn a new long-running named pair (Claude Code CLI sub-session) with optional pinned config (system prompt, allowed tools, MCP scope, cwd)."
+    },
+    {
+      "name": "pair_adopt",
+      "description": "Register an existing claude session UUID as a pair so it becomes addressable through this MCP."
+    },
+    {
+      "name": "pair_forget",
+      "description": "Remove a pair from the registry; archives transcript by default."
+    },
+    {
+      "name": "pair_send",
+      "description": "Send a message to a pair and block for the response. Concurrent sends to the same pair queue FIFO. Response includes context-usage status with warnings \u226560%."
+    },
+    {
+      "name": "pair_send_async",
+      "description": "Send a message asynchronously; returns task_id immediately."
+    },
+    {
+      "name": "pair_poll",
+      "description": "Check status of an async task: running | done | failed."
+    },
+    {
+      "name": "pair_list",
+      "description": "List all registered pairs (short form)."
+    },
+    {
+      "name": "pair_info",
+      "description": "Get full configuration + stats for one pair, including transcript path."
+    },
+    {
+      "name": "pair_transcript",
+      "description": "Tail the last N user/assistant turns from a pair's session JSONL."
+    },
+    {
+      "name": "pair_actions",
+      "description": "Discoverability: list curated actions, plus (if name given) the slash commands and agent types available in that specific pair."
+    },
+    {
+      "name": "pair_update",
+      "description": "Update mutable settings (model, effort, permission_mode, allowed_tools, purpose)."
+    },
+    {
+      "name": "pair_clear",
+      "description": "Reset a pair's conversation history by rotating to a fresh session_id; pinned config preserved, old transcript archived."
+    },
+    {
+      "name": "pair_compact",
+      "description": "Native /compact via stream-json. Optional steering prompt focused on conversation arc + binding rules + in-flight state (defer technical detail to .md docs)."
+    },
+    {
+      "name": "pair_context",
+      "description": "Invoke /context in the pair to get a rich token-usage breakdown (model, totals, categorized usage)."
+    },
+    {
+      "name": "pair_invoke",
+      "description": "Invoke a skill in the pair by name (translates to /<skill> via stream-json)."
+    },
+    {
+      "name": "pair_agent_define",
+      "description": "Define a custom claude-code agent in ~/.claude/agents/ \u2014 visible to all Claude sessions globally."
+    },
+    {
+      "name": "pair_agent_list",
+      "description": "List all custom agents under ~/.claude/agents/."
+    },
+    {
+      "name": "pair_settings_get",
+      "description": "Show current pair MCP settings: writable defaults (model/effort/permission_mode/persistent/extra_dirs), file paths, and read-only env knobs."
+    },
+    {
+      "name": "pair_settings_set",
+      "description": "Set per-user defaults for new pairs. bypassPermissions refused as default (foot-gun); pass per-call. Supports model='match-parent' for JSONL-based parent detection."
+    },
+    {
+      "name": "pair_settings_reset",
+      "description": "Remove ~/.claude/pairs/defaults.json; subsequent pair_create uses only hardcoded fallbacks (Opus/xhigh/auto)."
+    }
+  ],
+  "keywords": [
+    "claude-code",
+    "agents",
+    "recursion",
+    "subprocess",
+    "pair-programmer",
+    "session-management"
+  ],
+  "license": "MIT",
+  "compatibility": {
+    "platforms": [
+      "win32",
+      "darwin",
+      "linux"
+    ]
+  }
+}
