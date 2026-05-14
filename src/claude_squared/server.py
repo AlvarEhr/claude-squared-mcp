@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
+import sys
 import threading
 import uuid
 from collections import defaultdict
@@ -815,13 +817,21 @@ def _format_async_handle(task_id: str, why: str) -> str:
     whether ``claude_squared`` is importable from the agent's PATH-resolved
     ``python``. Falls back to ``python -m claude_squared wait`` if the install
     failed (non-fatal — only affects this hint, not actual functionality).
+
+    Uses ``sys.executable`` rather than bare ``python`` so the command works on
+    systems without ``python`` on the agent's bash PATH (e.g. Windows hosts
+    where ``python`` redirects to the Microsoft Store install prompt). Both
+    paths are shlex-quoted to survive spaces in install dirs ("Claude
+    Extensions/...", "Users/Alice Smith/...").
     """
+    py = shlex.quote(sys.executable)
     if _WAIT_SCRIPT_PATH is not None:
         # POSIX-style path is friendlier to bash on both Windows (Git Bash) and
         # POSIX shells than the native Windows backslashed form.
-        wait_cmd = f"python {_WAIT_SCRIPT_PATH.as_posix()} {task_id}"
+        wait_path = shlex.quote(_WAIT_SCRIPT_PATH.as_posix())
+        wait_cmd = f"{py} {wait_path} {task_id}"
     else:
-        wait_cmd = f"python -m claude_squared wait {task_id}"
+        wait_cmd = f"{py} -m claude_squared wait {task_id}"
     return (
         f"{why}\n"
         f"Async task: {task_id}\n"
