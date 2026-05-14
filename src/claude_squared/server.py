@@ -835,10 +835,14 @@ def _format_async_handle(task_id: str, why: str) -> str:
     return (
         f"{why}\n"
         f"Async task: {task_id}\n"
-        f"  pair_poll('{task_id}')                             # status\n"
-        f"  pair_poll('{task_id}', with_turn_log=True)         # content\n"
-        f"  Bash(run_in_background=True, command=\"{wait_cmd}\")  # notify on done\n"
-        f"Tip: run the Bash command now to get a notification when it finishes — otherwise poll manually."
+        f"  pair_poll('{task_id}')                             # status (always works)\n"
+        f"  pair_poll('{task_id}', with_turn_log=True)         # content (always works)\n"
+        f"  Bash(run_in_background=True, command=\"{wait_cmd}\")  # auto-notify on done\n"
+        f"Tip: run the Bash for hands-off completion notification. If your shell can't "
+        f"execute that python path (rare — embedded path is the MCP server's own python), "
+        f"either substitute a working python and re-run, or just poll manually with "
+        f"pair_poll — both pair_poll forms work regardless and don't depend on python "
+        f"being on your shell PATH."
     )
 
 

@@ -1,5 +1,10 @@
 # claude-squared
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.txt)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![CI](https://github.com/AlvarEhr/claude-squared-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/AlvarEhr/claude-squared-mcp/actions/workflows/ci.yml)
+[![MCP](https://img.shields.io/badge/MCP-server-green.svg)](https://modelcontextprotocol.io/)
+
 A local MCP server that exposes long-running Claude Code CLI sub-sessions as addressable "pairs". Gives the calling Claude session true recursion (children can spawn their own sub-agents), persistent context across turns, per-pair specialization (system prompt, allowed tools, MCP scope), and native slash-command support via stream-json.
 
 ## Why
