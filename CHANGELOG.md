@@ -4,6 +4,28 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] — 2026-05-27
+
+### Fixed
+- **`pair_send_async`'s `timeout_seconds` parameter renamed to
+  `hard_timeout_seconds`** (breaking API change). The old name shared the
+  spelling of `pair_send.timeout_seconds` but with the opposite semantics:
+  in `pair_send` it's the agent's stated patience (work continues regardless);
+  in `pair_send_async` it was always the hard auto-kill ceiling. Caused real
+  user failures — a session passed `timeout_seconds=5` to `pair_send_async`
+  thinking it was patience, the underlying claude operation got killed at 5s,
+  and the misleading error message ("Increase timeout_seconds, or use
+  pair_send_async to fire-and-forget") sent them looking for a `pair_poll`
+  bug. Now matches `pair_send.hard_timeout_seconds` naming.
+- **`CommandTimeout` error message rewritten** to be specific about what
+  happened ("auto-killed after Xs by the hard_timeout_seconds ceiling") and
+  give concrete recovery steps ("re-fire with a larger value, or omit it
+  entirely — None means no ceiling, recommended for most uses").
+- **`pair_send_async` docstring** now warns explicitly that
+  `hard_timeout_seconds` is NOT your patience and that the default `None`
+  (no ceiling) is almost always what you want — long Opus + sub-agent runs
+  can legitimately take 30+ minutes.
+
 ## [0.9.0] — 2026-05-14
 
 First public release. Project rebranded from `claude-pair-mcp` to

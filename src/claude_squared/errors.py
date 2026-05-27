@@ -46,8 +46,23 @@ class CLIError(PairError):
 
 
 class CommandTimeout(PairError):
+    """Raised when ``hard_timeout_seconds`` auto-kills the underlying claude
+    operation. NOT raised by sync-wait expiration — that path returns an async
+    handle ("still running") rather than failing.
+
+    By the time an agent reads this error, the work IS gone (the subprocess was
+    killed). Recovery is to re-fire the same send with a larger or no ceiling.
+    """
+
     def __init__(self, name: str, seconds: int):
         super().__init__(
-            f"Pair '{name}' did not respond within {seconds}s. "
-            f"Increase timeout_seconds, or use pair_send_async to fire-and-forget."
+            f"Pair '{name}' was auto-killed after {seconds}s by the "
+            f"hard_timeout_seconds ceiling — the underlying claude operation "
+            f"didn't finish in time. The pair runtime itself is still healthy; "
+            f"only this turn was killed. To recover: re-fire the same send with "
+            f"a larger hard_timeout_seconds (or omit it / pass None for no "
+            f"ceiling — recommended for most uses; long Opus + sub-agent runs "
+            f"can legitimately take 30+ minutes)."
         )
+        self.name = name
+        self.seconds = seconds

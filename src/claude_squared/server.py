@@ -1129,27 +1129,43 @@ async def pair_send(
 def pair_send_async(
     name: str,
     message: str,
-    timeout_seconds: int | None = None,
+    hard_timeout_seconds: int | None = None,
     override_model: str | None = None,
     override_effort: str | None = None,
     override_permission_mode: str | None = None,
 ) -> str:
     """Send a message to a pair asynchronously. Returns task_id immediately.
 
-    ``timeout_seconds=None`` (default) = no auto-kill ceiling — pair runs until
-    done or ``pair_stop`` is called. Multiple async sends to the same pair stay
-    FIFO-serialized via the per-pair lock.
-
     Use ``pair_poll(task_id)`` for status. For notification-on-completion (no
-    manual polling), background-run ``python -m claude_squared wait <id>`` via
-    the Bash tool — see README "Async handles" for the full pattern.
+    manual polling), background-run the wait script via the Bash tool — see
+    README "Async handles" for the full pattern.
+
+    Args:
+        hard_timeout_seconds: Auto-kill ceiling for the underlying claude
+            operation. **Default None (no ceiling) — STRONGLY recommended for
+            most uses.** This is NOT your "patience" — async sends don't have
+            patience (you poll separately). A non-None value KILLS the work at
+            that time, marking the task as ``failed``. Only set this if you
+            want a hard safety net against a wedged pair. Long Opus + sub-agent
+            recursion runs can legitimately take 30+ minutes; the default
+            "run as long as needed" is almost always what you want.
+
+            **Parameter renamed in v0.9.1**: this used to be called
+            ``timeout_seconds`` (matching ``pair_send``'s name), but the
+            meanings differed — sync ``pair_send.timeout_seconds`` is your
+            patience (work continues regardless), but here it was always the
+            kill ceiling. The shared name was a foot-gun and bit real users.
+            Renamed to match ``pair_send.hard_timeout_seconds``.
+
+    Multiple async sends to the same pair stay FIFO-serialized via the
+    per-pair lock.
     """
     # Sanity: pair must exist before we spawn a worker
     reg_mod.get_pair(name)
 
     runner = _build_send_runner(
         name, message,
-        hard_timeout_seconds=timeout_seconds,
+        hard_timeout_seconds=hard_timeout_seconds,
         override_model=override_model,
         override_effort=override_effort,
         override_permission_mode=override_permission_mode,
@@ -1157,8 +1173,8 @@ def pair_send_async(
         # Generous lock-acquire window; if a sync send is in flight elsewhere,
         # async should patiently queue rather than fail loudly.
         lock_acquire_timeout_s=(
-            max(120.0, float(timeout_seconds) + 60.0)
-            if timeout_seconds is not None else 3600.0
+            max(120.0, float(hard_timeout_seconds) + 60.0)
+            if hard_timeout_seconds is not None else 3600.0
         ),
     )
     state = async_tasks.start_task(name, message, runner)
