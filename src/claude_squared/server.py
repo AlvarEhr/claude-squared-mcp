@@ -835,14 +835,12 @@ def _format_async_handle(task_id: str, why: str) -> str:
     return (
         f"{why}\n"
         f"Async task: {task_id}\n"
-        f"  pair_poll('{task_id}')                             # status (always works)\n"
-        f"  pair_poll('{task_id}', with_turn_log=True)         # content (always works)\n"
+        f"  pair_poll('{task_id}')                          # instant status\n"
+        f"  pair_poll('{task_id}', wait_seconds=30)         # block-wait up to 30s for terminal state\n"
+        f"  pair_poll('{task_id}', with_turn_log=True)      # status + current/last-turn content\n"
         f"  Bash(run_in_background=True, command=\"{wait_cmd}\")  # auto-notify on done\n"
-        f"Tip: run the Bash for hands-off completion notification. If your shell can't "
-        f"execute that python path (rare — embedded path is the MCP server's own python), "
-        f"either substitute a working python and re-run, or just poll manually with "
-        f"pair_poll — both pair_poll forms work regardless and don't depend on python "
-        f"being on your shell PATH."
+        f"Tip: Bash watcher = hands-off notification. No background Bash (e.g. Cowork)? "
+        f"Use pair_poll(wait_seconds=N) to avoid spam-polling."
     )
 
 
@@ -1112,10 +1110,14 @@ async def pair_send(
     # No silent override — the agent sees server-cap framing AND their original
     # patience preserved, with a concrete path to wait the remainder.
     if stated_patience_s > rpc_hold_s:
+        remaining = stated_patience_s - rpc_hold_s
         framing = (
-            f"Sync wait held for {rpc_hold_s}s (server's RPC-hold cap; "
-            f"agent's stated patience was {stated_patience_s}s). "
-            f"Pair '{name}' is still working under hard_timeout={hard_str}."
+            f"Sync wait held for {rpc_hold_s}s (server's RPC-hold cap — set by "
+            f"CLAUDE_PAIR_SYNC_CAP_SECONDS, default 45s; raise it in your shell env "
+            f"if your host's RPC timeout is higher). Your stated patience was "
+            f"{stated_patience_s}s — {remaining}s remain; use "
+            f"pair_poll(wait_seconds={min(remaining, _sync_cap_seconds())}) below to wait "
+            f"the rest. Pair '{name}' is still working under hard_timeout={hard_str}."
         )
     else:
         framing = (
@@ -1236,7 +1238,12 @@ def _read_current_or_last_turn_log(
 
 
 @mcp.tool(output_schema=None, annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True})
-def pair_poll(task_id: str, with_turn_log: bool = False, verbose: bool = False) -> str:
+def pair_poll(
+    task_id: str,
+    with_turn_log: bool = False,
+    wait_seconds: int = 0,
+    verbose: bool = False,
+) -> str:
     """Inspect a specific async task — works for ALL statuses (running, done,
     failed, stopped). **This is the right tool whenever you have a task_id**,
     regardless of whether the task is still in flight or has already finished.
@@ -1269,6 +1276,18 @@ def pair_poll(task_id: str, with_turn_log: bool = False, verbose: bool = False) 
             ``pair_send``). Prefix is accepted as long as it's unique.
         with_turn_log: If True, append the current or just-completed turn's
             log lines. Default False (quick status only — doesn't flood context).
+        wait_seconds: If > 0, BLOCK up to N seconds for the task to reach a
+            terminal state (done/failed/stopped) before returning. Default 0 =
+            instant return (the original behavior). Uses an in-process Event
+            for immediate wakeup the moment the task transitions — no internal
+            polling, no wasted cycles. Capped at ``CLAUDE_PAIR_SYNC_CAP_SECONDS``
+            (default 45s) since the host's RPC timeout caps how long we can
+            hold the call open. If your wait expires with the task still
+            running, returns the running state — just call ``pair_poll`` again
+            with another wait window. Useful for environments without
+            background Bash (e.g. Claude Cowork) where the documented "fire
+            wait.py via Bash for hands-off notification" pattern isn't
+            available — block-polling beats spam-polling every few seconds.
         verbose: If True, return the full JSON ``AsyncTaskState``.
     """
     state = async_tasks.load_task(task_id)
@@ -1286,6 +1305,19 @@ def pair_poll(task_id: str, with_turn_log: bool = False, verbose: bool = False) 
             )
         else:
             raise PairError(f"No async task with id '{task_id}'.")
+
+    # Block-wait mode for hosts without background Bash. Only wait if the task
+    # is still running — terminal-status tasks return immediately regardless.
+    if wait_seconds > 0 and state.status == "running":
+        cap = _sync_cap_seconds()
+        effective_wait = min(int(wait_seconds), cap)
+        # wait_for_task uses threading.Event for instant wakeup on terminal
+        # transition; falls back to load_task on timeout. Returns the current
+        # state regardless of whether it fired or timed out.
+        waited_state = async_tasks.wait_for_task(task_id, timeout_s=float(effective_wait))
+        if waited_state is not None:
+            state = waited_state
+
     if verbose:
         return _verbose_dump(state)
 

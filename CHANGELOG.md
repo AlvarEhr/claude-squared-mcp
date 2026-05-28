@@ -4,6 +4,29 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.2] — 2026-05-27
+
+### Added
+- **`pair_poll(task_id, wait_seconds=N)`** — block-poll mode. When
+  `wait_seconds > 0`, the call blocks up to N seconds for the task to reach a
+  terminal state (done/failed/stopped) before returning. Uses an in-process
+  threading.Event for instant wakeup the moment the task transitions — no
+  internal polling, no wasted cycles. Capped at `CLAUDE_PAIR_SYNC_CAP_SECONDS`
+  (default 45s) since the host's RPC timeout caps how long we can hold the
+  call open. Intended for hosts without background Bash (e.g. Claude Cowork)
+  where the documented "fire wait.py via Bash" pattern isn't available —
+  block-polling beats spam-polling every few seconds.
+
+### Changed
+- **Async-handle Tip trimmed** from ~60 words to ~20. Old version was a
+  multi-clause paragraph explaining Microsoft Store stub edge cases; new
+  version just says "Bash watcher = hands-off notification. No background
+  Bash (e.g. Cowork)? Use pair_poll(wait_seconds=N) to avoid spam-polling."
+- **Sync-cap degradation message** now mentions `CLAUDE_PAIR_SYNC_CAP_SECONDS`
+  by name (so users know the cap is tunable), shows the remaining patience
+  budget explicitly, and recommends the new `pair_poll(wait_seconds=N)`
+  syntax to wait the rest.
+
 ## [0.9.1] — 2026-05-27
 
 ### Fixed
