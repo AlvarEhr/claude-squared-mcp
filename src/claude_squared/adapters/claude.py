@@ -402,7 +402,14 @@ class ClaudeAdapter(PairAdapter):
         model_usage = result_json.get("modelUsage", {}) or {}
         # Pick the first/main model used (order in dict is insertion order)
         model_used = next(iter(model_usage.keys()), spec.model)
-        ctx_window = model_usage.get(model_used, {}).get("contextWindow", 200_000)
+        # Prefer the CLI-reported window (authoritative — correctly reports 1M
+        # for million-context models). Fall back only when it's absent: infer 1M
+        # for 1m-variant model names (substring), else the standard 200k. Keeps
+        # the context-fill % honest on million-context pairs even if a future
+        # CLI omits contextWindow from modelUsage.
+        ctx_window = model_usage.get(model_used, {}).get("contextWindow")
+        if not ctx_window:
+            ctx_window = 1_000_000 if "1m" in (model_used or "").lower() else 200_000
         # True context fill = the LAST assistant sub-call's prompt size, NOT the
         # cumulative across the agentic loop. The stream-json `result` event's
         # usage block sums every sub-call's input — useful for billing but

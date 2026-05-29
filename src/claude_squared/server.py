@@ -12,6 +12,7 @@ import shlex
 import shutil
 import sys
 import threading
+import time
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -510,11 +511,11 @@ def pair_create(
     MCP scope — all persist across resume).
 
     Defaults for ``model`` / ``effort`` / ``permission_mode`` / ``persistent`` /
-    ``extra_dirs`` come from ``pair_settings_get`` (or hardcoded fallback: opus / xhigh /
-    auto / False / None). All list-typed args (``allowed_tools``, ``mcp_whitelist``,
-    ``extra_dirs``, ``allowed_invocations``) accept a list, JSON-array string, or
-    semicolon/newline-separated string. See README for invocation allow-list, mid-flight
-    config changes, and the full list of pair tools.
+    ``extra_dirs`` come from ``pair_settings_get`` (or hardcoded fallback: opus /
+    unset / auto / False / None). All list-typed args (``allowed_tools``,
+    ``mcp_whitelist``, ``extra_dirs``, ``allowed_invocations``) accept a list,
+    JSON-array string, or semicolon/newline-separated string. See README for
+    invocation allow-list, mid-flight config changes, and the full list of pair tools.
 
     Args:
         name: Unique addressable handle (e.g. "reviewer", "scout").
@@ -522,8 +523,9 @@ def pair_create(
         model: opus|sonnet|haiku alias or full name. Special: ``"match-parent"`` detects
             the calling session's model from JSONL (falls back to opus; pass
             ``parent_model`` to short-circuit detection).
-        effort: low|medium|high|xhigh|max. Coerced silently against model capability
-            (Sonnet xhigh/max → high; Haiku any → None) with a transparency message.
+        effort: low|medium|high|xhigh|max. Unset → omit the flag and let the CLI
+            apply its own per-model default. Coerced silently against model
+            capability (Sonnet xhigh/max → high; Haiku any → None) with a message.
         permission_mode: auto|acceptEdits|plan|default|dontAsk|bypassPermissions.
             ``bypassPermissions`` skips ALL gates — only use with tightly-scoped
             ``allowed_tools``/``cwd`` or when deliberately opting out of safety.
@@ -849,56 +851,36 @@ def _format_async_handle(task_id: str, why: str) -> str:
 # so the out-of-the-box behavior matches the original (pre-v0.8.0) signature.
 _HARDCODED_DEFAULTS = {
     "model": "opus",
-    "effort": None,         # None → derive from model via default_effort_for_model
+    # None → omit the --effort flag and let the CLI apply its own per-model
+    # default. (The match-parent path in _resolve_pair_create_args derives an
+    # explicit per-model default via default_effort_for_model; the plain-model
+    # path intentionally stays unset, which is also more future-proof — we never
+    # assert an effort token that a future CLI might rename.)
+    "effort": None,
     "permission_mode": "auto",
     "persistent": False,
     "extra_dirs": None,
 }
 
 
-def _resolve_match_parent_model(parent_model_arg: str | None) -> tuple[str, str | None]:
-    """Resolve ``model="match-parent"`` to a real model name.
+# How recently a JSONL must have been written to count as "the live parent
+# session" in the match-parent recency-fallback path. The parent session's
+# JSONL is touched by the very message that triggered pair_create, so it's
+# seconds-fresh; a sibling session not touched within this window is excluded.
+# Tight enough to isolate the active caller, loose enough to tolerate small
+# delays. Multiple JSONLs inside the window → genuine concurrency → ambiguous.
+_MATCH_PARENT_RECENCY_S = 45.0
 
-    Resolution ladder (each step falls through gracefully):
-      1. ``parent_model_arg`` (explicit, fast, no I/O)
-      2. ``CLAUDE_CODE_SESSION_ID`` env var → JSONL parse → latest assistant.model
-      3. Hardcoded fallback: ``"opus"``
 
-    Returns ``(resolved_model, transparency_message_or_None)``. The message is
-    surfaced to the agent in pair_create's response so they always know which
-    detection step actually fired (and what to do if detection failed).
+def _read_last_model_from_jsonl(path: Path) -> str | None:
+    """Return the last ``message.model`` seen in a session JSONL, or None.
+
+    Tolerates malformed lines (partial flushes, non-JSON) — skips them and
+    keeps scanning. Returns None on read error or if no model field is present.
     """
-    if parent_model_arg:
-        return parent_model_arg, (
-            f"match-parent: using explicit parent_model='{parent_model_arg}'."
-        )
-
-    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
-    if not sid:
-        return _HARDCODED_DEFAULTS["model"], (
-            "match-parent: no CLAUDE_CODE_SESSION_ID env var (the calling host "
-            f"isn't Claude Code, or env got dropped). Falling back to "
-            f"'{_HARDCODED_DEFAULTS['model']}'. Pass parent_model='<your model>' "
-            f"explicitly to skip detection."
-        )
-
-    # Reuse the existing _encode_cwd_for_project helper defined later in this
-    # file (used by _move_session_jsonl_for_cwd_change). Same regex as the
-    # adapter / runtime mirrors, kept as a single source within server.py.
-    encoded = _encode_cwd_for_project(str(Path.cwd()))
-    jsonl_path = reg_mod.claude_home() / "projects" / encoded / f"{sid}.jsonl"
-    if not jsonl_path.exists():
-        return _HARDCODED_DEFAULTS["model"], (
-            f"match-parent: session JSONL not found at {jsonl_path} "
-            f"(unexpected — this path formula is shared with sub-agent JSONL "
-            f"discovery, so something upstream changed). Falling back to "
-            f"'{_HARDCODED_DEFAULTS['model']}'. Pass parent_model='<your model>' "
-            f"explicitly to skip detection."
-        )
-
     try:
         last_model: str | None = None
-        with open(jsonl_path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 try:
                     obj = json.loads(line)
@@ -907,23 +889,112 @@ def _resolve_match_parent_model(parent_model_arg: str | None) -> tuple[str, str 
                 msg = obj.get("message", {})
                 if isinstance(msg, dict) and msg.get("model"):
                     last_model = msg["model"]
-        if last_model:
-            return last_model, (
-                f"match-parent: detected '{last_model}' from session JSONL "
-                f"({jsonl_path.name})."
-            )
-    except OSError as e:
-        return _HARDCODED_DEFAULTS["model"], (
-            f"match-parent: couldn't read session JSONL ({e}). Falling back to "
-            f"'{_HARDCODED_DEFAULTS['model']}'. Pass parent_model='<your model>' "
-            f"explicitly to skip detection."
+        return last_model
+    except OSError:
+        return None
+
+
+def _detect_model_from_recent_jsonl(project_dir: Path) -> tuple[str | None, str | None]:
+    """Find the live parent session's model when CLAUDE_CODE_SESSION_ID is stale.
+
+    The MCP server's ``CLAUDE_CODE_SESSION_ID`` is frozen at spawn, so it goes
+    stale whenever the server outlives the Claude session that launched it —
+    the exact-session lookup then misses. This fallback scans ``*.jsonl``
+    directly under ``project_dir`` (sub-agent JSONLs live in a ``<sid>/subagents/``
+    subdir, so the non-recursive glob naturally excludes them), drops any that
+    are registered PAIR sessions (else we'd detect a pair's own model — a
+    feedback loop), and keeps only those modified within the recency window.
+
+    Exactly one survivor → that's the active parent; read its last model.
+    Multiple → concurrent Claude sessions, genuinely ambiguous → give up.
+
+    Returns ``(model_or_None, detail_string)`` — detail explains the outcome
+    for the transparency message either way.
+    """
+    if not project_dir.is_dir():
+        return None, f"no project dir at {project_dir.name}"
+    try:
+        pair_sids = {p.session_id for p in reg_mod.load().pairs.values()}
+    except Exception:
+        pair_sids = set()
+    now = time.time()
+    candidates: list[tuple[float, Path]] = []
+    for jf in project_dir.glob("*.jsonl"):
+        if jf.stem in pair_sids:
+            continue  # skip our own pairs' transcripts
+        try:
+            age = now - jf.stat().st_mtime
+        except OSError:
+            continue
+        if age <= _MATCH_PARENT_RECENCY_S:
+            candidates.append((age, jf))
+    if not candidates:
+        return None, f"no non-pair session JSONL modified in last {int(_MATCH_PARENT_RECENCY_S)}s"
+    if len(candidates) > 1:
+        return None, (
+            f"{len(candidates)} sessions active in last {int(_MATCH_PARENT_RECENCY_S)}s "
+            f"(concurrent Claude sessions — ambiguous)"
+        )
+    age, jf = candidates[0]
+    model = _read_last_model_from_jsonl(jf)
+    if model:
+        return model, f"most-recent JSONL {jf.name} ({int(age)}s old)"
+    return None, f"most-recent JSONL {jf.name} had no model field"
+
+
+def _resolve_match_parent_model(parent_model_arg: str | None) -> tuple[str, str | None]:
+    """Resolve ``model="match-parent"`` to a real model name.
+
+    Resolution ladder (each step falls through gracefully):
+      1. ``parent_model_arg`` (explicit, fast, no I/O)
+      2. ``CLAUDE_CODE_SESSION_ID`` env var → that session's JSONL → latest model
+      3. **Recency fallback**: newest non-pair JSONL in the same cwd's project
+         dir, modified within ``_MATCH_PARENT_RECENCY_S`` (robust to the env var
+         being stale, which it is whenever the MCP server outlives its launching
+         Claude session)
+      4. Hardcoded fallback: ``"opus"`` — with an honest message naming why
+
+    Returns ``(resolved_model, transparency_message_or_None)``. The message is
+    surfaced in pair_create's response so the agent always knows which step
+    fired and what to do if detection was imperfect (pass ``parent_model``).
+    """
+    if parent_model_arg:
+        return parent_model_arg, (
+            f"match-parent: using explicit parent_model='{parent_model_arg}'."
         )
 
-    return _HARDCODED_DEFAULTS["model"], (
-        "match-parent: session JSONL had no assistant messages with model field "
-        "(brand-new session?). Falling back to "
-        f"'{_HARDCODED_DEFAULTS['model']}'. Pass parent_model='<your model>' "
-        f"explicitly."
+    encoded = _encode_cwd_for_project(str(Path.cwd()))
+    project_dir = reg_mod.claude_home() / "projects" / encoded
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    fallback = _HARDCODED_DEFAULTS["model"]
+
+    # Step 2: exact match on the env-var session's JSONL (fast path when the
+    # env var is fresh — i.e. the MCP server was spawned by THIS Claude session).
+    if sid:
+        jsonl_path = project_dir / f"{sid}.jsonl"
+        if jsonl_path.exists():
+            model = _read_last_model_from_jsonl(jsonl_path)
+            if model:
+                return model, (
+                    f"match-parent: detected '{model}' from session JSONL "
+                    f"({jsonl_path.name})."
+                )
+
+    # Step 3: recency fallback — the env var was missing, stale, or its JSONL
+    # had no model. Find the live parent by "newest non-pair JSONL in this cwd."
+    model, detail = _detect_model_from_recent_jsonl(project_dir)
+    if model:
+        why = "stale" if sid else "unset"
+        return model, (
+            f"match-parent: CLAUDE_CODE_SESSION_ID {why} (frozen at MCP spawn); "
+            f"detected '{model}' from {detail}. Pass parent_model='<your model>' "
+            f"to skip detection."
+        )
+
+    # Step 4: give up → static fallback, honest about why detection failed.
+    return fallback, (
+        f"match-parent: couldn't detect parent model ({detail}). Falling back to "
+        f"'{fallback}'. Pass parent_model='<your model>' to skip detection."
     )
 
 

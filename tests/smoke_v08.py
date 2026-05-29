@@ -186,72 +186,119 @@ def test_settings_reset():
 
 
 def test_match_parent_resolution():
-    """Tests the four branches of _resolve_match_parent_model:
+    """Tests the resolution ladder of _resolve_match_parent_model (v0.9.3):
        1. Explicit parent_model arg (no I/O)
-       2. JSONL parse with model field
-       3. JSONL exists but no model field (brand-new session)
-       4. JSONL doesn't exist OR no CLAUDE_CODE_SESSION_ID env (graceful fallback)
+       2. Exact env-var session JSONL → latest model
+       3. Recency fallback: newest non-pair JSONL in cwd within the window
+          (robust to a stale/frozen CLAUDE_CODE_SESSION_ID)
+       4. Graceful static fallback to opus, with an honest message
 
-    Bug #1 from historian's review (now fixed): the duplicate _encode_cwd_for_project
-    in server.py was calling re.sub on a Path object, crashing all match-parent
-    flows. This test exercises the JSONL path so the dedup regression is caught
-    if anyone re-introduces the duplicate."""
+    Also guards the v0.8.x dedup regression (_encode_cwd_for_project must accept
+    str input) by exercising the JSONL path end-to-end."""
     print("\n=== Match-parent resolution ===")
-    from claude_squared.server import _resolve_match_parent_model
+    import time
+    from claude_squared.server import _resolve_match_parent_model, _encode_cwd_for_project
+    from claude_squared.registry import claude_home
 
     # 1. Explicit parent_model arg short-circuits — no env / file I/O needed
     result, msg = _resolve_match_parent_model("claude-sonnet-4-6")
     assert_eq(result, "claude-sonnet-4-6", "explicit parent_model returned")
     assert "explicit parent_model" in msg, "explicit-arg path message"
 
-    # 2. Save+restore env, then test JSONL paths under the isolated CLAUDE_HOME.
-    # (Note: tmp dir at module load became CLAUDE_HOME, so `~/.claude/projects/...`
-    # resolves under that tmp dir.)
+    encoded = _encode_cwd_for_project(str(Path.cwd()))
+    jsonl_dir = claude_home() / "projects" / encoded
+
+    def _reset_dir():
+        if jsonl_dir.exists():
+            for f in jsonl_dir.glob("*.jsonl"):
+                f.unlink()
+        jsonl_dir.mkdir(parents=True, exist_ok=True)
+
+    def _write_jsonl(name, model, age_s=0.0):
+        p = jsonl_dir / f"{name}.jsonl"
+        with open(p, "w", encoding="utf-8") as f:
+            if model is not None:
+                f.write(json.dumps({"type": "assistant", "message": {"model": model, "role": "assistant"}}) + "\n")
+            else:
+                f.write(json.dumps({"type": "user", "message": {"role": "user"}}) + "\n")
+        if age_s:
+            t = time.time() - age_s
+            os.utime(p, (t, t))
+        return p
+
     saved_sid = os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
     try:
-        # 2a. No env var → fallback
-        result, msg = _resolve_match_parent_model(None)
-        assert_eq(result, "opus", "no env var → opus fallback")
-        assert "no CLAUDE_CODE_SESSION_ID" in msg, "no-env-var message"
-
-        # 2b. env var set, but JSONL doesn't exist → fallback
-        os.environ["CLAUDE_CODE_SESSION_ID"] = "fake-sid-no-file"
-        result, msg = _resolve_match_parent_model(None)
-        assert_eq(result, "opus", "missing JSONL → opus fallback")
-        assert "session JSONL not found" in msg, "missing-jsonl message"
-
-        # 2c. env var set, JSONL exists with model field → return it
-        from claude_squared.server import _encode_cwd_for_project
-        from claude_squared.registry import claude_home
-        sid = "test-sid-with-model"
+        # 2. Exact env-var session detection (last model in the file wins)
+        _reset_dir()
+        sid = "exact-sid"
         os.environ["CLAUDE_CODE_SESSION_ID"] = sid
-        encoded = _encode_cwd_for_project(str(Path.cwd()))
-        jsonl_dir = claude_home() / "projects" / encoded
-        jsonl_dir.mkdir(parents=True, exist_ok=True)
-        jsonl_path = jsonl_dir / f"{sid}.jsonl"
-        # Write 3 fake assistant messages; the LAST model wins
-        with open(jsonl_path, "w", encoding="utf-8") as f:
-            f.write(json.dumps({"type": "assistant", "message": {"model": "claude-opus-4-6", "role": "assistant"}}) + "\n")
+        p = jsonl_dir / f"{sid}.jsonl"
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "assistant", "message": {"model": "claude-opus-4-6"}}) + "\n")
             f.write(json.dumps({"type": "user", "message": {"role": "user"}}) + "\n")
-            f.write(json.dumps({"type": "assistant", "message": {"model": "claude-sonnet-4-6", "role": "assistant"}}) + "\n")
+            f.write(json.dumps({"type": "assistant", "message": {"model": "claude-sonnet-4-6"}}) + "\n")
         result, msg = _resolve_match_parent_model(None)
-        assert_eq(result, "claude-sonnet-4-6", "JSONL parse returns latest model")
-        assert "detected" in msg and "session JSONL" in msg, "JSONL-detection message"
+        assert_eq(result, "claude-sonnet-4-6", "exact env-var JSONL → latest model")
+        assert "detected" in msg and "session JSONL" in msg, "exact-detection message"
 
-        # 2d. JSONL exists but no assistant messages with model field → fallback
-        with open(jsonl_path, "w", encoding="utf-8") as f:
-            f.write(json.dumps({"type": "user", "message": {"role": "user"}}) + "\n")
-        result, msg = _resolve_match_parent_model(None)
-        assert_eq(result, "opus", "no model in JSONL → opus fallback")
-        assert "no assistant messages" in msg, "no-model-in-jsonl message"
-
-        # 2e. JSONL has malformed lines mixed with valid ones — should not crash
-        with open(jsonl_path, "w", encoding="utf-8") as f:
+        # 2e. Malformed lines tolerated; valid model still recovered
+        with open(p, "w", encoding="utf-8") as f:
             f.write("THIS IS NOT JSON\n")
-            f.write(json.dumps({"type": "assistant", "message": {"model": "claude-haiku-4-5", "role": "assistant"}}) + "\n")
+            f.write(json.dumps({"type": "assistant", "message": {"model": "claude-haiku-4-5"}}) + "\n")
             f.write("\x00\x01garbage\n")
         result, msg = _resolve_match_parent_model(None)
-        assert_eq(result, "claude-haiku-4-5", "malformed lines tolerated; valid model still recovered")
+        assert_eq(result, "claude-haiku-4-5", "malformed lines tolerated")
+
+        # 3. RECENCY FALLBACK — env var stale (its JSONL missing), but a recent
+        # non-pair JSONL exists → detect it. This is the v0.9.3 hardening.
+        _reset_dir()
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "stale-sid-no-file"
+        _write_jsonl("live-parent", "claude-opus-4-8")
+        result, msg = _resolve_match_parent_model(None)
+        assert_eq(result, "claude-opus-4-8", "recency fallback detects live parent")
+        assert "stale" in msg and "claude-opus-4-8" in msg, "recency-stale message"
+
+        # 3b. No env var at all + recent JSONL → recency fallback ("unset")
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        result, msg = _resolve_match_parent_model(None)
+        assert_eq(result, "claude-opus-4-8", "recency fallback with no env var")
+        assert "unset" in msg, "recency-unset message"
+
+        # 3c. A registered PAIR's JSONL must be EXCLUDED (no feedback loop).
+        # Make the only recent JSONL a pair session → fall back to opus.
+        _reset_dir()
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        from claude_squared import registry as reg_mod
+        from claude_squared.models import PairSpec
+        pair_sid = "pairs-own-session"
+        reg_mod.add_pair(PairSpec(name="_mp_test_pair", session_id=pair_sid, model="opus"))
+        try:
+            _write_jsonl(pair_sid, "claude-opus-4-8")
+            result, msg = _resolve_match_parent_model(None)
+            assert_eq(result, "opus", "registered pair JSONL excluded → fallback")
+        finally:
+            reg_mod.remove_pair("_mp_test_pair")
+
+        # 3d. Ambiguous — two recent non-pair JSONLs (concurrent sessions) → fallback
+        _reset_dir()
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        _write_jsonl("sess-a", "claude-opus-4-8")
+        _write_jsonl("sess-b", "claude-sonnet-4-6")
+        result, msg = _resolve_match_parent_model(None)
+        assert_eq(result, "opus", "ambiguous concurrent sessions → fallback")
+        assert "ambiguous" in msg or "concurrent" in msg, "ambiguous message"
+
+        # 3e. A JSONL older than the recency window is not picked → fallback
+        _reset_dir()
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        _write_jsonl("old-sess", "claude-opus-4-8", age_s=999.0)
+        result, msg = _resolve_match_parent_model(None)
+        assert_eq(result, "opus", "JSONL beyond recency window → fallback")
+
+        # 3f. Empty dir → fallback
+        _reset_dir()
+        result, msg = _resolve_match_parent_model(None)
+        assert_eq(result, "opus", "no recent JSONL → fallback")
     finally:
         # Restore env
         if saved_sid:

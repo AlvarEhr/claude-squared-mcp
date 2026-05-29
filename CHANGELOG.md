@@ -4,6 +4,47 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.3] — 2026-05-29
+
+Cleanup pass prompted by the Opus 4.8 release. **No urgent fix was needed** —
+the model-alias passthrough auto-adapted to 4.8 the moment the CLI updated
+(`--model opus` → `claude-opus-4-8`), validating the "don't hardcode versions"
+design. These are the quality improvements surfaced while investigating.
+
+### Changed
+- **Hardened `match-parent` detection.** The MCP server's
+  `CLAUDE_CODE_SESSION_ID` is frozen at spawn, so it goes stale whenever the
+  server outlives the Claude session that launched it — and the exact-session
+  JSONL lookup then silently fell back to the `opus` alias. New ladder adds a
+  recency fallback: when the env-var session isn't found, detect the live
+  parent from the **newest non-pair JSONL in the same cwd** modified within
+  45s. Registered pair sessions are excluded (no feedback loop); concurrent
+  sessions (multiple recent JSONLs) are treated as ambiguous and fall back to
+  `opus` with an explicit message naming why. The transparency message now
+  honestly reports a stale/unset env var and points at `parent_model=` as the
+  reliable escape hatch.
+- **1M context-window fallback.** `adapters/claude.py` previously defaulted to
+  200k when the CLI didn't report a `contextWindow`. Now infers 1,000,000 for
+  model names containing `1m` before that fallback — keeps the context-fill %
+  honest on million-context pairs. (The current CLI reports the window
+  correctly for Opus 4.8 1M; this is defensive for models that don't.)
+
+### Fixed (docs)
+- **Effort-default documentation accuracy.** The `pair_create` docstring and the
+  `_HARDCODED_DEFAULTS` comment implied the default effort was `xhigh` / "derived
+  from model", but the plain-model path intentionally leaves effort unset (omits
+  `--effort`, letting the CLI apply its own per-model default). Corrected both —
+  and noted this is the more future-proof behavior: a default pair never asserts
+  an effort token that a future CLI might rename (e.g. the "Extra" relabeling of
+  `xhigh` observed in newer menus — still `xhigh` as the flag value as of CLI
+  2.1.156, confirmed via probe).
+
+### Notes
+- Confirmed `--effort extra` is rejected by CLI 2.1.156; the valid set remains
+  `low, medium, high, xhigh, max`. "Extra" is a display label only. No effort
+  code change made; widening the `EffortLevel` type is held as a documented
+  watchpoint until/unless the flag value actually renames.
+
 ## [0.9.2] — 2026-05-27
 
 ### Added
