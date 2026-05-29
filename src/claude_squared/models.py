@@ -12,6 +12,18 @@ PermissionMode = Literal["auto", "acceptEdits", "plan", "default", "dontAsk", "b
 EffortLevel = Literal["low", "medium", "high", "xhigh", "max"]
 Backend = Literal["claude"]
 
+# Tools that cannot function in a headless ``claude --print`` pair: there is no
+# interactive UI to render them, so the CLI denies the call regardless of
+# permission_mode (even bypassPermissions) — and any content the model composed
+# *inside* the call (questions, options, prose) is lost with the denial rather
+# than surfacing in the assistant text channel. We strip these from every pair's
+# toolset at spawn (see ``ClaudeAdapter._common_create_args``) so the model
+# routes that content back as plain text instead. Single source of truth, shared
+# by the spawn-time disallow list and the permission-handoff formatter so the two
+# can't drift. AskUserQuestion is the confirmed offender (a pair is addressable
+# only by its orchestrator, so a clarifying question belongs in its text reply).
+HEADLESS_INCOMPATIBLE_TOOLS = ("AskUserQuestion",)
+
 
 # Per-model effort capability matrix (verified empirically by the user 2026-05-13):
 #   - Opus 4.7 / 4.7-1M / 4.6: all 5 levels

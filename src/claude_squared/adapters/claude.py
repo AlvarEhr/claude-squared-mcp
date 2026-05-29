@@ -15,6 +15,7 @@ from claude_squared.adapters.base import PairAdapter
 from claude_squared.cli_paths import encode_cwd_for_project as _encode_cwd_for_project
 from claude_squared.errors import CLIError, CommandTimeout, SessionMissing
 from claude_squared.models import (
+    HEADLESS_INCOMPATIBLE_TOOLS,
     CompactResult,
     ContextReport,
     ContextStatus,
@@ -212,6 +213,14 @@ class ClaudeAdapter(PairAdapter):
         # CLI-side and Desktop-side namespaces.
         args += ["--disallowed-tools", "mcp__pair__*",
                  "--disallowed-tools", "mcp__Claude_Squared__*"]
+        # Strip tools that can't work in headless --print mode (no interactive UI).
+        # AskUserQuestion is the key one: a headless pair has no way to render it,
+        # so the CLI denies the call regardless of permission_mode AND the content
+        # the model composed inside it is lost. Removing it from the toolset makes
+        # the model put clarifying questions in its plain-text reply, which routes
+        # back to the orchestrator intact. (See models.HEADLESS_INCOMPATIBLE_TOOLS.)
+        for t in HEADLESS_INCOMPATIBLE_TOOLS:
+            args += ["--disallowed-tools", t]
 
         # Workspace dirs → --add-dir (the spawned subprocess's cwd defines the workspace
         # root; --add-dir whitelists additional paths for the auto-mode classifier).

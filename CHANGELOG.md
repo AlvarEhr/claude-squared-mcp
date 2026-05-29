@@ -4,6 +4,40 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.4] — 2026-05-29
+
+Bug fix from live testing: a pair created with `permission_mode="bypassPermissions"`
+had an `AskUserQuestion` call blocked anyway, mislabeled as an auto-mode permission
+denial, with the suggested bypass remedy inapplicable (already in bypass) — and the
+~3 KB of report content the model composed inside the call was lost with the denial.
+
+### Fixed
+- **`AskUserQuestion` (and any headless-incompatible tool) is now stripped from
+  every pair's toolset at spawn** via `--disallowed-tools`. A headless
+  `claude --print` pair has no interactive UI to render `AskUserQuestion`, so the
+  CLI denied it regardless of `permission_mode` (even `bypassPermissions`) — and
+  whatever the model composed inside the call (questions, options, prose) was
+  dropped with the denied call instead of surfacing as assistant text. With the
+  tool removed, the model puts clarifying questions in its plain-text reply, which
+  routes back to the orchestrator intact. New shared constant
+  `models.HEADLESS_INCOMPATIBLE_TOOLS` is the single source of truth, used by both
+  the spawn-time disallow list and the handoff formatter. (A pair is addressable
+  only by its orchestrator, so it should never have `AskUserQuestion` — same as
+  teammates/sub-agents.)
+- **Permission-handoff message is now mode-aware and tool-aware.** It previously
+  hardcoded "blocked by auto-mode" regardless of the pair's actual
+  `permission_mode`, and always recommended retrying with `bypassPermissions` —
+  useless when the pair was already in that mode. Now it reports the actual
+  `permission_mode`, and partitions denials: headless-incompatible tools get a
+  structural remedy ("cannot run headless; bypassPermissions will NOT help;
+  re-request the content as plain text"), while genuine permission denials get the
+  bypass remedy. Mixed denials get both.
+
+### Note
+- The spawn-time fix is pinned at session start, so it only applies to NEWLY
+  created pairs. An existing pair needs `pair_clear` (or `pair_forget` +
+  `pair_create`) to pick up the stripped toolset.
+
 ## [0.9.3] — 2026-05-29
 
 Cleanup pass prompted by the Opus 4.8 release. **No urgent fix was needed** —

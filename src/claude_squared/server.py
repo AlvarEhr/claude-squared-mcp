@@ -32,6 +32,7 @@ from claude_squared.adapters import ClaudeAdapter, PairAdapter
 from claude_squared.cli_paths import encode_cwd_for_project as _encode_cwd_for_project
 from claude_squared.errors import PairAlreadyExists, PairError, PairNotFound
 from claude_squared.models import (
+    HEADLESS_INCOMPATIBLE_TOOLS,
     ActionInfo,
     AsyncTaskState,
     CompactResult,
@@ -218,36 +219,54 @@ def _fmt_send_result(r: SendResult) -> str:
         from collections import Counter
         counts = Counter(d.tool_name for d in r.permission_denials)
         denied_summary = ", ".join(f"{name} ×{n}" if n > 1 else name for name, n in counts.items())
+        # Report the pair's ACTUAL permission_mode rather than hardcoding
+        # "auto-mode" — a bypassPermissions pair was historically mislabeled,
+        # and the mode determines which remedy actually applies.
+        try:
+            mode = reg_mod.get_pair(r.name).permission_mode
+        except Exception:
+            mode = "unknown"
+        # Partition denials: structurally-headless-incompatible tools (e.g.
+        # AskUserQuestion) vs genuine permission denials. The former are denied
+        # regardless of permission_mode — bypassPermissions does NOT help — and
+        # any content the model composed inside the call is gone with it.
+        interactive = [t for t in counts if t in HEADLESS_INCOMPATIBLE_TOOLS]
+        permissionish = [t for t in counts if t not in HEADLESS_INCOMPATIBLE_TOOLS]
+
         lines.append(
-            f"\n⛔ PERMISSION HANDOFF: pair '{r.name}' was blocked by auto-mode for "
-            f"{len(r.permission_denials)} tool call(s) — {denied_summary}.\n"
-            f"   The pair worked around the denials in its reply above (or didn't, if the task required those tools).\n"
-            f"\n"
-            f"   To retry, the USER must explicitly authorize the blocked action. Do NOT assume or "
-            f"retry autonomously — this MCP intentionally surfaces the denial.\n"
-            f"\n"
-            f"     1. Check the user's most recent message to YOU. If it explicitly authorizes the blocked "
-            f"action (e.g. \"go ahead even if blocked\", \"let the pair access X\", \"bypass permissions for this\"), "
-            f"proceed to step 3. Otherwise, ASK the user first and wait for a clear go-ahead.\n"
-            f"     2. Decide which retry mechanism to use:\n"
-            f"          • For most denials in this MCP's headless-CLI mode, the reliable path is to re-send "
-            f"with `override_permission_mode=\"bypassPermissions\"`. This bypasses auto-mode for that one call. "
-            f"Empirically, just including \"the user authorized this\" in the message text is NOT enough in "
-            f"the pair's --print/--resume code path — the auto-mode classifier in headless mode does not "
-            f"reliably treat conversation text as user authorization the way interactive Claude Code does.\n"
-            f"          • For OUT-OF-SANDBOX path access (Read/Edit/Write of files outside the pair's cwd), "
-            f"either bypassPermissions OR pair_clear+pair_create with a wider cwd / --add-dir.\n"
-            f"          • For a persistent narrow allowlist of known-safe commands, pair_clear then pair_create "
-            f"with `allowed_tools=[...]` (allowed_tools is pinned at create-time, so update→clear→recreate).\n"
-            f"     3. Re-send. Pass the user's explicit authorization both as natural-language context in the "
-            f"message AND via override_permission_mode=\"bypassPermissions\" (belt + suspenders): "
-            f"`pair_send(name=\"...\", message=\"User explicitly authorized: ... Please retry: ...\", "
-            f"override_permission_mode=\"bypassPermissions\")`.\n"
-            f"\n"
-            f"   What was tried but doesn't reliably work in this MCP's mode:\n"
-            f"     • Just adding \"the user authorized this\" to the next message without override_permission_mode: "
-            f"empirically, the headless CLI's classifier still blocks. Works in interactive Claude Code, NOT here."
+            f"\n⛔ PAIR HANDOFF: pair '{r.name}' (permission_mode={mode}) had "
+            f"{len(r.permission_denials)} blocked tool call(s) — {denied_summary}."
         )
+        if interactive:
+            lines.append(
+                f"\n   • {', '.join(interactive)}: cannot run in headless mode — there is no "
+                f"interactive UI to render these. This is NOT a permission problem; "
+                f"bypassPermissions will NOT help (the call is blocked even in that mode). "
+                f"Whatever the pair composed INSIDE the call (questions, options, prose) was "
+                f"dropped with it and is NOT in the reply above.\n"
+                f"     Recovery: re-send asking the pair to return that content as PLAIN TEXT — e.g. "
+                f"pair_send(name=\"{r.name}\", message=\"Re-send your questions/recommendation as a normal "
+                f"markdown message — do not use AskUserQuestion\"). The content is still in the pair's "
+                f"context, so it can reproduce it.\n"
+                f"     (Newly created pairs have these tools stripped at spawn so this won't recur; an "
+                f"EXISTING pair like this one needs pair_clear — or pair_forget + pair_create — to pick "
+                f"up the change, since the toolset is pinned at session start.)"
+            )
+        if permissionish:
+            denied_p = ", ".join(permissionish)
+            lines.append(
+                f"\n   • {denied_p}: blocked by permission_mode={mode}. "
+                f"The pair worked around it in its reply above (or didn't, if the task needed those tools).\n"
+                f"     To retry, the USER must explicitly authorize. Do NOT retry autonomously — this MCP "
+                f"intentionally surfaces the denial.\n"
+                f"       1. Check the user's most recent message. If it explicitly authorizes the blocked "
+                f"action, proceed; otherwise ASK first and wait for a clear go-ahead.\n"
+                f"       2. Re-send with `override_permission_mode=\"bypassPermissions\"` (the reliable path "
+                f"in headless --print mode — natural-language \"the user authorized this\" alone does NOT "
+                f"reliably satisfy the headless classifier, unlike interactive Claude Code). For "
+                f"out-of-sandbox file access, bypassPermissions OR pair_clear+pair_create with a wider "
+                f"cwd/--add-dir; for a persistent narrow allowlist, recreate with `allowed_tools=[...]`."
+            )
     return "\n".join(lines)
 
 
