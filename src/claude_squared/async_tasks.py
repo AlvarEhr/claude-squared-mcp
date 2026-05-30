@@ -306,6 +306,35 @@ def find_task_by_prefix(prefix: str) -> list[str]:
     return out
 
 
+def latest_task_id_for_pair(pair_name: str) -> str | None:
+    """Return the most-recently-STARTED task id for a pair, or None if it has none.
+
+    Lets ``pair_poll`` accept a pair NAME instead of a UUID — agents fumble the
+    long task id, but they always know the pair's name. "Most recent" = max
+    ``started_at`` (the task you most likely just kicked off). Malformed/unparseable
+    state files are skipped. This does NOT change the canonical id (a pair has
+    many tasks over its life); it's purely an ergonomic resolver.
+    """
+    d = async_dir()
+    if not d.exists():
+        return None
+    best_id: str | None = None
+    best_started = ""
+    for p in d.glob("*.json"):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if data.get("pair_name") != pair_name:
+            continue
+        started = data.get("started_at") or ""
+        # ISO-8601 strings sort lexicographically in chronological order, so a
+        # plain string max gives the latest without datetime parsing.
+        if best_id is None or started > best_started:
+            best_id, best_started = data.get("task_id"), started
+    return best_id
+
+
 def _cleanup_orphaned_running_tasks() -> None:
     """Walk the async dir and mark any ``status="running"`` task **owned by this
     process** as failed.

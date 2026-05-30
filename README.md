@@ -154,13 +154,23 @@ Three ways to consume the handle:
    bundled via PYTHONPATH inside the MCP server's own subprocess).
 
 2. **Manual quick status**: `pair_poll(task_id)` returns one-line status; if
-   `status="done"` includes the full response text.
+   `status="done"` includes the full response text. **You can poll by pair
+   name** — `pair_poll("scout")` resolves to that pair's most-recent task, so
+   you don't have to copy the UUID (the output names the concrete task it
+   picked). Pass an explicit id only when you need an older task.
 
 3. **Live or just-completed turn content**:
-   `pair_poll(task_id, with_turn_log=True)` shows the in-flight turn (running)
-   or the just-completed turn (terminal status), with `[T-N]` tags drillable via
-   `pair_tool_detail`. Use this for ALL statuses — `pair_transcript` is the
-   broader conversation browser, not task-bound.
+   `pair_poll(name_or_task_id, with_turn_log=True)` shows the in-flight turn
+   (running) or the just-completed turn (terminal status), with `[T-N]` tags
+   drillable via `pair_tool_detail`. Use this for ALL statuses —
+   `pair_transcript` is the broader conversation browser, not task-bound.
+
+**Orphaned tasks** (`status` shows `⚠ ORPHANED`): the owning MCP server died
+mid-turn (host watchdog / crash). This is a supervision event, *not* a work
+error — the pair's `claude` subprocess runs in its own process group and usually
+completes the work anyway. Verify via `pair_transcript` + your git/file state,
+then `pair_send` to resume from the persisted session JSONL. `wait.py` reports
+this with exit code 4.
 
 **Universal fallback** (when `python` isn't on the agent's shell PATH):
 

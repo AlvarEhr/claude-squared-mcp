@@ -690,6 +690,7 @@ def pair_create(
                 state.task_id,
                 "Initial message queued as an async task (long Opus briefings "
                 "can take minutes; this avoids the host RPC timeout).",
+                pair_name=name,
             )
         except Exception as e:
             line += f"\n(initial_message queue failed: {e}; send manually via pair_send)"
@@ -826,12 +827,19 @@ def _build_send_runner(
     return _run
 
 
-def _format_async_handle(task_id: str, why: str) -> str:
+def _format_async_handle(task_id: str, why: str, pair_name: str | None = None) -> str:
     """Terse runtime hint when an operation degrades to async.
 
-    Returns only the task_id, three concrete commands, and a one-line nudge
-    to run the Bash watcher for hands-off notification — full pedagogy lives
-    in pair_send / pair_send_async docstrings.
+    Returns the task_id, three concrete poll commands, and a one-line nudge to
+    run the Bash watcher for hands-off notification — full pedagogy lives in
+    pair_send / pair_send_async docstrings.
+
+    When ``pair_name`` is given, the poll hints use the PAIR NAME rather than the
+    raw UUID — ``pair_poll('reviewer')`` resolves to the pair's latest task.
+    Agents reliably fumble the long task id but always know the pair name, so
+    this is the easy, hard-to-get-wrong path. (The Bash watcher still uses the
+    exact task id — it's pasted programmatically right here, not retyped later,
+    and wait.py resolves by task file.)
 
     The watcher command points at the standalone ``~/.claude/pairs/wait.py``
     (installed at server startup) — stdlib-only, so it works regardless of
@@ -853,12 +861,20 @@ def _format_async_handle(task_id: str, why: str) -> str:
         wait_cmd = f"{py} {wait_path} {task_id}"
     else:
         wait_cmd = f"{py} -m claude_squared wait {task_id}"
+    # Prefer the pair name in the poll hints — short, known, hard to mistype.
+    poll_ref = pair_name if pair_name else task_id
+    name_hint = (
+        f"  (polling by pair name '{pair_name}' returns its LATEST task; "
+        f"use the task id above for an older one)\n"
+        if pair_name else ""
+    )
     return (
         f"{why}\n"
         f"Async task: {task_id}\n"
-        f"  pair_poll('{task_id}')                          # instant status\n"
-        f"  pair_poll('{task_id}', wait_seconds=30)         # block-wait up to 30s for terminal state\n"
-        f"  pair_poll('{task_id}', with_turn_log=True)      # status + current/last-turn content\n"
+        f"  pair_poll('{poll_ref}')                          # instant status\n"
+        f"  pair_poll('{poll_ref}', wait_seconds=30)         # block-wait up to 30s for terminal state\n"
+        f"  pair_poll('{poll_ref}', with_turn_log=True)      # status + current/last-turn content\n"
+        f"{name_hint}"
         f"  Bash(run_in_background=True, command=\"{wait_cmd}\")  # auto-notify on done\n"
         f"Tip: Bash watcher = hands-off notification. No background Bash (e.g. Cowork)? "
         f"Use pair_poll(wait_seconds=N) to avoid spam-polling."
@@ -1214,7 +1230,7 @@ async def pair_send(
             f"Sync wait timed out at {rpc_hold_s}s (pair '{name}' still working "
             f"under hard_timeout={hard_str})."
         )
-    return _format_async_handle(state.task_id, framing)
+    return _format_async_handle(state.task_id, framing, pair_name=name)
 
 
 @mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False})
@@ -1270,7 +1286,7 @@ def pair_send_async(
         ),
     )
     state = async_tasks.start_task(name, message, runner)
-    return _format_async_handle(state.task_id, f"Started async task for pair '{name}'.")
+    return _format_async_handle(state.task_id, f"Started async task for pair '{name}'.", pair_name=name)
 
 
 def _read_current_or_last_turn_log(
@@ -1362,8 +1378,13 @@ def pair_poll(
     For arbitrary line ranges or earlier turns, use ``pair_log`` directly.
 
     Args:
-        task_id: Async task ID from ``pair_send_async`` (or a sync-degraded
-            ``pair_send``). Prefix is accepted as long as it's unique.
+        task_id: What to poll. Accepts (in resolution order): a **pair name**
+            (easiest — resolves to that pair's most-recently-started task; you
+            always know the name, unlike the UUID), a full async task id, or a
+            unique task-id prefix (e.g. the 8-char form ``pair_status`` shows).
+            When a name/prefix is resolved, the output names the concrete task it
+            picked so there's no ambiguity. Polling by name gives the LATEST task
+            for that pair — pass an explicit id if you need an older one.
         with_turn_log: If True, append the current or just-completed turn's
             log lines. Default False (quick status only — doesn't flood context).
         wait_seconds: If > 0, BLOCK up to N seconds for the task to reach a
@@ -1380,21 +1401,41 @@ def pair_poll(
             available — block-polling beats spam-polling every few seconds.
         verbose: If True, return the full JSON ``AsyncTaskState``.
     """
+    # Resolution ladder (additive — exact-id behavior unchanged):
+    #   1. exact task_id
+    #   2. a PAIR NAME → that pair's most-recent task (agents fumble UUIDs but
+    #      always know the pair name; this is the easy path)
+    #   3. a unique task_id prefix (e.g. the 8-char form pair_status shows)
+    resolved_note: str | None = None
     state = async_tasks.load_task(task_id)
     if state is None:
-        # Maybe the caller passed an 8-char prefix from pair_status output —
-        # try to resolve. Reject if ambiguous (multiple matches).
-        candidates = async_tasks.find_task_by_prefix(task_id)
-        if len(candidates) == 1:
-            state = async_tasks.load_task(candidates[0])
-            task_id = candidates[0]
-        elif len(candidates) > 1:
-            raise PairError(
-                f"Task ID prefix '{task_id}' is ambiguous; matches {len(candidates)} "
-                f"tasks: {', '.join(c[:12] for c in candidates[:5])}. Provide more characters."
-            )
+        if task_id in reg_mod.load().pairs:
+            # It's a pair name → resolve to the latest task for that pair.
+            latest = async_tasks.latest_task_id_for_pair(task_id)
+            if latest is None:
+                raise PairError(
+                    f"Pair '{task_id}' exists but has no async tasks yet "
+                    f"(no pair_send / pair_send_async has run for it). Send it a message first."
+                )
+            resolved_note = f"(resolved pair '{task_id}' → its latest task {_short(latest)})"
+            task_id = latest
+            state = async_tasks.load_task(latest)
         else:
-            raise PairError(f"No async task with id '{task_id}'.")
+            # Maybe an 8-char task-id prefix (from pair_status output).
+            candidates = async_tasks.find_task_by_prefix(task_id)
+            if len(candidates) == 1:
+                state = async_tasks.load_task(candidates[0])
+                task_id = candidates[0]
+            elif len(candidates) > 1:
+                raise PairError(
+                    f"Task ID prefix '{task_id}' is ambiguous; matches {len(candidates)} "
+                    f"tasks: {', '.join(c[:12] for c in candidates[:5])}. Provide more characters."
+                )
+            else:
+                raise PairError(
+                    f"No async task or pair named '{task_id}'. Pass a pair name "
+                    f"(polls its latest task), a full task_id, or a unique id prefix."
+                )
 
     # Reap orphans on observation: if the task's owning MCP server died mid-turn,
     # finalize it NOW (instead of waiting for the next server's startup sweep or
@@ -1446,6 +1487,10 @@ def pair_poll(
         headline = f"unknown status: {state.status}"
 
     lines = [headline]
+    # If we resolved a pair name (or prefix) to a concrete task, say so — the
+    # agent should never be guessing which task it's looking at.
+    if resolved_note:
+        lines.append(f"  {resolved_note}")
 
     # Auto hang-warning for running tasks — always shown, even without with_turn_log
     if state.status == "running":

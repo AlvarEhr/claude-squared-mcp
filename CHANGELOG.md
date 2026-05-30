@@ -4,6 +4,34 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.6] — 2026-05-30
+
+Ergonomics: agents kept mistyping the UUID task_id when polling. Now you can
+poll by the pair's NAME — which you always know — and the async handle steers
+you there.
+
+### Added
+- **`pair_poll` accepts a pair name.** Resolution order: exact task_id → pair
+  name (resolves to that pair's most-recently-started task) → unique task-id
+  prefix. So `pair_poll("reviewer")` just works. The output names the concrete
+  task it resolved to, so there's never a silent mismatch. Polling by name
+  always targets the LATEST task for that pair — pass an explicit id for an
+  older one. New helper `async_tasks.latest_task_id_for_pair`.
+- The unknown-ref error now names both options ("No async task or pair named
+  '…' — pass a pair name, a full task_id, or a unique id prefix").
+
+### Changed
+- **Async-handle poll hints now show the pair name** instead of the raw UUID —
+  e.g. `pair_poll('reviewer')` — since that's the hard-to-mistype path. The
+  Bash watcher line still uses the exact task id (it's pasted programmatically,
+  not retyped). Backward-compatible: the helper falls back to the task id when
+  no pair name is available.
+
+### Backward compatibility
+- Purely additive. Existing UUID and prefix polling are unchanged; the canonical
+  task id is still a UUID (a pair has many tasks over its life, so the id can't
+  *be* the name).
+
 ## [0.9.5] — 2026-05-30
 
 Bug fix from live testing: a pair's async task was reported `failed` ("MCP server
