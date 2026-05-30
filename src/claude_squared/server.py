@@ -853,19 +853,23 @@ def _format_async_handle(task_id: str, why: str, pair_name: str | None = None) -
     paths are shlex-quoted to survive spaces in install dirs ("Claude
     Extensions/...", "Users/Alice Smith/...").
     """
+    # Prefer the pair name everywhere in the hint — short, known, hard to
+    # mistype. wait.py and pair_poll both resolve a name → the pair's latest
+    # task. The exact task id is still printed on the "Async task:" line for the
+    # rare case an agent needs to target an older task explicitly.
+    poll_ref = pair_name if pair_name else task_id
     py = shlex.quote(sys.executable)
+    watch_ref = shlex.quote(poll_ref)
     if _WAIT_SCRIPT_PATH is not None:
         # POSIX-style path is friendlier to bash on both Windows (Git Bash) and
         # POSIX shells than the native Windows backslashed form.
         wait_path = shlex.quote(_WAIT_SCRIPT_PATH.as_posix())
-        wait_cmd = f"{py} {wait_path} {task_id}"
+        wait_cmd = f"{py} {wait_path} {watch_ref}"
     else:
-        wait_cmd = f"{py} -m claude_squared wait {task_id}"
-    # Prefer the pair name in the poll hints — short, known, hard to mistype.
-    poll_ref = pair_name if pair_name else task_id
+        wait_cmd = f"{py} -m claude_squared wait {watch_ref}"
     name_hint = (
-        f"  (polling by pair name '{pair_name}' returns its LATEST task; "
-        f"use the task id above for an older one)\n"
+        f"  (name '{pair_name}' resolves to its LATEST task everywhere here; "
+        f"use the task id above to target an older one)\n"
         if pair_name else ""
     )
     return (

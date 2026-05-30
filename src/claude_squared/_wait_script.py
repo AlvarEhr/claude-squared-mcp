@@ -56,8 +56,35 @@ def _claude_home() -> Path:
     return Path(h) if h else Path.home() / ".claude"
 
 
+def _async_dir() -> Path:
+    return _claude_home() / "pairs" / "async"
+
+
 def _state_path(task_id: str) -> Path:
-    return _claude_home() / "pairs" / "async" / f"{task_id}.json"
+    return _async_dir() / f"{task_id}.json"
+
+
+def _latest_task_for_pair(pair_name: str) -> str | None:
+    """If any task on disk has pair_name == this arg, return that pair's
+    most-recently-STARTED task id (max started_at). Lets the watcher be fired by
+    PAIR NAME, like pair_poll — agents know the name, not the UUID. Stdlib-only;
+    mirrors async_tasks.latest_task_id_for_pair. ISO-8601 started_at sorts
+    lexicographically, so a string max gives the latest without date parsing."""
+    d = _async_dir()
+    if not d.is_dir():
+        return None
+    best_id, best_started = None, ""
+    for p in d.glob("*.json"):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if data.get("pair_name") != pair_name:
+            continue
+        started = data.get("started_at") or ""
+        if best_id is None or started > best_started:
+            best_id, best_started = data.get("task_id"), started
+    return best_id
 
 
 def _pid_alive(pid: int) -> bool:
@@ -88,7 +115,8 @@ def _pid_alive(pid: int) -> bool:
 def main(argv: list[str]) -> int:
     if not argv or argv[0] in ("-h", "--help"):
         print(
-            "Usage: python wait.py <task_id> [--timeout SECS] [--poll SECS]\\n"
+            "Usage: python wait.py <task_id|pair_name> [--timeout SECS] [--poll SECS]\\n"
+            "  A pair name resolves to that pair's latest task.\\n"
             "  Exit codes: 0=done, 1=failed, 2=not-found, 3=timeout, 4=orphaned, 64=usage",
             file=sys.stderr,
         )
@@ -118,15 +146,28 @@ def main(argv: list[str]) -> int:
             print(f"unknown arg: {a}", file=sys.stderr)
             return 64
 
+    arg = task_id  # remember the original for error messages
     state_file = _state_path(task_id)
     deadline = time.monotonic() + timeout_s
 
-    # Initial existence check (one-tick race tolerance for filesystem startup)
+    # Accept a PAIR NAME as well as an exact task id (parity with pair_poll): if
+    # there's no task file by this name, treat the arg as a pair name and resolve
+    # to that pair's latest task. Two attempts tolerate the filesystem race right
+    # after the task is created.
+    for _attempt in (0, 1):
+        if state_file.exists():
+            break
+        latest = _latest_task_for_pair(task_id)
+        if latest:
+            print(f"resolved pair '{arg}' -> latest task {latest}", file=sys.stderr)
+            task_id = latest
+            state_file = _state_path(task_id)
+            break
+        if _attempt == 0:
+            time.sleep(min(poll_s, 1.0))
     if not state_file.exists():
-        time.sleep(min(poll_s, 1.0))
-        if not state_file.exists():
-            print(f"task not found: {task_id}", file=sys.stderr)
-            return 2
+        print(f"not found: no task id or pair named '{arg}'", file=sys.stderr)
+        return 2
 
     while True:
         try:

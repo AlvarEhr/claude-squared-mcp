@@ -24,7 +24,8 @@ def _cmd_wait(argv: list[str]) -> int:
     polling pattern in ``pair_send_async``."""
     if not argv or argv[0] in ("-h", "--help"):
         print(
-            "Usage: python -m claude_squared wait <task_id> [--timeout SECS] [--poll SECS]\n"
+            "Usage: python -m claude_squared wait <task_id|pair_name> [--timeout SECS] [--poll SECS]\n"
+            "  A pair name resolves to that pair's latest task.\n"
             "  Exit codes: 0=done, 1=failed, 2=not-found, 3=timeout, 64=usage error",
             file=sys.stderr,
         )
@@ -54,16 +55,29 @@ def _cmd_wait(argv: list[str]) -> int:
             return 64
 
     deadline = time.monotonic() + timeout_s
+    arg = task_id  # original, for error messages
     # First check: existence. If the task file never showed up in the first poll
     # window, treat as not-found (catches typos faster than letting timeout fire).
-    initial = async_tasks.load_task(task_id)
-    if initial is None:
+    # Also accept a PAIR NAME (parity with pair_poll / standalone wait.py): if the
+    # arg isn't a task id, resolve it to that pair's latest task.
+    def _resolve() -> bool:
+        nonlocal task_id
+        if async_tasks.load_task(task_id) is not None:
+            return True
+        latest = async_tasks.latest_task_id_for_pair(task_id)
+        if latest:
+            print(f"resolved pair '{arg}' -> latest task {latest}", file=sys.stderr)
+            task_id = latest
+            return async_tasks.load_task(task_id) is not None
+        return False
+
+    if not _resolve():
         # Give it one tick — async_tasks writes the state file synchronously
         # before returning task_id, so this should be vanishingly rare. But
         # filesystem racing during background-Bash startup is real.
         time.sleep(min(poll_s, 1.0))
-        if async_tasks.load_task(task_id) is None:
-            print(f"task not found: {task_id}", file=sys.stderr)
+        if not _resolve():
+            print(f"not found: no task id or pair named '{arg}'", file=sys.stderr)
             return 2
 
     while True:

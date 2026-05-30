@@ -4,6 +4,31 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.7] — 2026-05-30
+
+Completes v0.9.6: the **background watcher now accepts a pair name too**, so the
+entire async-handle hint is name-based and consistent (v0.9.6 only did
+`pair_poll`).
+
+### Added
+- **`wait.py <pair_name>`** resolves to that pair's latest task (stdlib scan
+  mirroring `latest_task_id_for_pair`), with a one-tick retry for the
+  filesystem race right after task creation. Exact task ids still work
+  unchanged. The same support was added to the `python -m claude_squared wait`
+  fallback path (`__main__._cmd_wait`).
+
+### Changed
+- **The async-handle Bash-watcher command now uses the pair name** (e.g.
+  `wait.py reviewer`) instead of the raw UUID — matching the `pair_poll` hints,
+  so nothing in the hint requires copying a UUID. The exact task id is still
+  printed on the `Async task:` line for targeting an older task explicitly.
+- `wait.py` / `wait` not-found message and usage updated to mention pair names.
+
+### Note
+- Resolving a name targets the LATEST task for that pair (same semantics as
+  `pair_poll`). For the auto-generated watcher this is always the just-started
+  task. Pass the explicit task id to target an older one.
+
 ## [0.9.6] — 2026-05-30
 
 Ergonomics: agents kept mistyping the UUID task_id when polling. Now you can
