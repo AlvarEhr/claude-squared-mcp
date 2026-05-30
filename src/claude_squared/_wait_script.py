@@ -31,9 +31,11 @@ the agent's Bash tool after pair_send/pair_send_async returns an async handle.
 
 Exit codes:
     0  task done
-    1  task failed (error message printed to stderr)
+    1  task failed (work error — message printed to stderr)
     2  task not found (typo, or already cleaned up)
     3  timeout (default 1800s; task still running)
+    4  orphaned (owner MCP server died mid-turn — supervision event, NOT a work
+       error; the work may well have completed — check pair_poll / git / transcript)
    64  usage error
 """
 from __future__ import annotations
@@ -43,6 +45,9 @@ import os
 import sys
 import time
 from pathlib import Path
+
+# Kept in sync with claude_squared.async_tasks.ORPHAN_ERROR_PREFIX.
+_ORPHAN_ERROR_PREFIX = "ORPHANED: "
 
 
 def _claude_home() -> Path:
@@ -55,11 +60,36 @@ def _state_path(task_id: str) -> Path:
     return _claude_home() / "pairs" / "async" / f"{task_id}.json"
 
 
+def _pid_alive(pid: int) -> bool:
+    """Stdlib cross-platform PID liveness. Biased toward 'alive' on uncertainty
+    so we never falsely abandon a healthy long-running task — only return False
+    when the OS definitively says the process is gone."""
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+            if h:
+                ctypes.windll.kernel32.CloseHandle(h)
+                return True
+            return False
+        except Exception:
+            return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except Exception:
+        return True
+
+
 def main(argv: list[str]) -> int:
     if not argv or argv[0] in ("-h", "--help"):
         print(
             "Usage: python wait.py <task_id> [--timeout SECS] [--poll SECS]\\n"
-            "  Exit codes: 0=done, 1=failed, 2=not-found, 3=timeout, 64=usage",
+            "  Exit codes: 0=done, 1=failed, 2=not-found, 3=timeout, 4=orphaned, 64=usage",
             file=sys.stderr,
         )
         return 64
@@ -114,7 +144,22 @@ def main(argv: list[str]) -> int:
         if status == "failed":
             err = data.get("error") or "(no error message)"
             print(err, file=sys.stderr)
-            return 1
+            # Orphaned (owner server died) is a supervision event, not a work
+            # error — distinct exit code so callers can tell them apart.
+            return 4 if err.startswith(_ORPHAN_ERROR_PREFIX) else 1
+        # Detect an orphan BEFORE any server sweeps it: a "running" task whose
+        # owner MCP server is no longer alive would otherwise sit here until the
+        # timeout (the bug that caused a 47-min silent wait). Surface it within
+        # one poll cycle instead.
+        owner = data.get("owner_pid")
+        if status == "running" and isinstance(owner, int) and owner > 0 and not _pid_alive(owner):
+            print(
+                f"orphaned: owner MCP server (pid {owner}) is no longer alive; the task was "
+                f"running but its supervisor died mid-turn. The work may have completed "
+                f"(check pair_poll / your git or file state); pair_send to resume.",
+                file=sys.stderr,
+            )
+            return 4
         if time.monotonic() >= deadline:
             print(f"timeout after {timeout_s}s; task still {status}", file=sys.stderr)
             return 3

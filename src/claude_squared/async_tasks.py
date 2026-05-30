@@ -73,6 +73,27 @@ def _is_pid_alive(pid: int) -> bool:
         return True
 
 
+# Marker prefix on the error of a task that was finalized NOT because the work
+# errored, but because its owning MCP server process died mid-turn (killed or
+# restarted — e.g. by the host's MCP watchdog during a long/heavy turn). The
+# status is still "failed" (it's a terminal non-success from the state-machine's
+# view), but this prefix lets pair_poll / wait.py render it honestly as a
+# supervision event rather than a work error. We control both ends of this
+# string, so prefix-matching it is reliable (not fragile text-scraping).
+ORPHAN_ERROR_PREFIX = "ORPHANED: "
+
+_ORPHAN_MESSAGE = (
+    ORPHAN_ERROR_PREFIX
+    + "the owning MCP server process died mid-turn (killed or restarted — e.g. by "
+    "the host's MCP watchdog during a long/heavy turn). This is a SUPERVISION event, "
+    "NOT a work error: the pair's claude subprocess runs in its own process group and "
+    "often runs to completion (committing files, writing docs) even after the server "
+    "is gone — but the turn's final report text was not captured. To recover: inspect "
+    "pair_transcript and your git/file state to see what actually landed, then pair_send "
+    "to resume (the session JSONL persisted, so the pair continues from where it left off)."
+)
+
+
 def _task_path(task_id: str) -> Path:
     return async_dir() / f"{task_id}.json"
 
@@ -89,6 +110,42 @@ def load_task(task_id: str) -> AsyncTaskState | None:
     if not p.exists():
         return None
     return AsyncTaskState.model_validate_json(p.read_text(encoding="utf-8"))
+
+
+def reap_orphan(task_id: str) -> AsyncTaskState | None:
+    """Finalize a task whose owning MCP server process has died, the moment we
+    observe it — instead of waiting for the next server's startup sweep.
+
+    Returns the (possibly-updated) state, or None if the task is unknown.
+
+    Only flips a task whose ``status == "running"`` AND whose ``owner_pid`` is a
+    real PID that is no longer alive — i.e. a genuine orphan. A task owned by a
+    still-live server (this one or another coexisting MCP process) is left
+    untouched, so this is safe to call from any observation path (pair_poll). A
+    legacy task with no owner_pid is left for the startup sweep (we can't safely
+    distinguish "old orphan" from "just-created" without the PID at runtime).
+
+    Atomic write + event fire so an in-process ``wait_for_task`` wakes immediately.
+    Idempotent across processes: concurrent reaps write identical content.
+    """
+    state = load_task(task_id)
+    if state is None:
+        return None
+    if state.status != "running":
+        return state
+    pid = state.owner_pid
+    if pid is None or pid <= 0 or _is_pid_alive(int(pid)):
+        return state  # no PID to judge, or owner still alive → not an orphan
+    # Owner is confirmed dead → finalize as an orphan.
+    state.status = "failed"
+    state.error = _ORPHAN_MESSAGE
+    state.finished_at = datetime.utcnow()
+    _save(state)
+    with _task_events_lock:
+        ev = _task_events.get(task_id)
+    if ev is not None:
+        ev.set()
+    return state
 
 
 # In-memory task-completion events for fast in-process wakeup. These are an
@@ -304,14 +361,7 @@ def _sweep_dead_predecessor_orphans() -> None:
         except Exception:
             return True  # malformed PID; treat as orphan
 
-    _sweep_running_tasks(
-        predicate=_predicate,
-        message=(
-            "MCP server died before completion (owner process no longer alive). "
-            "Work may have been partially captured in the session JSONL; "
-            "check pair_transcript or send a follow-up pair_send to resume."
-        ),
-    )
+    _sweep_running_tasks(predicate=_predicate, message=_ORPHAN_MESSAGE)
 
 
 def _sweep_running_tasks(predicate: Callable[[dict], bool], message: str) -> None:

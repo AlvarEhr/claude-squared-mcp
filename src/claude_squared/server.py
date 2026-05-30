@@ -1396,6 +1396,13 @@ def pair_poll(
         else:
             raise PairError(f"No async task with id '{task_id}'.")
 
+    # Reap orphans on observation: if the task's owning MCP server died mid-turn,
+    # finalize it NOW (instead of waiting for the next server's startup sweep or
+    # the watcher's timeout). A manual poll then immediately reflects reality.
+    reaped = async_tasks.reap_orphan(task_id)
+    if reaped is not None:
+        state = reaped
+
     # Block-wait mode for hosts without background Bash. Only wait if the task
     # is still running — terminal-status tasks return immediately regardless.
     if wait_seconds > 0 and state.status == "running":
@@ -1419,7 +1426,18 @@ def pair_poll(
             f"(started {_fmt_local(state.started_at)})"
         )
     elif state.status == "failed":
-        headline = f"failed: {state.error}"
+        # Distinguish a SUPERVISION event (owner MCP server died mid-turn) from a
+        # genuine work error — they look identical at the status level but mean
+        # very different things to the orchestrator.
+        if (state.error or "").startswith(async_tasks.ORPHAN_ERROR_PREFIX):
+            detail = state.error[len(async_tasks.ORPHAN_ERROR_PREFIX):]
+            headline = (
+                f"⚠ ORPHANED (pair '{state.pair_name}') — the owner MCP server died "
+                f"mid-turn. This is NOT a work failure; the work may well have completed.\n"
+                f"  {detail}"
+            )
+        else:
+            headline = f"failed: {state.error}"
     elif state.status == "stopped":
         headline = f"stopped: {state.error or 'stopped by pair_stop'}"
     elif state.status == "done":

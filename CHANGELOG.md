@@ -4,6 +4,42 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.5] — 2026-05-30
+
+Bug fix from live testing: a pair's async task was reported `failed` ("MCP server
+died before completion") even though the work fully succeeded — the git commit
+landed, files were written — and the watcher gave no notification for 47 minutes.
+
+Root cause: the owning MCP server process was killed mid-turn (host watchdog on a
+long, heavy, post-compaction turn). But the pair's `claude` subprocess runs in its
+OWN process group, so it was orphaned and ran to completion — committing the work —
+while the MCP layer lost the turn-completion event. The task then sat `running`
+until a later server's startup sweep flatly marked it `failed`. So "failed"
+conflated a supervision event with a work error, and detection was slow.
+
+### Fixed
+- **Orphaned tasks are now surfaced as a distinct supervision event, not a flat
+  failure.** The orphan error carries an `ORPHANED: ` marker, and `pair_poll`
+  renders "⚠ ORPHANED — NOT a work failure; the work may have completed" with
+  recovery guidance (verify via `pair_transcript` + git/file state, then
+  `pair_send` to resume), instead of "failed: ...".
+- **Prompt orphan detection — no more waiting for a future server's sweep.** New
+  `async_tasks.reap_orphan(task_id)` finalizes a `running` task whose `owner_pid`
+  is confirmed dead, *on observation*; `pair_poll` calls it so a manual poll
+  reflects reality immediately.
+- **`wait.py` detects a dead owner directly** (stdlib PID-liveness check) and
+  exits within one poll cycle with a new **exit code 4 (orphaned)**, instead of
+  sitting at "running" until the 1800s timeout — the direct cause of the 47-minute
+  silent wait. It also maps an already-swept `ORPHANED:` task to exit 4.
+
+### Notes
+- The MCP server's death itself is host-driven (watchdog/OOM/crash) and not
+  preventable from our side — v0.9.5 is about detecting it promptly and reporting
+  it honestly. Recovery is always `pair_send` to resume (the session JSONL
+  persists). See HANDOFF "Orphaned-but-completed work".
+- `wait.py` exit codes are now: 0=done, 1=failed (work error), 2=not-found,
+  3=timeout, 4=orphaned, 64=usage.
+
 ## [0.9.4] — 2026-05-29
 
 Bug fix from live testing: a pair created with `permission_mode="bypassPermissions"`
