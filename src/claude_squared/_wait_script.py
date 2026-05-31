@@ -95,6 +95,32 @@ def _latest_task_for_pair(pair_name: str) -> str | None:
     return best_id
 
 
+def _find_tasks_by_prefix(prefix: str) -> list[str]:
+    """Return task IDs whose file basename starts with `prefix`.
+
+    Stdlib mirror of ``async_tasks.find_task_by_prefix`` — added in v0.9.9 to
+    align wait.py's resolution ladder with ``pair_poll``'s (which accepts a
+    unique task-id prefix in addition to exact id and pair name). Without
+    this, a user copying the 8-char prefix from a ``pair_status`` listing
+    into ``wait.py`` would hit ``exit 2`` even though the same prefix works
+    fine through ``pair_poll`` — a small but real papercut.
+
+    Empty prefix → ``[]`` (so we never accidentally match every task on
+    disk). The caller decides what to do when len(out) is 0, 1, or >1.
+    """
+    if not prefix:
+        return []
+    d = _async_dir()
+    if not d.is_dir():
+        return []
+    out: list[str] = []
+    for p in d.glob(f"{prefix}*.json"):
+        tid = p.stem  # filename without .json
+        if tid.startswith(prefix):
+            out.append(tid)
+    return out
+
+
 def _pid_alive(pid: int) -> bool:
     """Stdlib cross-platform PID liveness. Biased toward 'alive' on uncertainty
     so we never falsely abandon a healthy long-running task — only return False
@@ -123,9 +149,10 @@ def _pid_alive(pid: int) -> bool:
 def main(argv: list[str]) -> int:
     if not argv or argv[0] in ("-h", "--help"):
         print(
-            "Usage: python wait.py <task_id|pair_name> [--timeout SECS] [--poll SECS]\\n"
-            "  A pair name resolves to that pair's latest task.\\n"
-            "  Exit codes: 0=done, 1=failed, 2=not-found, 3=timeout,\\n"
+            "Usage: python wait.py <task_id|prefix|pair_name> [--timeout SECS] [--poll SECS]\\n"
+            "  Resolution order (matches pair_poll): exact task id, then pair\\n"
+            "  name (-> that pair's latest task), then unique task-id prefix.\\n"
+            "  Exit codes: 0=done, 1=failed, 2=not-found-or-ambiguous, 3=timeout,\\n"
             "              4=orphaned (MCP server died), 5=stopped (pair_stop),\\n"
             "              6=crashed (claude.exe died mid-turn), 64=usage",
             file=sys.stderr,
@@ -160,23 +187,55 @@ def main(argv: list[str]) -> int:
     state_file = _state_path(task_id)
     deadline = time.monotonic() + timeout_s
 
-    # Accept a PAIR NAME as well as an exact task id (parity with pair_poll): if
-    # there's no task file by this name, treat the arg as a pair name and resolve
-    # to that pair's latest task. Two attempts tolerate the filesystem race right
-    # after the task is created.
+    # Resolution ladder, matched to pair_poll (v0.9.9): exact task id → pair
+    # name (-> that pair's latest task) → unique task-id prefix. Two attempts
+    # tolerate the filesystem race right after the task is created. An
+    # ambiguous prefix (matches >1 task) exits with code 2 (same as
+    # not-found) with a clear "ambiguous" message — the caller picks a
+    # longer prefix or the full id.
+    ambiguous_msg: str | None = None
     for _attempt in (0, 1):
         if state_file.exists():
             break
+        # Step 2: pair name
         latest = _latest_task_for_pair(task_id)
         if latest:
             print(f"resolved pair '{arg}' -> latest task {latest}", file=sys.stderr)
             task_id = latest
             state_file = _state_path(task_id)
             break
+        # Step 3: unique prefix (added in v0.9.9 to align with pair_poll —
+        # previously copying a prefix from `pair_status` into wait.py hit
+        # not-found even though pair_poll accepted it).
+        matches = _find_tasks_by_prefix(task_id)
+        if len(matches) == 1:
+            resolved = matches[0]
+            print(f"resolved prefix '{arg}' -> task {resolved}", file=sys.stderr)
+            task_id = resolved
+            state_file = _state_path(task_id)
+            break
+        elif len(matches) > 1:
+            # Ambiguous — surface ALL matches so the caller can disambiguate.
+            # Defer printing until we exit so the retry-on-race loop doesn't
+            # double-print on the first attempt.
+            shown = ", ".join(t[:12] for t in matches[:5])
+            more = f" (+{len(matches) - 5} more)" if len(matches) > 5 else ""
+            ambiguous_msg = (
+                f"ambiguous: prefix '{arg}' matches {len(matches)} tasks: "
+                f"{shown}{more}. Use a longer prefix or the full task id."
+            )
+            # Don't retry an ambiguous prefix — adding files in 1s won't help.
+            break
         if _attempt == 0:
             time.sleep(min(poll_s, 1.0))
     if not state_file.exists():
-        print(f"not found: no task id or pair named '{arg}'", file=sys.stderr)
+        if ambiguous_msg:
+            print(ambiguous_msg, file=sys.stderr)
+        else:
+            print(
+                f"not found: '{arg}' is not a task id, prefix, or pair name",
+                file=sys.stderr,
+            )
         return 2
 
     while True:

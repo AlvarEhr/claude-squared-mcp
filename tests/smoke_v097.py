@@ -78,7 +78,11 @@ def test_wait_unknown_name():
     print("\n=== wait.py <unknown> → exit 2 not-found ===")
     r = _run_wait("no-such-pair-or-task")
     assert_eq(r.returncode, 2, "exit 2 not-found")
-    assert_true("no task id or pair named" in (r.stderr or ""), "clear not-found message")
+    # Wording-stable substring: "not found" is in the message in both v0.9.7
+    # ("not found: no task id or pair named 'X'") and v0.9.9 ("not found: 'X'
+    # is not a task id, prefix, or pair name") wordings. Asserting the verbose
+    # phrase would break across the v0.9.9 message refactor.
+    assert_true("not found" in (r.stderr or ""), "clear not-found message")
 
 
 def test_exact_task_id_still_works():

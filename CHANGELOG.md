@@ -4,6 +4,52 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.9] — 2026-05-31
+
+Ergonomics: the v0.7-era unique-prefix resolution in `pair_poll` was
+asymmetric — `wait.py` and `python -m claude_squared wait` required the full
+UUID. Copying the 8-char prefix from a `pair_status` listing into the
+background watcher silently hit `exit 2` (not-found). Now aligned.
+
+Also fixes a v0.9.8 miss: `_cmd_wait` (the `python -m claude_squared wait`
+in-package equivalent of `wait.py`) was never brought up to v0.9.8 exit-code
+parity. It still mapped every terminal failure to exit 1, missing the
+4=orphan / 5=stopped / 6=crashed dispatch. Anyone hitting the fallback path
+(when wait.py install fails at server startup) would silently get the
+pre-v0.9.8 codes.
+
+### Changed
+- **`wait.py <arg>`** and **`python -m claude_squared wait <arg>`** now share
+  `pair_poll`'s exact resolution ladder: exact task id → pair name → unique
+  task-id prefix. Ambiguous prefix exits 2 with `"ambiguous: prefix 'X'
+  matches N tasks: ..."` (showing up to 5 matches with `+M more` if longer).
+  Don't retry an ambiguous prefix in the FS-race loop — adding files in 1s
+  won't change multi-match to single-match. Empty prefix returns `[]` so we
+  never accidentally match-all.
+- The not-found message wording is now uniform across both watchers:
+  `"not found: 'X' is not a task id, prefix, or pair name"`.
+- Usage strings for both watchers updated to name all three resolution paths
+  AND the full exit-code list including 4/5/6 (the v0.9.8 codes that the
+  in-package usage message had never been updated for).
+
+### Fixed
+- **`_cmd_wait` v0.9.8 exit-code parity** (the miss). Now also returns
+  `5` for `status="stopped"`, `4` for `ORPHANED: ` failures, and `6` for
+  `CRASHED: ` failures — matching the standalone wait.py behavior shipped
+  in v0.9.8. Pre-v0.9.9 fallback-path users would have seen every failure
+  bucketed to `1` even when wait.py itself was distinguishing them.
+
+### Smoke
+`tests/smoke_v099.py` — 12 functions, 24 assertions:
+- wait.py: unique prefix resolves · ambiguous exits 2 with clear message
+  · exact id still works · pair name still works · clearer not-found message.
+- `python -m claude_squared wait`: unique prefix · stopped→5 · CRASHED→6
+  · ORPHANED→4 · generic failed→1 · ambiguous→2.
+- Helper: `async_tasks.find_task_by_prefix` semantics.
+
+All prior smoke files green (`smoke_v097` was updated to use a
+wording-stable not-found substring since v0.9.9 refactored the message).
+
 ## [0.9.8] — 2026-05-31
 
 Five bug-fix clusters from a real-workload report against v0.9.7. The two
