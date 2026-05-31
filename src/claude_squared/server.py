@@ -270,6 +270,24 @@ def _fmt_send_result(r: SendResult) -> str:
     return "\n".join(lines)
 
 
+def _fmt_compact_result(r: CompactResult) -> str:
+    """Format a CompactResult for terminal display (parallel of _fmt_send_result).
+
+    Surfaces the pre→post token delta + retention % + duration + trigger source
+    so the agent knows the compact actually fired and by how much. Added in
+    v0.9.8 when pair_compact joined the async-task machinery (Bugs 2+8 fix) —
+    pair_poll now needs to render either SendResult or CompactResult depending
+    on which tool produced the task.
+    """
+    header = f"━━━ pair '{r.name}' compacted ━━━"
+    ratio_pct = (r.post_tokens / r.pre_tokens * 100) if r.pre_tokens else 0
+    body = (
+        f"Compacted: {r.pre_tokens:,} → {r.post_tokens:,} tokens "
+        f"({ratio_pct:.1f}% retained, {r.duration_ms / 1000:.1f}s, trigger={r.trigger})"
+    )
+    return f"{header}\n{body}"
+
+
 def _verbose_dump(model_obj) -> str:
     """JSON-stringified Pydantic model for verbose=True paths."""
     return model_obj.model_dump_json(indent=2, exclude_none=True)
@@ -823,6 +841,60 @@ def _build_send_runner(
                 total_cost_usd=current.total_cost_usd + result.cost_usd,
             )
             return result
+
+    return _run
+
+
+def _build_compact_runner(
+    name: str,
+    steering_prompt: str | None,
+    *,
+    compact_timeout_seconds: int,
+    lock_acquire_timeout_s: float | None = None,
+) -> "Callable[[], CompactResult]":
+    """Construct the closure that performs one pair_compact under the
+    cross-process lock. Parallel of ``_build_send_runner`` shape.
+
+    Returned callable holds the cross-process pair lock for the entire compact
+    operation (which can take minutes for long sessions) and evicts the warm
+    runtime BEFORE invoking the compact subprocess — compaction rewrites the
+    session JSONL, so any live runtime would carry stale in-memory state.
+
+    v0.9.8 Bugs 2+8 fix: this is the missing piece that lets pair_compact join
+    the async-task machinery. Pre-v0.9.8, pair_compact was a sync wrapper around
+    ``adapter.compact`` that held the JSON-RPC call open for up to
+    ``timeout_seconds`` (default 600s). The host's RPC budget (~60s in Claude
+    Desktop) killed the envelope long before the compact finished, surfacing
+    as MCP error -32001 — but the underlying compact subprocess often DID
+    complete (verified: 10 ``compact_boundary`` events in webdash's JSONL
+    despite repeated -32001 reports). With this runner shape, pair_compact
+    follows the v0.7.1 pair_send pattern: graceful degradation to an async
+    handle past the sync cap, work continues in the background, caller polls.
+    """
+    if lock_acquire_timeout_s is None:
+        # Generous default: compaction can take minutes on long sessions, so
+        # the lock-acquire timeout needs to comfortably exceed the compact
+        # ceiling. Mirror _build_send_runner's "base on hard timeout + 60s,
+        # fall back to 1h" pattern.
+        lock_acquire_timeout_s = max(120.0, float(compact_timeout_seconds) + 60.0)
+
+    def _run() -> CompactResult:
+        with _with_pair_lock(name, timeout_s=lock_acquire_timeout_s):
+            current = reg_mod.get_pair(name)
+            # Compaction rewrites the session JSONL — any warm runtime has
+            # stale in-memory state and would write a turn against a JSONL
+            # that no longer matches its view. Evict NOW, under the lock,
+            # so the next pair_send respawns fresh.
+            try:
+                runtime_mod.registry().evict(name)
+            except Exception:
+                pass
+            adapter = _adapter_for(current)
+            return adapter.compact(
+                current,
+                steering_prompt=steering_prompt,
+                timeout_seconds=compact_timeout_seconds,
+            )
 
     return _run
 
@@ -1471,14 +1543,28 @@ def pair_poll(
             f"(started {_fmt_local(state.started_at)})"
         )
     elif state.status == "failed":
-        # Distinguish a SUPERVISION event (owner MCP server died mid-turn) from a
-        # genuine work error — they look identical at the status level but mean
-        # very different things to the orchestrator.
-        if (state.error or "").startswith(async_tasks.ORPHAN_ERROR_PREFIX):
-            detail = state.error[len(async_tasks.ORPHAN_ERROR_PREFIX):]
+        # Distinguish SUPERVISION events from genuine work errors — same status
+        # at the state-machine level, very different to the orchestrator.
+        err = state.error or ""
+        if err.startswith(async_tasks.ORPHAN_ERROR_PREFIX):
+            detail = err[len(async_tasks.ORPHAN_ERROR_PREFIX):]
             headline = (
                 f"⚠ ORPHANED (pair '{state.pair_name}') — the owner MCP server died "
                 f"mid-turn. This is NOT a work failure; the work may well have completed.\n"
+                f"  {detail}"
+            )
+        elif err.startswith(async_tasks.CRASHED_ERROR_PREFIX):
+            # v0.9.8 Bug 4 + 5 fix: parallel of the ORPHANED render. The pair's
+            # claude.exe subprocess died mid-turn (claude.exe crash, OOM, etc.).
+            # Partial state may have persisted in the JSONL; the runtime will
+            # respawn from there on the next pair_send. Distinct from ORPHANED
+            # because the MCP server stayed alive — we observed the death in
+            # real time and captured the exit code in the error message.
+            detail = err[len(async_tasks.CRASHED_ERROR_PREFIX):]
+            headline = (
+                f"⚠ CRASHED (pair '{state.pair_name}') — the pair's claude.exe subprocess "
+                f"exited mid-turn. Partial state may have persisted in the JSONL; the "
+                f"runtime will respawn from the persisted session on the next pair_send.\n"
                 f"  {detail}"
             )
         else:
@@ -1486,7 +1572,16 @@ def pair_poll(
     elif state.status == "stopped":
         headline = f"stopped: {state.error or 'stopped by pair_stop'}"
     elif state.status == "done":
-        headline = _fmt_send_result(state.result) if state.result else "done (no result captured)"
+        # v0.9.8: polymorphic render. pair_compact tasks land here with a
+        # CompactResult; pair_send / pair_send_async with a SendResult. Pick
+        # the matching formatter via isinstance — Pydantic smart-union has
+        # already disambiguated them by unique-field signature during load.
+        if state.result is None:
+            headline = "done (no result captured)"
+        elif isinstance(state.result, CompactResult):
+            headline = _fmt_compact_result(state.result)
+        else:
+            headline = _fmt_send_result(state.result)
     else:
         headline = f"unknown status: {state.status}"
 
@@ -2498,10 +2593,21 @@ def pair_clear(name: str, archive_old: bool = True, verbose: bool = False) -> st
 def pair_compact(
     name: str,
     steering_prompt: str | None = None,
-    timeout_seconds: int = 600,
+    timeout_seconds: int = 45,
+    compact_timeout_seconds: int = 600,
     verbose: bool = False,
 ) -> str:
     """Compact a pair's conversation history via native /compact (stream-json).
+
+    v0.9.8: pair_compact now uses the same async-task machinery as pair_send
+    (graceful sync-cap degradation). The sync wait blocks for up to
+    ``timeout_seconds``; if compaction hasn't finished by then, returns an
+    async handle — compaction continues in the background, caller polls via
+    ``pair_poll(name)`` or the Bash watcher. **This fixes the pre-v0.9.8
+    bug** where pair_compact held the JSON-RPC call open up to 600s, well
+    past the host's ~60s RPC budget, producing MCP -32001 errors even though
+    the underlying compact often DID complete server-side (verified via
+    JSONL ``compact_boundary`` event counts).
 
     Args:
         name: Pair to compact.
@@ -2512,25 +2618,89 @@ def pair_compact(
             (3) in-flight work state.
             Defer technical detail to ``.md`` files in the project rather than restating
             it in the summary — the post-compaction agent can re-read those.
-        timeout_seconds: Max wait. Default 600 (compaction can be slow on long sessions).
+        timeout_seconds: Your stated patience for the sync wait (default 45s,
+            matching ``pair_send``). Compaction continues regardless — this only
+            affects whether you see the result inline or via a poll. Values >
+            sync cap (``CLAUDE_PAIR_SYNC_CAP_SECONDS``, default 45s) degrade
+            gracefully to an async handle. **Renamed semantic**: pre-v0.9.8 this
+            was the hard ceiling; now it's patience. The old hard-ceiling
+            behavior lives in ``compact_timeout_seconds``.
+        compact_timeout_seconds: Hard ceiling on the underlying /compact
+            subprocess (default 600s = 10 min, inherited from the pre-v0.9.8
+            default). Past this, the subprocess is killed and the task is
+            marked failed. Long sessions can legitimately take minutes to
+            compact.
     """
-    try:
-        with _with_pair_lock(name, timeout_s=max(120.0, float(timeout_seconds))):
-            spec = reg_mod.get_pair(name)
-            # Compaction rewrites the session JSONL — any live runtime has stale state
-            try:
-                runtime_mod.registry().evict(name)
-            except Exception:
-                pass
-            adapter = _adapter_for(spec)
-            result = adapter.compact(spec, steering_prompt=steering_prompt, timeout_seconds=timeout_seconds)
-            if verbose:
-                return _verbose_dump(result)
-            ratio = (result.post_tokens / result.pre_tokens * 100) if result.pre_tokens else 0
-            return (f"Compacted '{name}': {result.pre_tokens:,} → {result.post_tokens:,} tokens "
-                    f"({ratio:.1f}% retained, {result.duration_ms / 1000:.1f}s, trigger={result.trigger})")
-    except FileLockTimeout:
-        raise PairError(f"Pair '{name}' is busy in another process; could not acquire lock to compact.")
+    # Sanity: pair must exist (raises PairNotFound if not).
+    reg_mod.get_pair(name)
+
+    # Decouple stated patience (agent's "how long I'll wait inline") from the
+    # actual RPC-hold (server-cap-bounded to stay below host's RPC timeout).
+    # Same decoupling pattern as pair_send (v0.7.6).
+    stated_patience_s = int(timeout_seconds)
+    rpc_hold_s = min(stated_patience_s, _sync_cap_seconds())
+
+    runner = _build_compact_runner(
+        name, steering_prompt,
+        compact_timeout_seconds=compact_timeout_seconds,
+    )
+    # Async-task message description — surfaces in pair_status / async dir
+    # listings so the agent can tell at a glance "this task is a compact",
+    # not "this task is a send."
+    msg_desc = (
+        f"/compact (steering: {steering_prompt[:80]}...)"
+        if steering_prompt else "/compact"
+    )
+    state = async_tasks.start_task(name, msg_desc, runner)
+    final = async_tasks.wait_for_task(state.task_id, timeout_s=float(rpc_hold_s))
+
+    if final is None:
+        # Should be impossible — we just created the task.
+        raise PairError(f"Internal: task {state.task_id} disappeared after creation.")
+
+    if final.status == "done" and final.result is not None:
+        if verbose:
+            return _verbose_dump(final.result)
+        return _fmt_compact_result(final.result)
+
+    if final.status == "failed":
+        # Special-case FileLockTimeout for clarity (it surfaces as a generic
+        # Timeout exception in the task error, which is unhelpful).
+        err = final.error or "(no error message)"
+        if "Timeout" in err and "lock" in err.lower():
+            raise PairError(
+                f"Pair '{name}' is busy in another process; could not acquire "
+                f"lock to compact."
+            )
+        raise PairError(f"pair_compact for '{name}' failed: {err}")
+
+    if final.status == "stopped":
+        return (
+            f"pair_compact for '{name}' was stopped by pair_stop "
+            f"(task {state.task_id}).\n"
+            f"The pair's session JSONL was not modified — call pair_compact "
+            f"again to retry."
+        )
+
+    # status == "running" → graceful async-handle degradation. Compact keeps
+    # running in the background; the caller polls / watches for completion.
+    hard_str = f"{compact_timeout_seconds}s"
+    if stated_patience_s > rpc_hold_s:
+        remaining = stated_patience_s - rpc_hold_s
+        framing = (
+            f"Sync wait held for {rpc_hold_s}s (server's RPC-hold cap — set by "
+            f"CLAUDE_PAIR_SYNC_CAP_SECONDS, default 45s). Your stated patience "
+            f"was {stated_patience_s}s — {remaining}s remain; use "
+            f"pair_poll(wait_seconds={min(remaining, _sync_cap_seconds())}) "
+            f"to wait the rest. Compaction of '{name}' still running under "
+            f"compact_timeout={hard_str}."
+        )
+    else:
+        framing = (
+            f"Sync wait timed out at {rpc_hold_s}s (compaction of '{name}' "
+            f"still running under compact_timeout={hard_str})."
+        )
+    return _format_async_handle(state.task_id, framing, pair_name=name)
 
 
 @mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False})
@@ -2700,7 +2870,22 @@ def pair_status(name: str, last_n_log: int = 5, verbose: bool = False) -> str:
     main_log = (runtime_mod.logs_dir() / name / "main.log") if name else None
     cross_process_active = False
     same_process_busy = False
-    if not runtime_alive and main_log and main_log.exists():
+    # v0.9.8 Bug 3 fix: local-corpse detection. Our PairRuntime object is
+    # still in the registry but its subprocess has terminated (claude.exe
+    # crashed, OOM, or a pre-v0.9.8 evictor taskkill — though the v0.9.8
+    # mid-turn skip eliminates the latter). Capture the exit code so we can
+    # report it directly, instead of falling through to the mtime-based
+    # cross-process inference (which pre-v0.9.8 incorrectly reported
+    # "runtime live in another MCP process" for up to 120s post-crash —
+    # because main.log mtime stays fresh after the last pre-crash log line).
+    local_corpse_exit: int | None = None
+    recently_inactive_log_mtime: "datetime | None" = None
+    if runtime_obj is not None and runtime_obj.proc is not None:
+        rc = runtime_obj.proc.returncode
+        if rc is not None:
+            local_corpse_exit = rc
+
+    if local_corpse_exit is None and not runtime_alive and main_log and main_log.exists():
         try:
             log_mtime = datetime.utcfromtimestamp(main_log.stat().st_mtime)
             log_idle = (now - log_mtime).total_seconds()
@@ -2714,7 +2899,20 @@ def pair_status(name: str, last_n_log: int = 5, verbose: bool = False) -> str:
                 if inproc_lock is not None and inproc_lock.locked():
                     same_process_busy = True
                 else:
-                    cross_process_active = True
+                    # v0.9.8 Bug 3 fix part 2: real cross-process activity
+                    # requires BOTH recent mtime AND an in-flight task on
+                    # this pair somewhere. Pre-v0.9.8 the lack of the inflight
+                    # check meant the branch fired on any recent mtime — so
+                    # a runtime that crashed 30s ago looked "live in another
+                    # MCP process" purely because main.log was still fresh.
+                    if async_tasks.list_running_task_ids_for_pair(name):
+                        cross_process_active = True
+                    else:
+                        # Recent mtime, no inflight work — the log activity is
+                        # informational, not active. Surface this as a distinct
+                        # status so the agent knows the recency doesn't mean
+                        # "still working." Common case after a crash/eviction.
+                        recently_inactive_log_mtime = log_mtime
                 if last_activity is None:
                     last_activity = log_mtime
         except Exception:
@@ -2735,7 +2933,23 @@ def pair_status(name: str, last_n_log: int = 5, verbose: bool = False) -> str:
     # Heuristic. The active/slow/likely-hung gradient only makes sense when
     # there's actually in-flight work to monitor; otherwise an alive runtime
     # with no tasks is just idle (and that's fine).
-    if not runtime_alive and same_process_busy:
+    if local_corpse_exit is not None:
+        # v0.9.8 Bug 3 fix: local corpse — our runtime object is still in the
+        # registry but its subprocess has terminated. Report this directly
+        # with the captured exit code instead of "runtime cold + mystery
+        # status." The next pair_send will see is_alive=False and respawn
+        # from the persisted JSONL.
+        corpse_age = None
+        try:
+            corpse_age = (now - runtime_obj.last_activity).total_seconds()
+        except Exception:
+            pass
+        age_str = f" ~{corpse_age:.0f}s ago" if corpse_age is not None else ""
+        heuristic = (
+            f"local corpse (claude.exe exited code {local_corpse_exit}{age_str}); "
+            f"next pair_send will respawn from JSONL"
+        )
+    elif not runtime_alive and same_process_busy:
         # Same MCP process is mid-call on this pair — runtime was just evicted
         # (compact / invoke / update) and a one-shot subprocess is running.
         heuristic = (
@@ -2746,6 +2960,15 @@ def pair_status(name: str, last_n_log: int = 5, verbose: bool = False) -> str:
         heuristic = (
             f"runtime live in another MCP process ({idle_seconds:.0f}s since last log line). "
             f"In-process runtime: cold. Use pair_poll(<task_id>) or wait for current turn."
+        )
+    elif not runtime_alive and recently_inactive_log_mtime is not None:
+        # v0.9.8 Bug 3 fix: recent log mtime + no inflight work + no live
+        # runtime = recent crash or eviction. Tell the agent the recency
+        # is informational, not "still active in some other process."
+        recency_s = (now - recently_inactive_log_mtime).total_seconds()
+        heuristic = (
+            f"no runtime (cold; last log activity {recency_s:.0f}s ago, no in-flight work — "
+            f"likely a recent crash or eviction. Next pair_send will respawn from JSONL.)"
         )
     elif not runtime_alive:
         heuristic = "no runtime (cold; will spawn on next send)"

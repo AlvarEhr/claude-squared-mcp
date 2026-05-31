@@ -82,6 +82,35 @@ def _is_pid_alive(pid: int) -> bool:
 # string, so prefix-matching it is reliable (not fragile text-scraping).
 ORPHAN_ERROR_PREFIX = "ORPHANED: "
 
+# v0.9.8: parallel of ORPHAN_ERROR_PREFIX for the OTHER mid-turn failure mode —
+# the pair's claude.exe subprocess died (claude.exe crash, or pre-v0.9.8 our
+# own evictor taskkill). The MCP server stayed alive in this case (otherwise
+# we'd be in the orphan path), so the error is the in-process CLIError raised
+# by ``runtime.PairRuntime.send`` and surfaced verbatim through start_task's
+# exception handler. wait.py dispatches this to exit code 6. The constant is
+# duplicated in runtime.py and _wait_script.py — see runtime.py's comment for
+# why, and keep all three in sync if you change it.
+CRASHED_ERROR_PREFIX = "CRASHED: "
+
+# Both supervision-class prefixes — used by ``_format_task_error`` to decide
+# whether to pass an error through bare (so the prefix stays at position 0 for
+# wait.py's ``startswith`` dispatch) or wrap it with the exception class name.
+_SUPERVISION_PREFIXES = (ORPHAN_ERROR_PREFIX, CRASHED_ERROR_PREFIX)
+
+
+def _format_task_error(e: BaseException) -> str:
+    """Format a task error for storage.
+
+    Supervision-class errors (ORPHANED/CRASHED) are stored with their bare
+    prefix so wait.py can dispatch via ``startswith`` to a distinct exit code.
+    All other errors get the conventional ``"<TypeName>: <message>"`` format.
+    """
+    err_str = str(e)
+    for prefix in _SUPERVISION_PREFIXES:
+        if err_str.startswith(prefix):
+            return err_str
+    return f"{type(e).__name__}: {e}"
+
 _ORPHAN_MESSAGE = (
     ORPHAN_ERROR_PREFIX
     + "the owning MCP server process died mid-turn (killed or restarted — e.g. by "
@@ -250,7 +279,12 @@ def start_task(pair_name: str, message: str, runner: Callable[[], SendResult]) -
                 state.error = "stopped by pair_stop"
             else:
                 state.status = "failed"
-                state.error = f"{type(e).__name__}: {e}"
+                # v0.9.8: ``_format_task_error`` preserves supervision-class
+                # prefixes (ORPHANED/CRASHED) at the start of the error string
+                # so wait.py's ``startswith`` dispatch routes them to distinct
+                # exit codes (4=orphan, 6=crash). Other errors get the
+                # conventional ``"<TypeName>: <message>"`` wrapping for clarity.
+                state.error = _format_task_error(e)
         finally:
             state.finished_at = datetime.utcnow()
             _save(state)

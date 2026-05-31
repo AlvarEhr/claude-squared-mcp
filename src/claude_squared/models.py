@@ -273,7 +273,16 @@ class AsyncTaskState(BaseModel):
     status: Literal["running", "done", "failed", "stopped"]
     started_at: datetime
     finished_at: datetime | None = None
-    result: SendResult | None = None
+    # v0.9.8: widened from ``SendResult | None`` to also carry ``CompactResult``.
+    # pair_compact now goes through the same async-task machinery as pair_send
+    # (graceful sync-cap degradation, so long compacts return an async handle
+    # instead of host RPC timeout -32001). A "done" compact task's result has
+    # the CompactResult shape. Pydantic smart-union disambiguates via unique
+    # fields: ``response`` → SendResult, ``pre_tokens`` → CompactResult.
+    # pair_poll dispatches its rendering via ``isinstance`` to pick the right
+    # formatter. Existing pre-v0.9.8 task files (where result is always a
+    # SendResult dict) deserialize cleanly under the smart-union semantics.
+    result: "SendResult | CompactResult | None" = None
     error: str | None = None
     # PID of the MCP server process that owns this task. Set at start_task;
     # atexit cleanup only sweeps tasks owned by os.getpid(), and a startup

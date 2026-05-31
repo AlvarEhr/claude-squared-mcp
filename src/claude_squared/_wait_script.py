@@ -36,6 +36,11 @@ Exit codes:
     3  timeout (default 1800s; task still running)
     4  orphaned (owner MCP server died mid-turn — supervision event, NOT a work
        error; the work may well have completed — check pair_poll / git / transcript)
+    5  stopped (deliberately cancelled via pair_stop — NOT a work error; pair
+       runtime is still alive and ready for the next pair_send)
+    6  crashed (pair's claude.exe subprocess died mid-turn — partial state may
+       have persisted in the session JSONL; check pair_transcript / git / file
+       state, then pair_send to resume from where it left off)
    64  usage error
 """
 from __future__ import annotations
@@ -46,8 +51,11 @@ import sys
 import time
 from pathlib import Path
 
-# Kept in sync with claude_squared.async_tasks.ORPHAN_ERROR_PREFIX.
+# Kept in sync with claude_squared.async_tasks.ORPHAN_ERROR_PREFIX and
+# CRASHED_ERROR_PREFIX. Stdlib-only by design (see _wait_script.py module
+# docstring for why this script can\\'t import from claude_squared).
 _ORPHAN_ERROR_PREFIX = "ORPHANED: "
+_CRASHED_ERROR_PREFIX = "CRASHED: "
 
 
 def _claude_home() -> Path:
@@ -117,7 +125,9 @@ def main(argv: list[str]) -> int:
         print(
             "Usage: python wait.py <task_id|pair_name> [--timeout SECS] [--poll SECS]\\n"
             "  A pair name resolves to that pair's latest task.\\n"
-            "  Exit codes: 0=done, 1=failed, 2=not-found, 3=timeout, 4=orphaned, 64=usage",
+            "  Exit codes: 0=done, 1=failed, 2=not-found, 3=timeout,\\n"
+            "              4=orphaned (MCP server died), 5=stopped (pair_stop),\\n"
+            "              6=crashed (claude.exe died mid-turn), 64=usage",
             file=sys.stderr,
         )
         return 64
@@ -182,12 +192,28 @@ def main(argv: list[str]) -> int:
         status = data.get("status")
         if status == "done":
             return 0
+        if status == "stopped":
+            # v0.9.8: stopped via pair_stop (in-band interrupt or tree-kill).
+            # NOT a work error — the pair was deliberately cancelled. Distinct
+            # exit code so the caller can tell "the work failed" from "I (or
+            # someone) asked for it to stop." Pre-v0.9.8 this status fell
+            # through into the polling loop and silently timed out at 1800s
+            # (genuine bug surfaced during the v0.9.8 design pass).
+            err = data.get("error") or "stopped by pair_stop"
+            print(err, file=sys.stderr)
+            return 5
         if status == "failed":
             err = data.get("error") or "(no error message)"
             print(err, file=sys.stderr)
-            # Orphaned (owner server died) is a supervision event, not a work
-            # error — distinct exit code so callers can tell them apart.
-            return 4 if err.startswith(_ORPHAN_ERROR_PREFIX) else 1
+            # Supervision-class errors map to distinct exit codes so the
+            # caller can distinguish them from generic work errors without
+            # parsing stderr. v0.9.8 adds the CRASHED dispatch alongside the
+            # pre-existing ORPHAN dispatch.
+            if err.startswith(_ORPHAN_ERROR_PREFIX):
+                return 4
+            if err.startswith(_CRASHED_ERROR_PREFIX):
+                return 6
+            return 1
         # Detect an orphan BEFORE any server sweeps it: a "running" task whose
         # owner MCP server is no longer alive would otherwise sit here until the
         # timeout (the bug that caused a 47-min silent wait). Surface it within

@@ -4,6 +4,145 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.8] — 2026-05-31
+
+Five bug-fix clusters from a real-workload report against v0.9.7. The two
+biggest were diagnosed against on-disk evidence (4 failed `async/*.json` tasks
+all between 10:21 and 10:54 minutes; 10 `compact_boundary` events in webdash's
+JSONL across pair_compact `-32001` reports).
+
+### Fixed
+
+- **Idle evictor was killing legitimate long turns** (the source of every
+  `failed: CLIError: pair runtime exited mid-turn (code ?)` report observed).
+  `last_activity` was only bumped at send entry and result, so a turn lasting
+  >10 min looked idle to the evictor and got tree-killed at the next 60s
+  cycle. Two protections, belt-and-suspenders:
+    1. `_evict_idle` now skips runtimes whose `_current_scope` is set
+       (mid-turn). The scope is opened at send-stdin-write and cleared via
+       a new outer `try/finally` that fires on every exit path — normal
+       return, CLIError, CommandTimeout, any unhandled exception. Without
+       the finally, a leaked scope would permanently protect a zombie
+       runtime; with it, the signal is reliable.
+    2. `_append_main_log_line` now bumps `last_activity` (in addition to
+       `_last_log_activity_at`), so a turn producing log lines won't look
+       idle even if the scope check were ever bypassed. Side benefit:
+       `pair_runtimes` reports an accurate "last activity" mid-turn instead
+       of a stale send-entry timestamp.
+  **Behavior change**: a genuinely wedged turn (claude.exe stuck with no
+  output) is no longer auto-rescued at 10 min. Use `hard_timeout_seconds`
+  (None by default) or `pair_stop` for explicit recovery; `pair_status`
+  still reports likely-hung at 120s+.
+
+- **`pair_compact` hit host RPC -32001 timeout** even though the compact
+  often DID land server-side (verified: 10 `compact_boundary` events in
+  webdash's JSONL across the incidents). pair_compact now uses the same
+  async-task machinery as `pair_send` (v0.7.1 pattern): graceful sync-cap
+  degradation past the RPC-hold cap, work continues in the background,
+  caller polls via `pair_poll(name)` or the Bash watcher. New parameter
+  layout:
+    - `timeout_seconds` (default 45s) is now your **stated patience** —
+      the sync wait. Bounded by `CLAUDE_PAIR_SYNC_CAP_SECONDS`.
+    - `compact_timeout_seconds` (default 600s) is the **hard ceiling** on
+      the compact subprocess — the pre-v0.9.8 `timeout_seconds` semantic.
+  `_build_compact_runner` parallels `_build_send_runner`. `AsyncTaskState.result`
+  is widened to `SendResult | CompactResult | None` (Pydantic smart-union
+  disambiguates via unique fields; pre-v0.9.8 task files deserialize
+  unchanged). `pair_poll` dispatches the rendering via `isinstance` to a
+  new `_fmt_compact_result` for CompactResult tasks.
+
+- **`pair_status` falsely reported "runtime live in another MCP process"**
+  for up to 120s after a local crash, because main.log mtime was still
+  fresh from the last pre-crash log line and the in-process lock was no
+  longer held. Three-part fix:
+    1. **Local-corpse detection**: if our PairRuntime is still in the
+       registry but its `.proc.returncode` is set, report it directly as
+       "local corpse (claude.exe exited code X); next pair_send will
+       respawn from JSONL." No more falling through to cross-process
+       inference for a corpse we can identify directly.
+    2. **Cross-process activity requires an in-flight task**: pre-v0.9.8
+       the branch fired on any recent mtime — now also requires
+       `list_running_task_ids_for_pair` to return non-empty.
+    3. **Stale-mtime branch**: recent log activity + no inflight work +
+       no live runtime is surfaced as "no runtime (cold; last log
+       activity Xs ago, no in-flight work — likely a recent crash or
+       eviction)" instead of the misleading "live elsewhere" message.
+
+- **`CLIError "(code ?)"`** when the runtime exited mid-turn — root cause
+  was a race between `is_alive()` returning False (line 881) and reading
+  `self.proc.returncode` (line 887): a concurrent `stop()` could null
+  `self.proc` between those two points (pre-v0.9.8 evictor path). Snapshot
+  `self.proc` + `self._collect_stderr()` once, up front, before
+  constructing the error. The error message now reads
+  `(exit <code>)` when an exit code is available, or
+  `(exit unknown — runtime cleaned up concurrently)` when it isn't.
+
+- **`wait.py` conflated terminal states** behind a single exit code 1.
+  Now distinct codes per state:
+    - `0` done · `1` failed (work error) · `2` not-found · `3` timeout
+    - `4` orphaned (MCP server died) · **`5` stopped (deliberate cancel
+      via `pair_stop`)** · **`6` crashed (claude.exe died mid-turn)**
+      · `64` usage
+  The `stopped` branch is the genuine bug fix: pre-v0.9.8 `status="stopped"`
+  fell through into the polling loop and silently timed out at 1800s
+  (3). The `crashed` branch routes via a new `CRASHED: ` prefix on the
+  runtime-exit `CLIError` message, parallel to the existing `ORPHANED: `
+  prefix. `_format_task_error` preserves both prefixes bare so the
+  on-disk error string starts at position 0 for wait.py's `startswith`
+  dispatch.
+
+### Added
+
+- `_fmt_compact_result(r: CompactResult)` — formatter parallel to
+  `_fmt_send_result`. Shows the pre→post token delta, retention %,
+  duration, and trigger source. Used by `pair_poll` when the task's
+  result is a CompactResult.
+- `_build_compact_runner(name, steering_prompt, *, compact_timeout_seconds, ...)`
+  — runner closure parallel to `_build_send_runner`. Holds the
+  cross-process pair lock for the whole compact, evicts the warm runtime
+  BEFORE invoking compact (compaction rewrites the session JSONL).
+- `models.CompactResult` is now a valid type for `AsyncTaskState.result`.
+- `CRASHED_ERROR_PREFIX` constant in `runtime.py` and `async_tasks.py`
+  (mirrored bare in `_wait_script.py`). Used to distinguish "claude.exe
+  died mid-turn" from generic work errors at the wait.py exit-code layer.
+- `async_tasks._format_task_error(e)` — preserves supervision-class
+  prefixes (ORPHANED/CRASHED) at position 0 of the stored error string;
+  wraps other errors with the conventional `<TypeName>: <message>`.
+- `pair_poll` now renders `CRASHED` failures distinctly from generic
+  failures: "⚠ CRASHED (pair 'X') — the pair's claude.exe subprocess
+  exited mid-turn. Partial state may have persisted in the JSONL; the
+  runtime will respawn from the persisted session on the next pair_send."
+- `pair_status` local-corpse branch: "local corpse (claude.exe exited
+  code X ~Ys ago); next pair_send will respawn from JSONL."
+
+### Notes
+
+- **/context display semantics** (Bug 7 from the v0.9.7 batch report):
+  the apparent "headline % doesn't match category sum" in
+  `pair_context` output is an artifact of /context's own display —
+  headline is cache-aware (what's actually re-sent each turn), categories
+  show static loadout sizes (cache-blind). We pass `raw_markdown`
+  through verbatim from /context; not actionable on our side. Documented
+  in HANDOFF "Known caveats."
+- **Pair PowerShell sandbox `$env:PATHEXT='.CPL'`** (Bug 6 from the
+  same batch): we don't customize the pair subprocess environment
+  (`runtime.start` passes no `env=` to Popen — inheritance only). The
+  PATHEXT thing is claude.exe's own PowerShell sandbox initialization,
+  not us. Documented in HANDOFF "Known caveats."
+
+### Smoke
+
+`tests/smoke_v098.py` — 15 test functions, 31 assertions:
+- A: evictor mid-turn skip / non-mid-turn eviction / last_activity bump
+- B: AsyncTaskState ↔ CompactResult round-trip · backward compat for
+  SendResult · `_fmt_compact_result` · pair_poll polymorphic render
+- C: pair_status local-corpse detection
+- D: CRASHED_ERROR_PREFIX consistency · `_format_task_error` preserves
+  prefixes · CLIError stringifies correctly with CRASHED prefix
+- E: wait.py exit 5 (stopped) · exit 6 (CRASHED) · exit 1 (regression)
+  · exit 4 (regression)
+All v0.7-v0.9.7 smoke tests still green.
+
 ## [0.9.7] — 2026-05-30
 
 Completes v0.9.6: the **background watcher now accepts a pair name too**, so the

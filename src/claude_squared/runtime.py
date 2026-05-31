@@ -47,6 +47,15 @@ IDLE_TIMEOUT_SECONDS = 600  # 10 minutes
 EVICTOR_INTERVAL_SECONDS = 60
 INIT_TIMEOUT_SECONDS = 30
 
+# v0.9.8: error message prefix used when the pair runtime subprocess
+# (claude.exe) exits mid-turn. Parallel to async_tasks.ORPHAN_ERROR_PREFIX
+# (which fires when the OWNING MCP server dies). wait.py recognizes both
+# prefixes and exits with distinct codes (4=orphan, 6=crash). The constant
+# is duplicated in async_tasks.py and _wait_script.py rather than centralized
+# in models.py so wait.py — which is stdlib-only by design — can stay
+# self-contained. Any change must be made in all three places in sync.
+CRASHED_ERROR_PREFIX = "CRASHED: "
+
 
 def _claude_executable() -> str:
     env = os.environ.get("CLAUDE_PAIR_CLI_PATH")
@@ -671,15 +680,28 @@ class PairRuntime:
     def _append_main_log_line(self, line: str) -> None:
         """Write one line to main.log and increment the line counter (thread-safe).
 
-        Also stamps ``_last_log_activity_at`` so ``pair_status`` can derive the
-        "is this pair actively working or hung?" heuristic.
+        Stamps BOTH timestamps:
+          - ``_last_log_activity_at`` — used by ``pair_status``'s active/slow/
+            likely-hung heuristic.
+          - ``last_activity`` — used by the idle evictor AND ``pair_runtimes()``
+            display. v0.9.8: bumping per-log-line — not just at send entry /
+            result — is defense-in-depth for the mid-turn eviction fix
+            (Crack 3 from the v0.9.8 design pass). The primary protection is
+            ``_evict_idle``'s ``_current_scope`` skip, but if the scope is ever
+            stale for any reason (a leaked turn, an unhandled exception in
+            send before the try/finally cleanup), a runtime that's still
+            producing log lines is observably alive and shouldn't be killed.
+            Side benefit: ``pair_runtimes`` now reports an accurate "last
+            activity" mid-turn instead of a stale send-entry timestamp.
         """
         with self._main_log_lock:
             try:
                 with open(self.main_log_path, "a", encoding="utf-8") as f:
                     f.write(line + "\n")
                 self._main_log_lines += 1
-                self._last_log_activity_at = datetime.utcnow()
+                now = datetime.utcnow()
+                self._last_log_activity_at = now
+                self.last_activity = now
                 if self._current_scope is not None:
                     self._current_scope.end_line = self._main_log_lines
             except Exception:
@@ -859,60 +881,92 @@ class PairRuntime:
                 "type": "user",
                 "message": {"role": "user", "content": message},
             }) + "\n"
+            # Scope cleanup is via the outer try/finally below — every exit path
+            # (normal return, CLIError, CommandTimeout, any unhandled exception)
+            # is guaranteed to clear ``_current_scope``. Without this, an
+            # uncaught exception would leave the scope dangling, and the
+            # v0.9.8 evictor (which skips runtimes whose scope is set) would
+            # permanently protect a zombie runtime from idle eviction. Crack 1
+            # from the v0.9.8 design pass.
             try:
-                self.proc.stdin.write(payload.encode("utf-8"))
-                self.proc.stdin.flush()
-            except (BrokenPipeError, OSError) as e:
-                self._current_scope = None
-                raise CLIError(
-                    f"pair runtime stdin closed: {e}",
-                    stderr=self._collect_stderr(),
-                )
+                try:
+                    self.proc.stdin.write(payload.encode("utf-8"))
+                    self.proc.stdin.flush()
+                except (BrokenPipeError, OSError) as e:
+                    raise CLIError(
+                        f"pair runtime stdin closed: {e}",
+                        stderr=self._collect_stderr(),
+                    )
 
-            # timeout_seconds=None → no auto-kill ceiling. The read loop still polls
-            # every second via the inner queue.get(timeout=1) for liveness; if the
-            # subprocess dies we'll detect it. The pair just runs as long as it
-            # needs (or until pair_stop is called).
-            end: float | None = (time.monotonic() + timeout_seconds) if timeout_seconds is not None else None
-            while end is None or time.monotonic() < end:
-                try:
-                    line = self._stdout_q.get(timeout=1)
-                except queue.Empty:
-                    if not self.is_alive():
-                        scope = self._current_scope
-                        self._current_scope = None
-                        raise CLIError(
-                            f"pair runtime exited mid-turn (code {self.proc.returncode if self.proc else '?'})",
-                            stderr=self._collect_stderr(),
-                            exit_code=self.proc.returncode if self.proc else None,
-                        )
-                    continue
-                try:
-                    ev = json.loads(line.strip())
-                except Exception:
-                    continue
-                if on_event is not None:
+                # timeout_seconds=None → no auto-kill ceiling. The read loop still polls
+                # every second via the inner queue.get(timeout=1) for liveness; if the
+                # subprocess dies we'll detect it. The pair just runs as long as it
+                # needs (or until pair_stop is called).
+                end: float | None = (time.monotonic() + timeout_seconds) if timeout_seconds is not None else None
+                while end is None or time.monotonic() < end:
                     try:
-                        on_event(ev)
+                        line = self._stdout_q.get(timeout=1)
+                    except queue.Empty:
+                        if not self.is_alive():
+                            # Race-safe snapshot: a concurrent ``stop()`` / ``evict``
+                            # in another thread can null ``self.proc`` between
+                            # is_alive returning False and our error construction
+                            # (the source of the pre-v0.9.8 opaque "(code ?)"
+                            # reports). Capture proc + stderr ONCE here so the
+                            # error always carries a concrete code when one exists.
+                            proc_snapshot = self.proc
+                            returncode = (
+                                proc_snapshot.returncode
+                                if proc_snapshot is not None else None
+                            )
+                            stderr_snapshot = self._collect_stderr()
+                            code_str = (
+                                str(returncode) if returncode is not None
+                                else "unknown — runtime cleaned up concurrently"
+                            )
+                            # CRASHED: prefix is the parallel of ORPHANED: —
+                            # lets wait.py dispatch "claude.exe died mid-turn"
+                            # to exit code 6, distinct from generic work errors
+                            # (exit 1). v0.9.8 Bug 4 + Bug 5 fix.
+                            raise CLIError(
+                                f"{CRASHED_ERROR_PREFIX}pair runtime exited mid-turn (exit {code_str})",
+                                stderr=stderr_snapshot,
+                                exit_code=returncode,
+                            )
+                        continue
+                    try:
+                        ev = json.loads(line.strip())
                     except Exception:
-                        pass
-                if ev.get("type") == "result":
-                    self.last_activity = datetime.utcnow()
-                    # Record the JSONL mtime AFTER our own write completed —
-                    # any future mtime greater than this means SOMEONE ELSE wrote.
-                    self._last_seen_jsonl_mtime = self._current_jsonl_mtime()
-                    scope = self._current_scope
-                    self._current_scope = None
-                    if scope is not None:
-                        ev["_log_scope"] = {
-                            "log_path": str(scope.main_log_path),
-                            "start_line": scope.start_line,
-                            "end_line": scope.end_line,
-                            "subagent_logs": list(scope.subagent_logs),
-                        }
-                    return ev
-            self._current_scope = None
-            raise CommandTimeout(self.spec.name, timeout_seconds)
+                        continue
+                    if on_event is not None:
+                        try:
+                            on_event(ev)
+                        except Exception:
+                            pass
+                    if ev.get("type") == "result":
+                        self.last_activity = datetime.utcnow()
+                        # Record the JSONL mtime AFTER our own write completed —
+                        # any future mtime greater than this means SOMEONE ELSE wrote.
+                        self._last_seen_jsonl_mtime = self._current_jsonl_mtime()
+                        # Capture scope BEFORE the finally clears it (we need it
+                        # for ev["_log_scope"]).
+                        scope = self._current_scope
+                        if scope is not None:
+                            ev["_log_scope"] = {
+                                "log_path": str(scope.main_log_path),
+                                "start_line": scope.start_line,
+                                "end_line": scope.end_line,
+                                "subagent_logs": list(scope.subagent_logs),
+                            }
+                        return ev
+                raise CommandTimeout(self.spec.name, timeout_seconds)
+            finally:
+                # Defensive scope cleanup: clear ``_current_scope`` on EVERY
+                # exit path. The v0.9.8 evictor skips runtimes whose scope is
+                # set; without this finally, an unhandled exception escaping
+                # the read loop would leave the scope dangling and permanently
+                # protect a zombie runtime from idle eviction.
+                self._current_scope = None
 
     def _collect_stderr(self) -> str:
         with self._stderr_lock:
@@ -1003,6 +1057,31 @@ class RuntimeRegistry:
         with self._lock:
             for name, rt in self._runtimes.items():
                 if rt.spec.persistent:
+                    continue
+                # v0.9.8: skip runtimes that are mid-turn. The pre-v0.9.8
+                # evictor was the root cause of the "exited mid-turn (code ?)"
+                # cluster — ``last_activity`` was only bumped at send entry
+                # and result, so a turn lasting >10 min looked idle and got
+                # taskkill'd. Four real failures observed in one week, all
+                # between 10:21 and 10:54 (matching IDLE_TIMEOUT_SECONDS=600s
+                # + the 60s evictor cycle).
+                #
+                # Two protections, belt-and-suspenders:
+                #   1. ``_current_scope`` is set for the duration of any turn
+                #      (cleared by send's try/finally on EVERY exit path) →
+                #      this is the primary signal. GIL makes the attribute
+                #      read atomic; worst case is one cycle of lag.
+                #   2. ``last_activity`` is now also bumped on every log line
+                #      via ``_append_main_log_line``, so a turn that produces
+                #      log activity won't look idle even if scope is somehow
+                #      stale. Defense in depth (Crack 3 from design pass).
+                #
+                # Trade-off: a genuinely wedged turn (claude.exe stuck in an
+                # infinite loop with no output) will no longer be auto-rescued
+                # at 10 min. ``hard_timeout_seconds`` (None by default) or
+                # explicit ``pair_stop`` are the intended recovery paths;
+                # ``pair_status`` reports likely-hung at 120s+.
+                if rt._current_scope is not None:
                     continue
                 if rt.last_activity < cutoff or not rt.is_alive():
                     to_evict.append(name)

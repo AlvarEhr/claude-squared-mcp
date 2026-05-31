@@ -100,7 +100,7 @@ pair_compact(name="reviewer", steering_prompt="Focus on what was reviewed and an
 ### Mutation
 - `pair_update(name, model?, effort?, permission_mode?, allowed_tools?, allowed_invocations?, cwd?, extra_dirs?, purpose?)`
 - `pair_clear(name, archive_old=True)` — rotate to fresh session_id; pinned config preserved
-- `pair_compact(name, steering_prompt?, timeout_seconds=600)` — native /compact
+- `pair_compact(name, steering_prompt?, timeout_seconds=45, compact_timeout_seconds=600)` — native /compact (async-wrapped, v0.9.8+; degrades gracefully to an async handle past the sync cap)
 
 ### Skills / commands
 - `pair_invoke(name, skill_name, args?)` — invoke a slash command via stream-json. Server-side allow-list enforcement (`PairSpec.allowed_invocations`) — see "Per-pair invocation allow-list" below.
@@ -143,8 +143,10 @@ Three ways to consume the handle:
    task_id = pair_send_async(name="scout", message="long task...")
    Bash(run_in_background=True,
         command=f"python ~/.claude/pairs/wait.py {task_id}")
-   # Bash exits 0=done, 1=failed, 2=not-found, 3=timeout (default 1800s).
-   # On notification, call pair_poll(task_id) for the response.
+   # Exit codes (v0.9.8): 0=done, 1=failed (work error), 2=not-found,
+   #   3=timeout (default 1800s), 4=orphaned (MCP server died — supervision
+   #   event, not a work failure), 5=stopped (pair_stop), 6=crashed
+   #   (claude.exe died mid-turn). On notification, call pair_poll(task_id).
    ```
 
    The MCP server installs `~/.claude/pairs/wait.py` on startup — a
