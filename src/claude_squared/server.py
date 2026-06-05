@@ -535,6 +535,7 @@ def pair_create(
     cwd: str | None = None,
     extra_dirs: str | list[str] | None = None,
     persistent: bool | None = None,
+    ultracode: bool | None = None,
     allowed_invocations: str | list[str] | None = None,
     initial_message: str | None = None,
     session_id: str | None = None,
@@ -581,6 +582,13 @@ def pair_create(
         persistent: True = subprocess kept alive for MCP server lifetime (no idle
             eviction). Use for pairs you chat with frequently. Default False = lazy-spawn
             + 10-min idle eviction.
+        ultracode: True = activate Ultracode mode for this pair — "xhigh effort +
+            dynamic workflow orchestration" (Anthropic's framing). The MCP passes
+            ``--settings '{"ultracode": true}'`` to the CLI at every spawn,
+            which is Anthropic's canonical activation mechanism. Compatible with
+            any explicit ``effort`` value — ultracode and effort are independent
+            CLI fields. Default False. **Common pitfall**: ``effort="ultracode"``
+            is NOT valid — the CLI rejects it with a warning. Use this flag.
         allowed_invocations: ``pair_invoke`` allow-list (fnmatch globs). ``None`` = allow
             all (default, backward-compat); ``[]`` = deny all (lockdown); ``["clear",
             "mcp__claude_ai_*"]`` = allow matching only. Mutable via ``pair_update``
@@ -618,6 +626,7 @@ def pair_create(
         effort=effort,
         permission_mode=permission_mode,
         persistent=persistent,
+        ultracode=ultracode,
         parent_model=parent_model,
     )
     # Merge per-call extra_dirs with defaults' extra_dirs (per-call wins on overlap;
@@ -645,6 +654,7 @@ def pair_create(
         cwd=resolved_cwd,
         extra_dirs=extra_dirs_norm,
         persistent=resolved["persistent"],
+        ultracode=resolved["ultracode"],
     )
     # Register first so concurrent pair_send calls see it
     reg_mod.add_pair(spec)
@@ -679,7 +689,10 @@ def pair_create(
     line = (
         f"Created '{name}' (session {_short(result.session_id)}, "
         f"model {resolved['model']}, effort {effort_display}, "
-        f"permission_mode {resolved['permission_mode']})"
+        f"permission_mode {resolved['permission_mode']}"
+        # v0.9.10: surface ultracode in the headline when on so the user sees
+        # what they actually got. Suppressed when False to avoid noise.
+        f"{', ultracode' if resolved['ultracode'] else ''})"
     )
     for msg in transparency_msgs:
         line += f"\n  {msg}"
@@ -970,6 +983,10 @@ _HARDCODED_DEFAULTS = {
     "effort": None,
     "permission_mode": "auto",
     "persistent": False,
+    # v0.9.10: Ultracode opt-in. False by default so existing pairs and pre-
+    # v0.9.10 calls behave unchanged. Set explicitly per-pair via
+    # ``pair_create(ultracode=True)`` or session-wide via ``pair_settings_set``.
+    "ultracode": False,
     "extra_dirs": None,
 }
 
@@ -1115,6 +1132,7 @@ def _resolve_pair_create_args(
     effort: str | None,
     permission_mode: str | None,
     persistent: bool | None,
+    ultracode: bool | None,
     parent_model: str | None,
 ) -> tuple[dict, list[str]]:
     """Resolve per-call args + defaults file + hardcoded fallback into a
@@ -1146,6 +1164,7 @@ def _resolve_pair_create_args(
         permission_mode, defaults.permission_mode, _HARDCODED_DEFAULTS["permission_mode"]
     )
     resolved_persist = _layered(persistent, defaults.persistent, _HARDCODED_DEFAULTS["persistent"])
+    resolved_ultra = _layered(ultracode, defaults.ultracode, _HARDCODED_DEFAULTS["ultracode"])
 
     # Match-parent expansion. Happens AFTER layering so it works whether
     # match-parent comes from per-call (model="match-parent") or from
@@ -1174,6 +1193,7 @@ def _resolve_pair_create_args(
         "effort": resolved_effort,
         "permission_mode": resolved_perm,
         "persistent": resolved_persist,
+        "ultracode": resolved_ultra,
         "extra_dirs_default": defaults.extra_dirs,  # caller merges with per-call
         # Surface the defaults' allowed_invocations so caller can layer it on
         # only when the per-call value is None (preserves explicit-[] lockdown).
@@ -1850,6 +1870,7 @@ def pair_update(
     allowed_invocations: str | list[str] | None = None,
     cwd: str | None = None,
     extra_dirs: str | list[str] | None = None,
+    ultracode: bool | None = None,
     verbose: bool = False,
 ) -> str:
     """Update mutable settings of an existing pair (per-pair, not defaults —
@@ -1857,8 +1878,11 @@ def pair_update(
 
     Three field categories with different propagation semantics — see README
     "Mid-flight config changes":
-      - **Per-send** (``model``/``effort``/``permission_mode``): registry write
-        + runtime eviction → next ``pair_send`` respawns with new values.
+      - **Per-send** (``model``/``effort``/``permission_mode``/``ultracode``):
+        registry write + runtime eviction → next ``pair_send`` respawns with
+        new values. ``ultracode`` was added as a per-send field in v0.9.10 —
+        toggling it triggers runtime eviction so the spawn args reflect the
+        new ``--settings '{"ultracode": ...}'`` state.
       - **Server-side** (``allowed_invocations``): MCP-layer only, no eviction;
         takes effect on next ``pair_invoke``. Pass ``[]`` for lockdown.
       - **Pinned-at-create** (``allowed_tools``/``mcp_whitelist``/
@@ -1892,6 +1916,11 @@ def pair_update(
                 )
             if extra_dirs is not None:
                 fields["extra_dirs"] = _normalize_path_list(_coerce_to_str_list(extra_dirs))
+            if ultracode is not None:
+                # v0.9.10: ultracode is per-send (pinned at spawn args via
+                # --settings). Toggling triggers eviction below so the next
+                # send respawns with/without the --settings flag.
+                fields["ultracode"] = ultracode
 
             # Apply effort coercion against the resolved model. We do this
             # explicitly here (in addition to PairSpec's model_validator) because
@@ -1955,7 +1984,7 @@ def pair_update(
                 return f"No fields to update for '{name}'."
             spec = reg_mod.update_pair(name, **fields)
             # Material config changes invalidate any live runtime — next send will re-spawn
-            if any(k in fields for k in ("model", "permission_mode", "cwd", "extra_dirs", "allowed_tools")):
+            if any(k in fields for k in ("model", "permission_mode", "cwd", "extra_dirs", "allowed_tools", "ultracode")):
                 try:
                     runtime_mod.registry().evict(name)
                 except Exception:
@@ -2429,6 +2458,7 @@ def pair_settings_get(verbose: bool = False) -> str:
     lines.append(f"    effort          = {_show('effort', defaults.effort, eff_fallback)}")
     lines.append(f"    permission_mode = {_show('permission_mode', defaults.permission_mode, _HARDCODED_DEFAULTS['permission_mode'])}")
     lines.append(f"    persistent      = {_show('persistent', defaults.persistent, _HARDCODED_DEFAULTS['persistent'])}")
+    lines.append(f"    ultracode       = {_show('ultracode', defaults.ultracode, _HARDCODED_DEFAULTS['ultracode'])}")
     lines.append(f"    extra_dirs      = {_show('extra_dirs', defaults.extra_dirs, _HARDCODED_DEFAULTS['extra_dirs'])}")
     lines.append(f"    allowed_invocations = {_show('allowed_invocations', defaults.allowed_invocations, 'None (allow all)')}")
     lines.append("")
@@ -2454,6 +2484,7 @@ def pair_settings_set(
     effort: str | None = None,
     permission_mode: str | None = None,
     persistent: bool | None = None,
+    ultracode: bool | None = None,
     extra_dirs: str | list[str] | None = None,
     allowed_invocations: str | list[str] | None = None,
     verbose: bool = False,
@@ -2475,6 +2506,13 @@ def pair_settings_set(
         permission_mode: ``bypassPermissions`` is REFUSED as a default (foot-gun:
             every new pair would silently lose guardrails). Pass per-pair instead.
         persistent: Default persistent flag for new pairs.
+        ultracode: Default Ultracode flag for new pairs (v0.9.10+) — when True,
+            every fresh pair_create silently adds ``--settings '{"ultracode":
+            true}'`` to its spawn args, activating Anthropic's "xhigh effort +
+            dynamic workflow orchestration" mode at the CLI layer. Per-pair
+            ``pair_create(ultracode=False)`` still wins. NOT a foot-gun — it
+            doesn't reduce safety, just biases pairs toward higher-effort,
+            workflow-heavier behavior.
         extra_dirs: Default ``--add-dir`` paths for every new pair.
         allowed_invocations: Default ``pair_invoke`` allow-list (see ``pair_create``
             for syntax). ``[]`` REFUSED as a default (same foot-gun principle as
@@ -2492,6 +2530,8 @@ def pair_settings_set(
         fields["permission_mode"] = permission_mode
     if persistent is not None:
         fields["persistent"] = persistent
+    if ultracode is not None:
+        fields["ultracode"] = ultracode
     if extra_dirs is not None:
         fields["extra_dirs"] = _normalize_path_list(_coerce_to_str_list(extra_dirs))
     if allowed_invocations is not None:

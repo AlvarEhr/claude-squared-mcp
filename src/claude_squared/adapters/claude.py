@@ -222,6 +222,19 @@ class ClaudeAdapter(PairAdapter):
         for t in HEADLESS_INCOMPATIBLE_TOOLS:
             args += ["--disallowed-tools", t]
 
+        # v0.9.10: Ultracode mode. Anthropic's mechanism is a session settings
+        # key (--settings), NOT a --effort value. The CLI rejects --effort
+        # ultracode with a warning ("Unknown --effort value 'ultracode'") but
+        # silently accepts --settings '{"ultracode": true}'. Verified against
+        # CLI 2.1.165 via direct probe; binary strings document the design
+        # ("ultracode (xhigh effort plus standing dynamic-workflow
+        # orchestration) is active for the session. Set per session via the
+        # 'ultracode' settings key"). Pass it alongside any --effort value —
+        # ultracode and effort are independent fields in the CLI's data model
+        # (binary: ``effortValue:_,ultracode:f``).
+        if spec.ultracode:
+            args += ["--settings", '{"ultracode": true}']
+
         # Workspace dirs → --add-dir (the spawned subprocess's cwd defines the workspace
         # root; --add-dir whitelists additional paths for the auto-mode classifier).
         if spec.cwd:

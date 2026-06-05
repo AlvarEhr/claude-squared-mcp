@@ -58,6 +58,12 @@ class PairDefaults(BaseModel):
     permission_mode: PermissionMode | None = None
     # Whether new pairs should be marked persistent by default.
     persistent: bool | None = None
+    # v0.9.10: Whether new pairs should default to Ultracode mode ("xhigh
+    # effort + dynamic workflow orchestration"). The adapter appends
+    # ``--settings '{"ultracode": true}'`` at spawn when this is True.
+    # Mirrors ``PairSpec.ultracode``; None means "use the False hardcoded
+    # fallback" so existing pre-v0.9.10 defaults files load unchanged.
+    ultracode: bool | None = None
     # Extra --add-dir paths to whitelist on every new pair.
     extra_dirs: list[str] | None = None
     # Default allow-list for ``pair_invoke``. Mirrors ``PairSpec.allowed_invocations``.

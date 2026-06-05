@@ -82,7 +82,7 @@ pair_compact(name="reviewer", steering_prompt="Focus on what was reviewed and an
 ## Tools
 
 ### Lifecycle
-- `pair_create(name, purpose, model, effort, permission_mode, system_prompt_append?, profile_name?, allowed_tools?, mcp_whitelist?, cwd?, extra_dirs?, persistent?, allowed_invocations?, initial_message?, session_id?, parent_model?)`
+- `pair_create(name, purpose, model, effort, permission_mode, system_prompt_append?, profile_name?, allowed_tools?, mcp_whitelist?, cwd?, extra_dirs?, persistent?, ultracode?, allowed_invocations?, initial_message?, session_id?, parent_model?)`
 - `pair_adopt(name, session_id, ...)` — register an existing claude session
 - `pair_forget(name, archive=True)` — remove from registry; optionally archives transcript
 
@@ -98,7 +98,7 @@ pair_compact(name="reviewer", steering_prompt="Focus on what was reviewed and an
 - `pair_actions(name?)` — discoverability: curated commands + (if name) pair-installed skills
 
 ### Mutation
-- `pair_update(name, model?, effort?, permission_mode?, allowed_tools?, allowed_invocations?, cwd?, extra_dirs?, purpose?)`
+- `pair_update(name, model?, effort?, permission_mode?, allowed_tools?, allowed_invocations?, cwd?, extra_dirs?, ultracode?, purpose?)`
 - `pair_clear(name, archive_old=True)` — rotate to fresh session_id; pinned config preserved
 - `pair_compact(name, steering_prompt?, timeout_seconds=45, compact_timeout_seconds=600)` — native /compact (async-wrapped, v0.9.8+; degrades gracefully to an async handle past the sync cap)
 
@@ -109,8 +109,10 @@ pair_compact(name="reviewer", steering_prompt="Focus on what was reviewed and an
 
 ### Per-user defaults
 - `pair_settings_get()` — show writable defaults + file paths + read-only env knobs
-- `pair_settings_set(model?, effort?, permission_mode?, persistent?, extra_dirs?, allowed_invocations?)` — fill defaults for new pairs (per-call args ALWAYS override defaults)
+- `pair_settings_set(model?, effort?, permission_mode?, persistent?, ultracode?, extra_dirs?, allowed_invocations?)` — fill defaults for new pairs (per-call args ALWAYS override defaults)
 - `pair_settings_reset()` — delete defaults file → fall back to hardcoded fallbacks
+
+> **Ultracode (v0.9.10+)**: Anthropic added an "Ultracode" mode (xhigh effort + dynamic workflows for maximum thoroughness) to CLI 2.1.165. It's surfaced via `--settings '{"ultracode": true}'`, **not** `--effort ultracode` (the CLI rejects that). Use `pair_create(ultracode=True)` or set it as a default via `pair_settings_set(ultracode=True)`. Compatible with any explicit `effort` value — effort and ultracode are independent fields.
 
 ### Custom agents (global)
 - `pair_agent_define(name, description, prompt, tools?, model?)` — write `~/.claude/agents/<name>.md`

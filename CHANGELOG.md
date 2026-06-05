@@ -4,6 +4,79 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.10] — 2026-06-05
+
+Ultracode support. CLI 2.1.165 added an "Ultracode" mode — Anthropic's framing
+is "xhigh effort + dynamic workflows for maximum thoroughness" — surfaced as
+a session-level activation in the Desktop UI's effort menu. Users naturally
+read it as a new `--effort` value and try `--effort ultracode`. **That's
+wrong**: the CLI rejects `--effort ultracode` with
+`"Warning: Unknown --effort value 'ultracode' — ignoring it..."`. The
+canonical mechanism is `--settings '{"ultracode": true}'` (verified via
+direct probe AND binary-string introspection: the relevant strings include
+`"ultracode (xhigh effort plus standing dynamic-workflow orchestration) is
+active for the session. Set per session via the 'ultracode' settings key
+(--settings or apply_flag_settings)"` and the enum
+`<low|medium|high|xhigh|max|ultracode|auto>` from a config schema where
+`ultracode` is documented as a setting key, not a `--effort` flag value).
+
+### Added
+
+- **`PairSpec.ultracode: bool = False`** — new pinned-at-spawn field. When
+  True, ``ClaudeAdapter._common_create_args`` appends
+  `["--settings", '{"ultracode": true}']` to every spawn so the CLI
+  activates Ultracode at the session level. Compatible with any explicit
+  `effort` value — effort and ultracode are independent CLI fields
+  (confirmed by the binary's internal data shape: `effortValue:_,ultracode:f`).
+  Default False — purely additive, existing pairs unaffected.
+- **`PairDefaults.ultracode: bool | None = None`** — defaults-file equivalent.
+  Lets a user set `ultracode=True` as a per-user default so every fresh
+  `pair_create` activates Ultracode without per-call args. None means "use
+  the False hardcoded fallback."
+- **`pair_create(ultracode=None)`** — new optional kwarg. Resolution order
+  matches the other layerable fields: per-call wins over defaults file
+  wins over the False hardcoded fallback.
+- **`pair_update(ultracode=None)`** — mutate the flag on an existing pair.
+  Listed as a Per-send field (next `pair_send` respawns the runtime so the
+  `--settings` flag reflects the new value; eviction triggered by the
+  `ultracode` key being in the change set).
+- **`pair_settings_set(ultracode=None)`** — set/clear as a default. Not
+  guarded as a foot-gun (unlike `bypassPermissions` and
+  `allowed_invocations=[]`) — Ultracode doesn't reduce safety, it just biases
+  pairs toward higher-effort, workflow-heavier behavior.
+- **`pair_settings_get`** display now includes the `ultracode` line in the
+  Writable defaults section.
+- The `pair_create` headline response adds `, ultracode` after
+  `permission_mode` when the flag is True (suppressed when False to avoid
+  noise on the default path).
+
+### Notes
+
+- **Common pitfall to expect from users**: `effort="ultracode"` is NOT
+  valid — the CLI rejects it. Docstring on the new kwarg + on `effort` in
+  `pair_create` notes this. Detailed discovery story in HANDOFF's "Critical
+  CLI behaviors we depend on" section.
+- **Verification**: ran `claude --settings '{"ultracode": true}' --print
+  --model haiku -p "Reply with exactly: pong"` against CLI 2.1.165 — the
+  flag was silently accepted (no warning, no error). The opposite probe
+  `claude --effort ultracode --print --model haiku -p "Reply with exactly:
+  pong"` was rejected with the explicit "Unknown --effort value" warning.
+- **`/effort` and `/workflows` slash commands are gated to interactive
+  mode** (`"…isn't available in this environment."` in headless stream-json).
+  Doesn't affect Ultracode activation — `--settings` works headlessly.
+
+### Smoke
+
+`tests/smoke_v0910.py` — 13 functions, 22 assertions:
+- PairSpec / PairDefaults schema (field present, defaults False/None,
+  round-trip through JSON, pre-v0.9.10 backward compatibility).
+- Adapter wire-up (omits `--settings` when off, appends the exact JSON
+  `{"ultracode": true}` when on, coexists with `effort`).
+- Public API surface (signature checks for `pair_create`, `pair_update`,
+  `pair_settings_set`), hardcoded defaults map, layering resolution.
+
+All prior smoke files green.
+
 ## [0.9.9] — 2026-05-31
 
 Ergonomics: the v0.7-era unique-prefix resolution in `pair_poll` was

@@ -156,6 +156,21 @@ class PairSpec(BaseModel):
     cwd: str | None = None
     extra_dirs: list[str] | None = None  # additional --add-dir paths beyond cwd
     persistent: bool = False  # if True, runtime never evicted; otherwise 10-min idle eviction
+    # v0.9.10: Ultracode mode — "xhigh effort + dynamic workflow orchestration"
+    # per claude CLI 2.1.165+. When True, the adapter appends ``--settings
+    # '{"ultracode": true}'`` to every spawn so the CLI activates ultracode at
+    # the session level. Compatible with any ``effort`` setting (effort and
+    # ultracode are independent fields in the CLI's internal data model; the
+    # CLI sets effort to xhigh by default under ultracode but honors an
+    # explicit --effort override). Default False — backward compatible.
+    #
+    # NOTE: ``--effort ultracode`` is NOT a valid effort value (verified: the
+    # CLI rejects it with a warning). Ultracode is a SETTINGS key, not an
+    # effort level — see HANDOFF.md "Critical CLI behaviors we depend on" for
+    # the discovery story (binary strings: ``ultracodeKeywordTrigger``,
+    # ``ultracode \xB7 xhigh effort + dynamic workflows for maximum
+    # thoroughness``).
+    ultracode: bool = False
     created_at: datetime = Field(default_factory=datetime.utcnow)
     last_active_at: datetime = Field(default_factory=datetime.utcnow)
     turn_count: int = 0
