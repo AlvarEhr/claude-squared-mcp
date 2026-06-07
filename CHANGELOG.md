@@ -4,6 +4,50 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.11] — 2026-06-07
+
+Read-only **terminal commands** you run yourself — no agent, no inference. This
+is the answer to "can I inspect pairs without it costing a turn / flowing
+through the agent's context." Investigated whether a Claude Code plugin or MCP
+primitive could add a true client-side, model-free slash command (like the
+built-in `/usage`): **it can't** — every plugin `/command` is a skill that
+renders into a prompt and triggers a model turn, and every MCP prompt/resource
+feeds the model too (verified against the MCP spec + Claude Code docs; the only
+model-free path is a hooks block-hack with notice-style UX). So the clean
+answer is terminal subcommands on the entry point we already ship.
+
+### Added
+- **`python -m claude_squared list`** — print all registered pairs (name,
+  model, turns, last active, purpose). Pure read of
+  `~/.claude/pairs/registry.json`.
+- **`python -m claude_squared info <pair>`** — full config + stats for one pair,
+  including a **zero-inference context fill %** computed from the session
+  JSONL's last assistant-turn usage (reuses `_read_last_turn_context_fill`).
+- **`python -m claude_squared context <pair>`** — just the context fill % for
+  one pair (zero inference, from JSONL), with a compact-soon hint at ≥60%/≥85%.
+- **`python -m claude_squared help` / `--help`** — lists all subcommands.
+- README gains a **"Terminal commands"** section documenting these.
+
+These three read on-disk state directly and **never involve the agent or cost
+an inference**. The full categorized `/context` breakdown (the big table) is
+still only via the MCP `pair_context` tool, which costs a small pair inference.
+
+### Changed
+- The `async_tasks` import (whose module load runs a dead-owner orphan sweep —
+  a write side effect) was moved from `__main__`'s top level into `_cmd_wait`,
+  so the new read-only `list` / `info` / `context` commands are genuinely
+  side-effect-free. `wait` behavior is unchanged.
+- Unknown subcommands now print usage and exit 64 instead of silently falling
+  through to "run the server." The no-arg invocation (`python -m
+  claude_squared`) still runs the MCP server — every host config depends on it.
+
+### Smoke
+`tests/smoke_v0911.py` — 11 functions, 30 assertions: list (empty + populated),
+info (config, zero-inference context fill, not-found→2, no-arg→64), context
+(fill %, ≥85% warning, no-turns, helper None case), plus an end-to-end
+subprocess check (dispatch, `--help`, unknown→64). All 11 prior smoke files
+green.
+
 ## [0.9.10] — 2026-06-05
 
 Ultracode support. CLI 2.1.165 added an "Ultracode" mode — Anthropic's framing

@@ -118,6 +118,33 @@ pair_compact(name="reviewer", steering_prompt="Focus on what was reviewed and an
 - `pair_agent_define(name, description, prompt, tools?, model?)` — write `~/.claude/agents/<name>.md`
 - `pair_agent_list()` — list defined agents
 
+## Terminal commands (run them yourself — no agent, no inference)
+
+The tools above are **agent-facing** — Claude calls them. These are **for you**:
+read-only subcommands on the `python -m claude_squared` entry point that read
+`~/.claude/pairs/` directly and **never involve the agent or cost an inference**.
+
+```bash
+python -m claude_squared list             # all pairs: name, model, turns, last active, purpose
+python -m claude_squared info <pair>      # full config + zero-inference context fill %
+python -m claude_squared context <pair>   # just the context fill % (zero inference, from JSONL)
+python -m claude_squared wait <task|pair> # block until an async task finishes (background watcher)
+python -m claude_squared --help           # list these commands
+python -m claude_squared                  # (no args) run the MCP server — what host configs invoke
+```
+
+`list` / `info` / `context` are pure disk reads (the context % comes from the
+session JSONL's last turn, so it's free). The full categorized `/context`
+breakdown — the big per-category token table — is only available through the
+MCP `pair_context` tool, which costs a small inference on the pair.
+
+> **Why not an in-chat `/pair-info` slash command?** A Claude Code plugin
+> *can't* add a true client-side, model-free slash command like the built-in
+> `/usage` — every plugin `/command` is a skill that renders into a prompt and
+> triggers a model turn, and MCP prompts/resources feed the model too. The
+> terminal subcommands above are the clean model-free path. (See CHANGELOG
+> v0.9.11.)
+
 ## State on disk
 
 | Path | Purpose |
