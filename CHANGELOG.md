@@ -4,6 +4,86 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] — 2026-06-07
+
+Fork & rewind for pairs (the `/fork` and `/rewind` equivalents — neither is
+available headlessly, so we implement them on the session JSONL), more
+read-only terminal commands, and a terminal `stop`. No existing tool's behavior
+changed and no schema change. The one hot-path addition is an **opt-in
+`should_stop` poll** in the runtime send loop — a no-op (single `os.path.exists`
+~once/sec) unless a stop-request marker exists, so normal sends are unchanged.
+
+### Added
+
+- **`pair_fork(name, new_name?)`** — branch a pair into a NEW independent pair,
+  keeping both. The new pair is an exact copy of the source's conversation at
+  fork time and diverges from there; the source is untouched. Uses native
+  **`claude --fork-session`** (empirically verified: it rewrites the copied
+  history's internal id references and records a forked-from provenance pointer
+  — far safer than hand-copying the JSONL, and future-proof against schema
+  drift). `--print` requires a turn, so a unique sentinel turn is sent and then
+  truncated off the new pair's tip. New `ClaudeAdapter.fork`. Collision-safe
+  naming (`<name>-fork`, `-2`, `-3`…).
+- **`pair_rewind_points(name, last_n?)`** — read-only. Lists the genuine
+  user-message boundaries a pair can be rewound to, each enriched with
+  **after-context** (assistant turns / tool calls / files written before the
+  next user message) so the caller picks a point WITHOUT reading the transcript.
+- **`pair_rewind(name, to_point, archive?)`** — rewind the conversation to
+  before a chosen user message. **Conversation-only** (does NOT revert files
+  the pair wrote to disk — we don't checkpoint the filesystem). The full
+  pre-rewind transcript is archived first (`<name>-<ts>-prerewind.jsonl`) so it
+  is reversible, and the result lists any **files written in the discarded
+  range** so you can `git revert` them if desired. Truncation snaps to a
+  user-message boundary so no dangling `tool_use` is left (which would make the
+  next turn invalid).
+- **More read-only terminal commands** on `python -m claude_squared` (pure disk
+  reads; never interrupt an in-flight pair; deliberately do NOT import
+  `async_tasks`, whose module load runs the orphan sweep):
+  - `poll <task|pair>` — async task status (resolves id / pair name / prefix).
+  - `transcript <pair> [N]` — tail the last N conversation turns.
+  - `status <pair>` — liveness from task files + main.log recency (honest that
+    a terminal can't see the in-process runtime).
+  - `log <pair> [N]` — tail the last N main.log activity lines.
+- **`python -m claude_squared stop <pair> [-y]`** — the one MUTATING terminal
+  command (confirms with Y/N unless `-y`). A terminal can't reach the server's
+  in-process runtime, so it writes a timestamped marker at
+  `~/.claude/pairs/stop-requests/<pair>.json`; the runtime's send loop honors it
+  on its next ~1s tick with a graceful in-band interrupt (the pair stays alive,
+  task reported `stopped`). Design hardened per a 6-point review: **write-only
+  interrupt** from the read-loop thread (no reader-thread deadlock), **monotonic
+  high-water-mark** (a delete race can't drop a second stop), **epoch-float
+  clock on both sides**, **`ts >= turn-start`** so a stale pre-turn marker is
+  ignored, **re-check-after-Y** so a turn that finished during the prompt isn't
+  falsely "stopped", and **queue disclosure** (stops only the current turn).
+  The runner is now invoked as `runner(task_id)` so the stop closure marks the
+  correct task. `runtime.send` gains an optional `should_stop` (default None →
+  no polling); `adapter.send` threads it through.
+
+### Notes
+
+- **JSONL helpers** added to `transcript.py`: `parse_events`,
+  `list_user_turn_points` (genuine user messages; excludes tool_result events
+  + the create-probe), `find_sentinel_line`, `truncate_jsonl_before_line`,
+  `files_written_in_events`.
+- `/fork` and `/rewind` both return *"isn't available in this environment"* in
+  headless stream-json — confirming these must be MCP tools operating on the
+  JSONL, not `pair_invoke` passthroughs.
+- Native `--fork-session` does NOT honor `CLAUDE_HOME`; like all claude.exe
+  session storage it writes under the real `~/.claude/projects/`. Our path
+  computation already matches that in production (CLAUDE_HOME unset).
+
+### Smoke
+
+`tests/smoke_v0100.py` — 15 functions, ~40 assertions (user-turn-point parsing,
+after-context, sentinel finding, truncation + tail invariant, rewind_points /
+rewind / fork tools with a mocked adapter, plus the stop mechanism: marker
+honor/ignore/high-water/mark-task, epoch-marker write, idle no-op,
+runner-receives-task_id). Plus two one-off **real** integration probes:
+(1) actual `--fork-session` → our truncation → resume-after-truncate remembers
+the codeword; (2) real runtime turn interrupted via `should_stop` from the
+read-loop thread — returned at 2.3s instead of a 20s sleep, `error_during_execution`
+ack, no deadlock. All 12 prior smoke files green.
+
 ## [0.9.11] — 2026-06-07
 
 Read-only **terminal commands** you run yourself — no agent, no inference. This

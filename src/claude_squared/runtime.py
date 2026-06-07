@@ -847,8 +847,34 @@ class PairRuntime:
 
     # ---- send ----
 
+    def _write_interrupt_nowait(self) -> None:
+        """Write the CLI's in-band ``control_request: interrupt`` to stdin and
+        return IMMEDIATELY — do NOT wait for the ack.
+
+        v0.10.0 (terminal stop). Unlike ``send_interrupt`` (called from a
+        DIFFERENT thread, with a wait loop), this is called from the read-loop
+        thread itself; the loop that follows catches the resulting
+        ``error_during_execution`` result. Waiting here would deadlock (the same
+        thread can't both wait for the ack AND be the one draining stdout for
+        it) — Crack A from the v0.10.0 stop-design review. A tiny stdin write
+        never blocks (pipe buffer), so there's no deadlock the other way."""
+        if not self.is_alive() or self.proc is None or self.proc.stdin is None:
+            return
+        request_id = f"req_int_{int(time.time())}_{os.urandom(3).hex()}"
+        payload = json.dumps({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": {"subtype": "interrupt"},
+        }) + "\n"
+        try:
+            self.proc.stdin.write(payload.encode("utf-8"))
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+
     def send(self, message: str, timeout_seconds: int | None = 300,
-             on_event: Callable[[dict], None] | None = None) -> dict[str, Any]:
+             on_event: Callable[[dict], None] | None = None,
+             should_stop: "Callable[[], bool] | None" = None) -> dict[str, Any]:
         """Push a user message; return the result event dict (mirrors --print JSON).
 
         Augments the result dict with `_log_scope` containing this turn's main.log
@@ -860,6 +886,12 @@ class PairRuntime:
                 (use ``pair_stop`` for manual cancellation). When set and hit, raises
                 ``CommandTimeout`` AND the registry should evict the runtime so we
                 don't carry stale stdout into the next turn.
+            should_stop: Optional callback polled ~once/sec during the turn
+                (v0.10.0 terminal stop). When it returns True (the server's
+                marker-check closure found a fresh stop request and has already
+                marked the task stopped), we write an in-band interrupt and let
+                the loop catch the ack. Default None = no stop polling (zero
+                behavior change to existing sends).
         """
         with self.send_lock:
             if not self.is_alive():
@@ -903,7 +935,23 @@ class PairRuntime:
                 # subprocess dies we'll detect it. The pair just runs as long as it
                 # needs (or until pair_stop is called).
                 end: float | None = (time.monotonic() + timeout_seconds) if timeout_seconds is not None else None
+                _last_stop_check = 0.0
                 while end is None or time.monotonic() < end:
+                    # v0.10.0 terminal stop: poll the should_stop marker check at
+                    # most ~once/sec. On a hit, write the interrupt without
+                    # waiting (the loop below catches the ack). should_stop has
+                    # already marked the task stopped server-side, so the worker
+                    # reports "stopped". Any exception here must NEVER kill the
+                    # turn — swallow and keep looping.
+                    if should_stop is not None:
+                        _now_m = time.monotonic()
+                        if _now_m - _last_stop_check >= 1.0:
+                            _last_stop_check = _now_m
+                            try:
+                                if should_stop():
+                                    self._write_interrupt_nowait()
+                            except Exception:
+                                pass
                     try:
                         line = self._stdout_q.get(timeout=1)
                     except queue.Empty:

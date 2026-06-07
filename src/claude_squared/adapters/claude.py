@@ -85,7 +85,8 @@ class ClaudeAdapter(PairAdapter):
     def send(self, spec: PairSpec, message: str, *, model: str | None = None,
              effort: str | None = None, permission_mode: str | None = None,
              timeout_seconds: int = 300,
-             on_event: "callable | None" = None) -> SendResult:
+             on_event: "callable | None" = None,
+             should_stop: "callable | None" = None) -> SendResult:
         if not self.session_exists(spec):
             raise SessionMissing(spec.name, spec.session_id)
 
@@ -104,7 +105,8 @@ class ClaudeAdapter(PairAdapter):
             if rt.is_stale():
                 reg.evict(spec.name)
                 rt = reg.get_or_start(spec, self)
-            result_json = rt.send(message, timeout_seconds=timeout_seconds, on_event=on_event)
+            result_json = rt.send(message, timeout_seconds=timeout_seconds,
+                                  on_event=on_event, should_stop=should_stop)
             return self._build_send_result(spec, result_json)
 
         # Resolve the effective effort for this one-shot send: per-call override
@@ -144,6 +146,36 @@ class ClaudeAdapter(PairAdapter):
                     trigger=meta.get("trigger", "manual"),
                 )
         raise CLIError("Compaction did not produce a compact_boundary event")
+
+    def fork(self, spec: PairSpec, sentinel: str, timeout_seconds: int = 300) -> str:
+        """Fork the pair's session via native ``--fork-session``; return the new
+        session_id. (v0.10.0)
+
+        ``--fork-session`` resumes the existing session but writes to a NEW
+        session id, leaving the original untouched, and correctly rewrites the
+        copied history's internal id references (verified empirically — far
+        safer than hand-copying the JSONL, and future-proof against schema
+        drift). ``--print`` requires a turn, so we send one ``sentinel`` turn;
+        the caller truncates it back off the new JSONL's tip afterward (see
+        ``transcript.find_sentinel_line`` + ``truncate_jsonl_before_line``).
+        """
+        args = [
+            "--print", "--output-format", "json",
+            "--resume", spec.session_id, "--fork-session",
+            "--model", spec.model,
+            "--permission-mode", spec.permission_mode,
+            "-p", sentinel,
+        ]
+        result_json = self._run_print(
+            args, timeout_seconds=timeout_seconds, pair_name=spec.name, cwd=spec.cwd
+        )
+        new_sid = result_json.get("session_id")
+        if not new_sid or new_sid == spec.session_id:
+            raise CLIError(
+                f"--fork-session did not produce a new session id (got {new_sid!r}); "
+                f"the pair's original session is unchanged."
+            )
+        return new_sid
 
     def context(self, spec: PairSpec, timeout_seconds: int = 60) -> ContextReport:
         """Invoke /context and parse the markdown response."""

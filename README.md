@@ -101,6 +101,9 @@ pair_compact(name="reviewer", steering_prompt="Focus on what was reviewed and an
 - `pair_update(name, model?, effort?, permission_mode?, allowed_tools?, allowed_invocations?, cwd?, extra_dirs?, ultracode?, purpose?)`
 - `pair_clear(name, archive_old=True)` — rotate to fresh session_id; pinned config preserved
 - `pair_compact(name, steering_prompt?, timeout_seconds=45, compact_timeout_seconds=600)` — native /compact (async-wrapped, v0.9.8+; degrades gracefully to an async handle past the sync cap)
+- `pair_fork(name, new_name?)` — branch a pair into a new independent pair, keeping both (v0.10.0; like `/fork`, via native `--fork-session`)
+- `pair_rewind_points(name, last_n?)` — list user-message boundaries to rewind to, with after-context (v0.10.0)
+- `pair_rewind(name, to_point, archive?)` — rewind the conversation to before a chosen user message (v0.10.0; like `/rewind`, conversation-only, pre-rewind transcript archived)
 
 ### Skills / commands
 - `pair_invoke(name, skill_name, args?)` — invoke a slash command via stream-json. Server-side allow-list enforcement (`PairSpec.allowed_invocations`) — see "Per-pair invocation allow-list" below.
@@ -125,13 +128,23 @@ read-only subcommands on the `python -m claude_squared` entry point that read
 `~/.claude/pairs/` directly and **never involve the agent or cost an inference**.
 
 ```bash
-python -m claude_squared list             # all pairs: name, model, turns, last active, purpose
-python -m claude_squared info <pair>      # full config + zero-inference context fill %
-python -m claude_squared context <pair>   # just the context fill % (zero inference, from JSONL)
-python -m claude_squared wait <task|pair> # block until an async task finishes (background watcher)
-python -m claude_squared --help           # list these commands
-python -m claude_squared                  # (no args) run the MCP server — what host configs invoke
+python -m claude_squared list                # all pairs: name, model, turns, last active, purpose
+python -m claude_squared info <pair>         # full config + zero-inference context fill %
+python -m claude_squared context <pair>      # just the context fill % (zero inference, from JSONL)
+python -m claude_squared poll <task|pair>    # async task status (resolves id / pair name / prefix)
+python -m claude_squared transcript <pair> [N]  # tail the last N conversation turns
+python -m claude_squared status <pair>       # liveness from task files + main.log recency
+python -m claude_squared log <pair> [N]      # tail the last N main.log activity lines
+python -m claude_squared wait <task|pair>    # block until an async task finishes (background watcher)
+python -m claude_squared stop <pair> [-y]    # interrupt a pair's current turn (asks Y/N; the one mutating cmd)
+python -m claude_squared --help              # list these commands
+python -m claude_squared                     # (no args) run the MCP server — what host configs invoke
 ```
+
+`stop` is the only mutating terminal command — it writes a marker that the
+server's runtime honors with a graceful in-band interrupt within ~1s (the pair
+stays alive and can be re-sent). It confirms with Y/N unless you pass `-y`, and
+only stops the *current* turn (queued sends still run).
 
 `list` / `info` / `context` are pure disk reads (the context % comes from the
 session JSONL's last turn, so it's free). The full categorized `/context`

@@ -40,6 +40,7 @@ from __future__ import annotations
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 
 def _fmt_local(dt) -> str:
@@ -180,18 +181,327 @@ def _cmd_context(argv: list[str]) -> int:
     return 0
 
 
+# ---- async-task reading (read-only; we deliberately do NOT import async_tasks,
+#      whose module load runs a dead-owner orphan SWEEP — a write side effect.
+#      These helpers only ever READ task json, so the terminal read commands
+#      can never interrupt or mutate an in-flight pair). ----
+
+def _async_dir() -> Path:
+    from claude_squared import registry as reg_mod
+    return reg_mod.async_dir()
+
+
+def _read_task(task_id: str) -> "dict | None":
+    import json
+    p = _async_dir() / f"{task_id}.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _latest_task_for_pair(pair_name: str) -> "str | None":
+    import json
+    d = _async_dir()
+    if not d.is_dir():
+        return None
+    best_id, best_started = None, ""
+    for p in d.glob("*.json"):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if data.get("pair_name") != pair_name:
+            continue
+        started = data.get("started_at") or ""
+        if best_id is None or started > best_started:
+            best_id, best_started = data.get("task_id"), started
+    return best_id
+
+
+def _find_task_prefix(prefix: str) -> "list[str]":
+    d = _async_dir()
+    if not prefix or not d.is_dir():
+        return []
+    return [p.stem for p in d.glob(f"{prefix}*.json") if p.stem.startswith(prefix)]
+
+
+def _resolve_task_ref(ref: str) -> "tuple[str | None, str | None]":
+    """Resolve exact task id -> pair name (latest) -> unique prefix.
+    Returns (task_id_or_None, note_or_None). Mirrors pair_poll's ladder."""
+    if _read_task(ref) is not None:
+        return ref, None
+    latest = _latest_task_for_pair(ref)
+    if latest:
+        return latest, f"resolved pair '{ref}' -> latest task {latest}"
+    matches = _find_task_prefix(ref)
+    if len(matches) == 1:
+        return matches[0], f"resolved prefix '{ref}' -> {matches[0]}"
+    if len(matches) > 1:
+        shown = ", ".join(m[:12] for m in matches[:5])
+        return None, f"ambiguous prefix '{ref}' matches {len(matches)}: {shown}"
+    return None, None
+
+
+def _cmd_poll(argv: list[str]) -> int:
+    """Show an async task's status (read-only). Resolve by task id / pair / prefix."""
+    if not argv or argv[0] in ("-h", "--help"):
+        print("Usage: python -m claude_squared poll <task_id|pair_name|prefix>", file=sys.stderr)
+        return 64
+    tid, note = _resolve_task_ref(argv[0])
+    if note:
+        print(f"  ({note})", file=sys.stderr)
+    if tid is None:
+        print(f"not found: '{argv[0]}' is not a task id, pair name, or unique prefix",
+              file=sys.stderr)
+        return 2
+    data = _read_task(tid)
+    if data is None:
+        print(f"task disappeared: {tid}", file=sys.stderr)
+        return 2
+    status = data.get("status", "?")
+    print(f"task {tid[:8]} (pair '{data.get('pair_name')}'): {status}   "
+          f"started {_fmt_local(data.get('started_at'))}")
+    err = data.get("error")
+    if status in ("failed", "stopped") and err:
+        print(f"  {err[:400]}")
+    res = data.get("result")
+    if status == "done" and isinstance(res, dict):
+        if "response" in res:  # SendResult
+            print(f"  response: {(res.get('response') or '').strip()[:400]}")
+        elif "pre_tokens" in res:  # CompactResult
+            print(f"  compacted: {res.get('pre_tokens', 0):,} -> "
+                  f"{res.get('post_tokens', 0):,} tokens")
+    return 0
+
+
+def _cmd_transcript(argv: list[str]) -> int:
+    """Tail the last N conversation turns for a pair (read-only)."""
+    if not argv or argv[0] in ("-h", "--help"):
+        print("Usage: python -m claude_squared transcript <pair_name> [N]", file=sys.stderr)
+        return 64
+    name = argv[0]
+    n = 10
+    if len(argv) > 1:
+        try:
+            n = max(1, int(argv[1]))
+        except ValueError:
+            print(f"invalid N: {argv[1]}", file=sys.stderr)
+            return 64
+    from claude_squared import registry as reg_mod
+    from claude_squared.errors import PairNotFound
+    from claude_squared.transcript import tail_turns
+    try:
+        spec = reg_mod.get_pair(name)
+    except PairNotFound as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    tp = _transcript_path(spec)
+    turns = tail_turns(tp, last_n=n) if isinstance(tp, Path) and tp.exists() else []
+    if not turns:
+        print(f"Pair '{name}': no conversation turns yet.")
+        return 0
+    print(f"Pair '{name}' - last {len(turns)} turn(s):")
+    for t in turns:
+        content = (t.get("content") or "").strip().replace("\n", " ")
+        if len(content) > 300:
+            content = content[:297] + "..."
+        print(f"  [{t.get('role', '?')} @ {_fmt_local(t.get('timestamp'))}] {content}")
+        for tu in t.get("tool_uses") or []:
+            print(f"      -> {tu.get('name')}")
+    return 0
+
+
+def _cmd_status(argv: list[str]) -> int:
+    """Liveness for a pair from disk (read-only). A terminal can't see the
+    in-process runtime (that lives in the MCP server process); this is derived
+    from on-disk task files + main.log mtime."""
+    if not argv or argv[0] in ("-h", "--help"):
+        print("Usage: python -m claude_squared status <pair_name>", file=sys.stderr)
+        return 64
+    name = argv[0]
+    import json
+    from claude_squared import registry as reg_mod
+    from claude_squared.errors import PairNotFound
+    try:
+        reg_mod.get_pair(name)
+    except PairNotFound as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    d = _async_dir()
+    inflight: list[str] = []
+    if d.is_dir():
+        for p in d.glob("*.json"):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if data.get("pair_name") == name and data.get("status") == "running":
+                inflight.append(data.get("task_id"))
+    print(f"Pair '{name}' status (terminal view - from task files + main.log):")
+    flight = f" ({inflight[0][:8]}...)" if inflight else ""
+    print(f"  in-flight async tasks: {len(inflight)}{flight}")
+    logp = reg_mod.logs_dir() / name / "main.log"
+    if logp.exists():
+        idle = time.time() - logp.stat().st_mtime
+        print(f"  last log activity: {idle:.0f}s ago")
+        try:
+            lines = logp.read_text(encoding="utf-8", errors="replace").splitlines()[-5:]
+            print("  last log line(s):")
+            for l in lines:
+                print(f"    {l}")
+        except Exception:
+            pass
+    else:
+        print("  main.log: none yet")
+    print("  (note: live in-process runtime state needs the MCP pair_status tool)")
+    return 0
+
+
+def _cmd_log(argv: list[str]) -> int:
+    """Tail the last N lines of a pair's main.log activity log (read-only)."""
+    if not argv or argv[0] in ("-h", "--help"):
+        print("Usage: python -m claude_squared log <pair_name> [N]", file=sys.stderr)
+        return 64
+    name = argv[0]
+    n = 30
+    if len(argv) > 1:
+        try:
+            n = max(1, int(argv[1]))
+        except ValueError:
+            print(f"invalid N: {argv[1]}", file=sys.stderr)
+            return 64
+    from claude_squared import registry as reg_mod
+    logp = reg_mod.logs_dir() / name / "main.log"
+    if not logp.exists():
+        print(f"Pair '{name}': no main.log yet.")
+        return 0
+    lines = logp.read_text(encoding="utf-8", errors="replace").splitlines()[-n:]
+    print(f"Pair '{name}' - last {len(lines)} main.log line(s):")
+    for l in lines:
+        print(f"  {l}")
+    return 0
+
+
+def _stop_requests_dir() -> Path:
+    from claude_squared import registry as reg_mod
+    return reg_mod.pairs_dir() / "stop-requests"
+
+
+def _cmd_stop(argv: list[str]) -> int:
+    """Request that a pair interrupt its current turn. This is the ONLY mutating
+    terminal command — it confirms with Y/N unless ``-y`` / ``--yes`` is passed.
+
+    Cross-process design: a terminal can't reach the MCP server's in-process
+    runtime, so this writes a timestamped stop-request marker at
+    ``~/.claude/pairs/stop-requests/<pair>.json``. The server's runtime read
+    loop honors it on its next ~1s tick with a graceful in-band interrupt (the
+    pair stays alive and can be re-sent). Requires the MCP server on v0.10.0+.
+    The read-only commands above never touch this path, so they can never
+    interrupt an in-flight pair."""
+    import json
+    import os
+    if not argv or argv[0] in ("-h", "--help"):
+        print("Usage: python -m claude_squared stop <pair_name> [-y|--yes]", file=sys.stderr)
+        return 64
+    name = argv[0]
+    assume_yes = any(a in ("-y", "--yes") for a in argv[1:])
+    from claude_squared import registry as reg_mod
+    from claude_squared.errors import PairNotFound
+    try:
+        reg_mod.get_pair(name)
+    except PairNotFound as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    # Only stop if something is actually in flight (a running task for this pair).
+    d = _async_dir()
+    running: list[str] = []
+    if d.is_dir():
+        for p in d.glob("*.json"):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if data.get("pair_name") == name and data.get("status") == "running":
+                running.append(data.get("task_id"))
+    if not running:
+        print(f"Pair '{name}': nothing in flight to stop (no running task).")
+        return 0
+    # Confirmation gate (the "are you sure?" the user asked for).
+    if not assume_yes:
+        if not (sys.stdin and sys.stdin.isatty()):
+            print(f"Refusing to stop '{name}' without confirmation (stdin is not a "
+                  f"TTY). Re-run with -y to force.", file=sys.stderr)
+            return 64
+        queued = "" if len(running) == 1 else f"; {len(running) - 1} more queued behind it keep running"
+        try:
+            ans = input(f"Stop the current turn on '{name}'{queued}? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\naborted.", file=sys.stderr)
+            return 0
+        if ans not in ("y", "yes"):
+            print("aborted.")
+            return 0
+
+    # Re-check after the (possibly slow) confirmation — the turn may have
+    # finished while the user was reading the prompt. Don't write a marker the
+    # next turn would clear, and don't claim a stop that didn't happen.
+    still_running = [
+        json.loads(p.read_text(encoding="utf-8")).get("task_id")
+        for p in (_async_dir().glob("*.json") if _async_dir().is_dir() else [])
+        if _safe_running(p, name)
+    ]
+    if not still_running:
+        print(f"Pair '{name}': the turn already completed - nothing to interrupt.")
+        return 0
+
+    sd = _stop_requests_dir()
+    sd.mkdir(parents=True, exist_ok=True)
+    marker = sd / f"{name}.json"
+    payload = {
+        "pair_name": name,
+        # Epoch float on BOTH sides (terminal + runtime) — no ISO-parse ambiguity.
+        "requested_at": time.time(),
+        "requested_by_pid": os.getpid(),
+    }
+    tmp = marker.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    tmp.replace(marker)
+    print(f"Stop requested for '{name}'. The running turn will be interrupted within "
+          f"~1s (graceful in-band interrupt; the pair stays alive and can be re-sent). "
+          f"Only the current turn is stopped; any queued sends still run.")
+    return 0
+
+
+def _safe_running(p, name) -> bool:
+    import json
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return data.get("pair_name") == name and data.get("status") == "running"
+
+
 def _print_top_usage(to_stderr: bool = False) -> None:
     out = sys.stderr if to_stderr else sys.stdout
     print(
-        "claude-squared terminal commands (read-only; no agent, no inference):\n"
-        "  python -m claude_squared list             List all pairs\n"
-        "  python -m claude_squared info <pair>      Full config + context% for one pair\n"
-        "  python -m claude_squared context <pair>   Context fill % for one pair\n"
-        "  python -m claude_squared wait <task|pair> Block until an async task finishes\n"
+        "claude-squared terminal commands (read-only unless noted; no agent, no inference):\n"
+        "  python -m claude_squared list                List all pairs\n"
+        "  python -m claude_squared info <pair>         Full config + context% for one pair\n"
+        "  python -m claude_squared context <pair>      Context fill % for one pair\n"
+        "  python -m claude_squared poll <task|pair>    Async task status\n"
+        "  python -m claude_squared transcript <pair> [N]  Tail last N conversation turns\n"
+        "  python -m claude_squared status <pair>       Liveness (in-flight tasks + log recency)\n"
+        "  python -m claude_squared log <pair> [N]      Tail last N main.log activity lines\n"
+        "  python -m claude_squared wait <task|pair>    Block until an async task finishes\n"
+        "  python -m claude_squared stop <pair> [-y]    Interrupt a pair's current turn (asks Y/N)\n"
         "\n"
-        "  python -m claude_squared                  (no args) Run the MCP server\n"
+        "  python -m claude_squared                     (no args) Run the MCP server\n"
         "\n"
-        "list / info / context read ~/.claude/pairs/ directly - zero model involvement.",
+        "All read commands read ~/.claude/pairs/ directly - zero model involvement and they\n"
+        "never interrupt an in-flight pair. Only 'stop' mutates (and it confirms first).",
         file=out,
     )
 
@@ -356,7 +666,12 @@ _SUBCOMMANDS = {
     "list": _cmd_list,
     "info": _cmd_info,
     "context": _cmd_context,
+    "poll": _cmd_poll,
+    "transcript": _cmd_transcript,
+    "status": _cmd_status,
+    "log": _cmd_log,
     "wait": _cmd_wait,
+    "stop": _cmd_stop,
 }
 
 
@@ -394,6 +709,16 @@ def main() -> None:
         sys.exit(_cmd_info(rest))
     if cmd == "context":
         sys.exit(_cmd_context(rest))
+    if cmd == "poll":
+        sys.exit(_cmd_poll(rest))
+    if cmd == "transcript":
+        sys.exit(_cmd_transcript(rest))
+    if cmd == "status":
+        sys.exit(_cmd_status(rest))
+    if cmd == "log":
+        sys.exit(_cmd_log(rest))
+    if cmd == "stop":
+        sys.exit(_cmd_stop(rest))
     if cmd in ("help", "-h", "--help"):
         _print_top_usage(to_stderr=False)
         sys.exit(0)

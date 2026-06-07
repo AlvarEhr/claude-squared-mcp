@@ -503,6 +503,8 @@ _PAIR_ACTIONS = {
     "compact": "pair_compact — native /compact via stream-json, optional steering prompt",
     "context": "pair_context — invoke /context for accurate token usage breakdown",
     "clear": "pair_clear — rotate to a new session_id (preserves pair config; old transcript archived)",
+    "fork": "pair_fork — branch the pair into a new independent pair, keeping both (like /fork)",
+    "rewind": "pair_rewind_points / pair_rewind — list user-message boundaries, then rewind the conversation to one (like /rewind; conversation-only, archived)",
     "invoke": "pair_invoke — invoke a skill in the pair (translates to /<skill> via stream-json)",
     "transcript": "pair_transcript — tail recent turns from the pair's JSONL",
     "info": "pair_info — full pair details + transcript path + stats",
@@ -805,6 +807,53 @@ def pair_forget(name: str, archive: bool = True) -> str:
 # Communication
 # ============================================================================
 
+def _stop_marker_path(pair_name: str) -> Path:
+    """Path of the cross-process terminal-stop marker for a pair (v0.10.0).
+    Written by ``python -m claude_squared stop <pair>``; honored by the runtime
+    send loop via the should_stop closure below."""
+    return reg_mod.pairs_dir() / "stop-requests" / f"{pair_name}.json"
+
+
+def _make_stop_checker(pair_name: str, task_id: str) -> "Callable[[], bool]":
+    """Build the ``should_stop`` callback handed to ``runtime.send`` (v0.10.0).
+
+    Honors a stop-request marker only when it is BOTH newer than this turn's
+    start (cross-restart / cross-turn safety — a stale marker from before this
+    turn is ignored) AND newer than the last marker we honored (monotonic
+    high-water-mark, so a delete race can't drop a second stop — Crack B). Clock
+    is epoch float on both sides (Crack D). On an honored stop, marks THIS task
+    stopped (so the worker reports ``stopped``, not a generic result) and
+    best-effort deletes the marker (hygiene only — correctness rests on the
+    high-water comparison, not the delete). Any read/parse error → treat as no
+    marker and never disturb the turn.
+    """
+    turn_start = time.time()
+    marker_path = _stop_marker_path(pair_name)
+    state = {"high_water": 0.0}
+
+    def _check() -> bool:
+        try:
+            if not marker_path.exists():
+                return False
+            ts = float(json.loads(marker_path.read_text(encoding="utf-8")).get("requested_at") or 0.0)
+        except Exception:
+            return False
+        if ts < turn_start or ts <= state["high_water"]:
+            return False
+        state["high_water"] = ts
+        try:
+            async_tasks.mark_task_stopped(task_id)
+        except Exception:
+            pass
+        try:
+            marker_path.unlink()
+        except Exception:
+            pass
+        return True
+
+    return _check
+
+
 def _build_send_runner(
     name: str,
     message: str,
@@ -835,7 +884,12 @@ def _build_send_runner(
             else 3600.0
         )
 
-    def _run() -> SendResult:
+    def _run(task_id: str | None = None) -> SendResult:
+        # v0.10.0 terminal stop: bind a should_stop checker to THIS task so a
+        # `stop <pair>` marker interrupts this turn and reports it as stopped.
+        # task_id is always passed by async_tasks._go; default None keeps the
+        # runner callable directly in any edge path (then no stop polling).
+        should_stop = _make_stop_checker(name, task_id) if task_id else None
         with _with_pair_lock(name, timeout_s=lock_acquire_timeout_s):
             current = reg_mod.get_pair(name)
             adapter = _adapter_for(current)
@@ -846,6 +900,7 @@ def _build_send_runner(
                 permission_mode=override_permission_mode,
                 timeout_seconds=hard_timeout_seconds,
                 on_event=on_event,
+                should_stop=should_stop,
             )
             reg_mod.update_pair(
                 name,
@@ -891,7 +946,10 @@ def _build_compact_runner(
         # fall back to 1h" pattern.
         lock_acquire_timeout_s = max(120.0, float(compact_timeout_seconds) + 60.0)
 
-    def _run() -> CompactResult:
+    def _run(task_id: str | None = None) -> CompactResult:
+        # task_id accepted for runner-signature parity (async_tasks._go passes
+        # it); compaction runs via a one-shot subprocess, not the interruptible
+        # runtime loop, so there's no should_stop wiring here.
         with _with_pair_lock(name, timeout_s=lock_acquire_timeout_s):
             current = reg_mod.get_pair(name)
             # Compaction rewrites the session JSONL — any warm runtime has
@@ -2627,6 +2685,192 @@ def pair_clear(name: str, archive_old: bool = True, verbose: bool = False) -> st
             return msg
     except FileLockTimeout:
         raise PairError(f"Pair '{name}' is busy in another process; could not acquire lock to clear.")
+
+
+# Unique sentinel for the one turn native --fork-session requires; truncated off
+# the forked JSONL's tip immediately after. Must be distinctive enough not to
+# collide with real conversation content.
+_FORK_SENTINEL = "__claude_squared_fork_init__ (auto-removed by pair_fork)"
+
+
+@mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False})
+def pair_fork(name: str, new_name: str | None = None, verbose: bool = False) -> str:
+    """Fork a pair into a NEW independent pair, keeping BOTH (like /fork).
+
+    The new pair starts as an exact copy of the source's conversation at fork
+    time and diverges from there — future turns on each are independent. The
+    source pair is completely untouched.
+
+    Mechanism: native ``claude --fork-session`` (which correctly rewrites the
+    copied history's internal id references and records a forked-from provenance
+    pointer). It requires one turn, so a sentinel turn is sent and then truncated
+    off the new pair's tip, leaving a clean fork at the source's current point.
+
+    Args:
+        name: Source pair to fork.
+        new_name: Name for the new pair. Default ``"<name>-fork"`` (``-2``, ``-3``
+            … appended on collision).
+        verbose: If True, return the new pair's full JSON spec.
+    """
+    from claude_squared.transcript import find_sentinel_line, truncate_jsonl_before_line
+    try:
+        with _with_pair_lock(name, timeout_s=360.0):
+            spec = reg_mod.get_pair(name)
+            # Pick a non-colliding new name.
+            existing = set(reg_mod.load().pairs.keys())
+            base = new_name or f"{name}-fork"
+            target = base
+            i = 2
+            while target in existing:
+                target = f"{base}-{i}"
+                i += 1
+            adapter = _adapter_for(spec)
+            # NOTE: we do NOT evict the source runtime — fork reads the source
+            # JSONL via a separate --resume subprocess and never modifies the
+            # source. Holding the lock guarantees the JSONL is consistent (no
+            # in-flight turn). The source pair keeps its warm runtime.
+            new_sid = adapter.fork(spec, sentinel=_FORK_SENTINEL)
+            new_spec = spec.model_copy(update={
+                "name": target,
+                "session_id": new_sid,
+                "created_at": datetime.utcnow(),
+                "last_active_at": datetime.utcnow(),
+                "total_cost_usd": 0.0,
+            })
+            # Truncate the sentinel fork-init turn off the new JSONL's tip.
+            new_path = adapter.transcript_path(new_spec)
+            truncated = False
+            if new_path and new_path.exists():
+                cut = find_sentinel_line(new_path, _FORK_SENTINEL)
+                if cut is not None:
+                    truncate_jsonl_before_line(new_path, cut)
+                    truncated = True
+            reg_mod.add_pair(new_spec)
+    except FileLockTimeout:
+        raise PairError(f"Pair '{name}' is busy in another process; could not acquire lock to fork.")
+
+    if verbose:
+        return _verbose_dump(new_spec)
+    msg = (f"Forked '{name}' → '{target}' (new session {_short(new_sid)}). "
+           f"Both pairs are kept and independent from here; the source is untouched.")
+    if not truncated:
+        msg += ("\n  Note: the fork-init sentinel turn could not be located to "
+                "truncate, so it remains as the newest turn in '{target}'. Harmless.")
+    return msg
+
+
+@mcp.tool(output_schema=None, annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True})
+def pair_rewind_points(name: str, last_n: int = 20, verbose: bool = False) -> str:
+    """List the points a pair can be rewound to (genuine user-message boundaries).
+
+    Read-only. Each point is a "back to when you said X" boundary, enriched with
+    what the pair DID afterward (assistant turns / tool calls / files written
+    before the next user message) so you can choose WITHOUT reading the
+    transcript. Pass the chosen point number to ``pair_rewind(name, to_point=N)``.
+
+    Cutting only at user-message boundaries guarantees no dangling tool_use is
+    left (which would make the next turn invalid).
+    """
+    from claude_squared.transcript import list_user_turn_points
+    spec = reg_mod.get_pair(name)
+    adapter = _adapter_for(spec)
+    path = adapter.transcript_path(spec)
+    points = list_user_turn_points(path) if path and path.exists() else []
+    if verbose:
+        return json.dumps(points, indent=2, default=str)
+    if not points:
+        return f"Pair '{name}': no user-message rewind points yet."
+    shown = points[-last_n:] if last_n and last_n > 0 else points
+    header = f"Pair '{name}' — {len(points)} rewind point(s)"
+    if len(shown) < len(points):
+        header += f" (showing last {len(shown)})"
+    lines = [header + ":",
+             "  → pair_rewind(name, to_point=N) rewinds to BEFORE that user message.",
+             "  (conversation only — files the pair wrote to disk are NOT reverted)"]
+    for p in shown:
+        after = f"{p['after_assistant_turns']} asst turn(s), {p['after_tool_calls']} tool call(s)"
+        if p["after_files"]:
+            after += f", {len(p['after_files'])} file(s) written"
+        lines.append(f"  [{p['point']}] {_fmt_local(p['timestamp'])}  \"{p['preview']}\"")
+        lines.append(f"        then: {after}")
+    return "\n".join(lines)
+
+
+@mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False})
+def pair_rewind(name: str, to_point: int, archive: bool = True, verbose: bool = False) -> str:
+    """Rewind a pair's conversation to BEFORE a chosen user message (like /rewind).
+
+    **Conversation only.** This truncates the pair's session history so the next
+    send continues from the chosen point — it does NOT revert files the pair
+    wrote to disk (we don't checkpoint the filesystem; use git for that). The
+    full pre-rewind transcript is archived first, so the rewind is reversible.
+
+    Use ``pair_rewind_points(name)`` to see the numbered points. Truncation snaps
+    to a user-message boundary, so no dangling tool_use is left behind.
+
+    Args:
+        name: Pair to rewind.
+        to_point: Point number from ``pair_rewind_points``. The pair rewinds to
+            just before that user message (that message and everything after it
+            are dropped from the live session).
+        archive: If True (default), copy the full pre-rewind transcript to
+            ``~/.claude/pairs/archive/<name>-<ts>-prerewind.jsonl`` first.
+        verbose: If True, return a JSON summary.
+    """
+    from claude_squared.transcript import (
+        list_user_turn_points, truncate_jsonl_before_line, files_written_in_events,
+    )
+    try:
+        with _with_pair_lock(name):
+            spec = reg_mod.get_pair(name)
+            adapter = _adapter_for(spec)
+            path = adapter.transcript_path(spec)
+            if not path or not path.exists():
+                raise PairError(f"Pair '{name}' has no transcript to rewind.")
+            points = list_user_turn_points(path)
+            match = next((p for p in points if p["point"] == to_point), None)
+            if match is None:
+                valid = f"1..{len(points)}" if points else "(none)"
+                raise PairError(
+                    f"No rewind point {to_point} for '{name}' (valid: {valid}). "
+                    f"Use pair_rewind_points('{name}') to list them."
+                )
+            # The session JSONL is about to be truncated — a warm runtime pinned
+            # to it holds stale in-memory state, so evict it (next send respawns
+            # from the rewound file).
+            try:
+                runtime_mod.registry().evict(name)
+            except Exception:
+                pass
+            archived: str | None = None
+            if archive:
+                ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                dst = reg_mod.archive_dir() / f"{name}-{ts}-prerewind.jsonl"
+                shutil.copy2(path, dst)
+                archived = str(dst)
+            dropped = truncate_jsonl_before_line(path, match["raw_line_index"])
+            dropped_files = files_written_in_events(dropped)
+            reg_mod.update_pair(name, turn_count=max(0, to_point - 1),
+                                last_active_at=datetime.utcnow())
+    except FileLockTimeout:
+        raise PairError(f"Pair '{name}' is busy in another process; could not acquire lock to rewind.")
+
+    if verbose:
+        return json.dumps({
+            "name": name, "rewound_to_point": to_point,
+            "preview": match["preview"], "archived_to": archived,
+            "dropped_events": len(dropped), "files_modified_in_dropped_range": dropped_files,
+        }, indent=2, default=str)
+    lines = [f"Rewound '{name}' to before point {to_point}: \"{match['preview']}\""]
+    lines.append(f"  Dropped {len(dropped)} event(s); the pair now continues from there on next send.")
+    if archived:
+        lines.append(f"  Pre-rewind transcript archived to: {archived}")
+        lines.append(f"  (restore it over the live session JSONL to undo the rewind.)")
+    if dropped_files:
+        shown = ", ".join(dropped_files[:8]) + (f" (+{len(dropped_files) - 8} more)" if len(dropped_files) > 8 else "")
+        lines.append(f"  ⚠ Files written in the discarded range are NOT reverted "
+                     f"(use git if you want them back): {shown}")
+    return "\n".join(lines)
 
 
 @mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False})

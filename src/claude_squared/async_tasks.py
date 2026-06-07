@@ -240,12 +240,18 @@ def _drop_event(task_id: str) -> None:
         _task_events.pop(task_id, None)
 
 
-def start_task(pair_name: str, message: str, runner: Callable[[], SendResult]) -> AsyncTaskState:
-    """Spawn a daemon thread that runs `runner()` and writes the result.
+def start_task(pair_name: str, message: str,
+               runner: "Callable[[str], SendResult] | Callable[[], SendResult]") -> AsyncTaskState:
+    """Spawn a daemon thread that runs the runner and writes the result.
 
     Sets an in-memory threading.Event on completion so ``wait_for_task`` can wake
     up immediately within the same process. Cross-process waiters fall back to
     polling ``load_task``.
+
+    v0.10.0: the runner is invoked as ``runner(task_id)`` so the server's send
+    runner can build a should_stop closure bound to THIS task (terminal stop
+    marks the correct task stopped). Legacy zero-arg runners are still supported
+    via a TypeError fallback.
     """
     task_id = str(uuid.uuid4())
     state = AsyncTaskState(
@@ -261,7 +267,11 @@ def start_task(pair_name: str, message: str, runner: Callable[[], SendResult]) -
 
     def _go() -> None:
         try:
-            result = runner()
+            # v0.10.0: pass the task_id so the runner can bind a should_stop
+            # closure to THIS task (terminal stop marks the correct task). All
+            # runners (built by _build_send_runner / _build_compact_runner)
+            # accept it.
+            result = runner(task_id)
             # If the task was stopped just before the result came back (the
             # interrupt acknowledged via error_during_execution result event),
             # report "stopped" rather than "done."
