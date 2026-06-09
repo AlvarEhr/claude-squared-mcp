@@ -29,6 +29,12 @@ HEADLESS_INCOMPATIBLE_TOOLS = ("AskUserQuestion",)
 #   - Opus 4.7 / 4.7-1M / 4.6: all 5 levels
 #   - Sonnet (any version):    [low, medium, high]  (no xhigh / max)
 #   - Haiku (any version):     no effort levels at all
+#   - Fable 5 (2026-06-09):    handled as "unknown" family BY DESIGN —
+#     permissive passthrough verified against CLI 2.1.170 (--effort xhigh
+#     accepted alongside claude-fable-5[1m], no warning). New families stay
+#     "unknown" unless their capability DIFFERS from the permissive set;
+#     listing them here when it doesn't would be hardcoding with zero
+#     behavior delta.
 # When the requested effort isn't supported by the model, we coerce to the
 # nearest available level and surface a one-shot transparency message via
 # ``coerce_effort_for_model``. The Pydantic validator below also enforces

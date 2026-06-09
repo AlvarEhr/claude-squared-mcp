@@ -560,8 +560,11 @@ def pair_create(
     Args:
         name: Unique addressable handle (e.g. "reviewer", "scout").
         purpose: Human-readable description, stored only.
-        model: opus|sonnet|haiku alias or full name. Special: ``"match-parent"`` detects
-            the calling session's model from JSONL (falls back to opus; pass
+        model: any alias (opus|sonnet|haiku|fable|...) or full id the CLI
+            accepts, including tier suffixes (e.g. ``"claude-fable-5[1m]"``).
+            Unknown families pass through — the CLI is the authority. Special:
+            ``"match-parent"`` detects the calling session's model from JSONL
+            (falls back to opus; the 1M tier suffix is NOT detectable — pass
             ``parent_model`` to short-circuit detection).
         effort: low|medium|high|xhigh|max. Unset → omit the flag and let the CLI
             apply its own per-model default. Coerced silently against model
@@ -600,7 +603,8 @@ def pair_create(
         initial_message: If set, sent as the first turn. Response in initial_response.
         session_id: Caller-supplied UUID; auto-generated if omitted.
         parent_model: Explicit "my model is X" hint for ``model="match-parent"`` —
-            skips JSONL detection (e.g. ``"claude-opus-4-7"``).
+            skips JSONL detection (e.g. ``"claude-fable-5[1m]"`` — the only way
+            to carry a 1M tier through match-parent; JSONLs record bare ids).
         verbose: If True, return full JSON instead of one-line summary.
     """
     sid = session_id or str(uuid.uuid4())
@@ -1128,6 +1132,22 @@ def _detect_model_from_recent_jsonl(project_dir: Path) -> tuple[str | None, str 
     return None, f"most-recent JSONL {jf.name} had no model field"
 
 
+def _match_parent_tier_hint(model: str) -> str:
+    """Tier caveat appended to match-parent detection messages.
+
+    Session JSONLs record the bare model id only ('claude-fable-5',
+    'claude-opus-4-8') — the 1M-context tier suffix ('[1m]') is not persisted
+    anywhere structural, so detection from a 1M parent silently yields the
+    200K-tier id. Inferring tier from cumulative usage (>200K would prove 1M)
+    was considered and rejected: only conclusive for long sessions, so it
+    would be magic that works sometimes and silently fails otherwise.
+    """
+    return (
+        f" Tier note: JSONLs omit context-tier suffixes — if your session is "
+        f"a 1M variant, pass parent_model='{model}[1m]' to keep the tier."
+    )
+
+
 def _resolve_match_parent_model(parent_model_arg: str | None) -> tuple[str, str | None]:
     """Resolve ``model="match-parent"`` to a real model name.
 
@@ -1139,6 +1159,10 @@ def _resolve_match_parent_model(parent_model_arg: str | None) -> tuple[str, str 
          being stale, which it is whenever the MCP server outlives its launching
          Claude session)
       4. Hardcoded fallback: ``"opus"`` — with an honest message naming why
+
+    Steps 2-3 read the JSONL's ``message.model`` field, which records the bare
+    model id — the 1M tier suffix is not recoverable, so detected-model
+    messages carry ``_match_parent_tier_hint``.
 
     Returns ``(resolved_model, transparency_message_or_None)``. The message is
     surfaced in pair_create's response so the agent always knows which step
@@ -1163,7 +1187,7 @@ def _resolve_match_parent_model(parent_model_arg: str | None) -> tuple[str, str 
             if model:
                 return model, (
                     f"match-parent: detected '{model}' from session JSONL "
-                    f"({jsonl_path.name})."
+                    f"({jsonl_path.name})." + _match_parent_tier_hint(model)
                 )
 
     # Step 3: recency fallback — the env var was missing, stale, or its JSONL
@@ -1174,7 +1198,7 @@ def _resolve_match_parent_model(parent_model_arg: str | None) -> tuple[str, str 
         return model, (
             f"match-parent: CLAUDE_CODE_SESSION_ID {why} (frozen at MCP spawn); "
             f"detected '{model}' from {detail}. Pass parent_model='<your model>' "
-            f"to skip detection."
+            f"to skip detection." + _match_parent_tier_hint(model)
         )
 
     # Step 4: give up → static fallback, honest about why detection failed.

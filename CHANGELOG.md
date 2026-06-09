@@ -4,6 +4,28 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Match-parent detection messages now carry a 1M-tier hint.** Session JSONLs
+  record the bare model id only (`claude-fable-5`, `claude-opus-4-8`) — the
+  `[1m]` context-tier suffix is not persisted anywhere structural, so
+  `model="match-parent"` under a 1M-context parent silently resolves to the
+  200K-tier id. The detection transparency message (JSONL-detection steps of
+  the ladder) now appends: *pass `parent_model='<model>[1m]'` to keep the
+  tier*. Pre-existing behavior for every 1M parent since match-parent shipped
+  in v0.8.0; surfaced during Fable 5 verification.
+
+### Verified (no code change)
+
+- **Fable 5 works end-to-end with zero code change** (CLI 2.1.170): headless
+  `--print` accepts `claude-fable-5[1m]`, the bare `fable` alias (self-heals
+  to `claude-fable-5`), and `--effort xhigh` alongside fable. `pair_create`,
+  `pair_update(model=...)`, context-window display (1M) and footers all work
+  unmodified — the v0.8.0 unknown-family permissive passthrough behaving as
+  designed. Docstrings genericized away from `opus|sonnet|haiku`-only wording.
+
 ## [0.10.0] — 2026-06-07
 
 Fork & rewind for pairs (the `/fork` and `/rewind` equivalents — neither is
