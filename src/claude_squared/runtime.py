@@ -446,6 +446,13 @@ class PairRuntime:
         # Per-turn scope (set on send entry; updated as events arrive; consumed at result)
         self._current_scope: TurnLogScope | None = None
 
+        # v0.11.0 "newer model available" drift check: gate the parent-JSONL read
+        # to ONCE per runtime spawn (first send after a cold start), not per send.
+        # The server's send runner flips this true after checking; a respawn (new
+        # PairRuntime) resets it. Anti-nag dedup across spawns lives in the
+        # persisted spec.last_drift_notice, not here.
+        self._drift_checked: bool = False
+
     @staticmethod
     def _count_existing_lines(p: Path) -> int:
         if not p.exists():

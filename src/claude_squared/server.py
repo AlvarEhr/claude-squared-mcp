@@ -44,6 +44,7 @@ from claude_squared.models import (
     SendResult,
     coerce_effort_for_model,
     default_effort_for_model,
+    newer_version_available,
 )
 
 
@@ -213,6 +214,37 @@ def _fmt_send_result(r: SendResult) -> str:
     if r.subagent_logs:
         footer_parts.append(f"+{len(r.subagent_logs)} sub-agent log{'s' if len(r.subagent_logs) != 1 else ''}")
     lines.append(f"\n[{r.name}: " + ", ".join(footer_parts) + "]")
+    # v0.11.0 model-handling signals — surfaced prominently so a silent model
+    # swap or a safety block is obvious rather than buried.
+    if r.model_substitution:
+        lines.append(
+            f"🔄 MODEL CHANGED: {r.model_substitution}. The CLI served a different "
+            f"model than '{r.name}' requested — most often Anthropic auto-downgrading "
+            f"on a cyber/bio safety classifier, or a configured fallback_model kicking "
+            f"in (overload / lost access). The reply above came from the served model. "
+            f"It re-tries the requested model next turn, so this may not persist."
+        )
+    if r.safety_signal:
+        if r.safety_kind == "refusal":
+            lines.append(
+                f"⚠ SAFETY/BLOCK SIGNAL: {r.safety_signal}. The reply above may be a "
+                f"refusal, partial, or empty. NOTE: a hard PAUSE with no result at all "
+                f"would instead look like a slow turn (an async handle / no reply), not "
+                f"this signal — detection covers refuse-and-return, not a silent hang."
+            )
+        elif r.safety_kind == "model_unavailable":
+            # PERMANENT — the model was pulled / access lost. Distinct label + a
+            # concrete fix, NOT the "retry resolves it" wording of a transient error.
+            lines.append(f"⛔ MODEL UNAVAILABLE: {r.safety_signal}")
+        else:
+            # api_error_status / is_error — NOT a safety event. Labeled distinctly
+            # so a routine 529 overload doesn't read as "SAFETY BLOCK" and erode
+            # trust in the refusal signal.
+            lines.append(
+                f"⚠ TURN ENDED ABNORMALLY: {r.safety_signal}."
+            )
+    if r.drift_note:
+        lines.append(f"🆕 {r.drift_note}")
     if ctx and ctx.warning:
         lines.append(f"⚠ {ctx.warning}")
     if r.permission_denials:
@@ -538,6 +570,7 @@ def pair_create(
     extra_dirs: str | list[str] | None = None,
     persistent: bool | None = None,
     ultracode: bool | None = None,
+    fallback_model: str | None = None,
     allowed_invocations: str | list[str] | None = None,
     initial_message: str | None = None,
     session_id: str | None = None,
@@ -594,6 +627,14 @@ def pair_create(
             any explicit ``effort`` value — ultracode and effort are independent
             CLI fields. Default False. **Common pitfall**: ``effort="ultracode"``
             is NOT valid — the CLI rejects it with a warning. Use this flag.
+        fallback_model: Automatic fallback when the primary model is overloaded
+            or unavailable — passed to the CLI as ``--fallback-model`` (a single
+            id or comma-separated list tried in order; the CLI re-tries the
+            primary at the start of each turn, so it's per-turn, not sticky). The
+            main guard against losing access to a subscription/trial-flagged
+            model: set it and a send transparently continues on the fallback
+            instead of hard-erroring (the reply footer flags "ran on fallback Y").
+            Default None (no fallback). e.g. ``fallback_model="claude-opus-4-8"``.
         allowed_invocations: ``pair_invoke`` allow-list (fnmatch globs). ``None`` = allow
             all (default, backward-compat); ``[]`` = deny all (lockdown); ``["clear",
             "mcp__claude_ai_*"]`` = allow matching only. Mutable via ``pair_update``
@@ -633,8 +674,31 @@ def pair_create(
         permission_mode=permission_mode,
         persistent=persistent,
         ultracode=ultracode,
+        fallback_model=fallback_model,
         parent_model=parent_model,
     )
+
+    # v0.11.0 create-time "newer model available" notice. Compare the resolved
+    # pair model against the PARENT session's model in the same family — if the
+    # parent is on a newer version (e.g. parent opus-4-9, pair opus-4-8), say so
+    # once, here. Self-healing (no hardcoded 'latest' table). Best-effort: if the
+    # parent can't be detected, or it's a different family / not newer, stays
+    # silent (never a false notice). Seeds last_drift_notice so the send-time
+    # check doesn't immediately re-warn about the same version.
+    drift_seed: str | None = None
+    try:
+        _parent = _detect_parent_model()
+        if _parent:
+            _newer = newer_version_available(resolved["model"], _parent)
+            if _newer:
+                drift_seed = _newer
+                transparency_msgs.append(
+                    f"newer model in family available: your session runs '{_parent}', "
+                    f"this pair will run '{resolved['model']}'. Pass model='{_newer}' "
+                    f"(or pair_update later) if you want the pair on the newer one."
+                )
+    except Exception:
+        pass
     # Merge per-call extra_dirs with defaults' extra_dirs (per-call wins on overlap;
     # defaults add to the set when no per-call value).
     if extra_dirs_norm is None and resolved.get("extra_dirs_default"):
@@ -661,6 +725,8 @@ def pair_create(
         extra_dirs=extra_dirs_norm,
         persistent=resolved["persistent"],
         ultracode=resolved["ultracode"],
+        fallback_model=resolved["fallback_model"],
+        last_drift_notice=drift_seed,
     )
     # Register first so concurrent pair_send calls see it
     reg_mod.add_pair(spec)
@@ -906,12 +972,42 @@ def _build_send_runner(
                 on_event=on_event,
                 should_stop=should_stop,
             )
-            reg_mod.update_pair(
-                name,
+
+            # v0.11.0 send-time "newer model available" check. Warm-runtime path
+            # only (per-call overrides use a one-shot subprocess — no runtime to
+            # gate on). Gated to ONCE per runtime spawn via rt._drift_checked
+            # (bounds the parent-JSONL read to once per warm period) AND to once
+            # per NEW release via spec.last_drift_notice (so a deliberately-older
+            # model isn't nagged every spawn). Catches the "next day, opus-4-9
+            # dropped" case actively. Best-effort — any failure stays silent.
+            drift_persist: str | None = None
+            if override_model is None and override_effort is None and override_permission_mode is None:
+                try:
+                    rt = runtime_mod.registry().get_or_none(name)
+                    if rt is not None and not getattr(rt, "_drift_checked", True):
+                        rt._drift_checked = True
+                        parent = _detect_parent_model()
+                        if parent:
+                            newer = newer_version_available(current.model, parent)
+                            if newer and newer != current.last_drift_notice:
+                                result.drift_note = (
+                                    f"a newer model in this pair's family is now available — "
+                                    f"your session runs '{parent}', this pair runs "
+                                    f"'{current.model}'. pair_update('{name}', model='{newer}') "
+                                    f"to move it up (or ignore to stay on the current one)."
+                                )
+                                drift_persist = newer
+                except Exception:
+                    pass
+
+            update_fields: dict[str, Any] = dict(
                 last_active_at=datetime.utcnow(),
                 turn_count=current.turn_count + 1,
                 total_cost_usd=current.total_cost_usd + result.cost_usd,
             )
+            if drift_persist is not None:
+                update_fields["last_drift_notice"] = drift_persist
+            reg_mod.update_pair(name, **update_fields)
             return result
 
     return _run
@@ -1049,6 +1145,10 @@ _HARDCODED_DEFAULTS = {
     # v0.9.10 calls behave unchanged. Set explicitly per-pair via
     # ``pair_create(ultracode=True)`` or session-wide via ``pair_settings_set``.
     "ultracode": False,
+    # v0.11.0: no automatic fallback model by default (a send hard-errors if the
+    # primary is unavailable). Opt in per-pair via pair_create(fallback_model=...)
+    # or session-wide via pair_settings_set to guard against trial/access loss.
+    "fallback_model": None,
     "extra_dirs": None,
 }
 
@@ -1130,6 +1230,35 @@ def _detect_model_from_recent_jsonl(project_dir: Path) -> tuple[str | None, str 
     if model:
         return model, f"most-recent JSONL {jf.name} ({int(age)}s old)"
     return None, f"most-recent JSONL {jf.name} had no model field"
+
+
+def _detect_parent_model() -> str | None:
+    """Best-effort detection of the parent (calling) session's current model.
+
+    Returns the bare model id or ``None``. Reuses the same JSONL ladder as
+    match-parent: the ``CLAUDE_CODE_SESSION_ID`` session's JSONL first, then the
+    newest non-pair JSONL in the cwd's project dir (robust to the env var being
+    stale, which it is whenever the MCP server outlives its launching session).
+    Unlike ``_resolve_match_parent_model`` there is NO hardcoded fallback — a
+    failed detection must yield ``None`` so the drift checks stay silent rather
+    than compare against a wrong model. Note: the ``[1m]`` tier suffix is never
+    recorded in JSONLs (see the match-parent tier caveat), but drift comparison
+    is family+version only, so the missing tier doesn't matter here.
+    """
+    try:
+        encoded = _encode_cwd_for_project(str(Path.cwd()))
+        project_dir = reg_mod.claude_home() / "projects" / encoded
+        sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+        if sid:
+            jp = project_dir / f"{sid}.jsonl"
+            if jp.exists():
+                m = _read_last_model_from_jsonl(jp)
+                if m:
+                    return m
+        m, _ = _detect_model_from_recent_jsonl(project_dir)
+        return m or None
+    except Exception:
+        return None
 
 
 def _match_parent_tier_hint(model: str) -> str:
@@ -1215,6 +1344,7 @@ def _resolve_pair_create_args(
     permission_mode: str | None,
     persistent: bool | None,
     ultracode: bool | None,
+    fallback_model: str | None,
     parent_model: str | None,
 ) -> tuple[dict, list[str]]:
     """Resolve per-call args + defaults file + hardcoded fallback into a
@@ -1247,6 +1377,9 @@ def _resolve_pair_create_args(
     )
     resolved_persist = _layered(persistent, defaults.persistent, _HARDCODED_DEFAULTS["persistent"])
     resolved_ultra = _layered(ultracode, defaults.ultracode, _HARDCODED_DEFAULTS["ultracode"])
+    resolved_fallback = _layered(
+        fallback_model, defaults.fallback_model, _HARDCODED_DEFAULTS["fallback_model"]
+    )
 
     # Match-parent expansion. Happens AFTER layering so it works whether
     # match-parent comes from per-call (model="match-parent") or from
@@ -1276,6 +1409,7 @@ def _resolve_pair_create_args(
         "permission_mode": resolved_perm,
         "persistent": resolved_persist,
         "ultracode": resolved_ultra,
+        "fallback_model": resolved_fallback,
         "extra_dirs_default": defaults.extra_dirs,  # caller merges with per-call
         # Surface the defaults' allowed_invocations so caller can layer it on
         # only when the per-call value is None (preserves explicit-[] lockdown).
@@ -1953,10 +2087,15 @@ def pair_update(
     cwd: str | None = None,
     extra_dirs: str | list[str] | None = None,
     ultracode: bool | None = None,
+    fallback_model: str | None = None,
     verbose: bool = False,
 ) -> str:
     """Update mutable settings of an existing pair (per-pair, not defaults —
     use ``pair_settings_set`` for user-wide defaults).
+
+    ``fallback_model`` is pinned at spawn (like ``model``) so changing it evicts
+    the runtime; the next send respawns with the new ``--fallback-model``. Pass
+    an empty string ``""`` to clear an existing fallback.
 
     Three field categories with different propagation semantics — see README
     "Mid-flight config changes":
@@ -2003,6 +2142,10 @@ def pair_update(
                 # --settings). Toggling triggers eviction below so the next
                 # send respawns with/without the --settings flag.
                 fields["ultracode"] = ultracode
+            if fallback_model is not None:
+                # v0.11.0: --fallback-model is pinned at spawn — evict below so
+                # the next send respawns with it. Empty string clears it.
+                fields["fallback_model"] = fallback_model.strip() or None
 
             # Apply effort coercion against the resolved model. We do this
             # explicitly here (in addition to PairSpec's model_validator) because
@@ -2061,12 +2204,18 @@ def pair_update(
                         ) from e
                     fields["cwd"] = cwd_norm
 
+            # Changing the model invalidates the drift dedup marker — the pair is
+            # now on a different version, so the "newer available" check should
+            # re-evaluate from scratch on the next send.
+            if "model" in fields:
+                fields["last_drift_notice"] = None
+
             if not fields:
                 spec = reg_mod.get_pair(name)
                 return f"No fields to update for '{name}'."
             spec = reg_mod.update_pair(name, **fields)
             # Material config changes invalidate any live runtime — next send will re-spawn
-            if any(k in fields for k in ("model", "permission_mode", "cwd", "extra_dirs", "allowed_tools", "ultracode")):
+            if any(k in fields for k in ("model", "permission_mode", "cwd", "extra_dirs", "allowed_tools", "ultracode", "fallback_model")):
                 try:
                     runtime_mod.registry().evict(name)
                 except Exception:
@@ -2541,6 +2690,7 @@ def pair_settings_get(verbose: bool = False) -> str:
     lines.append(f"    permission_mode = {_show('permission_mode', defaults.permission_mode, _HARDCODED_DEFAULTS['permission_mode'])}")
     lines.append(f"    persistent      = {_show('persistent', defaults.persistent, _HARDCODED_DEFAULTS['persistent'])}")
     lines.append(f"    ultracode       = {_show('ultracode', defaults.ultracode, _HARDCODED_DEFAULTS['ultracode'])}")
+    lines.append(f"    fallback_model  = {_show('fallback_model', defaults.fallback_model, _HARDCODED_DEFAULTS['fallback_model'])}")
     lines.append(f"    extra_dirs      = {_show('extra_dirs', defaults.extra_dirs, _HARDCODED_DEFAULTS['extra_dirs'])}")
     lines.append(f"    allowed_invocations = {_show('allowed_invocations', defaults.allowed_invocations, 'None (allow all)')}")
     lines.append("")
@@ -2567,6 +2717,7 @@ def pair_settings_set(
     permission_mode: str | None = None,
     persistent: bool | None = None,
     ultracode: bool | None = None,
+    fallback_model: str | None = None,
     extra_dirs: str | list[str] | None = None,
     allowed_invocations: str | list[str] | None = None,
     verbose: bool = False,
@@ -2595,6 +2746,11 @@ def pair_settings_set(
             ``pair_create(ultracode=False)`` still wins. NOT a foot-gun — it
             doesn't reduce safety, just biases pairs toward higher-effort,
             workflow-heavier behavior.
+        fallback_model: Default ``--fallback-model`` for new pairs (v0.11.0+) —
+            an id or comma-separated list the CLI tries when the primary is
+            overloaded/unavailable. Not a foot-gun (only kicks in when the
+            primary is already failing). Empty string clears it. Per-pair
+            ``pair_create(fallback_model=...)`` still wins.
         extra_dirs: Default ``--add-dir`` paths for every new pair.
         allowed_invocations: Default ``pair_invoke`` allow-list (see ``pair_create``
             for syntax). ``[]`` REFUSED as a default (same foot-gun principle as
@@ -2614,6 +2770,9 @@ def pair_settings_set(
         fields["persistent"] = persistent
     if ultracode is not None:
         fields["ultracode"] = ultracode
+    if fallback_model is not None:
+        # v0.11.0: default --fallback-model for new pairs. Empty string clears it.
+        fields["fallback_model"] = fallback_model.strip() or None
     if extra_dirs is not None:
         fields["extra_dirs"] = _normalize_path_list(_coerce_to_str_list(extra_dirs))
     if allowed_invocations is not None:

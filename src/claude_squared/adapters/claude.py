@@ -23,12 +23,29 @@ from claude_squared.models import (
     PairSpec,
     PermissionDenial,
     SendResult,
+    model_substitution_note,
+    normalize_model_id,
+    parse_model_id,
 )
 from claude_squared.registry import claude_home, profiles_dir
 
 
 WARNING_THRESHOLD = 0.60
 STRONG_WARNING_THRESHOLD = 0.85
+# v0.11.0: the CLI's exact phrasing when a model is pulled / access lost. The
+# turn emits this both as stderr (on the non-stream --output-format json path,
+# with exit 1 AND a valid result JSON on STDOUT carrying is_error/api_error 404)
+# and as the result event's `result` text (on the stream-json runtime path,
+# is_error + api_error_status 404, modelUsage empty). Single source of truth so
+# the create path (_run_print) and the send path (_build_send_result) detect it
+# identically. Verified against CLI 2.1.170 the day Fable 5 was pulled.
+MODEL_UNAVAILABLE_MARKER = "issue with the selected model"
+_MODEL_UNAVAILABLE_HELP = (
+    "the selected model is unavailable — it may have been pulled, or you may have "
+    "lost access to it (e.g. a subscription/trial-flagged model). Switch the pair "
+    "with pair_update(name, model=\"<available-model>\"), or set a fallback via "
+    "pair_update(name, fallback_model=\"<model>\") so future sends auto-fall-back."
+)
 # _encode_cwd_for_project: kept as a local alias for backward compat within this
 # module (multiple call sites). Source of truth: cli_paths.encode_cwd_for_project.
 
@@ -49,6 +66,60 @@ def _claude_executable() -> str:
         if c.exists():
             return str(c)
     return "claude"
+
+
+def _extract_stop_details(result_json: dict) -> dict | None:
+    """Find a ``stop_details`` object across plausible envelope locations.
+
+    The CLI's exact passthrough of the API's ``stop_details`` (carrying the
+    refusal ``category`` — cyber/bio) isn't repro-verified, so we don't assume
+    it's hoisted to the top level. Checks ``stop_details`` at the top, under a
+    ``message`` object, and under ``result_meta`` (defensive). Returns the first
+    dict found, else ``None`` — callers treat ``None`` as "category unknown",
+    which is a clean degrade from the ``stop_reason`` boolean floor.
+    """
+    for path in (("stop_details",), ("message", "stop_details"),
+                 ("result_meta", "stop_details")):
+        cur: Any = result_json
+        for key in path:
+            cur = cur.get(key) if isinstance(cur, dict) else None
+            if cur is None:
+                break
+        if isinstance(cur, dict):
+            return cur
+    return None
+
+
+def _select_primary_model(model_usage: dict, requested: str) -> str:
+    """Pick the model the turn actually ran on from a multi-key ``modelUsage``.
+
+    The CLI's ``modelUsage`` routinely carries the lightweight helper model
+    (``claude-haiku-4-5-*``, used for summaries/titles) alongside the real one,
+    and their order is insertion-order — NOT guaranteed to put the main model
+    first (verified: the non-stream ``--output-format json`` path listed haiku
+    first). ``next(iter(...))`` would mislabel the turn AND read the helper's
+    200k context window. Tie-break: (1) the key whose family matches the
+    requested family, (2) the key with the largest contextWindow (the real work
+    model; the helper has the small window), (3) first key. Falls back to the
+    requested id when ``modelUsage`` is empty.
+    """
+    keys = list(model_usage.keys())
+    if not keys:
+        return requested
+    rf, _ = parse_model_id(requested)
+    if rf:
+        for k in keys:
+            kf, _ = parse_model_id(k)
+            if kf == rf:
+                return k
+
+    def _cw(k: str) -> int:
+        try:
+            return int((model_usage.get(k) or {}).get("contextWindow") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return max(keys, key=_cw)
 
 
 class ClaudeAdapter(PairAdapter):
@@ -118,6 +189,7 @@ class ClaudeAdapter(PairAdapter):
             "--resume", spec.session_id,
             "--model", model or spec.model,
         ]
+        args += self._fallback_args(spec)
         if eff is not None:
             args += ["--effort", eff]
         args += [
@@ -163,6 +235,7 @@ class ClaudeAdapter(PairAdapter):
             "--print", "--output-format", "json",
             "--resume", spec.session_id, "--fork-session",
             "--model", spec.model,
+            *self._fallback_args(spec),
             "--permission-mode", spec.permission_mode,
             "-p", sentinel,
         ]
@@ -229,6 +302,12 @@ class ClaudeAdapter(PairAdapter):
 
     # ---- internals -----------------------------------------------------
 
+    @staticmethod
+    def _fallback_args(spec: PairSpec) -> list[str]:
+        """``--fallback-model`` args when the pair has one configured, else []."""
+        fb = (spec.fallback_model or "").strip()
+        return ["--fallback-model", fb] if fb else []
+
     def _common_create_args(self, spec: PairSpec) -> list[str]:
         """Args that pin specialization at create time (verified to persist on resume)."""
         args: list[str] = []
@@ -266,6 +345,14 @@ class ClaudeAdapter(PairAdapter):
         # (binary: ``effortValue:_,ultracode:f``).
         if spec.ultracode:
             args += ["--settings", '{"ultracode": true}']
+
+        # v0.11.0: automatic fallback when the primary model is overloaded or
+        # unavailable (e.g. a subscription/trial-flagged model loses access).
+        # ``--fallback-model`` is print-only (all our spawn paths are --print)
+        # and re-tries the primary at the start of each user turn. Pinned here
+        # so both create() and the persistent runtime (runtime.start, which also
+        # calls _common_create_args) inherit it.
+        args += self._fallback_args(spec)
 
         # Workspace dirs → --add-dir (the spawned subprocess's cwd defines the workspace
         # root; --add-dir whitelists additional paths for the auto-mode classifier).
@@ -345,9 +432,23 @@ class ClaudeAdapter(PairAdapter):
             raise CommandTimeout(pair_name, timeout_seconds) from e
 
         if proc.returncode != 0:
+            stderr_txt = proc.stderr.decode("utf-8", errors="replace")
+            stdout_txt = proc.stdout.decode("utf-8", errors="replace")
+            # v0.11.0: surface the "model is gone" case clearly. When a model is
+            # pulled / access is lost, the CLI exits 1 — but for --output-format
+            # json the error lands on STDOUT as a valid result JSON (is_error,
+            # api_error_status 404), with stderr EMPTY (verified the day Fable 5
+            # was pulled). So check BOTH streams for the marker, not just stderr.
+            combined = (stderr_txt + "\n" + stdout_txt).lower()
+            if MODEL_UNAVAILABLE_MARKER in combined:
+                raise CLIError(
+                    _MODEL_UNAVAILABLE_HELP,
+                    stderr=stderr_txt or stdout_txt[:2000],
+                    exit_code=proc.returncode,
+                )
             raise CLIError(
                 f"claude CLI exited non-zero",
-                stderr=proc.stderr.decode("utf-8", errors="replace"),
+                stderr=stderr_txt or stdout_txt[:2000],
                 exit_code=proc.returncode,
             )
         try:
@@ -366,6 +467,7 @@ class ClaudeAdapter(PairAdapter):
         args = [cli, "--print", "--verbose",
                 "--resume", spec.session_id,
                 "--model", spec.model,
+                *self._fallback_args(spec),
                 "--permission-mode", spec.permission_mode,
                 "--input-format", "stream-json",
                 "--output-format", "stream-json"]
@@ -454,8 +556,9 @@ class ClaudeAdapter(PairAdapter):
         usage = result_json.get("usage", {}) or {}
         denials = [PermissionDenial(**d) for d in result_json.get("permission_denials", []) or []]
         model_usage = result_json.get("modelUsage", {}) or {}
-        # Pick the first/main model used (order in dict is insertion order)
-        model_used = next(iter(model_usage.keys()), spec.model)
+        # Robust primary-model pick (NOT next(iter(...)) — modelUsage carries the
+        # haiku helper too, in nondeterministic order). See _select_primary_model.
+        model_used = _select_primary_model(model_usage, spec.model)
         # Prefer the CLI-reported window (authoritative — correctly reports 1M
         # for million-context models). Fall back only when it's absent: infer 1M
         # for 1m-variant model names (substring), else the standard 200k. Keeps
@@ -490,6 +593,70 @@ class ClaudeAdapter(PairAdapter):
 
         scope = result_json.get("_log_scope") or {}
 
+        # v0.11.0 model-handling hardening — all three are None on a normal turn.
+        #
+        # (a) Silent model substitution: the CLI served a different model than the
+        #     pair requested. This is the UNIFYING signal for "the model changed
+        #     under you" — a safety downgrade (fable → opus-4-8 on a cyber/bio
+        #     classifier trip), --fallback-model kicking in on overload/trial-loss,
+        #     or a capacity fallback. Detected purely from served-vs-requested, so
+        #     it catches all three regardless of cause. The haiku helper in
+        #     modelUsage does NOT false-trigger: _select_primary_model already
+        #     resolved model_used to the requested family when present.
+        model_substitution = model_substitution_note(spec.model, model_used)
+        #
+        # (b) Content-safety block/refusal. The documented signal (Anthropic API)
+        #     is stop_reason=='refusal' with stop_details.category in {cyber, bio}
+        #     — exactly the classifier in play. Displayed generically; the exact
+        #     CLI passthrough of stop_details isn't repro-verified (reproducing a
+        #     real cyber/bio block is off-limits), so we surface what's present
+        #     and let the human interpret rather than hard-matching values.
+        stop_reason = result_json.get("stop_reason")
+        api_err = result_json.get("api_error_status")
+        safety_signal: str | None = None
+        safety_kind: str | None = None
+        if stop_reason == "refusal":
+            # The ONLY genuine safety event of the three — earns the safety
+            # banner. stop_details location isn't repro-verified, so probe a few
+            # plausible spots rather than only the top level (else the cyber/bio
+            # category enrichment would be silently unreachable wherever the CLI
+            # nests it). The stop_reason boolean is the floor; category is bonus.
+            details = _extract_stop_details(result_json)
+            cat = details.get("category") if isinstance(details, dict) else None
+            expl = details.get("explanation") if isinstance(details, dict) else None
+            parts = ["content-safety REFUSAL (stop_reason='refusal')"]
+            if cat:
+                parts.append(f"category={cat}")
+            if expl:
+                parts.append(str(expl)[:240])
+            safety_signal = " — ".join(parts)
+            safety_kind = "refusal"
+        elif MODEL_UNAVAILABLE_MARKER in (result_json.get("result") or "").lower():
+            # PERMANENT, not transient: the model was pulled / access lost (the
+            # stream-json path returns this as a result event with api_error_status
+            # 404 + this text + empty modelUsage). Must NOT read as "retry resolves
+            # it" (it won't) — give the switch-model / set-fallback guidance.
+            safety_signal = _MODEL_UNAVAILABLE_HELP
+            safety_kind = "model_unavailable"
+        elif api_err:
+            # NOT a safety event — a transient API error (overload/rate-limit).
+            # Labeled "error" so _fmt_send_result renders it as abnormal-not-block.
+            safety_signal = (
+                f"API error status ({api_err}) — most likely a transient overload "
+                f"or rate-limit; retry usually resolves it (not a safety block)"
+            )
+            safety_kind = "error"
+        elif result_json.get("is_error") and stop_reason not in (
+            None, "end_turn", "tool_use", "stop_sequence", "max_tokens"
+        ):
+            safety_signal = (
+                f"the turn ended with is_error and stop_reason={stop_reason!r} "
+                f"(abnormal completion; not necessarily a safety block)"
+            )
+            safety_kind = "error"
+        # Keep the raw stop_reason for transparency when it's not a normal finish.
+        stop_reason_kept = stop_reason if stop_reason not in (None, "end_turn") else None
+
         return SendResult(
             name=spec.name,
             response=result_json.get("result", ""),
@@ -504,6 +671,10 @@ class ClaudeAdapter(PairAdapter):
             log_line_start=scope.get("start_line"),
             log_line_end=scope.get("end_line"),
             subagent_logs=scope.get("subagent_logs") or [],
+            model_substitution=model_substitution,
+            safety_signal=safety_signal,
+            safety_kind=safety_kind,
+            stop_reason=stop_reason_kept,
         )
 
 

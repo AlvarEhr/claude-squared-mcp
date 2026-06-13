@@ -4,9 +4,73 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.11.0] — 2026-06-10
+
+Model-handling hardening. Anthropic now (a) silently downgrades a session's
+model to Opus 4.8 when a conversation trips a cyber/bio safety classifier, and
+(b) flags subscription/trial model access as revocable. This release surfaces
+both clearly when they hit a pair, and lets pairs survive losing access to a
+model. Fully additive — no existing tool's behavior changes; the one hot-path
+addition is a once-per-runtime-spawn parent-model read (gated, best-effort).
 
 ### Added
+
+- **Silent model-substitution detection.** Every `pair_send` reply now flags
+  `🔄 MODEL CHANGED` when the model the CLI actually *served* differs from what
+  the pair requested — the unifying signal for a safety downgrade (e.g. `fable`
+  → `claude-opus-4-8` on a cyber/bio classifier trip), a `--fallback-model`
+  kicking in, or a capacity fallback. Detection is served-vs-requested
+  (`models.model_substitution_note`), so it catches all three regardless of
+  cause. Two correctness details: the comparison is a **full version tuple**
+  (`(4,8)` vs `(4,9)`) so the exact opus-4.X downgrade isn't missed, and ids are
+  **normalized** (`[1m]` tier suffix + dated `-YYYYMMDD` snapshot stripped) so a
+  1M pair doesn't false-fire. The lightweight `claude-haiku-4-5` helper model
+  that rides along in `modelUsage` no longer mislabels the turn —
+  `_select_primary_model` resolves the real model by family-match → max
+  context-window → first (this also fixes a latent footer bug where the helper's
+  200K window could be reported for a 1M pair).
+- **Content-safety block/refusal signal.** A `pair_send` reply flags
+  `⚠ SAFETY/BLOCK SIGNAL` when the turn ended in `stop_reason == "refusal"`
+  (with `stop_details.category` — `cyber`/`bio` — when the CLI passes it), or
+  carried an `api_error_status`, or `is_error` with an abnormal stop reason.
+  Displayed generically (the exact block enum isn't repro-verified — generating
+  a real cyber/bio block is off-limits), with an explicit note that a hard
+  *pause* with no result would instead look like a slow turn / async handle, not
+  this signal.
+- **`fallback_model` — survive losing access to a model.** New field on
+  `pair_create` / `pair_update` / `pair_settings_set` (+ `PairSpec` /
+  `PairDefaults`), passed to the CLI as `--fallback-model` (single id or
+  comma-separated list, tried in order; the CLI re-tries the primary at the
+  start of each turn). Threaded through every spawn path (create, persistent
+  runtime, one-shot send, fork, stream-json). With it set, a send whose primary
+  model is unavailable (overloaded, or a trial/subscription model that lost
+  access) transparently continues on the fallback instead of hard-erroring, and
+  the substitution detector reports which model actually ran. Verified
+  end-to-end against CLI 2.1.170. Empty string clears it.
+- **"Newer model in your family is available" notice.** Compares the pair's
+  model version against the **parent session's** model version in the same
+  family — self-healing, no hardcoded "latest" table to rot. Fires at
+  `pair_create` (one-shot) and, for long-lived pairs, on the **first send after
+  each runtime spawn** — gated by a persisted `last_drift_notice` so it surfaces
+  once per *new release* (e.g. the day Opus 4.9 drops), never per send.
+  Best-effort: if the parent can't be detected, or it's a different family / not
+  newer, it stays silent (never a false notice).
+- **Actionable "model unavailable" error, on every path** (hardened against the
+  real Fable 5 pull). When a model is pulled / access is lost, the CLI surfaces
+  *"There's an issue with the selected model…"* in two different shapes, and both
+  now produce a clear `⛔ MODEL UNAVAILABLE` message with concrete next steps
+  (`pair_update` the model, or set a `fallback_model`):
+  - **Create path** (`--output-format json`): exits 1 with the error as JSON on
+    **stdout** and an *empty stderr* — so the detector checks both streams, not
+    just stderr (the stderr-only first cut missed it → bare "exited non-zero").
+  - **Send path** (stream-json): comes back as a result event with
+    `api_error_status: 404` + the marker text + empty `modelUsage`. This is
+    distinguished from a *transient* error (529 overload / 429 rate-limit, which
+    keep the "retry usually resolves it" wording) — a pulled model is permanent,
+    so it must not say "retry." Single shared marker constant
+    (`MODEL_UNAVAILABLE_MARKER`) drives both paths.
+
+### Added (earlier, folded into this release)
 
 - **Match-parent detection messages now carry a 1M-tier hint.** Session JSONLs
   record the bare model id only (`claude-fable-5`, `claude-opus-4-8`) — the

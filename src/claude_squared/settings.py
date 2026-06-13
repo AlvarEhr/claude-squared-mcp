@@ -64,6 +64,12 @@ class PairDefaults(BaseModel):
     # Mirrors ``PairSpec.ultracode``; None means "use the False hardcoded
     # fallback" so existing pre-v0.9.10 defaults files load unchanged.
     ultracode: bool | None = None
+    # v0.11.0: default ``--fallback-model`` for new pairs (comma-separated list
+    # the CLI tries in order when the primary is overloaded/unavailable). Mirrors
+    # ``PairSpec.fallback_model``; None = the False/no-fallback hardcoded
+    # behavior, so pre-v0.11.0 defaults files load unchanged. Not a foot-gun —
+    # a fallback only kicks in when the primary is already failing.
+    fallback_model: str | None = None
     # Extra --add-dir paths to whitelist on every new pair.
     extra_dirs: list[str] | None = None
     # Default allow-list for ``pair_invoke``. Mirrors ``PairSpec.allowed_invocations``.

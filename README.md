@@ -82,7 +82,7 @@ pair_compact(name="reviewer", steering_prompt="Focus on what was reviewed and an
 ## Tools
 
 ### Lifecycle
-- `pair_create(name, purpose, model, effort, permission_mode, system_prompt_append?, profile_name?, allowed_tools?, mcp_whitelist?, cwd?, extra_dirs?, persistent?, ultracode?, allowed_invocations?, initial_message?, session_id?, parent_model?)`
+- `pair_create(name, purpose, model, effort, permission_mode, system_prompt_append?, profile_name?, allowed_tools?, mcp_whitelist?, cwd?, extra_dirs?, persistent?, ultracode?, fallback_model?, allowed_invocations?, initial_message?, session_id?, parent_model?)`
 - `pair_adopt(name, session_id, ...)` — register an existing claude session
 - `pair_forget(name, archive=True)` — remove from registry; optionally archives transcript
 
@@ -98,7 +98,7 @@ pair_compact(name="reviewer", steering_prompt="Focus on what was reviewed and an
 - `pair_actions(name?)` — discoverability: curated commands + (if name) pair-installed skills
 
 ### Mutation
-- `pair_update(name, model?, effort?, permission_mode?, allowed_tools?, allowed_invocations?, cwd?, extra_dirs?, ultracode?, purpose?)`
+- `pair_update(name, model?, effort?, permission_mode?, allowed_tools?, allowed_invocations?, cwd?, extra_dirs?, ultracode?, fallback_model?, purpose?)`
 - `pair_clear(name, archive_old=True)` — rotate to fresh session_id; pinned config preserved
 - `pair_compact(name, steering_prompt?, timeout_seconds=45, compact_timeout_seconds=600)` — native /compact (async-wrapped, v0.9.8+; degrades gracefully to an async handle past the sync cap)
 - `pair_fork(name, new_name?)` — branch a pair into a new independent pair, keeping both (v0.10.0; like `/fork`, via native `--fork-session`)
@@ -112,10 +112,12 @@ pair_compact(name="reviewer", steering_prompt="Focus on what was reviewed and an
 
 ### Per-user defaults
 - `pair_settings_get()` — show writable defaults + file paths + read-only env knobs
-- `pair_settings_set(model?, effort?, permission_mode?, persistent?, ultracode?, extra_dirs?, allowed_invocations?)` — fill defaults for new pairs (per-call args ALWAYS override defaults)
+- `pair_settings_set(model?, effort?, permission_mode?, persistent?, ultracode?, fallback_model?, extra_dirs?, allowed_invocations?)` — fill defaults for new pairs (per-call args ALWAYS override defaults)
 - `pair_settings_reset()` — delete defaults file → fall back to hardcoded fallbacks
 
 > **Ultracode (v0.9.10+)**: Anthropic added an "Ultracode" mode (xhigh effort + dynamic workflows for maximum thoroughness) to CLI 2.1.165. It's surfaced via `--settings '{"ultracode": true}'`, **not** `--effort ultracode` (the CLI rejects that). Use `pair_create(ultracode=True)` or set it as a default via `pair_settings_set(ultracode=True)`. Compatible with any explicit `effort` value — effort and ultracode are independent fields.
+
+> **Model-handling hardening (v0.11.0+)**: Anthropic now silently downgrades a session's model (e.g. to Opus 4.8) when a conversation trips a cyber/bio safety classifier, and flags subscription/trial model access as revocable. The `pair_send` reply footer surfaces both: **`🔄 MODEL CHANGED`** when the model that actually ran differs from what the pair requested (a safety downgrade, a `fallback_model` kicking in, or a capacity fallback), and **`⚠ SAFETY/BLOCK SIGNAL`** on a content-safety refusal (`⚠ TURN ENDED ABNORMALLY` for transient API errors — distinct, so a 529 overload doesn't read as a safety block). Set **`fallback_model`** (e.g. `pair_create(name, fallback_model="claude-opus-4-8")`) so a send whose primary is unavailable — including a trial model that lost access — transparently continues on the fallback instead of hard-erroring. A **`🆕 newer model available`** notice fires when your parent session is on a newer version of the pair's model family (compared against the parent, not a hardcoded list — so it can't go stale). *Limitation*: a hard **pause** that returns no result at all looks like a slow turn (an async handle), not a flagged signal — detection covers refuse-and-return and downgrade-and-continue, not a silent hang.
 
 ### Custom agents (global)
 - `pair_agent_define(name, description, prompt, tools?, model?)` — write `~/.claude/agents/<name>.md`
