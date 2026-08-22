@@ -4,6 +4,128 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] — 2026-08-07
+
+Premium-model awareness. Fable 5 is now a *plan-gated* model: it carries its
+own separate weekly usage limit, burns usage faster than the standard models,
+and is only included on some plans (Max 20x yes; Pro no — there it bills as
+extra usage credits). Selecting it is therefore a usage/spending decision the
+user should make knowingly. Fable is **not blocked** — instead every switch
+point surfaces a confirmation prompt, so an agent can't quietly park a pair on
+it. Fully additive — no existing tool's behavior changes.
+
+### Added
+
+- **`💳 PREMIUM MODEL` warning** at every point a pair is *switched* onto a
+  premium family: `pair_create` (on the **resolved** model, so it catches a
+  premium default from `defaults.json` or a `match-parent` resolution, not just
+  an explicit argument), `pair_update(model=...)`, `pair_settings_set(model=...)`
+  (loudest case — it would apply to every future pair), and `pair_send` with a
+  per-call `override_model` (via the new `SendResult.premium_note`). A pair
+  whose spec already sits on a premium model is *not* re-warned every turn —
+  that switch was confirmed when it was made.
+- **`models.premium_model_note(model)`** — the single source of truth, keyed by
+  model *family* via `parse_model_id`, so one table entry covers every spelling
+  (`fable`, `claude-fable-5`, `claude-fable-5[1m]`, a future `claude-fable-6`).
+  Returns `None` for everything else and never raises on odd inputs
+  (`match-parent`, bare aliases, empty strings) — all covered by
+  `tests/smoke_v0120.py` (26 assertions).
+
+### Notes
+
+- **The premium table encodes commercial terms, so it rots by nature.** There is
+  no "is this premium?" flag to query from the CLI, and `claude auth status`
+  exposes `subscriptionType` but not the plan tier — which is the only reason
+  it is hardcoded at all. Each entry carries the date it was last confirmed;
+  re-verify before trusting an old one.
+- **`[1m]` is redundant on Opus 5.** Verified against CLI 2.1.224: bare
+  `claude-opus-5` reports `contextWindow=1000000`, i.e. the 1M tier is now the
+  default rather than an opt-in suffix. Prefer the bare id — it also sidesteps
+  the documented "match-parent can't detect the 1M tier" caveat entirely.
+
+### Added — self-woken turns (the "placeholder hand-back", closed)
+
+A pair that launches background work (`Agent` with `run_in_background`, a
+background `Bash`, or a `Workflow`) ends its turn with a placeholder ("recon's
+out, I'll synthesize when it lands"). Claude Code's notify-and-resume then
+fires — the persistent runtime keeps stdin open — and the pair **resumes on
+its own** with the real deliverable. Before v0.12.0 that continuation was
+invisible: `pair_status` called the pair idle while it was working hard,
+`pair_poll(name)` / `wait.py <name>` resolved to the last send's already-done
+task and returned instantly, and a `pair_send` arriving mid-continuation
+**tree-killed it** (the stale-JSONL check mistook the pair's own write for
+another process's, evicted the runtime, and `/T` took the background
+sub-agents with it). Now:
+
+- **Self-woken turns are first-class async tasks.** The runtime's reader
+  thread opens an *implicit* turn the moment a top-level event arrives with
+  no `pair_send` scope open, registers an on-disk task (message prefixed
+  `<self-woken turn>`), and finalizes it on the turn's `result` — with the
+  full `SendResult` (reply text, log range, cost) and the registry's
+  `turn_count` / `total_cost_usd` updated. Every existing consumer works
+  unchanged: `pair_status` shows it in flight (labeled **self-woken turn in
+  progress**), `pair_poll(name)` resolves to it (labeled, naming the latest
+  `pair_send` task next to it so the two can't be confused),
+  `pair_poll(name, wait_seconds=N)` and the `wait.py` watcher wait for it,
+  `pair_stop` interrupts it, orphan reaping covers it, other MCP processes
+  see it.
+- **Sub-agent events can't fake a turn.** Only events with
+  `parent_tool_use_id == null` (the pair's own) open one — a sub-agent's
+  events stream through with the id set (verified CLI 2.1.224). `system.init`
+  is deliberately *not* required: a continuation doesn't always start with
+  one (a live log showed 10 minutes of parent work after a result with none).
+- **`pair_send` queues FIFO behind an in-progress self-woken turn** instead
+  of interleaving (its result would otherwise be mistaken for the answer),
+  bounded like the read loop (`timeout_seconds`, `pair_stop`, process death).
+  The footer says how long it waited.
+- **Footers close the loop.** `⏳ BACKGROUND WORK LAUNCHED (…)` on the
+  placeholder turn itself (detected from the CLI's verbatim tool_result
+  markers for Agent / Bash / Workflow launches), `⏮ N SELF-WOKEN TURN(S)
+  completed since your last send` with task ids + log ranges + cost on the
+  next one (the records are parked on the pair's registry entry —
+  `PairSpec.self_woken_pending`, newest 25 — so they survive a runtime
+  respawn and are visible from any MCP process), and `⏸ USAGE LIMIT` when the CLI returns its limit notice as a
+  *success* result (observed live: each background completion woke a pair
+  that immediately hit its session limit and "succeeded" with the notice).
+- **`main.log` narrates it**: `=== SELF-WOKEN TURN (task …) ===` opens the
+  turn, `[background launch: agent]` marks the launches, and the CLI's
+  `task_started` / `task_notification` events are logged so the wake-up has a
+  visible cause.
+- **A reaper finalizes abandoned turns** (no log line for a full idle period)
+  as `ABANDONED:` failures instead of leaving a phantom in-flight task, and
+  `stop()` / eviction finalize an open one as `stopped`.
+
+### Fixed
+
+- **`is_stale()` no longer tree-kills a pair mid self-woken turn** (see
+  above): the adapter waits for an in-progress self-woken turn before the
+  stale check, and the turn's own JSONL write refreshes the watermark so the
+  warm runtime survives (a respawn would kill background sub-agents still
+  running). The cross-process hole that opens — a self-woken turn holds no
+  pair lock, so another MCP process's send could spawn on a JSONL mid-write —
+  is closed at the source: **a send now waits for any running self-woken task
+  owned by another live MCP process** (its on-disk task file is the signal),
+  bounded by the send's hard timeout / `pair_stop`. Historian-caught.
+- **Lost-update on `turn_count` / `total_cost_usd`**: the send runner now
+  re-reads the spec before writing its totals instead of `current + 1`, so
+  increments made by self-woken turns in between are not clobbered.
+- **Sub-agent log numbering survives a runtime respawn**: the counter resumes
+  from the highest existing `subagent-N-*.log` instead of restarting at 1 and
+  appending a second "#1" onto an older file.
+- **`send_interrupt` acks on a real `result` event** (`_result_seq`), not on
+  "main.log grew a line" — which was unconditionally true during a self-woken
+  turn, so `pair_stop` reported an ack the CLI had actually dropped.
+- **The reader attributes before it queues**: `send()` could previously pull
+  a result off the stdout queue and clear its scope before the reader had
+  attributed that same line (it only truncated the log range; under the new
+  design it would have manufactured a phantom completion). Lines with no
+  solicited scope open are no longer queued at all — bounded memory on a pair
+  that wakes itself for hours.
+- **`wait_for_task` leaked an in-memory event per `pair_stop`** ("stopped" was
+  not treated as terminal for event cleanup).
+- **`SendResult.terminal_reason`** is now carried from the result envelope
+  (shown only when it isn't `completed`).
+
 ## [0.11.0] — 2026-06-10
 
 Model-handling hardening. Anthropic now (a) silently downgrades a session's

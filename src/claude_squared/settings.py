@@ -35,7 +35,12 @@ from typing import Iterator
 from filelock import FileLock
 from pydantic import BaseModel, Field, field_validator
 
-from claude_squared.models import EffortLevel, PermissionMode, coerce_effort_for_model
+from claude_squared.models import (
+    EffortLevel,
+    PermissionMode,
+    coerce_effort_for_model,
+    premium_model_note,
+)
 from claude_squared.registry import pairs_dir
 
 logger = logging.getLogger(__name__)
@@ -186,6 +191,15 @@ def update_defaults(**fields) -> tuple[PairDefaults, list[str]]:
         # so the agent doesn't end up with a stale incompatible (model, effort)
         # combo. Surface this so the user sees what happened.
         new_model = fields.get("model")
+        # v0.12.0: a premium family as the GLOBAL default is the highest-stakes
+        # version of this warning — every subsequent pair_create would silently
+        # land on it. Still not blocked (unlike bypassPermissions above): the
+        # user may genuinely want it, and pair_create re-warns per pair.
+        if new_model is not None:
+            premium_msg = premium_model_note(new_model)
+            if premium_msg:
+                messages.insert(0, f"{premium_msg} Set as the DEFAULT, this "
+                                   f"applies to every new pair until changed.")
         explicit_effort = "effort" in fields
         if new_model is not None and not explicit_effort and new_model != d.model:
             # Only auto-reset if the current effort is incompatible with the new model.

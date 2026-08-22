@@ -44,6 +44,7 @@ from claude_squared.models import (
     SendResult,
     coerce_effort_for_model,
     default_effort_for_model,
+    premium_model_note,
     newer_version_available,
 )
 
@@ -232,6 +233,14 @@ def _fmt_send_result(r: SendResult) -> str:
                 f"would instead look like a slow turn (an async handle / no reply), not "
                 f"this signal — detection covers refuse-and-return, not a silent hang."
             )
+        elif r.safety_kind == "usage_limit":
+            # v0.12.0: the CLI returns the limit notice as a SUCCESS result —
+            # without this the "reply" reads like an (odd) answer.
+            lines.append(
+                f"⏸ USAGE LIMIT: {r.safety_signal}. The reply above is the limit "
+                f"notice, not an answer — the pair did NOT do the work. Wait for the "
+                f"reset, then re-send."
+            )
         elif r.safety_kind == "model_unavailable":
             # PERMANENT — the model was pulled / access lost. Distinct label + a
             # concrete fix, NOT the "retry resolves it" wording of a transient error.
@@ -243,8 +252,47 @@ def _fmt_send_result(r: SendResult) -> str:
             lines.append(
                 f"⚠ TURN ENDED ABNORMALLY: {r.safety_signal}."
             )
+    if r.premium_note:
+        lines.append(f"💳 {r.premium_note}")
     if r.drift_note:
         lines.append(f"🆕 {r.drift_note}")
+    # v0.12.0 self-woken turn signals (see runtime.PairRuntime._open_implicit_turn).
+    if r.background_launches:
+        from collections import Counter as _Counter
+        _kinds = _Counter(r.background_launches)
+        _desc = ", ".join(f"{n} {k}" for k, n in _kinds.items())
+        lines.append(
+            f"⏳ BACKGROUND WORK LAUNCHED ({_desc}): this turn started background work "
+            f"and ended before it finished — the reply above may be a placeholder. "
+            f"The pair will wake itself when the work completes; that continuation is "
+            f"tracked as its OWN task: pair_status('{r.name}') shows it in flight, "
+            f"pair_poll('{r.name}', wait_seconds=30) waits for it, and the wait.py "
+            f"watcher by name works too. Do NOT re-send the same request."
+        )
+    if r.self_woken_completed:
+        _n = len(r.self_woken_completed)
+        lines.append(
+            f"⏮ {_n} SELF-WOKEN TURN{'S' if _n != 1 else ''} completed since your last "
+            f"send (the pair resumed on its own after background work finished — NOT "
+            f"included in the reply above):"
+        )
+        for _c in r.self_woken_completed:
+            _tid = _c.get("task_id")
+            _tid_s = _tid[:8] if _tid else "(unattributed)"
+            _rng = f"main.log:{_c.get('log_line_start')}-{_c.get('log_line_end')}"
+            _cost = _c.get("cost_usd") or 0.0
+            _prev = (_c.get("response_preview") or _c.get("note") or "").replace("\n", " ")[:90]
+            _how = f" — pair_poll('{_tid}', with_turn_log=True)" if _tid else ""
+            lines.append(
+                f"   • task {_tid_s} [{_c.get('status')}] {_rng} ${_cost:.2f}: {_prev!r}{_how}"
+            )
+    if r.self_woken_waited_s:
+        lines.append(
+            f"(this send waited {r.self_woken_waited_s:.0f}s for the pair's in-progress "
+            f"self-woken turn to finish before its message was written)"
+        )
+    if r.terminal_reason and r.terminal_reason != "completed":
+        lines.append(f"(terminal_reason={r.terminal_reason!r})")
     if ctx and ctx.warning:
         lines.append(f"⚠ {ctx.warning}")
     if r.permission_denials:
@@ -678,6 +726,14 @@ def pair_create(
         parent_model=parent_model,
     )
 
+    # v0.12.0 premium-model notice. Fires on the RESOLVED model, so it catches a
+    # premium family arriving via defaults.json or match-parent detection, not
+    # just an explicit per-call argument. Prepended: a usage/spending decision
+    # outranks the version-drift note below it.
+    _premium = premium_model_note(resolved["model"])
+    if _premium:
+        transparency_msgs.insert(0, _premium)
+
     # v0.11.0 create-time "newer model available" notice. Compare the resolved
     # pair model against the PARENT session's model in the same family — if the
     # parent is on a newer version (e.g. parent opus-4-9, pair opus-4-8), say so
@@ -924,6 +980,78 @@ def _make_stop_checker(pair_name: str, task_id: str) -> "Callable[[], bool]":
     return _check
 
 
+def _foreign_self_woken_task_ids(name: str) -> list[str]:
+    """Running self-woken tasks for ``name`` owned by ANOTHER live MCP process."""
+    out: list[str] = []
+    for tid in async_tasks.list_running_task_ids_for_pair(name):
+        try:
+            st = async_tasks.load_task(tid)
+        except Exception:
+            continue
+        if st is None or not async_tasks.is_self_woken_task(st):
+            continue
+        pid = st.owner_pid
+        if pid is None or pid <= 0 or pid == os.getpid():
+            continue
+        if not async_tasks._is_pid_alive(int(pid)):  # noqa: SLF001
+            continue  # orphan — reap_orphan will finalize it; nothing to wait for
+        out.append(tid)
+    return out
+
+
+def _wait_for_foreign_self_woken(
+    name: str, timeout_s: float | None, should_stop: "Callable[[], bool] | None",
+) -> float:
+    """Cross-process FIFO for self-woken turns (v0.12.0). Returns seconds waited.
+
+    A self-woken turn has no pair_send behind it, so it does NOT hold the pair's
+    cross-process lock. Without this, a send from ANOTHER MCP process would
+    spawn its own ``claude --resume`` on a session JSONL the self-woken turn is
+    mid-writing — turn-lineage divergence. The turn's task file on disk (with
+    its owner pid) is the signal: wait for it like any queued send. Bounded by
+    the caller's hard timeout and pair_stop. Own-process turns are handled in
+    the adapter (``PairRuntime.wait_for_implicit_idle``), not here.
+    """
+    t0 = time.monotonic()
+    end = (t0 + timeout_s) if timeout_s is not None else None
+    while True:
+        foreign = _foreign_self_woken_task_ids(name)
+        if not foreign:
+            return time.monotonic() - t0
+        if end is not None and time.monotonic() >= end:
+            raise PairError(
+                f"Pair '{name}' is mid self-woken turn in another MCP process "
+                f"(task {_short(foreign[0])}; waited {timeout_s}s). Retry later, or "
+                f"pair_stop it from that process."
+            )
+        if should_stop is not None:
+            try:
+                stop_now = bool(should_stop())
+            except Exception:
+                stop_now = False
+            if stop_now:
+                raise PairError(
+                    "send cancelled by pair_stop while waiting for another process's "
+                    "self-woken turn"
+                )
+        time.sleep(1.0)
+
+
+def _take_self_woken_pending(name: str) -> list[dict]:
+    """Pop the self-woken completion records the runtime parked on the spec
+    (``PairSpec.self_woken_pending``). Returns [] on any failure."""
+    try:
+        pending = list(reg_mod.get_pair(name).self_woken_pending or [])
+    except Exception:
+        return []
+    if pending:
+        try:
+            reg_mod.update_pair(name, self_woken_pending=[])
+        except Exception:
+            pass
+    return pending
+
+
 def _build_send_runner(
     name: str,
     message: str,
@@ -962,6 +1090,11 @@ def _build_send_runner(
         should_stop = _make_stop_checker(name, task_id) if task_id else None
         with _with_pair_lock(name, timeout_s=lock_acquire_timeout_s):
             current = reg_mod.get_pair(name)
+            # v0.12.0 cross-process FIFO for self-woken turns: a self-woken turn
+            # in ANOTHER MCP process doesn't hold this pair's lock (no send
+            # behind it), so without this we'd spawn our own claude on a JSONL
+            # that process is mid-writing. Its on-disk task is the signal.
+            _wait_for_foreign_self_woken(name, hard_timeout_seconds, should_stop)
             adapter = _adapter_for(current)
             result = adapter.send(
                 current, message,
@@ -972,6 +1105,16 @@ def _build_send_runner(
                 on_event=on_event,
                 should_stop=should_stop,
             )
+
+            # v0.12.0 premium-model notice — per-call override only. A one-off
+            # `override_model='fable'` IS a switch, so it gets the same warning
+            # as pair_update. A pair whose spec already sits on a premium model
+            # was warned at that switch point; nagging every turn would be noise.
+            if override_model:
+                try:
+                    result.premium_note = premium_model_note(override_model)
+                except Exception:
+                    pass
 
             # v0.11.0 send-time "newer model available" check. Warm-runtime path
             # only (per-call overrides use a one-shot subprocess — no runtime to
@@ -1000,10 +1143,23 @@ def _build_send_runner(
                 except Exception:
                     pass
 
+            # v0.12.0: self-woken turns that completed since the previous send
+            # were parked on the spec by the runtime (respawn-safe, visible from
+            # any MCP process). Hand them to this reply's ⏮ footer and clear.
+            # Re-read the spec for the totals too: the self-woken turns bumped
+            # turn_count / cost since ``current`` was read at runner start, and
+            # writing current+1 would clobber those increments.
+            pending = _take_self_woken_pending(name)
+            if pending:
+                result.self_woken_completed = pending
+            try:
+                fresh = reg_mod.get_pair(name)
+            except Exception:
+                fresh = current
             update_fields: dict[str, Any] = dict(
                 last_active_at=datetime.utcnow(),
-                turn_count=current.turn_count + 1,
-                total_cost_usd=current.total_cost_usd + result.cost_usd,
+                turn_count=fresh.turn_count + 1,
+                total_cost_usd=fresh.total_cost_usd + result.cost_usd,
             )
             if drift_persist is not None:
                 update_fields["last_drift_notice"] = drift_persist
@@ -1730,6 +1886,25 @@ def pair_poll(
                     f"(no pair_send / pair_send_async has run for it). Send it a message first."
                 )
             resolved_note = f"(resolved pair '{task_id}' → its latest task {_short(latest)})"
+            # v0.12.0: if the latest task is a SELF-WOKEN turn, say so right here
+            # and name the latest pair_send task next to it — a by-name poll must
+            # never be mistaken for the answer to the caller's own message.
+            try:
+                _latest_state = async_tasks.load_task(latest)
+                if async_tasks.is_self_woken_task(_latest_state):
+                    _sol = async_tasks.latest_task_id_for_pair(task_id, solicited_only=True)
+                    _sol_state = async_tasks.load_task(_sol) if _sol else None
+                    _sol_desc = (
+                        f"{_short(_sol)} [{_sol_state.status}] — pair_poll('{_sol}') for it"
+                        if _sol_state is not None else "none"
+                    )
+                    resolved_note += (
+                        f"\n  ⚠ that task is a SELF-WOKEN turn (the pair resumed on its own "
+                        f"after background work; no pair_send behind it). Latest pair_send "
+                        f"task: {_sol_desc}."
+                    )
+            except Exception:
+                pass
             task_id = latest
             state = async_tasks.load_task(latest)
         else:
@@ -1778,6 +1953,11 @@ def pair_poll(
             f"running for {dur_s:.0f}s on pair '{state.pair_name}' "
             f"(started {_fmt_local(state.started_at)})"
         )
+        if async_tasks.is_self_woken_task(state):
+            headline += (
+                " — SELF-WOKEN turn: the pair resumed on its own after background "
+                "work completed (no pair_send behind it)"
+            )
     elif state.status == "failed":
         # Distinguish SUPERVISION events from genuine work errors — same status
         # at the state-machine level, very different to the orchestrator.
@@ -1818,6 +1998,11 @@ def pair_poll(
             headline = _fmt_compact_result(state.result)
         else:
             headline = _fmt_send_result(state.result)
+            if async_tasks.is_self_woken_task(state):
+                headline = (
+                    "(SELF-WOKEN turn — the pair resumed on its own after background "
+                    "work completed; no pair_send behind it)\n" + headline
+                )
     else:
         headline = f"unknown status: {state.status}"
 
@@ -2158,6 +2343,14 @@ def pair_update(
             if "model" in fields or "effort" in fields:
                 old_spec = reg_mod.get_pair(name)
                 effective_model = fields.get("model", old_spec.model)
+
+                # v0.12.0 premium-model notice. Guarded on an ACTUAL model change
+                # so routine updates to a pair already sitting on a premium family
+                # don't re-nag on every unrelated field edit.
+                if "model" in fields:
+                    _premium = premium_model_note(effective_model)
+                    if _premium:
+                        transparency_msgs.insert(0, _premium)
 
                 # Auto-reset effort when ONLY model is changing — mirrors
                 # pair_settings_set's UX so the same single-field-change flow
@@ -3305,6 +3498,11 @@ def pair_status(name: str, last_n_log: int = 5, verbose: bool = False) -> str:
     - **active**: in-flight task + last log line < 30s ago
     - **slow**: in-flight task + last log line 30-120s ago
     - **likely-hung**: in-flight task + no log activity in 120+ seconds
+    - any of the above prefixed **self-woken turn in progress** (v0.12.0) when
+      the in-flight work is the pair resuming ON ITS OWN after background work
+      it launched earlier (Agent/Bash ``run_in_background``, Workflow) — there
+      is no pair_send behind it. ``pair_poll(name, wait_seconds=N)`` or the
+      wait.py watcher waits for it like any other task.
 
     Args:
         name: Pair to inspect.
@@ -3396,6 +3594,17 @@ def pair_status(name: str, last_n_log: int = 5, verbose: bool = False) -> str:
     # eventually be reported as "likely-hung" purely because nobody had sent it
     # a message recently — which is not what the agent wants to see.
     inflight_tasks = async_tasks.list_running_task_ids_for_pair(name)
+    # v0.12.0: which in-flight tasks are SELF-WOKEN turns (the pair resumed on
+    # its own after background work; no pair_send behind them). Drives the
+    # labels below so "active" can't be misread as "my send is still running".
+    self_woken_inflight: list[str] = []
+    for _tid in inflight_tasks:
+        try:
+            if async_tasks.is_self_woken_task(async_tasks.load_task(_tid)):
+                self_woken_inflight.append(_tid)
+        except Exception:
+            pass
+    all_self_woken = bool(inflight_tasks) and len(self_woken_inflight) == len(inflight_tasks)
 
     # Heuristic. The active/slow/likely-hung gradient only makes sense when
     # there's actually in-flight work to monitor; otherwise an alive runtime
@@ -3453,6 +3662,8 @@ def pair_status(name: str, last_n_log: int = 5, verbose: bool = False) -> str:
         heuristic = f"slow ({idle_seconds:.0f}s since last log line; still working but worth watching)"
     else:
         heuristic = f"likely-hung ({idle_seconds:.0f}s idle — consider pair_log to inspect, then pair_stop if truly stuck)"
+    if all_self_woken and local_corpse_exit is None:
+        heuristic = f"self-woken turn in progress — {heuristic}"
 
     # Recent log lines
     recent_lines: list[str] = []
@@ -3473,6 +3684,7 @@ def pair_status(name: str, last_n_log: int = 5, verbose: bool = False) -> str:
             "idle_seconds": idle_seconds,
             "heuristic": heuristic,
             "inflight_async_tasks": inflight_tasks,
+            "self_woken_inflight": self_woken_inflight,
             "recent_log_lines": recent_lines,
             "persistent": spec.persistent,
         }, indent=2, default=str)
@@ -3491,7 +3703,15 @@ def pair_status(name: str, last_n_log: int = 5, verbose: bool = False) -> str:
             ids_str = ", ".join(inflight_tasks)
         else:
             ids_str = ", ".join(t[:8] for t in inflight_tasks[:3]) + "..."
-        lines.append(f"  in-flight async tasks: {len(inflight_tasks)} ({ids_str})")
+        _sw = ""
+        if self_woken_inflight:
+            _sw = (
+                " — self-woken: the pair resumed on its own after background work; "
+                "no pair_send behind it. pair_poll(name, wait_seconds=N) or the wait.py "
+                "watcher waits for it"
+                if all_self_woken else f" — {len(self_woken_inflight)} self-woken"
+            )
+        lines.append(f"  in-flight async tasks: {len(inflight_tasks)} ({ids_str}){_sw}")
         # Hint the focused tool. pair_poll is the task-scoped content viewer
         # for ANY status (running/done/failed/stopped); agents otherwise reach
         # for pair_transcript, which is the broader conversation browser.

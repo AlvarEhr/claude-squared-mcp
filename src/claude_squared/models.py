@@ -216,6 +216,57 @@ def newer_version_available(current: str, candidate: str) -> str | None:
     return None
 
 
+# --- Premium (plan-gated, separate-limit) model families (v0.12.0) ----------
+# Families whose availability and cost depend on the subscription plan: they
+# carry their own separate weekly usage limit, consume usage faster than the
+# standard models, and on some plans are not included at all (billed as extra
+# usage credits instead). These are NOT blocked — the user may legitimately
+# want one — but selecting one is a usage/spending decision the *user* must
+# make, so we surface a confirmation prompt at every switch point.
+#
+# Keyed by FAMILY (via ``parse_model_id``) so every spelling matches with one
+# entry: bare alias ``fable``, ``claude-fable-5``, ``claude-fable-5[1m]``, and
+# any future ``claude-fable-6``.
+#
+# THIS TABLE ROTS — it encodes Anthropic's commercial terms, which change
+# without notice and are not discoverable from the CLI (there is no "is this
+# premium?" flag to query, nor a plan-tier field in ``claude auth status``,
+# which is why it is hardcoded at all). Each entry carries the date it was
+# last confirmed; re-verify before trusting an old one, and delete the entry
+# outright if a family becomes a standard included model on every plan.
+_PREMIUM_FAMILIES: dict[str, str] = {
+    # Fable 5: included on Max 20x (own weekly limit, higher usage burn);
+    # NOT included on Pro (billed as extra usage credits); Max 5x unverified.
+    # Confirmed by the user 2026-08-07 on Max 20x — the earlier 2026-06 reading
+    # of "billed outside the subscription" was taken on a Pro plan.
+    "fable": "is a premium model: it has its own separate weekly usage limit, "
+             "consumes usage faster than standard models, and is only included "
+             "on some plans (Max 20x: included; Pro: not included, billed as "
+             "extra usage credits; Max 5x: unverified) (confirmed 2026-08-07)",
+}
+
+
+def premium_model_note(model: str) -> str | None:
+    """Warn when ``model`` is a premium (plan-gated) family; else ``None``.
+
+    Returns a message intended to be shown to the CALLING AGENT at the moment
+    of the switch, telling it to confirm the choice with the user before
+    proceeding. Deliberately advisory — nothing here blocks the model.
+    """
+    family, _ = parse_model_id(model)
+    if family is None:
+        return None
+    reason = _PREMIUM_FAMILIES.get(family)
+    if reason is None:
+        return None
+    return (
+        f"⚠ PREMIUM MODEL: '{normalize_model_id(model)}' {reason}. "
+        f"This is allowed, but it is a usage/spending decision — confirm the "
+        f"user explicitly asked for {family} before continuing, and switch back "
+        f"to a standard model (e.g. 'opus') when done."
+    )
+
+
 class PairSpec(BaseModel):
     """Persistent pair configuration stored in the registry."""
 
@@ -223,6 +274,12 @@ class PairSpec(BaseModel):
     backend: Backend = "claude"
     session_id: str = Field(..., description="UUID of underlying session")
     purpose: str = ""
+    # v0.12.0: self-woken turns that completed since the last pair_send, parked
+    # here by the runtime's reader thread (see runtime._record_self_woken) and
+    # popped by the next send for its ⏮ footer. On the spec — not in runtime
+    # memory — because the next send respawns the runtime (see is_stale) and
+    # because any MCP process should see them. Capped at the newest 25.
+    self_woken_pending: list[dict[str, Any]] = Field(default_factory=list)
     model: str = "opus"
     # Nullable since haiku has no effort knob. The runtime/adapter omits the
     # ``--effort`` CLI arg when this is None. Default is xhigh (opus' default);
@@ -372,6 +429,32 @@ class SendResult(BaseModel):
     # "A newer model in this pair's family is available" — set by the server's
     # once-per-spawn send-time drift check (pair version vs parent version).
     drift_note: str | None = None
+    # v0.12.0: set when this turn's ``override_model`` selected a premium
+    # (plan-gated, separate-limit) family — a per-call switch the agent should
+    # confirm with the user. NOT set for a pair whose spec already sits on a
+    # premium model: that switch was warned about at pair_create/pair_update,
+    # and re-warning on every turn would be noise.
+    premium_note: str | None = None
+    # v0.12.0 self-woken turns (see runtime.PairRuntime._open_implicit_turn).
+    # This turn launched background work (Agent run_in_background / Bash
+    # run_in_background / Workflow) and ended before it finished — the reply
+    # may be a placeholder. One entry per launch: "agent" / "bash" / "workflow".
+    # The continuation is tracked as its own async task when it arrives.
+    background_launches: list[str] = Field(default_factory=list)
+    # Self-woken turns that COMPLETED between the previous send and this one
+    # (the pair resumed on its own after background work finished). Each entry:
+    # {task_id, status, log_line_start, log_line_end, response_preview,
+    # cost_usd, subtype}. task_id is None for an unattributed completion (a
+    # result event that arrived with no open scope at all).
+    self_woken_completed: list[dict[str, Any]] = Field(default_factory=list)
+    # Seconds this send waited for an in-progress self-woken turn to finish
+    # before writing its message (it queues FIFO behind the pair's own work).
+    # None when it didn't have to wait.
+    self_woken_waited_s: float | None = None
+    # Raw ``terminal_reason`` from the result envelope ('completed' on a normal
+    # finish; CLI 2.1.224). Surfaced verbatim when it's anything else — not
+    # interpreted, the other values aren't repro-verified.
+    terminal_reason: str | None = None
 
 
 class CompactResult(BaseModel):

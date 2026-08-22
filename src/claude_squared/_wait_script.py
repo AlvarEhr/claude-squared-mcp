@@ -95,6 +95,18 @@ def _latest_task_for_pair(pair_name: str) -> str | None:
     return best_id
 
 
+def _is_self_woken(task_id: str) -> bool:
+    """Mirror of async_tasks.is_self_woken_task (v0.12.0): a task the pair's
+    runtime registered for a turn the pair started ON ITS OWN (background work
+    completed and it resumed) — no pair_send behind it. Prefix literal kept in
+    sync with async_tasks.SELF_WOKEN_MESSAGE_PREFIX (stdlib-only here)."""
+    try:
+        data = json.loads(_state_path(task_id).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return str(data.get("message") or "").startswith("<self-woken turn>")
+
+
 def _find_tasks_by_prefix(prefix: str) -> list[str]:
     """Return task IDs whose file basename starts with `prefix`.
 
@@ -201,6 +213,13 @@ def main(argv: list[str]) -> int:
         latest = _latest_task_for_pair(task_id)
         if latest:
             print(f"resolved pair '{arg}' -> latest task {latest}", file=sys.stderr)
+            if _is_self_woken(latest):
+                print(
+                    "  note: that is a SELF-WOKEN turn (the pair resumed on its own after "
+                    "background work; no pair_send behind it). Pass an explicit task id "
+                    "to wait on a specific pair_send instead.",
+                    file=sys.stderr,
+                )
             task_id = latest
             state_file = _state_path(task_id)
             break

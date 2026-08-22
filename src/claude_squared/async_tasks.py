@@ -320,12 +320,95 @@ def wait_for_task(task_id: str, timeout_s: float) -> AsyncTaskState | None:
     state = load_task(task_id)
     if state is None:
         return None
-    if state.status in ("done", "failed"):
+    if state.status in ("done", "failed", "stopped"):
         # Free the event now that the task is observed terminal — don't leak
         # entries indefinitely. Subsequent waiters that arrive AFTER completion
         # will find load_task already returns the terminal state synchronously.
+        # (v0.12.0: "stopped" added — it leaked an entry per pair_stop before.)
         _drop_event(task_id)
     return state
+
+
+# --- v0.12.0 self-woken turns -------------------------------------------------
+# A pair can resume ON ITS OWN after background work it launched (Agent
+# run_in_background / Bash run_in_background / Workflow) completes — Claude
+# Code's notify-and-resume fires because the persistent runtime keeps stdin
+# open. Those turns have no pair_send behind them. The runtime's reader thread
+# registers each one here as an "external" task with the SAME on-disk shape as
+# start_task, so every consumer — pair_status's in-flight list, pair_poll,
+# wait.py, pair_stop, orphan reaping, cross-process visibility — sees it with
+# zero special-casing. The message prefix is the only discriminator; wait.py
+# mirrors it as a literal (stdlib-only, can't import this).
+SELF_WOKEN_MESSAGE_PREFIX = "<self-woken turn>"
+SELF_WOKEN_MESSAGE = (
+    f"{SELF_WOKEN_MESSAGE_PREFIX} the pair resumed on its own after background "
+    f"work (sub-agent / background command / workflow) completed — there is no "
+    f"pair_send behind this turn"
+)
+# Error prefix for a self-woken turn the reaper finalized because it produced
+# no log activity for a full idle period (its owner is alive, so orphan reaping
+# would never touch it; without the reaper it would sit "running" forever).
+ABANDONED_ERROR_PREFIX = "ABANDONED: "
+
+
+def is_self_woken_task(state_or_message: "AsyncTaskState | str | None") -> bool:
+    msg = (state_or_message if isinstance(state_or_message, str)
+           else getattr(state_or_message, "message", None)) or ""
+    return msg.startswith(SELF_WOKEN_MESSAGE_PREFIX)
+
+
+def register_external_task(pair_name: str, message: str) -> AsyncTaskState:
+    """Register a RUNNING task for work this process observes but did not start.
+
+    No worker thread — the observer finalizes it via ``finalize_external_task``.
+    Creates the in-process Event so ``wait_for_task`` / ``pair_poll(wait_seconds)``
+    wake instantly on completion, exactly like a ``start_task`` task.
+    """
+    now = datetime.utcnow()
+    if now.microsecond == 0:
+        # ``latest_task_id_for_pair`` orders by the ISO string; pydantic drops
+        # the fractional part when microsecond == 0, which would sort this task
+        # BELOW a same-second sibling that kept its microseconds. Nudge by 1µs.
+        now = now.replace(microsecond=1)
+    state = AsyncTaskState(
+        task_id=str(uuid.uuid4()),
+        pair_name=pair_name,
+        message=message,
+        status="running",
+        started_at=now,
+        owner_pid=os.getpid(),
+    )
+    _save(state)
+    _get_or_create_event(state.task_id)
+    return state
+
+
+def finalize_external_task(
+    state: AsyncTaskState,
+    *,
+    status: str,
+    result: "SendResult | None" = None,
+    error: str | None = None,
+) -> AsyncTaskState:
+    """Move an external task to a terminal state. IDEMPOTENT — a task that has
+    already left ``running`` is returned unchanged (stop()/evict can race the
+    reader's own finalize, and stop() can run twice on the same runtime)."""
+    if state.status != "running":
+        return state
+    state.status = status  # type: ignore[assignment]
+    state.result = result if status == "done" else None
+    state.error = error
+    state.finished_at = datetime.utcnow()
+    _save(state)
+    _get_or_create_event(state.task_id).set()
+    _clear_stopped(state.task_id)
+    return state
+
+
+def was_stopped(task_id: str) -> bool:
+    """Public read of the in-process pair_stop marker (the runtime's finalize
+    path needs it to label an interrupted self-woken turn "stopped")."""
+    return _was_stopped(task_id)
 
 
 def find_task_by_prefix(prefix: str) -> list[str]:
@@ -350,8 +433,12 @@ def find_task_by_prefix(prefix: str) -> list[str]:
     return out
 
 
-def latest_task_id_for_pair(pair_name: str) -> str | None:
+def latest_task_id_for_pair(pair_name: str, *, solicited_only: bool = False) -> str | None:
     """Return the most-recently-STARTED task id for a pair, or None if it has none.
+
+    ``solicited_only=True`` skips self-woken turns (v0.12.0) — used to name the
+    latest *pair_send* task next to a self-woken one so a by-name poll can't be
+    mistaken for the answer to the caller's own message.
 
     Lets ``pair_poll`` accept a pair NAME instead of a UUID — agents fumble the
     long task id, but they always know the pair's name. "Most recent" = max
@@ -370,6 +457,8 @@ def latest_task_id_for_pair(pair_name: str) -> str | None:
         except (OSError, json.JSONDecodeError):
             continue
         if data.get("pair_name") != pair_name:
+            continue
+        if solicited_only and is_self_woken_task(str(data.get("message") or "")):
             continue
         started = data.get("started_at") or ""
         # ISO-8601 strings sort lexicographically in chronological order, so a

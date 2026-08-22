@@ -229,6 +229,37 @@ Same on-disk state file (`~/.claude/pairs/async/<task_id>.json`); the MCP writes
 atomically so a watcher in a different process (different MCP install) sees the
 result.
 
+## Self-woken turns (v0.12.0)
+
+A pair that launches background work — `Agent(run_in_background=True)`, a
+background `Bash`, or a `Workflow` — ends its turn with a **placeholder** reply
+("recon's out, I'll synthesize when it lands"). Claude Code's notify-and-resume
+then fires (the persistent runtime keeps stdin open) and the pair **resumes on
+its own** with the real deliverable. claude-squared tracks that continuation as
+its own async task, so nothing about it is hidden:
+
+- the placeholder reply's footer says `⏳ BACKGROUND WORK LAUNCHED (…)` — don't
+  re-send; the continuation is coming;
+- `pair_status(name)` reports **self-woken turn in progress** (the active /
+  slow / likely-hung gradient applies) while it runs;
+- `pair_poll(name, wait_seconds=30)` or the `wait.py` watcher **by name** waits
+  for it — `pair_poll(name)` resolves to the *latest* task, which may be the
+  self-woken one: it's labeled, and the latest `pair_send` task is named next to
+  it;
+- your **next** `pair_send` queues behind an in-progress continuation (FIFO — its
+  result is never mistaken for your answer; a send from *another* MCP process
+  queues behind it too) and its footer lists
+  `⏮ N SELF-WOKEN TURN(S) completed since your last send` with task ids, log
+  ranges and cost;
+- `main.log` shows `=== SELF-WOKEN TURN (task …) ===`, `[background launch: …]`
+  and the CLI's `task_notification` so the wake-up has a visible cause.
+
+Sub-agent use is **not** gated — blocking fan-out stays the recommended shape,
+and background launches are simply tracked. One caveat: a continuation that goes
+silent for a full idle period (10 min) is finalized as `ABANDONED:` by a reaper so
+it can't sit in flight forever; if the work later resumes, a fresh self-woken
+turn opens.
+
 ## Mid-flight config changes
 
 `pair_update` propagation depends on the field category — three buckets:
@@ -266,6 +297,8 @@ Mutable via `pair_update(allowed_invocations=...)` **without runtime eviction** 
 
 ## Limits / known issues
 
+- **Idle pairs expire: the Claude CLI deletes old session transcripts.** Claude Code runs a transcript-retention cleanup governed by `cleanupPeriodDays` in `~/.claude/settings.json` (unset → the CLI's own default, 30 days). It deletes exactly the session JSONLs a pair resumes from, so a pair left untouched for longer becomes unresumable and the next `pair_send` fails with `SessionMissing`. **If you rely on long-lived pairs, set `cleanupPeriodDays` to a large value** (e.g. `36500`) — this MCP cannot do it for you (it never writes your `settings.json`). It **cannot be disabled**: the minimum is `1`, and `0` is a trap — it fails validation, and [historically](https://github.com/anthropics/claude-code/issues/23710) disabled transcript *writing* altogether. Don't reach for `CLAUDE_CODE_SKIP_PROMPT_HISTORY` either; it disables transcript writes and breaks every pair. Note the sweep runs on interactive/desktop startup, not on the headless `claude -p` calls pairs use — so pairs never trigger it, and you can't test it through them. Recovery when it does happen: the pair's own `~/.claude/pairs/logs/<name>/main.log` is written by this MCP and is **not** affected, so the content survives; `pair_clear(name)` rotates the pair onto a fresh session while preserving all pinned config, after which it works normally. You lose the resumable conversation, not the record of it.
+- **Premium models warn, they don't block (v0.12.0).** Plan-gated model families (currently Fable — own weekly limit, faster usage burn, included on Max 20x but not on Pro) raise a `💳 PREMIUM MODEL` confirmation notice whenever a pair is *switched* onto one (`pair_create` / `pair_update` / `pair_settings_set` / a per-send `override_model`) rather than being refused — it's the user's call, not the MCP's. The table encodes Anthropic's commercial terms and is dated in-source; verify before trusting it.
 - Gemini adapter not implemented (Gemini's `--resume` uses index, not UUID — needs more design work).
 - Permission denials are surfaced but not retried automatically; the calling agent decides what to do.
 - No automatic compaction; the warning at ≥60% is informational. Caller must invoke `pair_compact`.

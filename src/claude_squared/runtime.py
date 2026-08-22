@@ -36,8 +36,10 @@ from typing import Any, Callable, TYPE_CHECKING
 
 from claude_squared.cli_paths import encode_cwd_for_project as _encode_cwd_for_project
 from claude_squared.errors import CLIError, CommandTimeout
-from claude_squared.models import PairSpec
+from claude_squared import async_tasks as _async_tasks
+from claude_squared.models import AsyncTaskState, PairSpec
 from claude_squared.registry import claude_home, logs_dir
+from claude_squared.registry import get_pair as _reg_get_pair, update_pair as _reg_update_pair
 
 if TYPE_CHECKING:
     from claude_squared.adapters.claude import ClaudeAdapter
@@ -390,6 +392,13 @@ class TurnLogScope:
         self.start_line = start_line
         self.end_line = start_line
         self.subagent_logs: list[str] = []  # paths to sub-agent log files this turn produced
+        # v0.12.0: background launches observed in this turn ("agent" / "bash" /
+        # "workflow") — the turn may end before they finish (placeholder reply).
+        self.background_launches: list[str] = []
+        # v0.12.0: reader-side snapshot taken the instant this turn's result
+        # event was attributed (exact end_line). send() prefers it over the
+        # live fields, which a self-woken continuation may already have moved.
+        self.result_snapshot: dict[str, Any] | None = None
 
 
 class PairRuntime:
@@ -430,8 +439,18 @@ class PairRuntime:
         # "potentially hung" (no log activity for minutes despite alive runtime).
         self._last_log_activity_at: datetime | None = None
 
-        # Sub-agent tracking
+        # Sub-agent tracking. v0.12.0: the counter resumes from the highest
+        # existing subagent-N-*.log in this pair's log dir, so a respawn (idle
+        # eviction, pair_update, stale-JSONL respawn) no longer restarts the
+        # numbering at 1 and appends a second "#1" onto an older file.
         self._subagent_counter = 0
+        try:
+            for _p in self.log_dir.glob("subagent-*-*.log"):
+                _n = _p.name.split("-", 2)[1]
+                if _n.isdigit():
+                    self._subagent_counter = max(self._subagent_counter, int(_n))
+        except Exception:
+            pass
         # tool_use_id -> {"n": int, "type": str, "started_ts": float, "description": str}
         self._pending_subagents: dict[str, dict] = {}
         self._subagent_seen_jsonls: set[str] = set()
@@ -452,6 +471,35 @@ class PairRuntime:
         # PairRuntime) resets it. Anti-nag dedup across spawns lives in the
         # persisted spec.last_drift_notice, not here.
         self._drift_checked: bool = False
+
+        # v0.12.0 self-woken turns. The pair can resume ON ITS OWN after
+        # background work it launched (Agent run_in_background / Bash
+        # run_in_background / Workflow) completes — Claude Code's
+        # notify-and-resume fires because this persistent runtime keeps stdin
+        # open. Those turns have no send() behind them; the reader thread
+        # tracks them as an "implicit" scope + an on-disk async task so every
+        # consumer (pair_status, pair_poll, wait.py, pair_stop, orphan reaping,
+        # other MCP processes) sees them unchanged.
+        #
+        # ``_scope_lock`` guards ONLY the pointer flips of _current_scope /
+        # _implicit_scope / _implicit_task / _completed_since_send. It is never
+        # held across I/O: stop() runs under the global RuntimeRegistry lock and
+        # must not stall every pair behind a reader doing file writes. Lock
+        # order where both are needed: _scope_lock → _main_log_lock, never the
+        # reverse.
+        self._scope_lock = threading.Lock()
+        self._implicit_scope: TurnLogScope | None = None
+        self._implicit_task: AsyncTaskState | None = None
+        self._implicit_done = threading.Event()
+        self._implicit_done.set()  # set == no self-woken turn in progress
+        # Completed self-woken turns are NOT kept here — they're parked on the
+        # spec (PairSpec.self_woken_pending) via _record_self_woken, because the
+        # next send respawns this runtime (see is_stale) and the records must
+        # survive that, and because another MCP process should see them too.
+        # Bumped by the reader on EVERY result event (solicited or not) — the
+        # ack signal send_interrupt waits for. Log growth alone is ambiguous
+        # during a self-woken turn, which produces log lines continuously.
+        self._result_seq: int = 0
 
     @staticmethod
     def _count_existing_lines(p: Path) -> int:
@@ -486,6 +534,23 @@ class PairRuntime:
         Returns False on the first send (no prior mtime to compare against) and
         when the file is missing (degenerate; let normal flow surface the issue).
         """
+        # v0.12.0: a self-woken turn IN PROGRESS is writing the JSONL right now
+        # — that's us, not another process. Pre-v0.12.0 this returned True
+        # here, the adapter evicted, and evict's tree-kill (/T) took the pair's
+        # in-flight background work with it. The adapter now waits for the turn
+        # BEFORE calling this (wait_for_implicit_idle); this guard is the belt.
+        #
+        # The watermark IS refreshed when a self-woken turn finalizes, so the
+        # warm runtime survives (a respawn would tree-kill background
+        # sub-agents still running). That would swallow a coexisting MCP
+        # process's write made DURING the turn — so the server makes that
+        # impossible instead: another process's send waits for our on-disk
+        # self-woken task before it spawns on the JSONL
+        # (server._wait_for_foreign_self_woken). The sequential case this
+        # check exists for (idle runtime, other process writes, we resume
+        # later) is unchanged. Historian-caught, 2026-08-22.
+        if self._implicit_scope is not None:
+            return False
         if self._last_seen_jsonl_mtime is None:
             return False
         cur = self._current_jsonl_mtime()
@@ -546,8 +611,25 @@ class PairRuntime:
         for raw in iter(self.proc.stdout.readline, b""):
             try:
                 line = raw.decode("utf-8", errors="replace")
-                self._stdout_q.put(line)
-                self._on_event_for_log(line)
+                # v0.12.0: attribute/log FIRST, queue SECOND. Otherwise send()
+                # can pull a result off the queue, return, and clear
+                # _current_scope before the reader has attributed that same
+                # line — manufacturing a phantom "self-woken" completion.
+                # Processing first means every queued line is already
+                # attributed to the scope that was open when it arrived.
+                try:
+                    self._on_event_for_log(line)
+                except Exception:
+                    pass
+                # Only a SOLICITED turn has a consumer for the queue. Lines
+                # arriving with no send() scope open belong to self-woken turns
+                # (already logged + tracked above); queueing them would grow
+                # memory without bound on a pair that wakes itself for hours,
+                # and send() would only drain them at entry anyway.
+                with self._scope_lock:
+                    wanted = self._current_scope is not None
+                if wanted:
+                    self._stdout_q.put(line)
             except Exception:
                 pass
 
@@ -601,27 +683,25 @@ class PairRuntime:
             self.proc.stdin.flush()
         except (BrokenPipeError, OSError):
             return False
-        # Wait for a result event (any subtype — typically error_during_execution).
-        # We use a separate marker queue lookup since the normal stdout_q is drained
-        # by whoever's currently in send(). To minimize fighting, we passively look
-        # at the log timestamp: if main.log gets a new line within the window AND
-        # process is still alive, treat it as acknowledged.
-        # Simpler heuristic: just wait `wait_for_result_seconds`, then check if the
-        # process is still alive. If it is and a recent log entry shows a TURN END
-        # / error, success. We approximate by checking last activity.
+        # Wait for a RESULT event (any subtype — typically error_during_execution).
+        # v0.12.0: the reader bumps ``_result_seq`` on every result, solicited
+        # or self-woken, so we don't have to fight send() for the stdout queue.
+        # The pre-v0.12.0 heuristic — "main.log grew by a line" — returned True
+        # unconditionally during a self-woken turn (which logs continuously),
+        # so pair_stop reported "interrupt acked" even when the CLI dropped it.
         deadline = time.monotonic() + wait_for_result_seconds
-        last_seen_lines = self._main_log_lines
+        seq0 = self._result_seq
         while time.monotonic() < deadline:
             if not self.is_alive():
                 # Subprocess died — interrupt may have triggered crash, not graceful
                 return False
-            # If main.log grew by ≥1 line AND last_activity bumped, interrupt likely processed
-            if self._main_log_lines > last_seen_lines:
-                # Some event arrived; let it settle one tick to capture the result
+            if self._result_seq > seq0:
+                # The ack result arrived; let it settle one tick so the turn
+                # marker / task finalization land before the caller reports.
                 time.sleep(0.3)
                 return True
             time.sleep(0.1)
-        # Timed out waiting for activity — interrupt may not have been received
+        # Timed out waiting for a result — interrupt may not have been received
         # OR the runtime is in a non-responsive state (true wedge).
         return False
 
@@ -636,6 +716,15 @@ class PairRuntime:
 
         Returns a short outcome string for telemetry.
         """
+        # v0.12.0: finalize any self-woken turn FIRST — after the tree-kill no
+        # result event will ever arrive to close it, and its task would sit
+        # "running" forever (owner alive → orphan reaping never touches it).
+        # Before the proc check on purpose: a runtime whose proc already died
+        # can still hold an open implicit scope.
+        self._abort_implicit_turn(
+            "runtime stopped/evicted while a self-woken turn was in progress — "
+            "its background work was tree-killed with it"
+        )
         if self.proc is None:
             return "no runtime"
         pid = self.proc.pid
@@ -711,6 +800,9 @@ class PairRuntime:
                 self.last_activity = now
                 if self._current_scope is not None:
                     self._current_scope.end_line = self._main_log_lines
+                # v0.12.0: a self-woken turn's scope tracks its range the same way.
+                if self._implicit_scope is not None:
+                    self._implicit_scope.end_line = self._main_log_lines
             except Exception:
                 pass
 
@@ -723,6 +815,26 @@ class PairRuntime:
             ev = json.loads(line)
         except Exception:
             return
+
+        # v0.12.0 self-woken turn tracking. Only the PAIR's OWN events count:
+        # events produced inside a sub-agent stream through with
+        # parent_tool_use_id set (verified CLI 2.1.224) and must NOT open a
+        # turn — they arrive between turns constantly and have no result of
+        # their own (→ a phantom task that never closes, forever in-flight).
+        # system.init is deliberately NOT part of the predicate: a self-woken
+        # continuation doesn't necessarily start with one (par6 log: the parent
+        # kept working for 10 min after a result with no init in between).
+        ev_type = ev.get("type")
+        if ev_type in ("assistant", "user") and not ev.get("parent_tool_use_id"):
+            with self._scope_lock:
+                needs_open = self._current_scope is None and self._implicit_scope is None
+            if needs_open:
+                self._open_implicit_turn()
+        elif ev_type == "system" and ev.get("subtype") in ("task_started", "task_notification"):
+            # Structured background-task lifecycle events (CLI 2.1.224). Logged
+            # so main.log shows WHY a pair woke up. Best-effort field reads —
+            # the shape isn't contractual.
+            self._log_task_lifecycle_event(ev)
 
         # Detect sub-agent SPAWN (assistant.tool_use of Agent) — special-cased for the
         # bookend label + log extraction. The T-N tag still gets assigned (so main.log
@@ -779,6 +891,7 @@ class PairRuntime:
                         self._append_main_log_line(
                             f"[{ts}] [{tag}] [<- sub-agent #{n} returned] {preview}"
                         )
+                        self._note_background_launch(res, tag)
                         try:
                             self._extract_subagent_log(n, sub_type, started_ts)
                         except Exception as e:
@@ -797,6 +910,7 @@ class PairRuntime:
                     self._append_main_log_line(
                         f"[{ts}] [{tag}] [tool_result{err_tag}] {preview}"
                     )
+                    self._note_background_launch(res, tag)
                 return
 
         # Default formatting for everything else (Agent tool_uses + their tool_results
@@ -806,6 +920,11 @@ class PairRuntime:
             skip_tool_names={"Agent"}, skip_user_tool_results=True,
         ):
             self._append_main_log_line(line_out)
+
+        # v0.12.0: attribute the result AFTER its TURN marker has been written,
+        # so a self-woken turn's recorded log range includes the marker.
+        if ev_type == "result":
+            self._after_result(ev)
 
     def _extract_subagent_log(self, n: int, sub_type: str, started_ts: float) -> None:
         """Find the sub-agent's JSONL and schedule deferred extraction.
@@ -851,6 +970,326 @@ class PairRuntime:
 
         threading.Thread(target=_bg_extract, daemon=True,
                          name=f"subagent-extract-{self.spec.name}-{n}").start()
+
+    # ---- v0.12.0 self-woken turns ----
+
+    _BG_LAUNCH_MARKERS = (
+        # (lowercased tool_result text marker, kind). All three are verbatim
+        # CLI-generated tool_result text — the model never writes tool_results,
+        # so they can't be paraphrased. Counted across the user's pair logs on
+        # 3+ dates: 105 / 2 / 2 occurrences, never varied. Matched on the first
+        # 400 chars of the result, lowercased.
+        ("async agent launched successfully", "agent"),
+        ("command running in background with id", "bash"),
+        ("workflow launched in background", "workflow"),
+    )
+
+    def _note_background_launch(self, res: Any, tag: str) -> None:
+        """Reader thread. Record a background launch on whichever scope is
+        open and say so in main.log — this is the turn that will end with a
+        placeholder reply."""
+        try:
+            raw = res if isinstance(res, str) else json.dumps(res, default=str)
+        except Exception:
+            return
+        head = raw[:400].lower()
+        kind = next((k for marker, k in self._BG_LAUNCH_MARKERS if marker in head), None)
+        if kind is None:
+            return
+        with self._scope_lock:
+            scope = self._current_scope or self._implicit_scope
+            if scope is not None:
+                scope.background_launches.append(kind)
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._append_main_log_line(
+            f"[{ts}] [{tag}] [background launch: {kind}] runs past the end of this "
+            f"turn — the pair will wake itself when it completes"
+        )
+
+    def _log_task_lifecycle_event(self, ev: dict) -> None:
+        """Reader thread. One main.log line per background-task lifecycle
+        event (CLI 2.1.224 ``system`` sub-events); best-effort field reads."""
+        ts = datetime.now().strftime("%H:%M:%S")
+        tid = str(ev.get("task_id") or "?")[:12]
+        if ev.get("subtype") == "task_started":
+            kind = ev.get("task_type") or ev.get("subagent_type") or "task"
+            desc = str(ev.get("description") or "")[:120].replace("\n", " ")
+            self._append_main_log_line(f"[{ts}] [system:task_started] {kind} {tid}: {desc}")
+        else:
+            status = ev.get("status") or "?"
+            summary = str(ev.get("summary") or "")[:160].replace("\n", " ")
+            # No "the pair will now resume" claim here: this fires for blocking
+            # sub-agents too. A self-woken turn announces itself with its own
+            # SELF-WOKEN marker line.
+            self._append_main_log_line(
+                f"[{ts}] [system:task_notification] task {tid} {status}"
+                f"{': ' + summary if summary else ''}"
+            )
+
+    def _open_implicit_turn(self) -> None:
+        """Reader thread. Open a self-woken turn: log scope + on-disk async task."""
+        with self._scope_lock:
+            if self._current_scope is not None or self._implicit_scope is not None:
+                return
+            with self._main_log_lock:
+                start_line = self._main_log_lines + 1
+            scope = TurnLogScope(self.main_log_path, start_line)
+            self._implicit_scope = scope
+            self._implicit_task = None
+            self._implicit_done.clear()
+        # Registration is file I/O — outside the lock (see __init__ note).
+        task: AsyncTaskState | None = None
+        try:
+            task = _async_tasks.register_external_task(
+                self.spec.name, _async_tasks.SELF_WOKEN_MESSAGE,
+            )
+        except Exception:
+            task = None
+        with self._scope_lock:
+            still_ours = self._implicit_scope is scope
+            if still_ours:
+                self._implicit_task = task
+        if not still_ours:
+            # stop()/abort raced us between the pointer flip and registration.
+            if task is not None:
+                try:
+                    _async_tasks.finalize_external_task(
+                        task, status="stopped",
+                        error="stopped: runtime stopped while the self-woken turn was starting",
+                    )
+                except Exception:
+                    pass
+            return
+        ts = datetime.now().strftime("%H:%M:%S")
+        tid = task.task_id[:8] if task is not None else "untracked"
+        # Deliberately does NOT match the ``=== TURN <x> (Nms) ===`` regex that
+        # slices turns for pair_poll — this line OPENS a turn, the result's
+        # marker closes it.
+        self._append_main_log_line(
+            f"[{ts}] === SELF-WOKEN TURN (task {tid}) — the pair resumed on its own "
+            f"after background work completed; no pair_send behind this turn ==="
+        )
+
+    def _record_self_woken(self, record: dict[str, Any]) -> None:
+        """Park a completed/aborted self-woken turn on the spec for the next
+        send's ⏮ footer. Registry RMW under its filelock; newest 25 kept.
+        Never raises (reader thread / stop path)."""
+        try:
+            cur = _reg_get_pair(self.spec.name)
+            pending = list(cur.self_woken_pending or []) + [record]
+            _reg_update_pair(self.spec.name, self_woken_pending=pending[-25:])
+        except Exception:
+            pass
+
+    def _abort_implicit_turn(self, reason: str, *, status: str = "stopped") -> bool:
+        """Finalize an open self-woken turn WITHOUT a result event (stop/evict,
+        or the reaper). Safe from any thread. Returns True if there was one."""
+        with self._scope_lock:
+            scope, task = self._implicit_scope, self._implicit_task
+            if scope is None:
+                return False
+            self._implicit_scope = None
+            self._implicit_task = None
+        if task is not None:
+            try:
+                _async_tasks.finalize_external_task(task, status=status, error=reason)
+            except Exception:
+                pass
+        self._record_self_woken({
+            "task_id": task.task_id if task is not None else None,
+            "status": status,
+            "log_line_start": scope.start_line,
+            "log_line_end": scope.end_line,
+            "response_preview": "",
+            "cost_usd": 0.0,
+            "subtype": None,
+            "note": reason,
+        })
+        self._implicit_done.set()
+        try:
+            ts = datetime.now().strftime("%H:%M:%S")
+            self._append_main_log_line(
+                f"[{ts}] === SELF-WOKEN TURN {status.upper()}: {reason} ==="
+            )
+        except Exception:
+            pass
+        return True
+
+    def _after_result(self, ev: dict) -> None:
+        """Reader thread, on EVERY result event. Solicited → snapshot the exact
+        log range for send(). Otherwise → close the self-woken turn (or record
+        an unattributed completion). Never CREATES state on the result path."""
+        self._result_seq += 1
+        with self._scope_lock:
+            solicited = self._current_scope
+            if solicited is not None:
+                solicited.result_snapshot = {
+                    "end_line": solicited.end_line,
+                    "subagent_logs": list(solicited.subagent_logs),
+                    "background_launches": list(solicited.background_launches),
+                }
+                return
+            scope, task = self._implicit_scope, self._implicit_task
+            self._implicit_scope = None
+            self._implicit_task = None
+        self._close_implicit_turn(ev, scope, task)
+
+    def _close_implicit_turn(
+        self, ev: dict, scope: TurnLogScope | None, task: AsyncTaskState | None,
+    ) -> None:
+        # The pair wrote its OWN session JSONL during this turn. Refresh the
+        # stale-mtime watermark so the next send keeps the warm runtime (its
+        # in-memory view IS current — same claude.exe) instead of evicting,
+        # which would tree-kill any background sub-agents still running.
+        # Sound because another MCP process can't have written meanwhile: its
+        # send waits for our on-disk self-woken task first
+        # (server._wait_for_foreign_self_woken). See is_stale().
+        self._last_seen_jsonl_mtime = self._current_jsonl_mtime()
+        self.last_activity = datetime.utcnow()
+        cost = float(ev.get("total_cost_usd") or 0.0)
+        subtype = ev.get("subtype") or ""
+        record: dict[str, Any] = {
+            "task_id": task.task_id if task is not None else None,
+            # A result with no open scope at all: a turn that produced no
+            # top-level content (nothing to finalize). Recorded so the next
+            # send's footer still mentions it.
+            "status": "unattributed",
+            "log_line_start": scope.start_line if scope is not None else self._main_log_lines,
+            "log_line_end": scope.end_line if scope is not None else self._main_log_lines,
+            "response_preview": str(ev.get("result") or "")[:200],
+            "cost_usd": cost,
+            "subtype": subtype,
+        }
+        if scope is not None:
+            ev["_log_scope"] = {
+                "log_path": str(scope.main_log_path),
+                "start_line": scope.start_line,
+                "end_line": scope.end_line,
+                "subagent_logs": list(scope.subagent_logs),
+                "background_launches": list(scope.background_launches),
+            }
+            result = None
+            error: str | None = None
+            try:
+                result = self.adapter._build_send_result(self.spec, ev)  # noqa: SLF001
+            except Exception as e:
+                error = f"{type(e).__name__}: {e}"
+            status = "done"
+            if (task is not None and _async_tasks.was_stopped(task.task_id)
+                    and subtype == "error_during_execution"):
+                # pair_stop interrupted THIS turn (the CLI acked with
+                # error_during_execution). A stop marker on a turn that still
+                # completed normally (drain_queue racing a fresh wake) stays
+                # "done" — the work happened.
+                status, error = "stopped", "stopped by pair_stop"
+            elif error is not None:
+                status = "failed"
+            if task is not None:
+                try:
+                    _async_tasks.finalize_external_task(
+                        task, status=status, result=result, error=error,
+                    )
+                except Exception:
+                    pass
+            record["status"] = status
+            # Registry totals — the server's send runner does this for
+            # solicited turns; nobody else will for this one. A self-woken
+            # turn can't overlap a solicited turn's read-modify-write (send()
+            # queues behind it), so the plain RMW is safe in practice.
+            try:
+                cur = _reg_get_pair(self.spec.name)
+                _reg_update_pair(
+                    self.spec.name,
+                    turn_count=cur.turn_count + 1,
+                    total_cost_usd=cur.total_cost_usd + cost,
+                    last_active_at=datetime.utcnow(),
+                )
+            except Exception:
+                pass
+        self._record_self_woken(record)
+        self._implicit_done.set()
+
+    def wait_for_implicit_idle(
+        self, timeout_seconds: int | None, should_stop: "Callable[[], bool] | None",
+    ) -> float:
+        """Block until no self-woken turn is in progress. Returns seconds waited.
+
+        Called by the adapter BEFORE its stale check (so a self-woken turn is
+        never evicted mid-flight) and again at send() entry as the belt. Bounded
+        exactly like the read loop: timeout_seconds → CommandTimeout, should_stop
+        → in-band interrupt then CLIError once the turn has ended, proc death →
+        the implicit task is finalized CRASHED and CLIError is raised.
+
+        Why wait rather than interleave: a message written while the CLI is
+        mid self-woken turn is processed AFTER that turn, and its result would
+        arrive after the self-woken turn's — send() would return the wrong one
+        (the original placeholder handback, inverted).
+        """
+        t0 = time.monotonic()
+        end = (t0 + timeout_seconds) if timeout_seconds is not None else None
+        last_stop_check = 0.0
+        interrupted = False
+        while True:
+            with self._scope_lock:
+                open_now = self._implicit_scope is not None
+            if not open_now:
+                if interrupted:
+                    raise CLIError(
+                        "send cancelled by pair_stop before the message was written",
+                        stderr=self._collect_stderr(),
+                    )
+                return time.monotonic() - t0
+            if end is not None and time.monotonic() >= end:
+                raise CommandTimeout(self.spec.name, timeout_seconds)
+            if not self.is_alive():
+                self._abort_implicit_turn(
+                    f"{CRASHED_ERROR_PREFIX}pair runtime exited mid self-woken turn",
+                    status="failed",
+                )
+                raise CLIError(
+                    f"{CRASHED_ERROR_PREFIX}pair runtime exited during a self-woken turn "
+                    f"(before this message was written)",
+                    stderr=self._collect_stderr(),
+                )
+            if should_stop is not None:
+                now_m = time.monotonic()
+                if now_m - last_stop_check >= 1.0:
+                    last_stop_check = now_m
+                    try:
+                        if should_stop() and not interrupted:
+                            interrupted = True
+                            self._write_interrupt_nowait()
+                    except Exception:
+                        pass
+            self._implicit_done.wait(timeout=1.0)
+
+    def _prepare_solicited_turn(
+        self, timeout_seconds: int | None, should_stop: "Callable[[], bool] | None",
+    ) -> float:
+        """send() entry. Wait out any self-woken turn (belt — the adapter
+        already did), then drain stale stdout and open this turn's scope
+        atomically w.r.t. the reader's scope transitions. Returns seconds
+        waited. Loops because a new self-woken turn can open between the
+        wait returning and the lock being taken."""
+        waited = 0.0
+        while True:
+            waited += self.wait_for_implicit_idle(timeout_seconds, should_stop)
+            with self._scope_lock:
+                if self._implicit_scope is not None:
+                    continue  # opened in the gap — wait again
+                # Belt: every queued line was attributed by the reader before
+                # it was queued (and lines with no scope open aren't queued at
+                # all), so anything here belongs to a finished turn.
+                while True:
+                    try:
+                        self._stdout_q.get_nowait()
+                    except queue.Empty:
+                        break
+                with self._main_log_lock:
+                    self._current_scope = TurnLogScope(
+                        self.main_log_path, self._main_log_lines + 1,
+                    )
+                return waited
 
     # ---- send ----
 
@@ -912,9 +1351,11 @@ class PairRuntime:
             # don't collide with theirs.
             self._main_tool_counter.reload()
 
-            # Open a turn scope: future log writes update its end_line
-            with self._main_log_lock:
-                self._current_scope = TurnLogScope(self.main_log_path, self._main_log_lines + 1)
+            # v0.12.0: queue FIFO behind any self-woken turn in progress, drain
+            # stale stdout, then open this turn's scope atomically w.r.t. the
+            # reader's scope transitions. Returns how long we waited + the
+            # self-woken turns that completed since the previous send (footer).
+            waited_s = self._prepare_solicited_turn(timeout_seconds, should_stop)
 
             payload = json.dumps({
                 "type": "user",
@@ -1007,12 +1448,22 @@ class PairRuntime:
                         # for ev["_log_scope"]).
                         scope = self._current_scope
                         if scope is not None:
+                            # Prefer the reader's snapshot (taken the instant the
+                            # result was attributed) — by now a self-woken
+                            # continuation may already have moved the live fields.
+                            snap = scope.result_snapshot or {}
                             ev["_log_scope"] = {
                                 "log_path": str(scope.main_log_path),
                                 "start_line": scope.start_line,
-                                "end_line": scope.end_line,
-                                "subagent_logs": list(scope.subagent_logs),
+                                "end_line": snap.get("end_line", scope.end_line),
+                                "subagent_logs": list(snap.get("subagent_logs", scope.subagent_logs)),
+                                "background_launches": list(
+                                    snap.get("background_launches", scope.background_launches)
+                                ),
                             }
+                        # Completed self-woken turns are popped from the spec by
+                        # the server's send runner, not carried here (respawn-safe).
+                        ev["_self_woken"] = {"waited_s": waited_s}
                         return ev
                 raise CommandTimeout(self.spec.name, timeout_seconds)
             finally:
@@ -1021,7 +1472,8 @@ class PairRuntime:
                 # set; without this finally, an unhandled exception escaping
                 # the read loop would leave the scope dangling and permanently
                 # protect a zombie runtime from idle eviction.
-                self._current_scope = None
+                with self._scope_lock:
+                    self._current_scope = None
 
     def _collect_stderr(self) -> str:
         with self._stderr_lock:
@@ -1111,6 +1563,22 @@ class RuntimeRegistry:
         to_evict: list[str] = []
         with self._lock:
             for name, rt in self._runtimes.items():
+                # v0.12.0 reaper: a self-woken turn with no log line for a full
+                # idle period is finalized as ABANDONED. Its task would
+                # otherwise sit "running" forever — the owner is alive, so
+                # orphan reaping never touches it — and pair_status would show
+                # it in flight indefinitely. Persistent runtimes too. The abort
+                # does NOT kill the runtime: if the background work resumes
+                # later, a fresh self-woken turn simply opens.
+                if (rt._implicit_scope is not None  # noqa: SLF001
+                        and rt._last_log_activity_at is not None  # noqa: SLF001
+                        and rt._last_log_activity_at < cutoff):  # noqa: SLF001
+                    rt._abort_implicit_turn(  # noqa: SLF001
+                        f"{_async_tasks.ABANDONED_ERROR_PREFIX}no log activity for "
+                        f"{self._idle_timeout}s during a self-woken turn — finalized by "
+                        f"the reaper; the pair's background work may still be running",
+                        status="failed",
+                    )
                 if rt.spec.persistent:
                     continue
                 # v0.9.8: skip runtimes that are mid-turn. The pre-v0.9.8

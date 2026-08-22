@@ -173,11 +173,20 @@ class ClaudeAdapter(PairAdapter):
             # stale in-memory session state — re-resume it from the up-to-date file.
             # Caller must hold the cross-process pair lock when invoking this path,
             # otherwise the stale-check itself races.
+            # v0.12.0: wait out any self-woken turn BEFORE the stale check —
+            # the turn is writing the JSONL, which would otherwise read as
+            # stale and evict (tree-kill) the pair's in-flight background work.
+            # After the turn the JSONL IS newer than the watermark, so the
+            # respawn below happens on purpose (see runtime.is_stale).
+            pre_wait_s = rt.wait_for_implicit_idle(timeout_seconds, should_stop)
             if rt.is_stale():
                 reg.evict(spec.name)
                 rt = reg.get_or_start(spec, self)
             result_json = rt.send(message, timeout_seconds=timeout_seconds,
                                   on_event=on_event, should_stop=should_stop)
+            if pre_wait_s:
+                sw = result_json.setdefault("_self_woken", {})
+                sw["waited_s"] = float(sw.get("waited_s") or 0.0) + pre_wait_s
             return self._build_send_result(spec, result_json)
 
         # Resolve the effective effort for this one-shot send: per-call override
@@ -592,6 +601,11 @@ class ClaudeAdapter(PairAdapter):
                        f"arc + binding rules + in-flight state.")
 
         scope = result_json.get("_log_scope") or {}
+        # v0.12.0: injected by runtime.send() — self-woken turns that completed
+        # since the previous send + how long this send queued behind one.
+        self_woken = result_json.get("_self_woken") or {}
+        waited = self_woken.get("waited_s")
+        waited_s = float(waited) if (waited and float(waited) >= 0.5) else None
 
         # v0.11.0 model-handling hardening — all three are None on a normal turn.
         #
@@ -631,6 +645,18 @@ class ClaudeAdapter(PairAdapter):
                 parts.append(str(expl)[:240])
             safety_signal = " — ".join(parts)
             safety_kind = "refusal"
+        elif _USAGE_LIMIT_RE.search(result_json.get("result") or ""):
+            # v0.12.0: the CLI reports a usage-limit hit as subtype SUCCESS with
+            # the limit notice as the result text (observed on par6, 2026-08-22:
+            # each background sub-agent completion woke the pair, which hit the
+            # limit and "succeeded" with "You've hit your session limit · resets
+            # 2pm"). Nobody was told. Labeled distinctly — it's neither a safety
+            # event nor transient in the retry-now sense.
+            safety_signal = (
+                f"usage limit reached — the CLI returned the limit notice as this "
+                f"turn's result: {(result_json.get('result') or '').strip()[:160]!r}"
+            )
+            safety_kind = "usage_limit"
         elif MODEL_UNAVAILABLE_MARKER in (result_json.get("result") or "").lower():
             # PERMANENT, not transient: the model was pulled / access lost (the
             # stream-json path returns this as a result event with api_error_status
@@ -675,6 +701,10 @@ class ClaudeAdapter(PairAdapter):
             safety_signal=safety_signal,
             safety_kind=safety_kind,
             stop_reason=stop_reason_kept,
+            background_launches=list(scope.get("background_launches") or []),
+            self_woken_completed=list(self_woken.get("completed") or []),
+            self_woken_waited_s=waited_s,
+            terminal_reason=result_json.get("terminal_reason"),
         )
 
 
@@ -685,6 +715,12 @@ def _fmt_tokens(n: int) -> str:
         return f"{n / 1_000:.0f}k"
     return str(n)
 
+
+# v0.12.0: the CLI's usage-limit notice, returned as a SUCCESS result's text.
+# Observed: "You've hit your session limit · resets 2pm (Europe/London)". The
+# middle is left loose ("weekly", "usage", ...) — the exact wording isn't
+# contractual. Case-insensitive; tolerates a straight or curly apostrophe.
+_USAGE_LIMIT_RE = re.compile(r"you[’']?ve hit your [a-z ]{0,30}limit", re.IGNORECASE)
 
 CONTEXT_TOKEN_RE = re.compile(r"\*\*Tokens:\*\*\s*([\d.]+)([kKmM]?)\s*/\s*([\d.]+)([kKmM]?)\s*\((\d+)%\)")
 
