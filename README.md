@@ -240,12 +240,15 @@ its own async task, so nothing about it is hidden:
 
 - the placeholder reply's footer says `⏳ BACKGROUND WORK LAUNCHED (…)` — don't
   re-send; the continuation is coming;
-- `pair_status(name)` reports **self-woken turn in progress** (the active /
-  slow / likely-hung gradient applies) while it runs;
-- `pair_poll(name, wait_seconds=30)` or the `wait.py` watcher **by name** waits
-  for it — `pair_poll(name)` resolves to the *latest* task, which may be the
-  self-woken one: it's labeled, and the latest `pair_send` task is named next to
-  it;
+- `pair_status(name)` says *idle — but N background tasks from the last turn
+  are still running* while the work is out, then **self-woken turn in
+  progress** (the active / slow / likely-hung gradient applies) once the pair
+  wakes;
+- `pair_poll(name, wait_seconds=30)` waits for the wake-up — even before the
+  self-woken task exists — and shows its reply; `pair_poll(name)` resolves to
+  the *latest* task, which may be the self-woken one: it's labeled, and the
+  latest `pair_send` task is named next to it (the `wait.py` watcher by name
+  works once the task exists);
 - your **next** `pair_send` queues behind an in-progress continuation (FIFO — its
   result is never mistaken for your answer; a send from *another* MCP process
   queues behind it too) and its footer lists

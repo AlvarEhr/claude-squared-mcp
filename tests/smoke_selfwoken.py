@@ -307,6 +307,57 @@ async_tasks._get_or_create_event(tid2[0])
 async_tasks.wait_for_task(tid2[0], timeout_s=0.1)
 check("event dropped after observing stopped", tid2[0] not in async_tasks._task_events)
 
+print("\n=== 16. v0.12.1: runtime tracks pending background tasks from system events ===")
+rt6 = PairRuntime(spec, adapter)
+feed(rt6, {"type": "system", "subtype": "task_started", "task_id": "bgA", "task_type": "local_agent",
+           "description": "recon"})
+feed(rt6, {"type": "system", "subtype": "task_started", "task_id": "bgB", "task_type": "local_bash",
+           "description": "sleep"})
+check("two pending", sorted(p["task_id"] for p in rt6.pending_background_tasks()) == ["bgA", "bgB"])
+feed(rt6, {"type": "system", "subtype": "task_notification", "task_id": "bgA", "status": "completed",
+           "summary": "done"})
+check("notification clears one", [p["task_id"] for p in rt6.pending_background_tasks()] == ["bgB"])
+feed(rt6, {"type": "system", "subtype": "task_updated", "task_id": "bgB", "patch": {"status": "completed"}})
+check("task_updated clears the other", rt6.pending_background_tasks() == [])
+check("no implicit turn opened by system events", rt6._implicit_scope is None)
+
+print("\n=== 17. v0.12.1: pair_status says so when idle with background work out (disk heuristic) ===")
+runtime_mod.registry()._runtimes.pop("swt", None)
+bg_send = async_tasks.start_task("swt", "launch recon", lambda tid: SendResult(
+    name="swt", response="BG-LAUNCHED", session_id=SID, model_used="claude-opus-5",
+    cost_usd=0.01, duration_ms=5, background_launches=["agent"]))
+async_tasks.wait_for_task(bg_send.task_id, timeout_s=10)
+server._take_self_woken_pending("swt")
+kinds, src = server._background_pending("swt")
+check("disk heuristic sees the pending launch", kinds == ["agent"] and src == "disk")
+st17 = tool(server.pair_status)("swt")
+check("pair_status mentions the background work", "launched background work" in st17)
+
+print("\n=== 18. v0.12.1: by-name pair_poll waits for the wake-up task ===")
+t0 = datetime.utcnow()
+out18a = tool(server.pair_poll)("swt", wait_seconds=2)
+check("nothing-yet path waited ~2s", (datetime.utcnow() - t0).total_seconds() >= 1.5)
+check("nothing-yet note", "nothing yet" in out18a and "BG-LAUNCHED" in out18a)
+import threading as _th  # noqa: E402
+
+
+def _wake():
+    t = async_tasks.register_external_task("swt", async_tasks.SELF_WOKEN_MESSAGE)
+    async_tasks.finalize_external_task(t, status="done", result=SendResult(
+        name="swt", response="WOKE: synthesized", session_id=SID, model_used="claude-opus-5",
+        cost_usd=0.2, duration_ms=7))
+
+
+_th.Timer(1.5, _wake).start()
+t0 = datetime.utcnow()
+out18b = tool(server.pair_poll)("swt", wait_seconds=8)
+el = (datetime.utcnow() - t0).total_seconds()
+check("returned once the wake-up landed (not the full window)", 1.0 <= el < 7.0)
+check("shows the self-woken reply", "WOKE: synthesized" in out18b and "SELF-WOKEN" in out18b)
+check("wake note present", "waited" in out18b and "wake-up" in out18b)
+check("explicit-id poll is unchanged (no wake wait)",
+      "BG-LAUNCHED" in tool(server.pair_poll)(bg_send.task_id, wait_seconds=2))
+
 print(f"\n{passed} passed, {failed} failed")
 try:
     runtime_mod.registry()._runtimes.pop("swt", None)

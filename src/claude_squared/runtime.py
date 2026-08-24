@@ -500,6 +500,17 @@ class PairRuntime:
         # ack signal send_interrupt waits for. Log growth alone is ambiguous
         # during a self-woken turn, which produces log lines continuously.
         self._result_seq: int = 0
+        # v0.12.1: background tasks the CLI has told us about and not yet
+        # reported finished (task_started → task_notification/task_updated).
+        # task_id → {kind, description, started_at}. Lets pair_status say
+        # "idle, but N background tasks may still be running" and lets a
+        # by-name pair_poll wait for the wake-up. Guarded by _scope_lock.
+        self._bg_tasks: dict[str, dict[str, Any]] = {}
+
+    def pending_background_tasks(self) -> list[dict[str, Any]]:
+        """Background tasks started and not yet reported finished (v0.12.1)."""
+        with self._scope_lock:
+            return [dict(v, task_id=k) for k, v in self._bg_tasks.items()]
 
     @staticmethod
     def _count_existing_lines(p: Path) -> int:
@@ -830,10 +841,13 @@ class PairRuntime:
                 needs_open = self._current_scope is None and self._implicit_scope is None
             if needs_open:
                 self._open_implicit_turn()
-        elif ev_type == "system" and ev.get("subtype") in ("task_started", "task_notification"):
+        elif ev_type == "system" and ev.get("subtype") in (
+            "task_started", "task_notification", "task_updated",
+        ):
             # Structured background-task lifecycle events (CLI 2.1.224). Logged
-            # so main.log shows WHY a pair woke up. Best-effort field reads —
-            # the shape isn't contractual.
+            # so main.log shows WHY a pair woke up, and tracked so pair_status
+            # knows what's still out. Best-effort field reads — the shape isn't
+            # contractual.
             self._log_task_lifecycle_event(ev)
 
         # Detect sub-agent SPAWN (assistant.tool_use of Agent) — special-cased for the
@@ -1006,25 +1020,47 @@ class PairRuntime:
             f"turn — the pair will wake itself when it completes"
         )
 
+    _TASK_TERMINAL_STATUSES = ("completed", "failed", "killed", "cancelled", "canceled", "stopped", "error")
+
     def _log_task_lifecycle_event(self, ev: dict) -> None:
         """Reader thread. One main.log line per background-task lifecycle
-        event (CLI 2.1.224 ``system`` sub-events); best-effort field reads."""
+        event (CLI 2.1.224 ``system`` sub-events) + pending-task tracking;
+        best-effort field reads."""
         ts = datetime.now().strftime("%H:%M:%S")
-        tid = str(ev.get("task_id") or "?")[:12]
-        if ev.get("subtype") == "task_started":
+        full_tid = str(ev.get("task_id") or "")
+        tid = (full_tid or "?")[:12]
+        sub = ev.get("subtype")
+        if sub == "task_started":
             kind = ev.get("task_type") or ev.get("subagent_type") or "task"
             desc = str(ev.get("description") or "")[:120].replace("\n", " ")
+            if full_tid:
+                with self._scope_lock:
+                    self._bg_tasks[full_tid] = {
+                        "kind": str(kind), "description": desc,
+                        "started_at": datetime.utcnow().isoformat(),
+                    }
             self._append_main_log_line(f"[{ts}] [system:task_started] {kind} {tid}: {desc}")
-        else:
-            status = ev.get("status") or "?"
-            summary = str(ev.get("summary") or "")[:160].replace("\n", " ")
-            # No "the pair will now resume" claim here: this fires for blocking
-            # sub-agents too. A self-woken turn announces itself with its own
-            # SELF-WOKEN marker line.
-            self._append_main_log_line(
-                f"[{ts}] [system:task_notification] task {tid} {status}"
-                f"{': ' + summary if summary else ''}"
-            )
+            return
+        if sub == "task_updated":
+            # Quiet bookkeeping only (no log line — these are frequent).
+            patch = ev.get("patch") if isinstance(ev.get("patch"), dict) else {}
+            if full_tid and str(patch.get("status") or "").lower() in self._TASK_TERMINAL_STATUSES:
+                with self._scope_lock:
+                    self._bg_tasks.pop(full_tid, None)
+            return
+        # task_notification
+        status = ev.get("status") or "?"
+        if full_tid and str(status).lower() in self._TASK_TERMINAL_STATUSES:
+            with self._scope_lock:
+                self._bg_tasks.pop(full_tid, None)
+        summary = str(ev.get("summary") or "")[:160].replace("\n", " ")
+        # No "the pair will now resume" claim here: this fires for blocking
+        # sub-agents too. A self-woken turn announces itself with its own
+        # SELF-WOKEN marker line.
+        self._append_main_log_line(
+            f"[{ts}] [system:task_notification] task {tid} {status}"
+            f"{': ' + summary if summary else ''}"
+        )
 
     def _open_implicit_turn(self) -> None:
         """Reader thread. Open a self-woken turn: log scope + on-disk async task."""

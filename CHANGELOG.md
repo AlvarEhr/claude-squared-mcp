@@ -4,6 +4,35 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.1] — 2026-08-22
+
+Two gaps the v0.12.0 live test exposed, both in the window between a
+placeholder reply and the pair waking itself up.
+
+### Added
+
+- **`pair_status` knows what's still out.** The runtime now tracks the CLI's
+  `task_started` / `task_notification` / `task_updated` events, so an idle
+  pair whose last turn launched background work reports *"idle — but N
+  background task(s) from the last turn are still running (…); the pair will
+  wake itself"* instead of a bare `idle`. From another process (or a cold
+  runtime) a disk heuristic — latest task is a finished send that launched
+  background work, no wake-up task yet — gives a hedged version of the same
+  note. Verbose JSON carries `background_pending` + its source.
+- **A by-name `pair_poll(name, wait_seconds=N)` waits for the wake-up.** When
+  the pair's latest task is already finished but background work is still
+  out, the poll waits (within the window) for the self-woken task to *appear*,
+  then blocks on it and reports its reply — the "wait for the next turn to
+  end" primitive. Nothing in time → a clear "nothing yet" note. Explicit task
+  ids keep their exact semantics. Works across processes (the wake-up's task
+  file on disk is the signal).
+
+### Changed
+
+- The `⏳ BACKGROUND WORK LAUNCHED` footer now points at the two tools above
+  accurately (it previously implied `pair_poll(name, wait_seconds)` could wait
+  before the self-woken task existed).
+
 ## [0.12.0] — 2026-08-07
 
 Premium-model awareness. Fable 5 is now a *plan-gated* model: it carries its

@@ -265,9 +265,9 @@ def _fmt_send_result(r: SendResult) -> str:
             f"⏳ BACKGROUND WORK LAUNCHED ({_desc}): this turn started background work "
             f"and ended before it finished — the reply above may be a placeholder. "
             f"The pair will wake itself when the work completes; that continuation is "
-            f"tracked as its OWN task: pair_status('{r.name}') shows it in flight, "
-            f"pair_poll('{r.name}', wait_seconds=30) waits for it, and the wait.py "
-            f"watcher by name works too. Do NOT re-send the same request."
+            f"tracked as its OWN task: pair_poll('{r.name}', wait_seconds=30) waits "
+            f"for the wake-up and shows its reply; pair_status('{r.name}') shows what's "
+            f"still out. Do NOT re-send the same request."
         )
     if r.self_woken_completed:
         _n = len(r.self_woken_completed)
@@ -1035,6 +1035,35 @@ def _wait_for_foreign_self_woken(
                     "self-woken turn"
                 )
         time.sleep(1.0)
+
+
+def _background_pending(name: str) -> tuple[list[str], str]:
+    """Background work the pair may still have out (v0.12.1).
+
+    Returns ``(kinds, source)``. ``source == "runtime"`` when this process owns
+    the pair's live runtime (authoritative: it saw task_started and hasn't seen
+    the matching completion). Otherwise a disk heuristic: the pair's latest
+    task is a finished pair_send whose reply launched background work and no
+    newer task (the wake-up) exists yet — which from another process or a
+    cold runtime is the best available signal. ``("", [])`` when nothing is
+    pending.
+    """
+    try:
+        rt = runtime_mod.registry().get_or_none(name)
+        if rt is not None and rt.is_alive():
+            kinds = [str(p.get("kind") or "task") for p in rt.pending_background_tasks()]
+            return kinds, ("runtime" if kinds else "")
+    except Exception:
+        pass
+    try:
+        latest = async_tasks.latest_task_id_for_pair(name)
+        st = async_tasks.load_task(latest) if latest else None
+        if (st is not None and st.status == "done" and not async_tasks.is_self_woken_task(st)
+                and isinstance(st.result, SendResult) and st.result.background_launches):
+            return list(st.result.background_launches), "disk"
+    except Exception:
+        pass
+    return [], ""
 
 
 def _take_self_woken_pending(name: str) -> list[dict]:
@@ -1931,11 +1960,46 @@ def pair_poll(
     if reaped is not None:
         state = reaped
 
+    # v0.12.1: a by-NAME poll on a finished task while the pair still has
+    # background work out → wait for the wake-up (a newer task for this pair)
+    # and report THAT. This is the "wait for the next turn to end" primitive
+    # the placeholder-handback report asked for; it works across processes
+    # because the wake-up registers a task file on disk.
+    wake_note: str | None = None
+    budget_s = min(int(wait_seconds), _sync_cap_seconds()) if wait_seconds > 0 else 0
+    if budget_s > 0 and resolved_note and state.status != "running":
+        bg_kinds, _bg_src = _background_pending(state.pair_name)
+        if bg_kinds:
+            t0 = time.monotonic()
+            deadline = t0 + budget_s
+            newer: str | None = None
+            while time.monotonic() < deadline:
+                cand = async_tasks.latest_task_id_for_pair(state.pair_name)
+                if cand and cand != state.task_id:
+                    newer = cand
+                    break
+                time.sleep(1.0)
+            waited = time.monotonic() - t0
+            budget_s = max(0, int(deadline - time.monotonic()))
+            new_state = async_tasks.load_task(newer) if newer else None
+            if new_state is not None:
+                state, task_id = new_state, newer
+                wake_note = (
+                    f"(waited {waited:.0f}s for the pair's wake-up after its background "
+                    f"work → now showing task {_short(newer)})"
+                )
+            else:
+                _desc = ", ".join(sorted(set(bg_kinds)))
+                wake_note = (
+                    f"(waited {waited:.0f}s for the pair to wake up after its background "
+                    f"work ({_desc}) — nothing yet. Poll again with wait_seconds, or "
+                    f"pair_status('{state.pair_name}') to see what's still out.)"
+                )
+
     # Block-wait mode for hosts without background Bash. Only wait if the task
     # is still running — terminal-status tasks return immediately regardless.
-    if wait_seconds > 0 and state.status == "running":
-        cap = _sync_cap_seconds()
-        effective_wait = min(int(wait_seconds), cap)
+    if budget_s > 0 and state.status == "running":
+        effective_wait = budget_s
         # wait_for_task uses threading.Event for instant wakeup on terminal
         # transition; falls back to load_task on timeout. Returns the current
         # state regardless of whether it fired or timed out.
@@ -2011,6 +2075,8 @@ def pair_poll(
     # agent should never be guessing which task it's looking at.
     if resolved_note:
         lines.append(f"  {resolved_note}")
+    if wake_note:
+        lines.append(f"  {wake_note}")
 
     # Auto hang-warning for running tasks — always shown, even without with_turn_log
     if state.status == "running":
@@ -3664,6 +3730,26 @@ def pair_status(name: str, last_n_log: int = 5, verbose: bool = False) -> str:
         heuristic = f"likely-hung ({idle_seconds:.0f}s idle — consider pair_log to inspect, then pair_stop if truly stuck)"
     if all_self_woken and local_corpse_exit is None:
         heuristic = f"self-woken turn in progress — {heuristic}"
+    # v0.12.1: idle, but the last turn launched background work that hasn't
+    # reported back — say so, or "idle" reads as "nothing is happening".
+    bg_kinds, bg_src = ([], "") if inflight_tasks else _background_pending(name)
+    if bg_kinds:
+        from collections import Counter as _Counter
+        _n = len(bg_kinds)
+        _desc = ", ".join(f"{c} {k}" for k, c in _Counter(bg_kinds).items())
+        if runtime_alive and bg_src == "runtime":
+            heuristic += (
+                f" — but {_n} background task{'s' if _n != 1 else ''} from the last turn "
+                f"{'are' if _n != 1 else 'is'} still running ({_desc}); the pair will wake "
+                f"itself when {'they' if _n != 1 else 'it'} finish{'' if _n != 1 else 'es'}. "
+                f"pair_poll('{name}', wait_seconds=N) waits for that wake-up."
+            )
+        else:
+            heuristic += (
+                f" — note: the last reply launched background work ({_desc}) and no "
+                f"wake-up has followed yet. If the pair's runtime is alive in another "
+                f"MCP process it will wake itself; if it was evicted, that work died with it."
+            )
 
     # Recent log lines
     recent_lines: list[str] = []
@@ -3685,6 +3771,8 @@ def pair_status(name: str, last_n_log: int = 5, verbose: bool = False) -> str:
             "heuristic": heuristic,
             "inflight_async_tasks": inflight_tasks,
             "self_woken_inflight": self_woken_inflight,
+            "background_pending": bg_kinds,
+            "background_pending_source": bg_src,
             "recent_log_lines": recent_lines,
             "persistent": spec.persistent,
         }, indent=2, default=str)
