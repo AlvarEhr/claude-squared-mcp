@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import sys
 import zipfile
@@ -121,6 +122,26 @@ def bump_version(part: str) -> str:
     return new
 
 
+def stamp_extension_pyproject(version: str) -> None:
+    """Keep extension/pyproject.toml's version equal to manifest.json's.
+
+    That file is never pip-installed (the MCPB bundle vendors deps and injects
+    sys.path from server/main.py), but stale metadata in it is exactly the
+    drift trap the root pyproject fell into (stuck at 0.10.0 through v0.12.1
+    releases; root is now dynamic from __init__.py). Stamped on every build
+    rather than bumped, so it self-heals and there is no third file to forget.
+    """
+    p = EXT_DIR / "pyproject.toml"
+    try:
+        text = p.read_text(encoding="utf-8")
+    except OSError:
+        return
+    new_text = re.sub(r'(?m)^version = "[^"]*"$', f'version = "{version}"', text, count=1)
+    if new_text != text:
+        p.write_text(new_text, encoding="utf-8")
+        print(f"  extension/pyproject.toml: version -> {version}")
+
+
 def pack(version: str) -> Path:
     DIST_DIR.mkdir(exist_ok=True)
     out = DIST_DIR / f"claude-squared-{version}.mcpb"
@@ -204,6 +225,7 @@ def main() -> int:
     sync_source_into_extension()
 
     version = read_version()
+    stamp_extension_pyproject(version)
     print(f"== pack v{version} ==")
     mcpb = pack(version)
 

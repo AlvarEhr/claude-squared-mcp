@@ -4,7 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-squared"
-version = "0.10.0"
+# Version is single-sourced from src/claude_squared/__init__.py (__version__),
+# which the build script bumps in lockstep with extension/manifest.json —
+# a literal here drifted (stuck at 0.10.0 while releases reached 0.12.1).
+dynamic = ["version"]
 description = "MCP server exposing long-running Claude Code CLI sub-sessions as addressable pairs"
 requires-python = ">=3.10"
 authors = [{name = "Alvar"}]
@@ -16,6 +19,9 @@ dependencies = [
 
 [project.scripts]
 claude-squared = "claude_squared.__main__:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "claude_squared.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
