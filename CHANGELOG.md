@@ -69,6 +69,18 @@ re-verification of the Claude quirks on CLI 2.1.258.
   note; the post-compaction size is estimated from the compaction record
   because Codex's own post-compaction `token_count` reports zeros. Verified
   on a 164k-token Sol thread (→ 17k on the next turn, summary retained).
+- **Fixes from the Astra (Codex) pair's review of the diff**: floating model
+  aliases are stored as typed (`sol`) and re-resolved at every spawn — the
+  first cut stored the resolved slug, silently pinning the pair; prompts are
+  delivered to `codex exec` over stdin (`-`) so a long briefing can't exceed
+  Windows' ~32K argv limit; an explicit model picks its backend before
+  `defaults.backend`; `pair_forget` tree-kills (or marks for stop) a running
+  Codex turn before removing the pair; guardian verdicts are matched to the
+  parent thread rather than by time alone; multi-line replies count as one
+  log line so task-scoped log ranges stay exact (Claude runtime counts
+  physical lines too); Codex compaction polls the stop checker; the
+  app-server handshake sends `initialized`; `tomli` is declared for Python
+  3.10 so `~/.codex/config.toml` (and the Windows sandbox key) can be read.
 - **Corrupt `registry.json` can no longer wipe the registry** (caught by the
   first Codex pair's review): a file that isn't valid JSON reads as empty
   (copy kept as `registry.corrupt-<ts>.json`) and every write is refused with

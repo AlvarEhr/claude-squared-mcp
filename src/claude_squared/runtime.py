@@ -807,7 +807,9 @@ class PairRuntime:
             try:
                 with open(self.main_log_path, "a", encoding="utf-8") as f:
                     f.write(line + "\n")
-                self._main_log_lines += 1
+                # Count PHYSICAL lines: a multi-line text/thinking preview is
+                # several lines on disk, and pair_poll slices by line number.
+                self._main_log_lines += line.count("\n") + 1
                 now = datetime.utcnow()
                 self._last_log_activity_at = now
                 self.last_activity = now

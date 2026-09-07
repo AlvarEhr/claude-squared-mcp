@@ -166,15 +166,25 @@ def _user_config_path() -> Path:
     return codex_home() / "config.toml"
 
 
-def _load_user_config() -> dict[str, Any]:
-    p = _user_config_path()
+try:  # py3.11+ stdlib; ``tomli`` (declared for <3.11 in pyproject) is API-compatible
+    import tomllib as _toml
+except ImportError:  # pragma: no cover
     try:
-        import tomllib  # py3.11+
-    except ImportError:  # pragma: no cover
+        import tomli as _toml  # type: ignore[no-redef]
+    except ImportError:
+        _toml = None  # type: ignore[assignment]
+
+
+def _load_user_config() -> dict[str, Any]:
+    """Parsed ``~/.codex/config.toml`` or {} when missing/unreadable. Without a
+    TOML parser (Python 3.10 with no ``tomli``) this silently returns {} —
+    which drops the ``windows.sandbox`` re-add; ``sandbox_support_note`` says so."""
+    p = _user_config_path()
+    if _toml is None:
         return {}
     try:
         with open(p, "rb") as f:
-            return tomllib.load(f)
+            return _toml.load(f)
     except Exception:
         return {}
 
@@ -254,6 +264,10 @@ def sandbox_support_note() -> str | None:
     be enforced (degrades to read-only). Surfaced at create."""
     if os.name != "nt":
         return None
+    if _toml is None:
+        return ("this Python has no TOML parser (3.10 without `tomli`), so ~/.codex/config.toml "
+                "cannot be read and `[windows] sandbox` is NOT re-added under --ignore-user-config — "
+                "'workspace'/'auto' levels will run READ-ONLY. Install `tomli` or use Python 3.11+.")
     cfg = _load_user_config()
     if isinstance(cfg.get("windows"), dict) and cfg["windows"].get("sandbox"):
         return None
@@ -300,10 +314,14 @@ def rollout_path_for(thread_id: str) -> Path | None:
     return None
 
 
-def guardian_verdicts_since(since_epoch: float) -> list[dict[str, Any]]:
+def guardian_verdicts_since(since_epoch: float, parent_thread_id: str | None = None) -> list[dict[str, Any]]:
     """Verdicts of ``codex-auto-review`` guardian threads created since
     ``since_epoch`` (the ``--approve-for-me`` reviewer). Each: {thread_id,
-    outcome, risk_level, rationale}. Best-effort; [] on any failure."""
+    outcome, risk_level, rationale}. When ``parent_thread_id`` is given only
+    guardian threads whose rollout references it (their ``token_usage_record``
+    carries the parent thread as ``session_id``) are returned, so concurrent
+    pairs / Desktop activity can't cross-attribute verdicts (Astra catch).
+    Best-effort; [] on any failure."""
     db = _state_db_path()
     if db is None:
         return []
@@ -322,10 +340,13 @@ def guardian_verdicts_since(since_epoch: float) -> list[dict[str, Any]]:
         return []
     for tid, rp, _ts in rows:
         verdict: dict[str, Any] = {"thread_id": tid}
+        matched_parent = parent_thread_id is None
         try:
             p = Path(rp) if rp else rollout_path_for(tid)
             if p and p.exists():
                 for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+                    if parent_thread_id and parent_thread_id in line:
+                        matched_parent = True
                     try:
                         d = json.loads(line)
                     except Exception:
@@ -338,7 +359,8 @@ def guardian_verdicts_since(since_epoch: float) -> list[dict[str, Any]]:
                             verdict["raw"] = str(pl.get("message"))[:200]
         except Exception:
             pass
-        out.append(verdict)
+        if matched_parent:
+            out.append(verdict)
     return out
 
 
@@ -650,9 +672,13 @@ class CodexAdapter(PairAdapter):
                 f"{sys_text}\n</operating instructions>\n\n{prompt}"
             )
         args = self._exec_args(spec, model=None, effort=None, permission_mode=None)
-        args.append(prompt)
+        # Prompt over stdin ("-"): a long briefing as an argv element would
+        # exceed Windows' ~32K command-line limit (Astra catch). Verified:
+        # ``exec … -`` reads the prompt from stdin and proceeds on EOF.
+        args.append("-")
         events, stderr, code, _dur = self._run(args, spec, timeout_seconds=300,
-                                               task_label="create", log=False)
+                                               task_label="create", log=False,
+                                               stdin_text=prompt)
         tid = next((e.get("thread_id") for e in events if e.get("type") == "thread.started"), None)
         failed = next((e for e in events if e.get("type") == "turn.failed"), None)
         if not tid:
@@ -689,11 +715,12 @@ class CodexAdapter(PairAdapter):
         if not self.session_exists(spec):
             raise SessionMissing(spec.name, spec.session_id)
         args = self._exec_args(spec, model=model, effort=effort, permission_mode=permission_mode)
-        args += ["resume", spec.session_id, message]
+        args += ["resume", spec.session_id, "-"]   # message over stdin (see create)
         started = time.time()
         events, stderr, code, dur_ms = self._run(
             args, spec, timeout_seconds=timeout_seconds, task_label="send", log=True,
             on_event=on_event, should_stop=should_stop, task_id=task_id,
+            stdin_text=message,
         )
         return self._build_send_result(
             spec, events, stderr, code, dur_ms, started,
@@ -716,7 +743,8 @@ class CodexAdapter(PairAdapter):
         return tid
 
     def compact(self, spec: PairSpec, steering_prompt: str | None = None,
-                timeout_seconds: int = 600) -> CompactResult:
+                timeout_seconds: int = 600,
+                should_stop: Callable[[], bool] | None = None) -> CompactResult:
         """Manual compaction through ``codex app-server`` (stdio JSON-RPC).
 
         ``codex exec`` has no compaction command (a literal ``/compact`` prompt
@@ -739,7 +767,7 @@ class CodexAdapter(PairAdapter):
         pre = int((info0.get("last_token_usage") or {}).get("input_tokens")
                   or (info0.get("total_token_usage") or {}).get("total_tokens") or 0)
         t0 = time.monotonic()
-        outcome = self._appserver_compact(spec, timeout_seconds=timeout_seconds)
+        outcome = self._appserver_compact(spec, timeout_seconds=timeout_seconds, should_stop=should_stop)
         dur_ms = int((time.monotonic() - t0) * 1000)
         tc1 = read_last_token_count(rollout) or {}
         info1 = tc1.get("info") or {}
@@ -771,9 +799,11 @@ class CodexAdapter(PairAdapter):
                              post_tokens=post, duration_ms=dur_ms, trigger="manual (app-server)",
                              summary_preview=note)
 
-    def _appserver_compact(self, spec: PairSpec, *, timeout_seconds: int) -> str | None:
+    def _appserver_compact(self, spec: PairSpec, *, timeout_seconds: int,
+                           should_stop: Callable[[], bool] | None = None) -> str | None:
         """Drive one compaction over the app-server's stdio JSON-RPC. Returns a
-        short note (or None) and raises CLIError / CommandTimeout on failure."""
+        short note (or None) and raises CLIError / CommandTimeout on failure;
+        ``should_stop`` (polled ~1/s) tree-kills the daemon and raises."""
         exe = codex_executable()
         args = [exe, "app-server"] + config_readd_args()
         popen_kwargs: dict[str, Any] = {
@@ -820,8 +850,28 @@ class CodexAdapter(PairAdapter):
                                           "params": params}) + "\n").encode("utf-8"))
             proc.stdin.flush()
 
+        last_stop_check = [0.0]
+
+        def _check_stop() -> None:
+            if should_stop is None:
+                return
+            now = time.monotonic()
+            if now - last_stop_check[0] < 1.0:
+                return
+            last_stop_check[0] = now
+            try:
+                if should_stop():
+                    _tree_kill(proc)
+                    raise CLIError("compaction stopped by pair_stop (codex app-server tree-killed; "
+                                   "the thread is unchanged unless the compaction record was already written)")
+            except CLIError:
+                raise
+            except Exception:
+                pass
+
         def _wait_result(i: int) -> dict:
             while time.monotonic() < deadline and proc.poll() is None:
+                _check_stop()
                 with lock:
                     for m in msgs:
                         if m.get("id") == i and ("result" in m or "error" in m):
@@ -841,6 +891,14 @@ class CodexAdapter(PairAdapter):
                 if not r and proc.poll() is not None:
                     _fail(f"codex app-server exited (code {proc.poll()}) before initialize completed")
                 _fail(f"codex app-server initialize failed: {json.dumps(r.get('error'))[:300] if r else 'timeout'}")
+            # JSON-RPC handshake completion notification (documented; the
+            # server tolerated its absence on 0.153.4 but don't rely on that).
+            try:
+                assert proc.stdin is not None
+                proc.stdin.write((json.dumps({"jsonrpc": "2.0", "method": "initialized"}) + "\n").encode("utf-8"))
+                proc.stdin.flush()
+            except Exception:
+                pass
             cfg: dict[str, Any] = {"mcp_servers": {}}
             if spec.effort:
                 cfg["model_reasoning_effort"] = spec.effort
@@ -865,6 +923,7 @@ class CodexAdapter(PairAdapter):
             turn_status: str | None = None
             turn_error: str | None = None
             while time.monotonic() < deadline and proc.poll() is None:
+                _check_stop()
                 with lock:
                     for m in msgs:
                         meth = m.get("method")
@@ -1070,10 +1129,13 @@ class CodexAdapter(PairAdapter):
              on_event: Callable[[dict], None] | None = None,
              should_stop: Callable[[], bool] | None = None,
              task_id: str | None = None,
+             stdin_text: str | None = None,
              ) -> tuple[list[dict], str, int | None, int]:
-        """Spawn codex with stdin CLOSED, stream stdout JSONL, write main.log
-        lines as items arrive, honor should_stop (tree-kill) and the hard
-        timeout (tree-kill + CommandTimeout). Returns (events, stderr, exit
+        """Spawn codex, stream stdout JSONL, write main.log lines as items
+        arrive, honor should_stop (tree-kill) and the hard timeout (tree-kill +
+        CommandTimeout). stdin is CLOSED (DEVNULL) unless ``stdin_text`` is
+        given, in which case it is written whole and closed immediately (the
+        prompt path — exec proceeds on EOF). Returns (events, stderr, exit
         code, duration_ms)."""
         log_dir = logs_dir() / spec.name
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -1084,19 +1146,24 @@ class CodexAdapter(PairAdapter):
         # Item ids seen so we can tag completions with the same T-N.
         tags: dict[str, str] = {}
 
+        log_lock = threading.Lock()
+
         def _log(line: str) -> None:
             nonlocal line_count
             if not log:
                 return
+            line = line.replace("\r", "").replace("\n", " / ")  # exactly one physical line
             try:
-                with open(main_log, "a", encoding="utf-8") as f:
-                    f.write(line + "\n")
-                line_count += 1
+                with log_lock:
+                    with open(main_log, "a", encoding="utf-8") as f:
+                        f.write(line + "\n")
+                    line_count += 1
             except Exception:
                 pass
 
         popen_kwargs: dict[str, Any] = {
-            "stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE,
+            "stdin": subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
             "stderr": subprocess.PIPE, "cwd": spec.cwd or None,
         }
         if os.name == "nt":
@@ -1109,6 +1176,22 @@ class CodexAdapter(PairAdapter):
             proc = subprocess.Popen(args, **popen_kwargs)
         except OSError as e:
             raise CLIError(f"could not start codex ({args[0]}): {e}")
+        if stdin_text is not None:
+            # Write the whole prompt and close — from a thread, so a prompt
+            # larger than the pipe buffer can't deadlock against our readers.
+            def _feed() -> None:
+                try:
+                    assert proc.stdin is not None
+                    proc.stdin.write(stdin_text.encode("utf-8"))
+                    proc.stdin.flush()
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        proc.stdin.close()  # type: ignore[union-attr]
+                    except Exception:
+                        pass
+            threading.Thread(target=_feed, daemon=True).start()
         with _INFLIGHT_LOCK:
             _INFLIGHT[spec.name] = {"proc": proc, "task_id": task_id, "started_at": started_at,
                                     "last_activity": started_at, "label": task_label}
@@ -1235,18 +1318,20 @@ class CodexAdapter(PairAdapter):
             it = ev.get("item") or {}
             ity = it.get("type")
             iid = str(it.get("id") or "")
+            # One PHYSICAL line per log line — a multi-line reply would
+            # otherwise desync the recorded line ranges (Astra catch).
             if ity == "agent_message":
                 if t == "item.completed":
-                    txt = (it.get("text") or "").strip()
+                    txt = (it.get("text") or "").strip().replace("\r", "").replace("\n", " / ")
                     if txt:
                         out.append(f"[{ts}] [text] {txt[:400]}")
             elif ity == "reasoning":
                 if t == "item.completed":
-                    txt = (it.get("text") or it.get("summary") or "")
+                    txt = str(it.get("text") or it.get("summary") or "").replace("\n", " / ")
                     if txt:
-                        out.append(f"[{ts}] [thinking] {str(txt)[:300]}")
+                        out.append(f"[{ts}] [thinking] {txt[:300]}")
             elif ity == "error":
-                out.append(f"[{ts}] [error] {str(it.get('message'))[:300]}")
+                out.append(f"[{ts}] [error] {str(it.get('message')).replace(chr(10), ' / ')[:300]}")
             else:
                 # command_execution / file_change / mcp_tool_call / web_search …
                 if t == "item.started":
@@ -1369,7 +1454,7 @@ class CodexAdapter(PairAdapter):
             )
         guardian: list[str] = []
         if permission_level == "auto":
-            for v in guardian_verdicts_since(started_epoch):
+            for v in guardian_verdicts_since(started_epoch, parent_thread_id=spec.session_id):
                 outcome = str(v.get("outcome") or "?")
                 rat = str(v.get("rationale") or v.get("raw") or "")[:200]
                 risk = v.get("risk_level")

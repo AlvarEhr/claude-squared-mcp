@@ -31,7 +31,7 @@ class PairAdapter(ABC):
 
     @abstractmethod
     def compact(self, spec: PairSpec, steering_prompt: str | None = None,
-                timeout_seconds: int = 600) -> CompactResult:
+                timeout_seconds: int = 600, should_stop=None) -> CompactResult:
         ...
 
     @abstractmethod

@@ -791,8 +791,9 @@ def pair_create(
         be = str(backend).strip().lower()
         if be not in BACKENDS:
             raise PairError(f"backend must be one of {list(BACKENDS)} (got {backend!r})")
-    elif model is not None and infer_backend(model) == "codex":
-        be = "codex"
+    elif model is not None and model != "match-parent":
+        # An explicit model names its backend (either way) before any default.
+        be = infer_backend(model)
     elif _defaults.backend:
         be = _defaults.backend
     elif model is None and _defaults.model and infer_backend(_defaults.model) == "codex":
@@ -872,7 +873,11 @@ def pair_create(
                         f"(or pair_update later) if you want the pair on the newer one."
                     )
         else:
-            _newer = codex_models.newer_generation_available(resolved["model"])
+            try:
+                _slug = codex_models.resolve_codex_model(resolved["model"])[0]
+            except Exception:
+                _slug = resolved["model"]
+            _newer = codex_models.newer_generation_available(_slug)
             if _newer:
                 drift_seed = _newer
                 transparency_msgs.append(
@@ -880,14 +885,14 @@ def pair_create(
                     f"'{resolved['model']}' is pinned. Use the floating alias "
                     f"'{short_model_label(_newer)}' to follow generation bumps automatically."
                 )
-            _up = codex_models.upgrade_note(resolved["model"])
+            _up = codex_models.upgrade_note(_slug)
             if _up:
                 transparency_msgs.append(_up)
             _sb = codex_adapter_mod.sandbox_support_note()
             if _sb and resolved["permission_mode"] in ("workspace", "auto"):
                 transparency_msgs.append(_sb)
             if resolved["context_window"] == "default":
-                _cw = codex_models.context_windows(resolved["model"])
+                _cw = codex_models.context_windows(_slug)
                 _num = (f"~{_cw[0] // 1000}k usable now, ~{_cw[1] // 1000}k with '1m'"
                         if _cw else "~258k usable now, ~828k with '1m'")
                 transparency_msgs.append(
@@ -1032,9 +1037,10 @@ def pair_adopt(
     model_note: str | None = None
     if be == "codex":
         try:
-            model, model_note = codex_models.resolve_codex_model(model)
+            _slug, model_note = codex_models.resolve_codex_model(model)
         except ValueError as e:
             raise PairError(str(e))
+        model = model.strip().lower()  # alias stays floating; slug stays pinned
     # Surface effort coercion message to the caller — the PairSpec validator
     # silently coerces but the caller deserves to know if their requested
     # effort got changed.
@@ -1084,11 +1090,21 @@ def pair_forget(name: str, archive: bool = True) -> str:
         archive: If True, copy the pair's JSONL transcript to ~/.claude/pairs/archive/
             before removal. Default True.
     """
-    # Stop any live runtime for this pair before removing it
+    # Stop any live runtime / in-flight turn for this pair before removing it
+    # (a Codex turn is a one-shot process with no runtime — tree-kill it here,
+    # or leave the cross-process stop marker; once the pair is forgotten,
+    # pair_stop can no longer reach it. Astra catch.)
+    spec = reg_mod.get_pair(name)
     try:
         runtime_mod.registry().evict(name)
     except Exception:
         pass
+    if spec.backend == "codex":
+        try:
+            if not codex_adapter_mod.stop_inflight(name) and async_tasks.list_running_task_ids_for_pair(name):
+                _write_stop_marker(name)
+        except Exception:
+            pass
     spec = reg_mod.remove_pair(name)
     archived: str | None = None
     if archive:
@@ -1114,6 +1130,17 @@ def _stop_marker_path(pair_name: str) -> Path:
     Written by ``python -m claude_squared stop <pair>``; honored by the runtime
     send loop via the should_stop closure below."""
     return reg_mod.pairs_dir() / "stop-requests" / f"{pair_name}.json"
+
+
+def _write_stop_marker(pair_name: str) -> None:
+    """Write the cross-process stop marker (same format as the terminal
+    ``stop`` command). Any process running a turn for the pair polls it ~1/s."""
+    marker = _stop_marker_path(pair_name)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    tmp = marker.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"pair_name": pair_name, "requested_at": time.time(),
+                               "requested_by_pid": os.getpid()}), encoding="utf-8")
+    tmp.replace(marker)
 
 
 def _make_stop_checker(pair_name: str, task_id: str) -> "Callable[[], bool]":
@@ -1439,9 +1466,11 @@ def _build_compact_runner(
         lock_acquire_timeout_s = max(120.0, float(compact_timeout_seconds) + 60.0)
 
     def _run(task_id: str | None = None) -> CompactResult:
-        # task_id accepted for runner-signature parity (async_tasks._go passes
-        # it); compaction runs via a one-shot subprocess, not the interruptible
-        # runtime loop, so there's no should_stop wiring here.
+        # v0.13.0: a stop checker bound to this task, so pair_stop / the
+        # terminal stop marker can cancel a Codex app-server compaction from
+        # any process (the Claude path runs a one-shot subprocess and ignores
+        # it). Astra catch.
+        should_stop = _make_stop_checker(name, task_id) if task_id else None
         with _with_pair_lock(name, timeout_s=lock_acquire_timeout_s):
             current = reg_mod.get_pair(name)
             # Compaction rewrites the session JSONL — any warm runtime has
@@ -1457,6 +1486,7 @@ def _build_compact_runner(
                 current,
                 steering_prompt=steering_prompt,
                 timeout_seconds=compact_timeout_seconds,
+                should_stop=should_stop,
             )
 
     return _run
@@ -1824,11 +1854,21 @@ def _resolve_pair_create_args(
             raise PairError("model='match-parent' is Claude-only (it reads the calling Claude "
                             "session's JSONL); pass an explicit Codex model or alias instead.")
         try:
-            resolved_model, note = codex_models.resolve_codex_model(resolved_model)
+            _slug, note = codex_models.resolve_codex_model(resolved_model)
         except ValueError as e:
             raise PairError(str(e))
         if note:
             messages.append(note)
+        # Keep a FLOATING alias floating: store what was typed ("sol") so the
+        # adapter re-resolves it at every spawn; a numbered slug stays pinned.
+        # No model at all → the dynamic default, stored as its tier alias so
+        # it follows generation bumps too (policy 2026-09-07). Astra catch.
+        _typed = (resolved_model or "").strip().lower()
+        if not _typed or _typed == "codex":
+            _tier = short_model_label(_slug)
+            resolved_model = _tier if _tier in codex_models.CODEX_TIER_ALIASES else _slug
+        else:
+            resolved_model = _typed
         if resolved_ultra:
             raise PairError("ultracode is a Claude setting; on Codex use effort='ultra' "
                             "(maximum reasoning + automatic task delegation) instead.")
@@ -2680,13 +2720,15 @@ def pair_update(
                     )
                 if cur_spec.backend == "codex":
                     try:
-                        model, _note = codex_models.resolve_codex_model(model)
+                        _slug, _note = codex_models.resolve_codex_model(model)
                     except ValueError as e:
                         raise PairError(str(e))
                     if _note:
                         transparency_msgs.append(_note)
+                    # Store the alias as typed (floating) or the slug (pinned).
+                    model = model.strip().lower()
                     if model != cur_spec.model:
-                        _up = codex_models.upgrade_note(model)
+                        _up = codex_models.upgrade_note(_slug)
                         if _up:
                             transparency_msgs.append(_up)
                 fields["model"] = model
@@ -3898,13 +3940,7 @@ def pair_stop(
             actions.append(f"{outcome} the in-flight codex turn (thread intact; next send resumes it)")
         elif running_task_ids:
             try:
-                sd = reg_mod.pairs_dir() / "stop-requests"
-                sd.mkdir(parents=True, exist_ok=True)
-                marker = sd / f"{name}.json"
-                tmp = marker.with_suffix(".tmp")
-                tmp.write_text(json.dumps({"pair_name": name, "requested_at": time.time(),
-                                           "requested_by_pid": os.getpid()}), encoding="utf-8")
-                tmp.replace(marker)
+                _write_stop_marker(name)
                 actions.append("stop marker written (the codex turn runs in another MCP process; "
                                "it tree-kills within ~1s)")
             except Exception as e:

@@ -281,8 +281,13 @@ def _allowed_efforts(model: str, backend: str | None = None) -> list[str]:
     be = backend or infer_backend(model)
     if be == "codex":
         try:
-            from claude_squared.codex_models import supported_efforts
-            levels = supported_efforts(model)
+            from claude_squared.codex_models import resolve_codex_model, supported_efforts
+            slug = model
+            try:
+                slug, _ = resolve_codex_model(model)  # floating alias → today's slug
+            except Exception:
+                pass
+            levels = supported_efforts(slug)
         except Exception:
             levels = None
         return list(levels) if levels else list(EFFORT_LEVELS_CODEX_FALLBACK)

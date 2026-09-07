@@ -276,8 +276,10 @@ class ClaudeAdapter(PairAdapter):
         return self._build_send_result(spec, result_json)
 
     def compact(self, spec: PairSpec, steering_prompt: str | None = None,
-                timeout_seconds: int = 600) -> CompactResult:
-        """Run /compact natively via stream-json. Returns pre/post token counts."""
+                timeout_seconds: int = 600, should_stop: "callable | None" = None) -> CompactResult:
+        """Run /compact natively via stream-json. Returns pre/post token counts.
+        ``should_stop`` is accepted for parity with CodexAdapter (a one-shot
+        subprocess.run can't be interrupted mid-way here)."""
         cmd = "/compact" if not steering_prompt else f"/compact {steering_prompt}"
         events = self._run_stream_json(spec, [cmd], timeout_seconds=timeout_seconds)
 

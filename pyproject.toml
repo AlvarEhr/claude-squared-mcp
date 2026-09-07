@@ -15,6 +15,7 @@ dependencies = [
     "fastmcp>=2.0",
     "filelock>=3.13",
     "pydantic>=2.5",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.scripts]
