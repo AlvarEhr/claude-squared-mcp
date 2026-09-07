@@ -1,4 +1,13 @@
-"""Pydantic schemas for pair MCP I/O."""
+"""Pydantic schemas for pair MCP I/O + the backend-neutral vocabularies.
+
+v0.13.0 introduced a second backend (OpenAI Codex CLI) behind the same
+``PairAdapter`` seam. Everything a caller types — permission level, effort,
+context window, model alias — is backend-NEUTRAL here and translated to the
+native flags inside each adapter. The old Claude-specific spellings
+(``bypassPermissions``, ``acceptEdits``, ``[1m]`` model suffixes …) stay
+accepted as INPUT aliases forever; outputs and the registry use the neutral
+form.
+"""
 
 from __future__ import annotations
 
@@ -9,13 +18,18 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 
-PermissionMode = Literal["auto", "acceptEdits", "plan", "default", "dontAsk", "bypassPermissions"]
-EffortLevel = Literal["low", "medium", "high", "xhigh", "max"]
-Backend = Literal["claude"]
+Backend = Literal["claude", "codex"]
+BACKENDS: tuple[str, ...] = ("claude", "codex")
+
+# Kept as a public name for backward compatibility with older imports. Effort is
+# validated per backend (see ``coerce_effort_for_model``), NOT by this alias —
+# a hard Literal would make one codex pair with ``effort="ultra"`` poison the
+# whole registry file (historian finding F3).
+EffortLevel = str
 
 # Tools that cannot function in a headless ``claude --print`` pair: there is no
 # interactive UI to render them, so the CLI denies the call regardless of
-# permission_mode (even bypassPermissions) — and any content the model composed
+# permission level (even unrestricted) — and any content the model composed
 # *inside* the call (questions, options, prose) is lost with the denial rather
 # than surfacing in the assistant text channel. We strip these from every pair's
 # toolset at spawn (see ``ClaudeAdapter._common_create_args``) so the model
@@ -23,34 +37,236 @@ Backend = Literal["claude"]
 # by the spawn-time disallow list and the permission-handoff formatter so the two
 # can't drift. AskUserQuestion is the confirmed offender (a pair is addressable
 # only by its orchestrator, so a clarifying question belongs in its text reply).
+# Codex's equivalent (``request_user_input``) self-disables headless — nothing
+# to strip there.
 HEADLESS_INCOMPATIBLE_TOOLS = ("AskUserQuestion",)
 
 
-# Per-model effort capability matrix (verified empirically by the user 2026-05-13):
-#   - Opus 4.7 / 4.7-1M / 4.6: all 5 levels
-#   - Sonnet (any version):    [low, medium, high]  (no xhigh / max)
-#   - Haiku (any version):     no effort levels at all
-#   - Fable 5 (2026-06-09):    handled as "unknown" family BY DESIGN —
-#     permissive passthrough verified against CLI 2.1.170 (--effort xhigh
-#     accepted alongside claude-fable-5[1m], no warning). New families stay
-#     "unknown" unless their capability DIFFERS from the permissive set;
-#     listing them here when it doesn't would be hardcoding with zero
-#     behavior delta.
-# When the requested effort isn't supported by the model, we coerce to the
-# nearest available level and surface a one-shot transparency message via
-# ``coerce_effort_for_model``. The Pydantic validator below also enforces
-# this invariant on the PairSpec itself so back-door update paths can't
-# bypass the coercion.
-_EFFORT_RANK = {None: -1, "low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4}
+# ============================================================================
+# Permission levels — one vocabulary, translated per backend
+# ============================================================================
+#
+# Loosest → strictest, each name says what the pair may DO rather than which
+# CLI flag it comes from. Levels that exist natively on only one backend route
+# to the nearest equivalent on the other; the table below is the contract.
+#
+#   level         meaning                                   Claude           Codex (exec)
+#   ------------  ----------------------------------------  ---------------  ------------------------------
+#   read-only     reads only; every write/exec is denied     default          -s read-only
+#                 and REPORTED back to you (handoff)
+#   plan          Claude's planning workflow (reads + a      plan             -s read-only  (nearest)
+#                 written plan, no edits); Codex → read-only
+#   workspace     edits + commands inside the workspace       acceptEdits      -s workspace-write
+#                 (cwd + extra_dirs) without review; outside
+#                 → denied and reported
+#   auto          in-workspace actions auto-approved; risky   auto             --approve-for-me (workspace-
+#                 / out-of-workspace actions reviewed by the                   write sandbox + escalations
+#                 backend's own classifier/reviewer                            judged by the codex-auto-review
+#                                                                              "guardian" model)
+#   unrestricted  no gates at all: no sandbox, no approvals   bypassPermissions --dangerously-bypass-
+#                                                                              approvals-and-sandbox
+#
+# Claude-specific nuance (documented, not encoded): ``plan`` still allows Bash,
+# so it is looser than ``read-only`` on Claude; ``workspace`` (acceptEdits)
+# auto-accepts EDITS but Bash still needs permission, which headless means
+# "denied and reported" — Codex's workspace-write allows sandboxed commands.
+# ``unrestricted`` on Codex also drops the network sandbox; on Claude there is
+# no sandbox to drop. Gate it as hard as bypassPermissions always was.
+PermissionLevel = Literal["read-only", "plan", "workspace", "auto", "unrestricted"]
+PERMISSION_LEVELS: tuple[str, ...] = ("read-only", "plan", "workspace", "auto", "unrestricted")
+
+# Input aliases — accepted forever, never emitted. Lower-cased lookup.
+PERMISSION_ALIASES: dict[str, str] = {
+    # Claude CLI spellings (pre-v0.13.0 canonical)
+    "default": "read-only",
+    "dontask": "read-only",
+    "acceptedits": "workspace",
+    "bypasspermissions": "unrestricted",
+    # Codex spellings
+    "workspace-write": "workspace",
+    "approve-for-me": "auto",
+    "danger-full-access": "unrestricted",
+    # convenience
+    "readonly": "read-only",
+    "read_only": "read-only",
+    "ro": "read-only",
+    "edit": "workspace",
+    "edits": "workspace",
+    "bypass": "unrestricted",
+    "full": "unrestricted",
+    "full-access": "unrestricted",
+    "none": "unrestricted",
+}
+
+# Neutral level → native Claude ``--permission-mode`` value. ``read-only`` maps
+# to the ask-for-everything mode, spelled ``manual`` since CLI 2.1.258 (the
+# older ``default`` is still accepted); ``ClaudeAdapter.native_permission``
+# picks whichever spelling the installed CLI's --help lists.
+CLAUDE_PERMISSION_MAP: dict[str, str] = {
+    "read-only": "manual",
+    "plan": "plan",
+    "workspace": "acceptEdits",
+    "auto": "auto",
+    "unrestricted": "bypassPermissions",
+}
+
+# Neutral level → Codex exec flags: (sandbox, approval_flag). ``approval_flag``
+# is one of None / "approve-for-me" / "bypass". Codex exec has NO ``-a`` flag
+# (verified 0.153.4: "unexpected argument '-a'"); approval in exec is "never"
+# unless one of the two flags below is given. ``--approve-for-me`` IMPLIES the
+# workspace-write sandbox and the CLI rejects ``-s`` next to it, so the
+# ``auto`` row's sandbox value is documentary — the adapter emits the flag alone.
+CODEX_PERMISSION_MAP: dict[str, tuple[str | None, str | None]] = {
+    "read-only": ("read-only", None),
+    "plan": ("read-only", None),
+    "workspace": ("workspace-write", None),
+    "auto": ("workspace-write", "approve-for-me"),
+    "unrestricted": (None, "bypass"),
+}
+
+PERMISSION_DESCRIPTIONS: dict[str, str] = {
+    "read-only": "reads only; every write/exec is denied and reported back (Claude: default; Codex: read-only sandbox)",
+    "plan": "Claude planning workflow — reads + a written plan, no edits (Codex: routes to read-only)",
+    "workspace": "edits + commands inside cwd/extra_dirs without review; outside → denied and reported (Claude: acceptEdits; Codex: workspace-write sandbox)",
+    "auto": "in-workspace work auto-approved, escalations judged by the backend's own reviewer (Claude: auto; Codex: --approve-for-me guardian review)",
+    "unrestricted": "no gates — no sandbox, no approvals (Claude: bypassPermissions; Codex: --dangerously-bypass-approvals-and-sandbox)",
+}
+
+
+def normalize_permission(value: str | None, *, default: str = "auto") -> str:
+    """Map any accepted spelling to the neutral level. ``None`` → ``default``.
+
+    Raises ``ValueError`` on an unknown name, listing what IS accepted.
+    """
+    if value is None:
+        return default
+    v = str(value).strip()
+    if v in PERMISSION_LEVELS:
+        return v
+    lower = v.lower()
+    if lower in PERMISSION_LEVELS:
+        return lower
+    if lower in PERMISSION_ALIASES:
+        return PERMISSION_ALIASES[lower]
+    raise ValueError(
+        f"unknown permission level {value!r}. Use one of {list(PERMISSION_LEVELS)} "
+        f"(old spellings still accepted: default/dontAsk→read-only, "
+        f"acceptEdits→workspace, bypassPermissions→unrestricted)."
+    )
+
+
+def permission_native(level: str, backend: str) -> str:
+    """Human-readable native mapping for a level on a backend (for messages)."""
+    lvl = normalize_permission(level)
+    if backend == "codex":
+        sandbox, appr = CODEX_PERMISSION_MAP[lvl]
+        if appr == "bypass":
+            return "--dangerously-bypass-approvals-and-sandbox"
+        if appr == "approve-for-me":
+            return "--approve-for-me (workspace-write + guardian review)"
+        return f"-s {sandbox}"
+    return f"--permission-mode {CLAUDE_PERMISSION_MAP[lvl]}"
+
+
+def permission_help_text() -> str:
+    """One line per level — used by tool docstrings and settings output."""
+    return "\n".join(f"  {lvl:12} {PERMISSION_DESCRIPTIONS[lvl]}" for lvl in PERMISSION_LEVELS)
+
+
+# ============================================================================
+# Backend inference + model-id helpers
+# ============================================================================
+
+# Codex tier aliases the user may type instead of a full slug. Resolved against
+# the live models cache by ``codex_models.resolve_codex_model`` — never
+# hardcoded to a generation here.
+CODEX_TIER_ALIASES: tuple[str, ...] = ("sol", "terra", "luna", "astra")
+_CODEX_SLUG_RE = re.compile(r"^gpt-(\d+)(?:\.(\d+))?(?:-([a-z][a-z0-9-]*))?$")
+
+
+def infer_backend(model: str | None) -> str:
+    """Guess the backend from a model string. ``gpt-*`` / ``codex-*`` / a bare
+    Codex tier alias → ``codex``; everything else (claude-*, opus, sonnet,
+    haiku, fable, match-parent, unknown) → ``claude``."""
+    m = (model or "").strip().lower()
+    if not m:
+        return "claude"
+    if m.startswith("gpt-") or m.startswith("codex-") or m.startswith("o3") or m.startswith("o4"):
+        return "codex"
+    if m in CODEX_TIER_ALIASES or m == "codex":
+        return "codex"
+    return "claude"
+
+
+def parse_codex_model(model: str) -> tuple[tuple[int, ...], str | None] | None:
+    """``'gpt-5.6-luna'`` → ``((5, 6), 'luna')``; ``'gpt-5.5'`` → ``((5, 5), None)``;
+    ``'gpt-6-astra'`` → ``((6,), 'astra')``. ``None`` when it isn't a gpt slug
+    (``codex-auto-review``, a bare tier alias, a Claude id …)."""
+    m = (model or "").strip().lower()
+    mt = _CODEX_SLUG_RE.match(m)
+    if not mt:
+        return None
+    major, minor, tier = mt.group(1), mt.group(2), mt.group(3)
+    gen: tuple[int, ...] = (int(major),) + ((int(minor),) if minor is not None else ())
+    return gen, tier
+
+
+def is_pinned_model(model: str, backend: str | None = None) -> bool:
+    """"Pinned" = the string names a specific numbered generation
+    (``claude-opus-5``, ``gpt-5.6-sol``). "Floating" = a family/tier alias
+    (``opus``, ``sol``) that follows whatever generation the backend currently
+    resolves it to. Drives the auto-upgrade-on-generation-bump policy."""
+    m = (model or "").strip().lower()
+    be = backend or infer_backend(m)
+    if be == "codex":
+        return parse_codex_model(m) is not None
+    _fam, ver = parse_model_id(m)
+    return bool(ver)
+
+
+def short_model_label(model: str) -> str:
+    """Footer label: ``claude-opus-5`` → ``opus``; ``gpt-5.6-luna`` → ``luna``;
+    ``gpt-5.5`` → ``gpt-5.5``; anything else unchanged."""
+    m = (model or "").strip()
+    if m.lower().startswith("claude-"):
+        parts = m.split("-")
+        return parts[1] if len(parts) > 1 else m
+    parsed = parse_codex_model(m)
+    if parsed and parsed[1]:
+        return parsed[1]
+    return m
+
+
+# ============================================================================
+# Effort
+# ============================================================================
+#
+# Both backends share the names low/medium/high/xhigh/max; Codex adds ``ultra``
+# ("maximum reasoning with automatic task delegation" — its ultracode-like
+# multi-agent mode, opt-in, never a default). Per-model capability:
+#   - Claude Opus / Fable / unknown families: all five (CLI is the authority)
+#   - Claude Sonnet: low/medium/high
+#   - Claude Haiku: no effort knob at all
+#   - Codex: whatever ``models_cache.json`` lists for the slug (dynamic), falling
+#     back to the six-level set when the cache is unavailable.
+# Unsupported requests are coerced to the NEAREST supported level with a
+# transparency message; the PairSpec validator re-applies the same rule so
+# back-door writes can't store an invalid combo.
+#
+# DEFAULT EFFORT = "high" on both backends (user policy 2026-09-07): pairs are
+# told what to do; raise per pair when the task warrants it.
+DEFAULT_EFFORT = "high"
+EFFORT_LEVELS_CLAUDE: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+EFFORT_LEVELS_CODEX_FALLBACK: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max", "ultra")
+_EFFORT_RANK = {None: -1, "low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4, "ultra": 5}
 
 
 def _model_family(model: str) -> str:
-    """Reduce a full model string ('claude-sonnet-4-6', 'opus', etc.) to its family.
-
-    Returns 'opus' / 'sonnet' / 'haiku' / 'unknown'. The family decides effort
-    capability — version doesn't matter for that question.
-    """
-    m = model.lower()
+    """Reduce a Claude model string ('claude-sonnet-4-6', 'opus', etc.) to its
+    family: 'opus' / 'sonnet' / 'haiku' / 'unknown'. Codex ids → 'unknown'."""
+    m = (model or "").lower()
+    if infer_backend(m) == "codex":
+        return "unknown"
     if "haiku" in m:
         return "haiku"
     if "sonnet" in m:
@@ -60,70 +276,95 @@ def _model_family(model: str) -> str:
     return "unknown"
 
 
-def _allowed_efforts(model: str) -> list[str]:
+def _allowed_efforts(model: str, backend: str | None = None) -> list[str]:
     """Effort levels the model accepts. Empty list = model has no effort knob."""
+    be = backend or infer_backend(model)
+    if be == "codex":
+        try:
+            from claude_squared.codex_models import supported_efforts
+            levels = supported_efforts(model)
+        except Exception:
+            levels = None
+        return list(levels) if levels else list(EFFORT_LEVELS_CODEX_FALLBACK)
     fam = _model_family(model)
-    if fam == "opus":
-        return ["low", "medium", "high", "xhigh", "max"]
     if fam == "sonnet":
         return ["low", "medium", "high"]
     if fam == "haiku":
         return []
-    # Unknown family: be permissive (let the CLI surface its own error).
-    return ["low", "medium", "high", "xhigh", "max"]
+    return list(EFFORT_LEVELS_CLAUDE)
 
 
-def coerce_effort_for_model(model: str, effort: str | None) -> tuple[str | None, str | None]:
+def coerce_effort_for_model(model: str, effort: str | None,
+                            backend: str | None = None) -> tuple[str | None, str | None]:
     """Return ``(coerced_effort, transparency_message_or_None)``.
 
-    Coercion rules:
-      - Haiku: any non-None effort → None ("model X doesn't support effort levels")
-      - Sonnet with xhigh/max: → ``high`` ("model X doesn't support 'xhigh'; coerced to 'high'")
-      - Otherwise: passthrough (None, low/medium/high stay; opus accepts all 5)
-
-    Caller is responsible for surfacing ``transparency_message`` to the user
-    once at the moment of coercion — this function is pure (returns the same
-    message repeatedly for the same input, but the caller decides when to show).
+    ``None`` passes through untouched (= let the CLI default). An unsupported
+    level is coerced to the nearest supported one by rank (Sonnet+xhigh →
+    high; Codex luna+ultra → max; Haiku anything → None). Unknown effort
+    strings on a model with a known level list are coerced too (with a message)
+    rather than rejected, so a typo can't brick a registry entry.
     """
-    fam = _model_family(model)
-    if fam == "haiku":
-        if effort is None:
-            return None, None
+    if effort is None:
+        return None, None
+    eff = str(effort).strip().lower()
+    allowed = _allowed_efforts(model, backend)
+    if not allowed:
         return None, (
-            f"model '{model}' doesn't support effort levels — "
-            f"using None (was '{effort}')."
+            f"model '{model}' doesn't support effort levels — using None (was '{eff}')."
         )
-    if fam == "sonnet":
-        if effort in (None, "low", "medium", "high"):
-            return effort, None
-        if effort in ("xhigh", "max"):
-            return "high", (
-                f"model '{model}' doesn't support effort '{effort}' — "
-                f"coerced to 'high' (sonnet's max effort level)."
-            )
-        # Unknown effort string; let the Literal validation reject downstream.
-        return effort, None
-    # Opus + unknown families accept everything; passthrough.
-    return effort, None
+    if eff in allowed:
+        return eff, None
+    want = _EFFORT_RANK.get(eff)
+    if want is None:
+        fallback = DEFAULT_EFFORT if DEFAULT_EFFORT in allowed else allowed[-1]
+        return fallback, (
+            f"unknown effort '{eff}' for model '{model}' — using '{fallback}' "
+            f"(supported: {', '.join(allowed)})."
+        )
+    ranked = sorted(allowed, key=lambda a: _EFFORT_RANK.get(a, 99))
+    lower = [a for a in ranked if _EFFORT_RANK.get(a, 99) <= want]
+    nearest = lower[-1] if lower else ranked[0]
+    return nearest, (
+        f"model '{model}' doesn't support effort '{eff}' — coerced to '{nearest}' "
+        f"(supported: {', '.join(ranked)})."
+    )
 
 
-def default_effort_for_model(model: str) -> str | None:
-    """The model-appropriate default effort when none is specified.
+def default_effort_for_model(model: str, backend: str | None = None) -> str | None:
+    """The default effort when none is specified: ``high`` everywhere except
+    models with no effort knob (Haiku → None). Coerced against capability."""
+    coerced, _ = coerce_effort_for_model(model, DEFAULT_EFFORT, backend)
+    return coerced
 
-    Mirrors Claude Code's own out-of-the-box defaults:
-      - Opus → xhigh
-      - Sonnet → high
-      - Haiku → None (no effort knob)
-      - Unknown → xhigh (permissive default; CLI will reject if model truly invalid)
-    """
-    fam = _model_family(model)
-    if fam == "opus":
-        return "xhigh"
-    if fam == "sonnet":
-        return "high"
-    if fam == "haiku":
-        return None
-    return "xhigh"
+
+# ============================================================================
+# Context window (neutral): "default" or "1m"
+# ============================================================================
+#
+# One field expresses the INTENT; the adapters translate and the footers report
+# the MEASURED window (Claude: modelUsage.contextWindow; Codex: the rollout's
+# token_count.model_context_window). Claude: "1m" appends the ``[1m]`` tier
+# suffix to the model id (redundant on Opus 5 / Fable, which are 1M bare —
+# harmless). Codex: "1m" passes ``-c model_context_window=1000000 -c
+# model_auto_compact_token_limit=900000``; the server clamps it to the model's
+# ``max_context_window`` (872k on the 5.6 family → 828,400 usable; default
+# 272k → 258,400 usable). Verified 0.153.4, 2026-09-07.
+ContextWindow = Literal["default", "1m"]
+_CONTEXT_WINDOW_ALIASES = {
+    "default": "default", "standard": "default", "normal": "default", "200k": "default",
+    "256k": "default", "272k": "default", "small": "default",
+    "1m": "1m", "1000000": "1m", "1000k": "1m", "extended": "1m", "large": "1m",
+    "max": "1m", "million": "1m",
+}
+
+
+def normalize_context_window(value: str | None) -> str:
+    if value is None:
+        return "default"
+    v = str(value).strip().lower().replace("[", "").replace("]", "")
+    if v in _CONTEXT_WINDOW_ALIASES:
+        return _CONTEXT_WINDOW_ALIASES[v]
+    raise ValueError(f"unknown context_window {value!r}; use 'default' or '1m'.")
 
 
 # --- Model-id parsing for downgrade / version-drift detection (v0.11.0) -------
@@ -139,8 +380,6 @@ def normalize_model_id(model: str) -> str:
 
     ``'claude-fable-5[1m]'`` → ``'claude-fable-5'``;
     ``'claude-haiku-4-5-20251001'`` → ``'claude-haiku-4-5'``. Lowercased.
-    Without this, ``[1m]`` makes every 1M pair look "substituted" and a dated
-    snapshot's ``20251001`` parses as a giant version component.
     """
     m = (model or "").strip().lower()
     m = re.sub(r"\[[^\]]*\]", "", m)      # drop [1m] / [200k] tier suffixes
@@ -148,18 +387,33 @@ def normalize_model_id(model: str) -> str:
     return m.strip()
 
 
-def parse_model_id(model: str) -> tuple[str | None, tuple[int, ...]]:
-    """Parse a model id/alias into ``(family, version_tuple)``.
+def split_model_tier(model: str) -> tuple[str, str]:
+    """``'claude-opus-5[1m]'`` → ``('claude-opus-5', '1m')``; no suffix →
+    ``(model, 'default')``. Used to migrate ``[1m]`` into ``context_window``."""
+    m = (model or "").strip()
+    mt = re.search(r"\[([^\]]*)\]\s*$", m)
+    if not mt:
+        return m, "default"
+    bare = m[: mt.start()].strip()
+    try:
+        cw = normalize_context_window(mt.group(1))
+    except ValueError:
+        cw = "default"
+    return bare, cw
 
-    ``'claude-opus-4-8'`` → ``('opus', (4, 8))``;
-    ``'claude-fable-5[1m]'`` → ``('fable', (5,))``;
-    ``'opus'`` (bare alias) → ``('opus', ())`` — family known, version unknown;
-    ``'claude-opus-4-6-fast'`` → ``('opus', (4, 6))`` — trailing non-numeric
-    (``-fast``) ignored. ``(None, ())`` when no leading family token parses
-    (e.g. legacy ``claude-3-5-sonnet`` family-in-the-middle naming) — callers
-    treat ``None`` as "can't reason, stay silent".
+
+def parse_model_id(model: str) -> tuple[str | None, tuple[int, ...]]:
+    """Parse a Claude model id/alias into ``(family, version_tuple)``.
+
+    ``'claude-opus-4-8'`` → ``('opus', (4, 8))``; ``'opus'`` → ``('opus', ())``;
+    ``'claude-opus-4-6-fast'`` → ``('opus', (4, 6))``. ``(None, ())`` when no
+    leading family token parses. Codex slugs are handled by
+    ``parse_codex_model`` — this returns ``(None, ())`` for them so the Claude
+    drift/substitution logic stays silent.
     """
     m = normalize_model_id(model)
+    if infer_backend(m) == "codex":
+        return None, ()
     rest = m[len("claude-"):] if m.startswith("claude-") else m
     fam_parts: list[str] = []
     ver_parts: list[int] = []
@@ -175,17 +429,8 @@ def parse_model_id(model: str) -> tuple[str | None, tuple[int, ...]]:
 
 
 def model_substitution_note(requested: str, served: str) -> str | None:
-    """Note if ``served`` looks like a downgrade/substitution of ``requested``.
-
-    Flags when (a) the served family differs from the requested family, or
-    (b) same family but the served version is strictly LOWER than an *explicitly
-    requested* version. An alias request (no explicit version, e.g. ``'opus'``)
-    never flags within-family — an alias means "whatever the CLI resolves", so
-    any same-family serve is acceptable. ``None`` when either side is
-    unparseable (stay silent rather than false-alarm). Worded "this turn ran on"
-    because ``--fallback-model`` retries the primary each turn — substitution is
-    per-turn, not sticky.
-    """
+    """Note if ``served`` looks like a downgrade/substitution of ``requested``
+    (Claude). ``None`` when either side is unparseable or for Codex ids."""
     rf, rv = parse_model_id(requested)
     sf, sv = parse_model_id(served)
     if rf is None or sf is None:
@@ -199,14 +444,8 @@ def model_substitution_note(requested: str, served: str) -> str | None:
 
 
 def newer_version_available(current: str, candidate: str) -> str | None:
-    """If ``candidate`` is a NEWER version of the same family as ``current``,
-    return the candidate's normalized id; else ``None``.
-
-    Both must parse to the same family with explicit version tuples and
-    ``candidate_version > current_version``. Used for the "newer model in your
-    family is available" notice (compared against the parent session's model —
-    self-healing, no hardcoded 'latest' table to rot).
-    """
+    """If ``candidate`` is a NEWER version of the same Claude family as
+    ``current``, return the candidate's normalized id; else ``None``."""
     cf, cv = parse_model_id(current)
     nf, nv = parse_model_id(candidate)
     if cf is None or nf is None or cf != nf:
@@ -216,63 +455,82 @@ def newer_version_available(current: str, candidate: str) -> str | None:
     return None
 
 
-# --- Premium (plan-gated, separate-limit) model families (v0.12.0) ----------
-# Families whose availability and cost depend on the subscription plan: they
-# carry their own separate weekly usage limit, consume usage faster than the
-# standard models, and on some plans are not included at all (billed as extra
-# usage credits instead). These are NOT blocked — the user may legitimately
-# want one — but selecting one is a usage/spending decision the *user* must
-# make, so we surface a confirmation prompt at every switch point.
+# --- Premium (plan-gated, separate-limit, never-default) models --------------
+# Families/tiers whose availability and cost depend on the subscription plan.
+# NOT blocked — the user may legitimately want one — but selecting one is a
+# usage/spending decision the *user* must make, so we surface a confirmation at
+# every switch point. These are also NEVER chosen as a default (policy
+# 2026-09-07): Claude never defaults to Fable, Codex never to Astra — but a pair
+# explicitly set to one STAYS on it.
 #
-# Keyed by FAMILY (via ``parse_model_id``) so every spelling matches with one
-# entry: bare alias ``fable``, ``claude-fable-5``, ``claude-fable-5[1m]``, and
-# any future ``claude-fable-6``.
-#
-# THIS TABLE ROTS — it encodes Anthropic's commercial terms, which change
-# without notice and are not discoverable from the CLI (there is no "is this
-# premium?" flag to query, nor a plan-tier field in ``claude auth status``,
-# which is why it is hardcoded at all). Each entry carries the date it was
-# last confirmed; re-verify before trusting an old one, and delete the entry
-# outright if a family becomes a standard included model on every plan.
+# THIS TABLE ROTS — it encodes commercial terms that change without notice and
+# are not discoverable from the CLIs. Each entry carries the date it was last
+# confirmed; re-verify before trusting an old one.
 _PREMIUM_FAMILIES: dict[str, str] = {
     # Fable 5: included on Max 20x (own weekly limit, higher usage burn);
-    # NOT included on Pro (billed as extra usage credits); Max 5x unverified.
-    # Confirmed by the user 2026-08-07 on Max 20x — the earlier 2026-06 reading
-    # of "billed outside the subscription" was taken on a Pro plan.
+    # NOT included on Pro (billed as extra usage credits); Max 5x: the user
+    # is on Max 5x as of 2026-09-07 and can select it.
     "fable": "is a premium model: it has its own separate weekly usage limit, "
              "consumes usage faster than standard models, and is only included "
              "on some plans (Max 20x: included; Pro: not included, billed as "
-             "extra usage credits; Max 5x: unverified) (confirmed 2026-08-07)",
+             "extra usage credits) (confirmed 2026-08-07)",
 }
+_PREMIUM_CODEX_TIERS: dict[str, str] = {
+    # gpt-6-astra (2026-09-03): the frontier tier above the 5.6 family; listed
+    # only on upgraded ChatGPT plans (Pro / Business / Enterprise; the user's
+    # plan lists it since 2026-09-07) and by far the most usage-hungry.
+    "astra": "is the frontier Codex tier: plan-gated (Pro/Business/Enterprise) "
+             "and the most usage-hungry model on the plan's weekly limit "
+             "(confirmed 2026-09-07)",
+}
+NEVER_DEFAULT_CLAUDE_FAMILIES: tuple[str, ...] = ("fable",)
+NEVER_DEFAULT_CODEX_TIERS: tuple[str, ...] = ("astra",)
 
 
 def premium_model_note(model: str) -> str | None:
-    """Warn when ``model`` is a premium (plan-gated) family; else ``None``.
-
-    Returns a message intended to be shown to the CALLING AGENT at the moment
-    of the switch, telling it to confirm the choice with the user before
-    proceeding. Deliberately advisory — nothing here blocks the model.
-    """
-    family, _ = parse_model_id(model)
+    """Warn when ``model`` is a premium (plan-gated) family/tier; else ``None``.
+    Advisory — nothing here blocks the model."""
+    m = (model or "").strip()
+    if not m:
+        return None
+    if infer_backend(m) == "codex":
+        parsed = parse_codex_model(m)
+        tier = parsed[1] if parsed else (m.lower() if m.lower() in CODEX_TIER_ALIASES else None)
+        reason = _PREMIUM_CODEX_TIERS.get(tier or "")
+        if reason is None:
+            return None
+        return (
+            f"⚠ PREMIUM MODEL: '{m.lower()}' {reason}. This is allowed, but it is a "
+            f"usage/spending decision — confirm the user explicitly asked for "
+            f"{tier} before continuing, and switch back to the current-generation "
+            f"default (e.g. 'sol') when done."
+        )
+    family, _ = parse_model_id(m)
     if family is None:
         return None
     reason = _PREMIUM_FAMILIES.get(family)
     if reason is None:
         return None
     return (
-        f"⚠ PREMIUM MODEL: '{normalize_model_id(model)}' {reason}. "
+        f"⚠ PREMIUM MODEL: '{normalize_model_id(m)}' {reason}. "
         f"This is allowed, but it is a usage/spending decision — confirm the "
         f"user explicitly asked for {family} before continuing, and switch back "
         f"to a standard model (e.g. 'opus') when done."
     )
 
 
+# ============================================================================
+# Schemas
+# ============================================================================
+
 class PairSpec(BaseModel):
     """Persistent pair configuration stored in the registry."""
 
     name: str = Field(..., description="Unique addressable name")
+    # Which CLI runs this pair. Fixed at create (a Claude session can't become a
+    # Codex thread); inferred from the model when not given.
     backend: Backend = "claude"
-    session_id: str = Field(..., description="UUID of underlying session")
+    session_id: str = Field(..., description="Claude session UUID / Codex thread id")
     purpose: str = ""
     # v0.12.0: self-woken turns that completed since the last pair_send, parked
     # here by the runtime's reader thread (see runtime._record_self_woken) and
@@ -280,64 +538,45 @@ class PairSpec(BaseModel):
     # memory — because the next send respawns the runtime (see is_stale) and
     # because any MCP process should see them. Capped at the newest 25.
     self_woken_pending: list[dict[str, Any]] = Field(default_factory=list)
+    # Model id or alias. Bare (no ``[1m]`` — that lives in ``context_window``).
+    # Floating aliases (``opus``, ``sol``) follow the backend's current
+    # generation; pinned ids (``claude-opus-5``, ``gpt-5.6-sol``) stay put.
     model: str = "opus"
-    # Nullable since haiku has no effort knob. The runtime/adapter omits the
-    # ``--effort`` CLI arg when this is None. Default is xhigh (opus' default);
-    # the model_validator below rewrites it to None for haiku, 'high' for
-    # sonnet+xhigh/max combos, etc., as a safety net against back-door updates.
-    effort: EffortLevel | None = "xhigh"
-    permission_mode: PermissionMode = "auto"
+    # Nullable since haiku has no effort knob. The adapter omits the effort arg
+    # when this is None. Default "high" (policy 2026-09-07) on both backends;
+    # the validator coerces it against the model's capability.
+    effort: str | None = DEFAULT_EFFORT
+    # Neutral level (see PERMISSION_LEVELS). Aliases are normalized on load.
+    permission_mode: str = "auto"
+    # v0.13.0: "default" | "1m". Intent only — footers report the measured window.
+    context_window: str = "default"
+    # v0.13.0: per-backend escape hatch for knobs with no neutral equivalent.
+    # Documented keys — codex: ``config`` (dict of extra ``-c key=value``
+    # overrides), ``args`` (list of raw extra exec args), ``sandbox`` /
+    # ``approval`` (native override of the permission translation:
+    # sandbox ∈ read-only|workspace-write|danger-full-access, approval ∈
+    # none|approve-for-me|bypass). Claude: none yet (every native mode is
+    # reachable through the level aliases).
+    backend_options: dict[str, Any] = Field(default_factory=dict)
     system_prompt_append: str | None = None
     profile_name: str | None = None  # references ~/.claude/pairs/profiles/<name>.md
     allowed_tools: list[str] | None = None
     mcp_whitelist: list[str] | None = None  # None = strict empty MCP config
     # MCP-level safety rail on ``pair_invoke``: which slash commands the calling
-    # agent may invoke through the structured channel. ``None`` = allow all
-    # (backward compat with pre-v0.8.1 — no surprise lockdowns). ``[]`` = explicit
-    # lockdown (deny all). Patterns use ``fnmatch`` glob syntax — e.g.
-    # ``["clear", "compact", "context", "mcp__claude_ai_*"]``.
-    #
-    # Threat-model note: this is **safety rails, not enforcement**. It blocks the
-    # explicit ``pair_invoke(name, "X")`` channel only. A natural-language
-    # ``pair_send(name, "please clear yourself")`` can still cause the pair to
-    # self-invoke ``/clear``. The value is preventing **accidental** main-agent
-    # missteps on first-class commands, not adversarial protection.
-    #
-    # Mutability: server-side enforcement layer, so ``pair_update`` changes take
-    # effect on the next ``pair_invoke`` call WITHOUT runtime eviction (unlike
-    # ``allowed_tools`` which is pinned at CLI startup and needs ``pair_clear``).
+    # agent may invoke through the structured channel. ``None`` = allow all;
+    # ``[]`` = explicit lockdown (deny all). Patterns use ``fnmatch`` glob syntax.
+    # Safety rails, not enforcement — see README "Per-pair invocation allow-list".
     allowed_invocations: list[str] | None = None
     cwd: str | None = None
     extra_dirs: list[str] | None = None  # additional --add-dir paths beyond cwd
     persistent: bool = False  # if True, runtime never evicted; otherwise 10-min idle eviction
-    # v0.9.10: Ultracode mode — "xhigh effort + dynamic workflow orchestration"
-    # per claude CLI 2.1.165+. When True, the adapter appends ``--settings
-    # '{"ultracode": true}'`` to every spawn so the CLI activates ultracode at
-    # the session level. Compatible with any ``effort`` setting (effort and
-    # ultracode are independent fields in the CLI's internal data model; the
-    # CLI sets effort to xhigh by default under ultracode but honors an
-    # explicit --effort override). Default False — backward compatible.
-    #
-    # NOTE: ``--effort ultracode`` is NOT a valid effort value (verified: the
-    # CLI rejects it with a warning). Ultracode is a SETTINGS key, not an
-    # effort level — see HANDOFF.md "Critical CLI behaviors we depend on" for
-    # the discovery story (binary strings: ``ultracodeKeywordTrigger``,
-    # ``ultracode \xB7 xhigh effort + dynamic workflows for maximum
-    # thoroughness``).
+    # v0.9.10: Ultracode mode (Claude) — ``--settings '{"ultracode": true}'`` at
+    # every spawn. NOT an effort value. Codex's analog is ``effort="ultra"``.
     ultracode: bool = False
-    # v0.11.0: automatic fallback model(s) when the primary is overloaded or
-    # unavailable. Passed to the CLI as ``--fallback-model`` (comma-separated
-    # list, tried in order; the CLI re-tries the primary at the start of each
-    # user turn, so a fallback is per-turn, not sticky). The main guard against
-    # losing access to a subscription/trial-flagged model: with this set, a send
-    # transparently continues on the fallback instead of hard-erroring, and the
-    # substitution detector surfaces "ran on fallback Y instead of X". ``None``
-    # = no fallback (default; the send hard-errors if the model is unavailable).
+    # v0.11.0: automatic fallback model(s) — Claude ``--fallback-model``. Codex
+    # has no analog (hard-errors at create if set on a codex pair).
     fallback_model: str | None = None
-    # v0.11.0: dedup marker for the "newer model in your family is available"
-    # notice. Stores the parent-version normalized id we last warned about for
-    # this pair, so the send-time check fires once per NEW release rather than
-    # every send or every runtime spawn. See server._build_send_runner drift check.
+    # v0.11.0: dedup marker for the "newer model available" notice.
     last_drift_notice: str | None = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
     last_active_at: datetime = Field(default_factory=datetime.utcnow)
@@ -346,27 +585,45 @@ class PairSpec(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _coerce_effort_for_model(cls, values):
-        """Safety-net coercion: ensure (model, effort) pair is internally consistent.
-
-        Surface-level coercion via ``coerce_effort_for_model`` happens at the API
-        boundary (pair_create / pair_settings_set) so the user gets a transparency
-        message. This validator ensures any back-door path (pair_update,
-        registry migration, manual edit) ALSO ends up with a valid combo —
-        without surfacing messages here, since the validator can't reach the
-        agent's response stream.
-        """
+    def _normalize(cls, values):
+        """Safety-net normalization on EVERY load/construct: legacy permission
+        spellings → neutral; ``[1m]`` in the model → ``context_window``;
+        backend inferred when absent; effort coerced against the model so
+        back-door writes (pair_update, registry migration, hand edits) can't
+        store an invalid combo. Messages are surfaced at the API boundary,
+        not here."""
         if not isinstance(values, dict):
             return values
-        model = values.get("model", "opus")
+        model = values.get("model", "opus") or "opus"
+        bare, cw = split_model_tier(str(model))
+        if bare != model:
+            values["model"] = bare
+            if cw == "1m":
+                values["context_window"] = "1m"
+        if not values.get("backend"):
+            values["backend"] = infer_backend(values.get("model"))
+        if "permission_mode" in values and values["permission_mode"] is not None:
+            try:
+                values["permission_mode"] = normalize_permission(values["permission_mode"])
+            except ValueError:
+                values["permission_mode"] = "auto"
+        if "context_window" in values and values["context_window"] is not None:
+            try:
+                values["context_window"] = normalize_context_window(values["context_window"])
+            except ValueError:
+                values["context_window"] = "default"
+        if values.get("backend_options") is None:
+            values["backend_options"] = {}
         if "effort" in values:
-            coerced, _msg = coerce_effort_for_model(model, values["effort"])
+            coerced, _msg = coerce_effort_for_model(
+                values.get("model", "opus"), values["effort"], values.get("backend"),
+            )
             values["effort"] = coerced
         return values
 
 
 class Registry(BaseModel):
-    version: int = 2
+    version: int = 3
     pairs: dict[str, PairSpec] = Field(default_factory=dict)
 
 
@@ -396,65 +653,43 @@ class SendResult(BaseModel):
     response: str
     session_id: str
     model_used: str
-    cost_usd: float
+    # None on backends that bill by plan quota rather than USD (Codex).
+    cost_usd: float | None = 0.0
     duration_ms: int
     permission_denials: list[PermissionDenial] = Field(default_factory=list)
     context: ContextStatus | None = None
     cache_read_tokens: int = 0
     needs_action: str | None = None
     # Audit pointer: the line range in the pair's main.log this turn produced.
-    # Caller can fetch via pair_log(name, start=..., end=...) for retroactive review.
     log_path: str | None = None
     log_line_start: int | None = None
     log_line_end: int | None = None
     # Sub-agent logs spawned during this turn (one entry per Agent tool_use).
     subagent_logs: list[str] = Field(default_factory=list)
-    # v0.11.0 model-handling hardening. All None on a normal turn; surfaced by
-    # ClaudeAdapter._build_send_result and rendered by server._fmt_send_result.
-    # The CLI SERVED a different model than the pair requested — a silent safety
-    # downgrade (e.g. fable → opus-4-8 when a cyber/bio classifier trips) or
-    # ``--fallback-model`` kicking in. Per-turn note (see model_substitution_note).
+    # v0.11.0 model-handling hardening — see ClaudeAdapter._build_send_result.
     model_substitution: str | None = None
-    # The turn may have been blocked/paused or errored. Message text only —
-    # ``safety_kind`` says how to LABEL it so a transient API overload isn't
-    # mislabeled as a safety block (the boy-who-cried-wolf failure).
     safety_signal: str | None = None
-    # "refusal" = genuine content-safety refusal (the only one that earns the
-    # SAFETY-BLOCK banner); "error" = api_error_status / is_error (transient
-    # overload, rate-limit, or tool error — rendered as a generic "abnormal").
+    # "refusal" | "usage_limit" | "model_unavailable" | "error"
     safety_kind: str | None = None
-    # Raw stop_reason from the result envelope, kept when it's anything other
-    # than the normal 'end_turn' (transparency for the human to interpret).
     stop_reason: str | None = None
-    # "A newer model in this pair's family is available" — set by the server's
-    # once-per-spawn send-time drift check (pair version vs parent version).
     drift_note: str | None = None
-    # v0.12.0: set when this turn's ``override_model`` selected a premium
-    # (plan-gated, separate-limit) family — a per-call switch the agent should
-    # confirm with the user. NOT set for a pair whose spec already sits on a
-    # premium model: that switch was warned about at pair_create/pair_update,
-    # and re-warning on every turn would be noise.
     premium_note: str | None = None
-    # v0.12.0 self-woken turns (see runtime.PairRuntime._open_implicit_turn).
-    # This turn launched background work (Agent run_in_background / Bash
-    # run_in_background / Workflow) and ended before it finished — the reply
-    # may be a placeholder. One entry per launch: "agent" / "bash" / "workflow".
-    # The continuation is tracked as its own async task when it arrives.
+    # v0.12.0 self-woken turns (Claude runtime only).
     background_launches: list[str] = Field(default_factory=list)
-    # Self-woken turns that COMPLETED between the previous send and this one
-    # (the pair resumed on its own after background work finished). Each entry:
-    # {task_id, status, log_line_start, log_line_end, response_preview,
-    # cost_usd, subtype}. task_id is None for an unattributed completion (a
-    # result event that arrived with no open scope at all).
     self_woken_completed: list[dict[str, Any]] = Field(default_factory=list)
-    # Seconds this send waited for an in-progress self-woken turn to finish
-    # before writing its message (it queues FIFO behind the pair's own work).
-    # None when it didn't have to wait.
     self_woken_waited_s: float | None = None
-    # Raw ``terminal_reason`` from the result envelope ('completed' on a normal
-    # finish; CLI 2.1.224). Surfaced verbatim when it's anything else — not
-    # interpreted, the other values aren't repro-verified.
     terminal_reason: str | None = None
+    # v0.13.0: which backend produced this turn (footers/labels).
+    backend: str = "claude"
+    # v0.13.0 (Codex): plan-quota position from the rollout's rate_limits —
+    # "15% of the weekly limit used, resets 2026-09-14 …". The USD cost analog.
+    plan_usage: str | None = None
+    # v0.13.0 (Codex, auto level): verdicts the codex-auto-review "guardian"
+    # returned for escalations this turn ("allow — rationale" / "deny — …").
+    guardian_notes: list[str] = Field(default_factory=list)
+    # v0.13.0: free-form transparency notes the adapter wants surfaced once
+    # (e.g. "sandbox degraded to read-only: windows.sandbox missing").
+    notes: list[str] = Field(default_factory=list)
 
 
 class CompactResult(BaseModel):
@@ -468,7 +703,7 @@ class CompactResult(BaseModel):
 
 
 class ContextReport(BaseModel):
-    """Result of pair_context (invokes /context in stream-json)."""
+    """Result of pair_context (Claude: /context; Codex: rollout token_count)."""
 
     name: str
     session_id: str
@@ -476,7 +711,7 @@ class ContextReport(BaseModel):
     tokens_used: int
     tokens_max: int
     percent: float
-    raw_markdown: str  # the full /context output for callers that want detail
+    raw_markdown: str  # the full breakdown for callers that want detail
 
 
 class PairListItem(BaseModel):
@@ -502,24 +737,11 @@ class AsyncTaskState(BaseModel):
     status: Literal["running", "done", "failed", "stopped"]
     started_at: datetime
     finished_at: datetime | None = None
-    # v0.9.8: widened from ``SendResult | None`` to also carry ``CompactResult``.
-    # pair_compact now goes through the same async-task machinery as pair_send
-    # (graceful sync-cap degradation, so long compacts return an async handle
-    # instead of host RPC timeout -32001). A "done" compact task's result has
-    # the CompactResult shape. Pydantic smart-union disambiguates via unique
-    # fields: ``response`` → SendResult, ``pre_tokens`` → CompactResult.
-    # pair_poll dispatches its rendering via ``isinstance`` to pick the right
-    # formatter. Existing pre-v0.9.8 task files (where result is always a
-    # SendResult dict) deserialize cleanly under the smart-union semantics.
+    # v0.9.8: ``SendResult | CompactResult``. Pydantic smart-union disambiguates
+    # via unique fields: ``response`` → SendResult, ``pre_tokens`` → CompactResult.
     result: "SendResult | CompactResult | None" = None
     error: str | None = None
-    # PID of the MCP server process that owns this task. Set at start_task;
-    # atexit cleanup only sweeps tasks owned by os.getpid(), and a startup
-    # sweep marks tasks owned by no-longer-alive PIDs as failed. Without this
-    # field, an MCP server shutdown would trash tasks being worked on by
-    # other coexisting MCP processes (CLI install + Desktop install share
-    # ~/.claude/pairs/async/ on disk). Optional for backward compatibility
-    # with task state files written before this field existed.
+    # PID of the MCP server process that owns this task (orphan supervision).
     owner_pid: int | None = None
 
 

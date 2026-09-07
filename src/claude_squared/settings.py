@@ -10,9 +10,11 @@ Read at the API boundary by ``pair_create`` to fill missing args; written by
 "intent always wins" principle from historian's design pass).
 
 Hardcoded fallbacks (when neither the call nor the defaults file specifies):
-    model = "opus"
-    effort = "xhigh" (model-coerced for sonnet → "high", haiku → None)
+    backend = inferred from the model ("claude" unless the model is a Codex id)
+    model = "opus" (Claude) / the dynamic current-generation Codex default
+    effort = "high" (model-coerced: haiku → None)
     permission_mode = "auto"
+    context_window = "default"
     persistent = False
     extra_dirs = None
 
@@ -36,9 +38,10 @@ from filelock import FileLock
 from pydantic import BaseModel, Field, field_validator
 
 from claude_squared.models import (
-    EffortLevel,
-    PermissionMode,
+    BACKENDS,
     coerce_effort_for_model,
+    normalize_context_window,
+    normalize_permission,
     premium_model_note,
 )
 from claude_squared.registry import pairs_dir
@@ -52,15 +55,22 @@ class PairDefaults(BaseModel):
     Each field is Optional. Unset (None) means "use the hardcoded default."
     """
 
+    # v0.13.0: default backend for pairs created without a model or backend.
+    # None → "claude" (or inferred from ``model`` when that is a Codex id).
+    backend: str | None = None
     # Model defaults. Special string "match-parent" triggers JSONL detection.
     model: str | None = None
     # Effort can be explicitly set, or auto-derive from model via
-    # ``default_effort_for_model`` if None.
-    effort: EffortLevel | None = None
-    # Permission mode. The setter REJECTS bypassPermissions as a default value
-    # (foot-gun: every new pair would silently have no guardrails). Pass it
-    # per-pair on pair_create where the decision is visible.
-    permission_mode: PermissionMode | None = None
+    # ``default_effort_for_model`` if None. Validated per backend/model at
+    # apply time (not a hard Literal — Codex has ``ultra``).
+    effort: str | None = None
+    # Neutral permission level (old spellings accepted). The setter REJECTS
+    # ``unrestricted`` (= bypassPermissions) as a default value (foot-gun: every
+    # new pair would silently have no guardrails). Pass it per-pair on
+    # pair_create where the decision is visible.
+    permission_mode: str | None = None
+    # v0.13.0: "default" | "1m" for new pairs.
+    context_window: str | None = None
     # Whether new pairs should be marked persistent by default.
     persistent: bool | None = None
     # v0.9.10: Whether new pairs should default to Ultracode mode ("xhigh
@@ -85,14 +95,32 @@ class PairDefaults(BaseModel):
 
     @field_validator("permission_mode")
     @classmethod
-    def _refuse_bypass_as_default(cls, v: PermissionMode | None) -> PermissionMode | None:
-        if v == "bypassPermissions":
+    def _refuse_bypass_as_default(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        level = normalize_permission(v)  # ValueError on unknown names
+        if level == "unrestricted":
             raise ValueError(
-                "permission_mode='bypassPermissions' cannot be set as a global default — "
-                "every new pair would silently have no guardrails. Pass it per-pair on "
-                "pair_create where the decision is visible."
+                "permission_mode='unrestricted' (bypassPermissions) cannot be set as a "
+                "global default — every new pair would silently have no guardrails. Pass "
+                "it per-pair on pair_create where the decision is visible."
             )
-        return v
+        return level
+
+    @field_validator("backend")
+    @classmethod
+    def _check_backend(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        b = str(v).strip().lower()
+        if b not in BACKENDS:
+            raise ValueError(f"backend must be one of {list(BACKENDS)} (got {v!r})")
+        return b
+
+    @field_validator("context_window")
+    @classmethod
+    def _check_context_window(cls, v: str | None) -> str | None:
+        return None if v is None else normalize_context_window(v)
 
     @field_validator("allowed_invocations")
     @classmethod
@@ -172,9 +200,8 @@ def update_defaults(**fields) -> tuple[PairDefaults, list[str]]:
     ``change_messages`` describes coercions/auto-resets done.
 
     Single-field UX: changing model alone may auto-reset effort to a
-    model-appropriate default (Opus→xhigh, Sonnet→high, Haiku→None) — silent
-    field clearing would surprise the user, so we surface the auto-reset in
-    change_messages.
+    model-appropriate default (high; Haiku→None) — silent field clearing would
+    surprise the user, so we surface the auto-reset in change_messages.
     """
     valid_fields = set(PairDefaults.model_fields.keys())
     unknown = set(fields.keys()) - valid_fields

@@ -579,14 +579,16 @@ class PairRuntime:
         args += [
             "--print", "--verbose",
             "--resume", self.spec.session_id,
-            "--model", self.spec.model,
+            # v0.13.0: neutral spec → native flags via the adapter (``[1m]``
+            # from context_window; permission level → --permission-mode).
+            "--model", self.adapter.cli_model(self.spec),
         ]
         # Skip --effort for haiku (no effort knob) or any spec where effort
         # was coerced to None for the model's capability.
         if self.spec.effort is not None:
             args += ["--effort", self.spec.effort]
         args += [
-            "--permission-mode", self.spec.permission_mode,
+            "--permission-mode", self.adapter.native_permission(self.spec.permission_mode),
             "--input-format", "stream-json",
             "--output-format", "stream-json",
         ]
@@ -1530,6 +1532,8 @@ class RuntimeRegistry:
             if rt is not None and rt.is_alive():
                 if (rt.spec.session_id != spec.session_id
                         or rt.spec.model != spec.model
+                        or rt.spec.context_window != spec.context_window
+                        or rt.spec.effort != spec.effort
                         or rt.spec.cwd != spec.cwd
                         or rt.spec.permission_mode != spec.permission_mode):
                     self._stop_unlocked(spec.name)

@@ -24,15 +24,20 @@ from filelock import FileLock, Timeout as FileLockTimeout
 
 from claude_squared import agents as agents_mod
 from claude_squared import async_tasks
+from claude_squared import codex_models
 from claude_squared import registry as reg_mod
 from claude_squared import transcript as transcript_mod
 from claude_squared import runtime as runtime_mod
 from claude_squared import settings as settings_mod
-from claude_squared.adapters import ClaudeAdapter, PairAdapter
+from claude_squared.adapters import ClaudeAdapter, CodexAdapter, PairAdapter
+from claude_squared.adapters import codex as codex_adapter_mod
 from claude_squared.cli_paths import encode_cwd_for_project as _encode_cwd_for_project
 from claude_squared.errors import PairAlreadyExists, PairError, PairNotFound
 from claude_squared.models import (
+    BACKENDS,
+    DEFAULT_EFFORT,
     HEADLESS_INCOMPATIBLE_TOOLS,
+    PERMISSION_LEVELS,
     ActionInfo,
     AsyncTaskState,
     CompactResult,
@@ -44,8 +49,15 @@ from claude_squared.models import (
     SendResult,
     coerce_effort_for_model,
     default_effort_for_model,
+    infer_backend,
+    is_pinned_model,
+    normalize_context_window,
+    normalize_permission,
+    permission_help_text,
+    permission_native,
     premium_model_note,
     newer_version_available,
+    short_model_label,
 )
 
 
@@ -201,7 +213,8 @@ def _fmt_send_result(r: SendResult) -> str:
     footer_parts: list[str] = []
     if ctx:
         footer_parts.append(f"{ctx.percent:.0f}% ctx ({ctx.tokens_used:,}/{ctx.tokens_max:,})")
-    footer_parts.append(r.model_used.split("-")[1] if r.model_used.startswith("claude-") else r.model_used)
+    label = short_model_label(r.model_used)
+    footer_parts.append(f"codex/{label}" if r.backend == "codex" else label)
     if r.duration_ms:
         footer_parts.append(f"{r.duration_ms / 1000:.1f}s")
     # Log audit pointer: which lines of which file this turn produced
@@ -256,6 +269,14 @@ def _fmt_send_result(r: SendResult) -> str:
         lines.append(f"💳 {r.premium_note}")
     if r.drift_note:
         lines.append(f"🆕 {r.drift_note}")
+    # v0.13.0 Codex signals: plan-quota position (the cost analog), guardian
+    # verdicts on escalations (auto level), and adapter notes.
+    if r.plan_usage:
+        lines.append(f"📊 plan usage: {r.plan_usage}")
+    for g in r.guardian_notes or []:
+        lines.append(f"🛡 guardian review: {g}")
+    for n in r.notes or []:
+        lines.append(f"ℹ {n}")
     # v0.12.0 self-woken turn signals (see runtime.PairRuntime._open_implicit_turn).
     if r.background_launches:
         from collections import Counter as _Counter
@@ -299,29 +320,37 @@ def _fmt_send_result(r: SendResult) -> str:
         from collections import Counter
         counts = Counter(d.tool_name for d in r.permission_denials)
         denied_summary = ", ".join(f"{name} ×{n}" if n > 1 else name for name, n in counts.items())
-        # Report the pair's ACTUAL permission_mode rather than hardcoding
-        # "auto-mode" — a bypassPermissions pair was historically mislabeled,
-        # and the mode determines which remedy actually applies.
+        # Report the pair's ACTUAL permission level rather than hardcoding
+        # "auto-mode" — an unrestricted pair was historically mislabeled,
+        # and the level determines which remedy actually applies.
         try:
-            mode = reg_mod.get_pair(r.name).permission_mode
+            _spec = reg_mod.get_pair(r.name)
+            mode = _spec.permission_mode
+            backend = _spec.backend
         except Exception:
-            mode = "unknown"
+            mode, backend = "unknown", r.backend
+        native = ""
+        try:
+            native = f" = {permission_native(mode, backend)}"
+        except Exception:
+            pass
         # Partition denials: structurally-headless-incompatible tools (e.g.
         # AskUserQuestion) vs genuine permission denials. The former are denied
-        # regardless of permission_mode — bypassPermissions does NOT help — and
+        # regardless of permission level — unrestricted does NOT help — and
         # any content the model composed inside the call is gone with it.
         interactive = [t for t in counts if t in HEADLESS_INCOMPATIBLE_TOOLS]
-        permissionish = [t for t in counts if t not in HEADLESS_INCOMPATIBLE_TOOLS]
+        guardian = [t for t in counts if t == "guardian-review"]
+        permissionish = [t for t in counts if t not in HEADLESS_INCOMPATIBLE_TOOLS and t != "guardian-review"]
 
         lines.append(
-            f"\n⛔ PAIR HANDOFF: pair '{r.name}' (permission_mode={mode}) had "
-            f"{len(r.permission_denials)} blocked tool call(s) — {denied_summary}."
+            f"\n⛔ PAIR HANDOFF: pair '{r.name}' (permission level '{mode}'{native}) had "
+            f"{len(r.permission_denials)} blocked action(s) — {denied_summary}."
         )
         if interactive:
             lines.append(
                 f"\n   • {', '.join(interactive)}: cannot run in headless mode — there is no "
                 f"interactive UI to render these. This is NOT a permission problem; "
-                f"bypassPermissions will NOT help (the call is blocked even in that mode). "
+                f"'unrestricted' will NOT help (the call is blocked even at that level). "
                 f"Whatever the pair composed INSIDE the call (questions, options, prose) was "
                 f"dropped with it and is NOT in the reply above.\n"
                 f"     Recovery: re-send asking the pair to return that content as PLAIN TEXT — e.g. "
@@ -332,20 +361,40 @@ def _fmt_send_result(r: SendResult) -> str:
                 f"EXISTING pair like this one needs pair_clear — or pair_forget + pair_create — to pick "
                 f"up the change, since the toolset is pinned at session start.)"
             )
+        if guardian:
+            lines.append(
+                f"\n   • guardian-review: the Codex auto-reviewer (the 'auto' level's escalation judge) "
+                f"DENIED an out-of-sandbox action — see the 🛡 line(s) above for its rationale. "
+                f"To allow it, the USER must authorize: then re-send with "
+                f"override_permission_mode=\"unrestricted\", or widen the workspace "
+                f"(pair_update extra_dirs=[...]) so the action no longer needs an escalation."
+            )
         if permissionish:
             denied_p = ", ".join(permissionish)
+            if backend == "codex":
+                remedy = (
+                    f"       2. Re-send with `override_permission_mode=\"unrestricted\"` (Codex: "
+                    f"--dangerously-bypass-approvals-and-sandbox — no sandbox at all, network "
+                    f"included), OR widen the sandbox instead: pair_update('{r.name}', "
+                    f"extra_dirs=[...]) adds writable roots; permission_mode='auto' lets the "
+                    f"guardian reviewer approve one-off escalations."
+                )
+            else:
+                remedy = (
+                    f"       2. Re-send with `override_permission_mode=\"unrestricted\"` (the reliable path "
+                    f"in headless --print mode — natural-language \"the user authorized this\" alone does NOT "
+                    f"reliably satisfy the headless classifier, unlike interactive Claude Code). For "
+                    f"out-of-sandbox file access, unrestricted OR pair_clear+pair_create with a wider "
+                    f"cwd/--add-dir; for a persistent narrow allowlist, recreate with `allowed_tools=[...]`."
+                )
             lines.append(
-                f"\n   • {denied_p}: blocked by permission_mode={mode}. "
+                f"\n   • {denied_p}: blocked at permission level '{mode}'. "
                 f"The pair worked around it in its reply above (or didn't, if the task needed those tools).\n"
                 f"     To retry, the USER must explicitly authorize. Do NOT retry autonomously — this MCP "
                 f"intentionally surfaces the denial.\n"
                 f"       1. Check the user's most recent message. If it explicitly authorizes the blocked "
                 f"action, proceed; otherwise ASK first and wait for a clear go-ahead.\n"
-                f"       2. Re-send with `override_permission_mode=\"bypassPermissions\"` (the reliable path "
-                f"in headless --print mode — natural-language \"the user authorized this\" alone does NOT "
-                f"reliably satisfy the headless classifier, unlike interactive Claude Code). For "
-                f"out-of-sandbox file access, bypassPermissions OR pair_clear+pair_create with a wider "
-                f"cwd/--add-dir; for a persistent narrow allowlist, recreate with `allowed_tools=[...]`."
+                f"{remedy}"
             )
     return "\n".join(lines)
 
@@ -365,6 +414,8 @@ def _fmt_compact_result(r: CompactResult) -> str:
         f"Compacted: {r.pre_tokens:,} → {r.post_tokens:,} tokens "
         f"({ratio_pct:.1f}% retained, {r.duration_ms / 1000:.1f}s, trigger={r.trigger})"
     )
+    if r.summary_preview:
+        body += f"\n  {r.summary_preview}"
     return f"{header}\n{body}"
 
 
@@ -484,6 +535,25 @@ def _summarize_event(pair_name: str, ev: dict) -> str | None:
                 if isinstance(block, dict) and block.get("type") == "tool_result":
                     preview = str(block.get("content"))[:100].replace("\n", " ")
                     return f"[{pair_name}] tool_result: {preview}"
+    # v0.13.0 Codex --json shapes.
+    elif t == "thread.started":
+        return f"[{pair_name}] codex thread {str(ev.get('thread_id'))[:8]}"
+    elif t in ("item.started", "item.completed"):
+        it = ev.get("item") or {}
+        ity = it.get("type")
+        if ity == "agent_message" and t == "item.completed":
+            preview = (it.get("text") or "")[:160].replace("\n", " ")
+            return f"[{pair_name}] {preview}" if preview else None
+        if ity == "command_execution" and t == "item.started":
+            return f"[{pair_name}] using exec({CodexAdapter._item_preview(it)[:120]})"  # noqa: SLF001
+        if ity == "file_change" and t == "item.started":
+            return f"[{pair_name}] editing: {CodexAdapter._item_preview(it)[:120]}"  # noqa: SLF001
+        if ity == "error":
+            return f"[{pair_name}] error: {str(it.get('message'))[:120]}"
+    elif t == "turn.completed":
+        return f"[{pair_name}] turn completed"
+    elif t == "turn.failed":
+        return f"[{pair_name}] turn FAILED: {str((ev.get('error') or {}).get('message'))[:120]}"
     return None
 
 # Per-pair locks for FIFO send queueing.
@@ -574,7 +644,15 @@ def _get_lock(name: str) -> threading.Lock:
 def _adapter_for(spec: PairSpec) -> PairAdapter:
     if spec.backend == "claude":
         return ClaudeAdapter()
-    raise PairError(f"Unsupported backend '{spec.backend}'")
+    if spec.backend == "codex":
+        return CodexAdapter()
+    raise PairError(f"Unsupported backend '{spec.backend}' (known: {list(BACKENDS)})")
+
+
+def _require_claude(spec: PairSpec, tool: str, why: str) -> None:
+    """Hard-error for tools that only exist on the Claude backend."""
+    if spec.backend != "claude":
+        raise PairError(f"{tool} is not available for {spec.backend} pair '{spec.name}': {why}")
 
 
 # Curated MCP-level commands surfaced via pair_actions
@@ -588,9 +666,9 @@ _PAIR_ACTIONS = {
     "invoke": "pair_invoke — invoke a skill in the pair (translates to /<skill> via stream-json)",
     "transcript": "pair_transcript — tail recent turns from the pair's JSONL",
     "info": "pair_info — full pair details + transcript path + stats",
-    "update": "pair_update — change pair config (model, effort, permission_mode, allowed_tools, purpose)",
+    "update": "pair_update — change pair config (model, effort, permission level, context_window, allowed_tools, purpose)",
     "forget": "pair_forget — remove from registry; archives transcript by default",
-    "adopt": "pair_adopt — register an existing claude session UUID as a pair",
+    "adopt": "pair_adopt — register an existing claude session UUID / codex thread id as a pair",
     "agent_define": "pair_agent_define — write a custom agent definition to ~/.claude/agents/",
     "agent_list": "pair_agent_list — list defined custom agents",
 }
@@ -610,6 +688,8 @@ def pair_create(
     model: str | None = None,
     effort: str | None = None,
     permission_mode: str | None = None,
+    backend: str | None = None,
+    context_window: str | None = None,
     system_prompt_append: str | None = None,
     profile_name: str | None = None,
     allowed_tools: str | list[str] | None = None,
@@ -620,83 +700,115 @@ def pair_create(
     ultracode: bool | None = None,
     fallback_model: str | None = None,
     allowed_invocations: str | list[str] | None = None,
+    backend_options: dict | str | None = None,
     initial_message: str | None = None,
     session_id: str | None = None,
     parent_model: str | None = None,
     verbose: bool = False,
 ) -> str:
-    """Create a new long-running addressable pair (Claude Code CLI sub-session).
+    """Create a new long-running addressable pair — a Claude Code CLI sub-session
+    (``backend="claude"``, default) or an OpenAI Codex CLI thread (``backend="codex"``).
 
-    The child has true recursion (can spawn its own Agent sub-tasks), persistent context
+    The child has true recursion (can spawn its own sub-agents), persistent context
     across turns, and is specialized via pinned config (system prompt, allowed tools,
-    MCP scope — all persist across resume).
+    MCP scope — all persist across resume). One vocabulary covers both backends:
+    permission levels, effort names, ``context_window`` and model aliases are
+    backend-neutral and translated to native flags per backend.
 
-    Defaults for ``model`` / ``effort`` / ``permission_mode`` / ``persistent`` /
-    ``extra_dirs`` come from ``pair_settings_get`` (or hardcoded fallback: opus /
-    unset / auto / False / None). All list-typed args (``allowed_tools``,
-    ``mcp_whitelist``, ``extra_dirs``, ``allowed_invocations``) accept a list,
-    JSON-array string, or semicolon/newline-separated string. See README for
-    invocation allow-list, mid-flight config changes, and the full list of pair tools.
+    Defaults for ``backend`` / ``model`` / ``effort`` / ``permission_mode`` /
+    ``context_window`` / ``persistent`` / ``extra_dirs`` come from
+    ``pair_settings_get`` (hardcoded fallback: claude / opus (Codex: the current-
+    generation default, Sol > Terra > Luna) / high / auto / default / False / None).
+    All list-typed args accept a list, JSON-array string, or semicolon/newline-
+    separated string. See README for the full tool list.
 
     Args:
         name: Unique addressable handle (e.g. "reviewer", "scout").
         purpose: Human-readable description, stored only.
-        model: any alias (opus|sonnet|haiku|fable|...) or full id the CLI
-            accepts, including tier suffixes (e.g. ``"claude-fable-5[1m]"``).
-            Unknown families pass through — the CLI is the authority. Special:
-            ``"match-parent"`` detects the calling session's model from JSONL
-            (falls back to opus; the 1M tier suffix is NOT detectable — pass
-            ``parent_model`` to short-circuit detection).
-        effort: low|medium|high|xhigh|max. Unset → omit the flag and let the CLI
-            apply its own per-model default. Coerced silently against model
-            capability (Sonnet xhigh/max → high; Haiku any → None) with a message.
-        permission_mode: auto|acceptEdits|plan|default|dontAsk|bypassPermissions.
-            ``bypassPermissions`` skips ALL gates — only use with tightly-scoped
-            ``allowed_tools``/``cwd`` or when deliberately opting out of safety.
-        system_prompt_append: Text appended to the default system prompt. Pinned at create.
-        profile_name: ``~/.claude/pairs/profiles/<name>.md`` used as system_prompt_append
-            (combined with ``system_prompt_append`` if both given).
-        allowed_tools: Permission patterns like ``["Bash(git *)", "Read", "Edit"]``.
-            Pinned at create.
-        mcp_whitelist: MCP server names to enable. None or [] = all MCPs disabled.
-        cwd: Absolute workspace root for auto-mode (gates file ops OUTSIDE this path).
-            Default: MCP server's cwd (which inherits from the calling session for CLI
-            users). Use ``extra_dirs`` to widen access without changing root.
-        extra_dirs: Additional ``--add-dir`` paths beyond cwd. Each entry runs through
-            ~/$VAR/%VAR% expansion ("~/OneDrive" works). Comma-splitting NOT supported
-            (OneDrive-Business folders like "OneDrive - Acme, Inc" would break in half).
-        persistent: True = subprocess kept alive for MCP server lifetime (no idle
-            eviction). Use for pairs you chat with frequently. Default False = lazy-spawn
-            + 10-min idle eviction.
-        ultracode: True = activate Ultracode mode for this pair — "xhigh effort +
-            dynamic workflow orchestration" (Anthropic's framing). The MCP passes
-            ``--settings '{"ultracode": true}'`` to the CLI at every spawn,
-            which is Anthropic's canonical activation mechanism. Compatible with
-            any explicit ``effort`` value — ultracode and effort are independent
-            CLI fields. Default False. **Common pitfall**: ``effort="ultracode"``
-            is NOT valid — the CLI rejects it with a warning. Use this flag.
-        fallback_model: Automatic fallback when the primary model is overloaded
-            or unavailable — passed to the CLI as ``--fallback-model`` (a single
-            id or comma-separated list tried in order; the CLI re-tries the
-            primary at the start of each turn, so it's per-turn, not sticky). The
-            main guard against losing access to a subscription/trial-flagged
-            model: set it and a send transparently continues on the fallback
-            instead of hard-erroring (the reply footer flags "ran on fallback Y").
-            Default None (no fallback). e.g. ``fallback_model="claude-opus-4-8"``.
-        allowed_invocations: ``pair_invoke`` allow-list (fnmatch globs). ``None`` = allow
-            all (default, backward-compat); ``[]`` = deny all (lockdown); ``["clear",
-            "mcp__claude_ai_*"]`` = allow matching only. Mutable via ``pair_update``
-            without eviction. See README "Per-pair invocation allow-list" — this is
-            safety rails, not enforcement (``pair_send`` natural language can still
-            self-invoke commands).
-        initial_message: If set, sent as the first turn. Response in initial_response.
-        session_id: Caller-supplied UUID; auto-generated if omitted.
-        parent_model: Explicit "my model is X" hint for ``model="match-parent"`` —
-            skips JSONL detection (e.g. ``"claude-fable-5[1m]"`` — the only way
-            to carry a 1M tier through match-parent; JSONLs record bare ids).
+        model: Claude: any alias (opus|sonnet|haiku|fable) or full id; unknown
+            families pass through (the CLI is the authority). Codex: a full slug
+            (``gpt-5.6-sol``) or a FLOATING tier alias — ``sol`` | ``terra`` |
+            ``luna`` | ``astra`` — resolved against the live models cache at every
+            spawn, so a generation bump (5.6 → 5.7) upgrades the pair automatically;
+            a numbered slug stays pinned (you get a one-time nudge instead). The
+            backend is inferred from the model when ``backend`` is omitted.
+            Fable (Claude) and Astra (Codex) are never defaults but stick once set.
+            Special (Claude only): ``"match-parent"`` detects the calling session's
+            model from JSONL (pass ``parent_model`` to short-circuit).
+        effort: low|medium|high|xhigh|max (Codex also: ``ultra`` = maximum reasoning
+            + automatic task delegation, its multi-agent mode). Default ``high`` on
+            both backends. Coerced to the nearest level the model supports, with a
+            message (Sonnet xhigh → high; Haiku → none; Codex per the models cache).
+        permission_mode: backend-neutral level, loosest last —
+            ``read-only`` | ``plan`` | ``workspace`` | ``auto`` | ``unrestricted``.
+            read-only: reads only, every write/exec is denied AND reported back to
+            you. plan: Claude's planning workflow (Codex → read-only). workspace:
+            edits + commands inside cwd/extra_dirs, outside → denied + reported.
+            auto (default): in-workspace work auto-approved, escalations judged by
+            the backend's own reviewer (Claude auto-mode classifier / Codex
+            ``--approve-for-me`` guardian). unrestricted: no gates at all (Codex:
+            no sandbox, network included) — only with a tightly-scoped cwd or when
+            deliberately opting out of safety. Old spellings (``default``,
+            ``acceptEdits``, ``bypassPermissions`` …) are accepted as aliases.
+        backend: ``claude`` (default) or ``codex``. Fixed for the pair's lifetime.
+        context_window: ``default`` or ``1m``. Claude: ``1m`` = the ``[1m]`` tier
+            (already the bare default on Opus 5 / Fable — harmless). Codex: the
+            default window is ~258k usable tokens; ``1m`` raises it to ~828k usable
+            (the server clamps the marketing 1M to the model's ceiling) at more
+            tokens per turn. **If the pair will scour large files or whole repos,
+            pick ``1m``** — a compaction costs a full-context turn, so the window is the budget.
+        system_prompt_append: Text appended to the default system prompt. Pinned at
+            create. Codex: delivered as the thread's first user message (exec has no
+            system-prompt flag); it persists in the thread history.
+        profile_name: ``~/.claude/pairs/profiles/<name>.md`` used as system_prompt_append.
+        allowed_tools: Claude permission patterns like ``["Bash(git *)", "Read"]``.
+            Pinned at create. Ignored by Codex.
+        mcp_whitelist: Claude MCP server names to enable. None or [] = all MCPs disabled.
+        cwd: Absolute workspace root (gates file ops OUTSIDE this path on both
+            backends). Default: MCP server's cwd. Use ``extra_dirs`` to widen access.
+        extra_dirs: Additional writable roots (``--add-dir`` on both backends).
+            ~/$VAR/%VAR% expansion applies; comma-splitting NOT supported.
+        persistent: Claude: keep the warm subprocess alive (no idle eviction).
+            Codex runs one process per turn, so this only affects bookkeeping.
+        ultracode: Claude Ultracode mode (``--settings '{"ultracode": true}'``).
+            Codex: not a setting — use ``effort="ultra"`` instead (error if set).
+        fallback_model: Claude ``--fallback-model`` (id or comma list). Codex: n/a.
+        allowed_invocations: ``pair_invoke`` allow-list (fnmatch globs; Claude).
+        backend_options: per-backend escape hatch (dict or JSON string). Codex keys:
+            ``config`` {toml key: value} extra ``-c`` overrides; ``args`` [raw exec
+            args]; ``sandbox`` / ``approval`` native override of the permission
+            translation (sandbox: read-only|workspace-write|danger-full-access;
+            approval: none|approve-for-me|bypass).
+        initial_message: If set, sent as the first turn (as an async task).
+        session_id: Claude: caller-supplied UUID (auto-generated if omitted). Codex
+            names its own thread — ignored.
+        parent_model: Explicit hint for ``model="match-parent"`` (skips detection).
         verbose: If True, return full JSON instead of one-line summary.
     """
-    sid = session_id or str(uuid.uuid4())
+    # Backend: explicit > inferred from the per-call model > defaults > claude.
+    _defaults = settings_mod.load_defaults()
+    if backend is not None:
+        be = str(backend).strip().lower()
+        if be not in BACKENDS:
+            raise PairError(f"backend must be one of {list(BACKENDS)} (got {backend!r})")
+    elif model is not None and infer_backend(model) == "codex":
+        be = "codex"
+    elif _defaults.backend:
+        be = _defaults.backend
+    elif model is None and _defaults.model and infer_backend(_defaults.model) == "codex":
+        be = "codex"
+    else:
+        be = "claude"
+    if model is not None and be != infer_backend(model) and model != "match-parent" \
+            and (be == "codex" or infer_backend(model) == "codex"):
+        raise PairError(
+            f"model {model!r} looks like a {infer_backend(model)} model but backend={be!r} "
+            f"was requested. Drop one of the two or make them agree."
+        )
+    # Claude pre-assigns the session id (the CLI honors --session-id); Codex
+    # names its own thread at thread.started, so the placeholder is replaced
+    # with CreateResult.session_id below (historian F1).
+    sid = session_id or (str(uuid.uuid4()) if be == "claude" else "pending-create")
     # Defensive coercion: hosts may JSON-encode list params into strings; widen accepted shapes.
     allowed_tools_norm = _coerce_to_str_list(allowed_tools)
     mcp_whitelist_norm = _coerce_to_str_list(mcp_whitelist)
@@ -724,7 +836,15 @@ def pair_create(
         ultracode=ultracode,
         fallback_model=fallback_model,
         parent_model=parent_model,
+        backend=be,
+        context_window=context_window,
     )
+    backend_options_norm = _coerce_backend_options(backend_options)
+    if be == "codex" and backend_options_norm:
+        try:
+            CodexAdapter.validate_backend_options(resolved["permission_mode"], backend_options_norm)
+        except ValueError as e:
+            raise PairError(str(e))
 
     # v0.12.0 premium-model notice. Fires on the RESOLVED model, so it catches a
     # premium family arriving via defaults.json or match-parent detection, not
@@ -734,24 +854,47 @@ def pair_create(
     if _premium:
         transparency_msgs.insert(0, _premium)
 
-    # v0.11.0 create-time "newer model available" notice. Compare the resolved
-    # pair model against the PARENT session's model in the same family — if the
-    # parent is on a newer version (e.g. parent opus-4-9, pair opus-4-8), say so
-    # once, here. Self-healing (no hardcoded 'latest' table). Best-effort: if the
-    # parent can't be detected, or it's a different family / not newer, stays
-    # silent (never a false notice). Seeds last_drift_notice so the send-time
-    # check doesn't immediately re-warn about the same version.
+    # v0.11.0 create-time "newer model available" notice (Claude: vs the PARENT
+    # session's model in the same family; Codex: vs the models cache for a
+    # PINNED slug — floating aliases upgrade themselves). Seeds
+    # last_drift_notice so the send-time check doesn't immediately re-warn.
     drift_seed: str | None = None
     try:
-        _parent = _detect_parent_model()
-        if _parent:
-            _newer = newer_version_available(resolved["model"], _parent)
+        if be == "claude":
+            _parent = _detect_parent_model()
+            if _parent:
+                _newer = newer_version_available(resolved["model"], _parent)
+                if _newer:
+                    drift_seed = _newer
+                    transparency_msgs.append(
+                        f"newer model in family available: your session runs '{_parent}', "
+                        f"this pair will run '{resolved['model']}'. Pass model='{_newer}' "
+                        f"(or pair_update later) if you want the pair on the newer one."
+                    )
+        else:
+            _newer = codex_models.newer_generation_available(resolved["model"])
             if _newer:
                 drift_seed = _newer
                 transparency_msgs.append(
-                    f"newer model in family available: your session runs '{_parent}', "
-                    f"this pair will run '{resolved['model']}'. Pass model='{_newer}' "
-                    f"(or pair_update later) if you want the pair on the newer one."
+                    f"newer generation available for this tier: '{_newer}' is listed; "
+                    f"'{resolved['model']}' is pinned. Use the floating alias "
+                    f"'{short_model_label(_newer)}' to follow generation bumps automatically."
+                )
+            _up = codex_models.upgrade_note(resolved["model"])
+            if _up:
+                transparency_msgs.append(_up)
+            _sb = codex_adapter_mod.sandbox_support_note()
+            if _sb and resolved["permission_mode"] in ("workspace", "auto"):
+                transparency_msgs.append(_sb)
+            if resolved["context_window"] == "default":
+                _cw = codex_models.context_windows(resolved["model"])
+                _num = (f"~{_cw[0] // 1000}k usable now, ~{_cw[1] // 1000}k with '1m'"
+                        if _cw else "~258k usable now, ~828k with '1m'")
+                transparency_msgs.append(
+                    f"context window: default ({_num}). If this pair will scour large "
+                    f"files or whole repos, prefer context_window='1m' (more tokens per "
+                    f"turn; a compaction costs a full-context turn and loses detail, so "
+                    f"the window is the budget)."
                 )
     except Exception:
         pass
@@ -767,11 +910,14 @@ def pair_create(
 
     spec = PairSpec(
         name=name,
+        backend=be,  # type: ignore[arg-type]
         session_id=sid,
         purpose=purpose,
         model=resolved["model"],
         effort=resolved["effort"],  # type: ignore[arg-type]
         permission_mode=resolved["permission_mode"],  # type: ignore[arg-type]
+        context_window=resolved["context_window"],
+        backend_options=backend_options_norm,
         system_prompt_append=system_prompt_append,
         profile_name=profile_name,
         allowed_tools=allowed_tools_norm,
@@ -815,9 +961,9 @@ def pair_create(
     # coerced. Followed by any transparency messages (one per line of context).
     effort_display = resolved["effort"] if resolved["effort"] is not None else "none"
     line = (
-        f"Created '{name}' (session {_short(result.session_id)}, "
-        f"model {resolved['model']}, effort {effort_display}, "
-        f"permission_mode {resolved['permission_mode']}"
+        f"Created '{name}' ({'codex thread' if be == 'codex' else 'session'} "
+        f"{_short(result.session_id)}, model {resolved['model']}, effort {effort_display}, "
+        f"permission {resolved['permission_mode']}, context_window {resolved['context_window']}"
         # v0.9.10: surface ultracode in the headline when on so the user sees
         # what they actually got. Suppressed when False to avoid noise.
         f"{', ultracode' if resolved['ultracode'] else ''})"
@@ -865,37 +1011,67 @@ def pair_adopt(
     session_id: str,
     purpose: str = "",
     model: str = "opus",
-    effort: str = "xhigh",
+    effort: str | None = None,
     permission_mode: str = "auto",
     cwd: str | None = None,
+    backend: str | None = None,
+    context_window: str | None = None,
     verbose: bool = False,
 ) -> str:
-    """Register an EXISTING claude session UUID as a pair.
+    """Register an EXISTING claude session UUID (or Codex thread id) as a pair.
 
-    Use when you have a session created elsewhere (interactive claude, another tool) and
-    want to address it through this MCP. The session_id must reference a session that
-    exists under ~/.claude/projects/.
+    Use when you have a session created elsewhere (interactive claude / the Codex
+    app, another tool) and want to address it through this MCP. A Claude
+    session_id must exist under ~/.claude/projects/; a Codex thread id must
+    have a rollout under ~/.codex/sessions/. ``backend`` is inferred from the
+    model when omitted; ``effort`` defaults to ``high``.
     """
-    # Surface effort coercion message to the caller (Sonnet xhigh/max → high,
-    # Haiku any → None) — the PairSpec model_validator silently coerces but
-    # the caller deserves to know if their requested effort got changed.
-    coerced_effort, coercion_msg = coerce_effort_for_model(model, effort)
+    be = (backend or infer_backend(model)).strip().lower()
+    if be not in BACKENDS:
+        raise PairError(f"backend must be one of {list(BACKENDS)} (got {backend!r})")
+    model_note: str | None = None
+    if be == "codex":
+        try:
+            model, model_note = codex_models.resolve_codex_model(model)
+        except ValueError as e:
+            raise PairError(str(e))
+    # Surface effort coercion message to the caller — the PairSpec validator
+    # silently coerces but the caller deserves to know if their requested
+    # effort got changed.
+    coerced_effort, coercion_msg = coerce_effort_for_model(
+        model, effort if effort is not None else DEFAULT_EFFORT, be,
+    )
+    try:
+        level = normalize_permission(permission_mode)
+        cw = normalize_context_window(context_window)
+    except ValueError as e:
+        raise PairError(str(e))
     spec = PairSpec(
         name=name,
+        backend=be,  # type: ignore[arg-type]
         session_id=session_id,
         purpose=purpose,
         model=model,
         effort=coerced_effort,  # type: ignore[arg-type]
-        permission_mode=permission_mode,  # type: ignore[arg-type]
+        permission_mode=level,  # type: ignore[arg-type]
+        context_window=cw,
         cwd=cwd,
     )
+    if not _adapter_for(spec).session_exists(spec):
+        raise PairError(
+            f"no {'codex thread' if be == 'codex' else 'claude session'} transcript found for "
+            f"id {session_id!r} (cwd={cwd or os.getcwd()!r}). Check the id, or pass the cwd "
+            f"the session was created under."
+        )
     reg_mod.add_pair(spec)
     if verbose:
         return _verbose_dump(spec)
     eff_display = coerced_effort if coerced_effort is not None else "none"
-    line = f"Adopted session {_short(session_id)} as pair '{name}' (model {model}, effort {eff_display})"
-    if coercion_msg:
-        line += f"\n  {coercion_msg}"
+    line = (f"Adopted {'codex thread' if be == 'codex' else 'session'} {_short(session_id)} as "
+            f"pair '{name}' (model {model}, effort {eff_display}, permission {level})")
+    for m in (coercion_msg, model_note):
+        if m:
+            line += f"\n  {m}"
     return line
 
 
@@ -1125,14 +1301,25 @@ def _build_send_runner(
             # that process is mid-writing. Its on-disk task is the signal.
             _wait_for_foreign_self_woken(name, hard_timeout_seconds, should_stop)
             adapter = _adapter_for(current)
+            # v0.13.0: neutral permission override → validated here so a typo
+            # fails fast instead of reaching the CLI. (Bound to a NEW name —
+            # assigning the closed-over parameter would make it a local of
+            # this nested function and unbound on first read.)
+            eff_perm: str | None = None
+            if override_permission_mode is not None:
+                try:
+                    eff_perm = normalize_permission(override_permission_mode)
+                except ValueError as e:
+                    raise PairError(str(e))
             result = adapter.send(
                 current, message,
                 model=override_model,
                 effort=override_effort,
-                permission_mode=override_permission_mode,
+                permission_mode=eff_perm,
                 timeout_seconds=hard_timeout_seconds,
                 on_event=on_event,
                 should_stop=should_stop,
+                task_id=task_id,
             )
 
             # v0.12.0 premium-model notice — per-call override only. A one-off
@@ -1155,20 +1342,40 @@ def _build_send_runner(
             drift_persist: str | None = None
             if override_model is None and override_effort is None and override_permission_mode is None:
                 try:
-                    rt = runtime_mod.registry().get_or_none(name)
-                    if rt is not None and not getattr(rt, "_drift_checked", True):
-                        rt._drift_checked = True
-                        parent = _detect_parent_model()
-                        if parent:
-                            newer = newer_version_available(current.model, parent)
-                            if newer and newer != current.last_drift_notice:
+                    if current.backend == "codex":
+                        # Codex: the models cache is the authority. A PINNED
+                        # slug gets a one-time nudge per newer generation; a
+                        # floating alias already follows it. Deprecation
+                        # notices from the cache are surfaced the same way.
+                        newer = codex_models.newer_generation_available(current.model)
+                        up = codex_models.upgrade_note(current.model)
+                        marker = newer or (f"retire:{current.model}" if up else None)
+                        if marker and marker != current.last_drift_notice:
+                            if newer:
                                 result.drift_note = (
-                                    f"a newer model in this pair's family is now available — "
-                                    f"your session runs '{parent}', this pair runs "
-                                    f"'{current.model}'. pair_update('{name}', model='{newer}') "
-                                    f"to move it up (or ignore to stay on the current one)."
+                                    f"a newer generation of this tier is listed — '{newer}' — "
+                                    f"while this pair is pinned to '{current.model}'. "
+                                    f"pair_update('{name}', model='{newer}') to move up, or "
+                                    f"model='{short_model_label(newer)}' to float with future bumps."
                                 )
-                                drift_persist = newer
+                            else:
+                                result.drift_note = up
+                            drift_persist = marker
+                    else:
+                        rt = runtime_mod.registry().get_or_none(name)
+                        if rt is not None and not getattr(rt, "_drift_checked", True):
+                            rt._drift_checked = True
+                            parent = _detect_parent_model()
+                            if parent:
+                                newer = newer_version_available(current.model, parent)
+                                if newer and newer != current.last_drift_notice:
+                                    result.drift_note = (
+                                        f"a newer model in this pair's family is now available — "
+                                        f"your session runs '{parent}', this pair runs "
+                                        f"'{current.model}'. pair_update('{name}', model='{newer}') "
+                                        f"to move it up (or ignore to stay on the current one)."
+                                    )
+                                    drift_persist = newer
                 except Exception:
                     pass
 
@@ -1188,7 +1395,7 @@ def _build_send_runner(
             update_fields: dict[str, Any] = dict(
                 last_active_at=datetime.utcnow(),
                 turn_count=fresh.turn_count + 1,
-                total_cost_usd=fresh.total_cost_usd + result.cost_usd,
+                total_cost_usd=fresh.total_cost_usd + float(result.cost_usd or 0.0),
             )
             if drift_persist is not None:
                 update_fields["last_drift_notice"] = drift_persist
@@ -1317,14 +1524,16 @@ def _format_async_handle(task_id: str, why: str, pair_name: str | None = None) -
 # defaults.json value specifies a field. Kept in sync with PairSpec's defaults
 # so the out-of-the-box behavior matches the original (pre-v0.8.0) signature.
 _HARDCODED_DEFAULTS = {
+    "backend": "claude",
+    # Floating alias: follows whatever generation the CLI resolves ``opus`` to
+    # (policy 2026-09-07: defaults track the current numbered generation and
+    # auto-upgrade on a bump; a pinned id like ``claude-opus-5`` stays put).
+    # Codex has no static default — see codex_models.codex_default_model.
     "model": "opus",
-    # None → omit the --effort flag and let the CLI apply its own per-model
-    # default. (The match-parent path in _resolve_pair_create_args derives an
-    # explicit per-model default via default_effort_for_model; the plain-model
-    # path intentionally stays unset, which is also more future-proof — we never
-    # assert an effort token that a future CLI might rename.)
-    "effort": None,
+    # "high" on both backends (policy 2026-09-07); coerced per model (Haiku → None).
+    "effort": DEFAULT_EFFORT,
     "permission_mode": "auto",
+    "context_window": "default",
     "persistent": False,
     # v0.9.10: Ultracode opt-in. False by default so existing pairs and pre-
     # v0.9.10 calls behave unchanged. Set explicitly per-pair via
@@ -1522,15 +1731,38 @@ def _resolve_match_parent_model(parent_model_arg: str | None) -> tuple[str, str 
     )
 
 
+def _coerce_backend_options(value: Any) -> dict[str, Any]:
+    """``backend_options`` arrives as a dict or a JSON string (some hosts
+    stringify object params). Empty/None → {}."""
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return {}
+        try:
+            parsed = json.loads(s)
+        except json.JSONDecodeError as e:
+            raise PairError(f"backend_options must be a JSON object: {e}")
+        if not isinstance(parsed, dict):
+            raise PairError("backend_options must be a JSON object")
+        return parsed
+    raise PairError(f"backend_options must be a dict or JSON string (got {type(value).__name__})")
+
+
 def _resolve_pair_create_args(
     *,
-    model: str | None,
-    effort: str | None,
-    permission_mode: str | None,
-    persistent: bool | None,
-    ultracode: bool | None,
-    fallback_model: str | None,
-    parent_model: str | None,
+    model: str | None = None,
+    effort: str | None = None,
+    permission_mode: str | None = None,
+    persistent: bool | None = None,
+    ultracode: bool | None = None,
+    fallback_model: str | None = None,
+    parent_model: str | None = None,
+    backend: str = "claude",
+    context_window: str | None = None,
 ) -> tuple[dict, list[str]]:
     """Resolve per-call args + defaults file + hardcoded fallback into a
     concrete dict of values to pass to PairSpec. Returns ``(resolved_dict,
@@ -1541,9 +1773,11 @@ def _resolve_pair_create_args(
       2. ~/.claude/pairs/defaults.json value (if set)
       3. Hardcoded fallback from ``_HARDCODED_DEFAULTS``
 
-    Special: ``model="match-parent"`` (from any layer) triggers the JSONL
-    detection ladder; ``effort`` for match-parent uses model-appropriate
-    default (Opus→xhigh, Sonnet→high, Haiku→None) unless explicitly passed.
+    Backend-specific: a Codex pair ignores a Claude-only default model (and
+    vice versa) and resolves aliases/None through the live models cache;
+    ``match-parent`` is Claude-only; ``ultracode`` / ``fallback_model`` are
+    rejected on Codex. Permission and context_window are normalized to the
+    neutral vocabulary with a note when an alias was used.
     """
     defaults = settings_mod.load_defaults()
     messages: list[str] = []
@@ -1555,35 +1789,67 @@ def _resolve_pair_create_args(
             return default_val
         return fallback
 
-    resolved_model = _layered(model, defaults.model, _HARDCODED_DEFAULTS["model"])
+    # A defaults-file model only applies when it belongs to this backend.
+    default_model = defaults.model
+    if default_model is not None and infer_backend(default_model) != backend \
+            and default_model != "match-parent":
+        default_model = None
+    if default_model == "match-parent" and backend == "codex":
+        default_model = None
+    resolved_model = _layered(model, default_model, _HARDCODED_DEFAULTS["model"] if backend == "claude" else None)
     resolved_effort = _layered(effort, defaults.effort, _HARDCODED_DEFAULTS["effort"])
     resolved_perm = _layered(
         permission_mode, defaults.permission_mode, _HARDCODED_DEFAULTS["permission_mode"]
     )
+    resolved_cw = _layered(context_window, defaults.context_window, _HARDCODED_DEFAULTS["context_window"])
     resolved_persist = _layered(persistent, defaults.persistent, _HARDCODED_DEFAULTS["persistent"])
     resolved_ultra = _layered(ultracode, defaults.ultracode, _HARDCODED_DEFAULTS["ultracode"])
     resolved_fallback = _layered(
         fallback_model, defaults.fallback_model, _HARDCODED_DEFAULTS["fallback_model"]
     )
 
-    # Match-parent expansion. Happens AFTER layering so it works whether
-    # match-parent comes from per-call (model="match-parent") or from
-    # defaults.json. Effort under match-parent uses per-model default.
-    if resolved_model == "match-parent":
+    # Neutral vocabularies (ValueError → PairError at the tool boundary).
+    try:
+        norm_perm = normalize_permission(resolved_perm)
+        if str(resolved_perm) != norm_perm:
+            messages.append(f"permission '{resolved_perm}' → neutral level '{norm_perm}' "
+                            f"({permission_native(norm_perm, backend)} on {backend}).")
+        resolved_perm = norm_perm
+        resolved_cw = normalize_context_window(resolved_cw)
+    except ValueError as e:
+        raise PairError(str(e))
+
+    if backend == "codex":
+        if resolved_model == "match-parent":
+            raise PairError("model='match-parent' is Claude-only (it reads the calling Claude "
+                            "session's JSONL); pass an explicit Codex model or alias instead.")
+        try:
+            resolved_model, note = codex_models.resolve_codex_model(resolved_model)
+        except ValueError as e:
+            raise PairError(str(e))
+        if note:
+            messages.append(note)
+        if resolved_ultra:
+            raise PairError("ultracode is a Claude setting; on Codex use effort='ultra' "
+                            "(maximum reasoning + automatic task delegation) instead.")
+        if resolved_fallback:
+            raise PairError("fallback_model is Claude-only (--fallback-model); Codex has no "
+                            "equivalent — leave it unset for codex pairs.")
+    elif resolved_model == "match-parent":
+        # Match-parent expansion. Happens AFTER layering so it works whether
+        # match-parent comes from per-call (model="match-parent") or from
+        # defaults.json. Effort under match-parent uses the per-model default.
         resolved_model, msg = _resolve_match_parent_model(parent_model)
         if msg:
             messages.append(msg)
-        # Only auto-derive effort if user didn't explicitly pass one anywhere.
-        # (User explicit effort + match-parent model is valid: "use my parent's
-        # model but with effort=low to save tokens".)
         effort_was_explicit = effort is not None or defaults.effort is not None
         if not effort_was_explicit:
-            resolved_effort = default_effort_for_model(resolved_model)
+            resolved_effort = default_effort_for_model(resolved_model, backend)
 
     # Effort coercion against the now-resolved model. Surface a transparency
     # message if coercion happened so the user knows what the actual stored
     # value is (not what they asked for).
-    coerced_effort, coercion_msg = coerce_effort_for_model(resolved_model, resolved_effort)
+    coerced_effort, coercion_msg = coerce_effort_for_model(resolved_model, resolved_effort, backend)
     if coercion_msg:
         messages.append(coercion_msg)
     resolved_effort = coerced_effort
@@ -1592,6 +1858,7 @@ def _resolve_pair_create_args(
         "model": resolved_model,
         "effort": resolved_effort,
         "permission_mode": resolved_perm,
+        "context_window": resolved_cw,
         "persistent": resolved_persist,
         "ultracode": resolved_ultra,
         "fallback_model": resolved_fallback,
@@ -2081,8 +2348,17 @@ def pair_poll(
     # Auto hang-warning for running tasks — always shown, even without with_turn_log
     if state.status == "running":
         runtime_obj = runtime_mod.registry().get_or_none(state.pair_name)
+        _last_act = None
         if runtime_obj is not None and runtime_obj._last_log_activity_at is not None:  # noqa: SLF001
-            idle_s = (datetime.utcnow() - runtime_obj._last_log_activity_at).total_seconds()  # noqa: SLF001
+            _last_act = runtime_obj._last_log_activity_at  # noqa: SLF001
+        else:
+            # v0.13.0: a Codex turn is a one-shot process — its liveness lives
+            # in the adapter's in-flight table, not a runtime.
+            _cx = codex_adapter_mod.inflight_info(state.pair_name)
+            if _cx and _cx.get("last_activity") is not None:
+                _last_act = _cx["last_activity"]
+        if _last_act is not None:
+            idle_s = (datetime.utcnow() - _last_act).total_seconds()
             if idle_s > 120:
                 lines.append(
                     f"  ⚠ no log activity for {idle_s:.0f}s — pair may be hung. "
@@ -2167,13 +2443,16 @@ def pair_list(verbose: bool = False) -> str:
     for s in reg.pairs.values():
         last = _fmt_local(s.last_active_at, "%H:%M")
         purpose = f" - {s.purpose}" if s.purpose else ""
-        lines.append(f"  {s.name} ({s.model}, {s.turn_count} turns, last {last}){purpose}")
+        model_disp = f"codex:{s.model}" if s.backend == "codex" else s.model
+        if s.context_window == "1m":
+            model_disp += " [1m]"
+        lines.append(f"  {s.name} ({model_disp}, {s.turn_count} turns, last {last}){purpose}")
     # Defaults header — surfaces what NEW pairs would inherit so agents picking
     # up mid-session can see the configured state at a glance. Cheap; no I/O
     # beyond the defaults.json read (cached by OS, sub-millisecond).
     defaults = settings_mod.load_defaults()
     defaults_summary_parts = []
-    for field in ("model", "effort", "permission_mode", "persistent"):
+    for field in ("backend", "model", "effort", "permission_mode", "context_window", "persistent"):
         v = getattr(defaults, field)
         if v is not None:
             defaults_summary_parts.append(f"{field}={v}")
@@ -2204,10 +2483,19 @@ def pair_info(name: str, verbose: bool = False) -> str:
     )
     if verbose:
         return _verbose_dump(info)
+    native = ""
+    try:
+        native = f" ({permission_native(spec.permission_mode, spec.backend)})"
+    except Exception:
+        pass
+    bo = f"\n  backend_options: {json.dumps(spec.backend_options)}" if spec.backend_options else ""
     return (
         f"{name}:\n"
-        f"  session: {spec.session_id} (transcript: {'ok' if info.transcript_exists else 'MISSING'})\n"
-        f"  model: {spec.model}, effort: {spec.effort}, permissions: {spec.permission_mode}\n"
+        f"  backend: {spec.backend}\n"
+        f"  {'thread' if spec.backend == 'codex' else 'session'}: {spec.session_id} "
+        f"(transcript: {'ok' if info.transcript_exists else 'MISSING'})\n"
+        f"  model: {spec.model}, effort: {spec.effort}, permission: {spec.permission_mode}{native}, "
+        f"context_window: {spec.context_window}{bo}\n"
         f"  turns: {spec.turn_count}, last active: {_fmt_local(spec.last_active_at)}\n"
         f"  cwd: {spec.cwd or '(default)'}\n"
         f"  purpose: {spec.purpose or '(none)'}"
@@ -2278,15 +2566,23 @@ def pair_actions(name: str | None = None, verbose: bool = False) -> str:
     if name is not None:
         spec = reg_mod.get_pair(name)
         adapter = _adapter_for(spec)
-        try:
-            events = adapter._run_stream_json(spec, ["/context"], timeout_seconds=30)  # type: ignore[attr-defined]
-            for ev in events:
-                if ev.get("type") == "system" and ev.get("subtype") == "init":
-                    out["pair_skills"] = ev.get("slash_commands") or []
-                    out["pair_agents"] = ev.get("agents") or []
-                    break
-        except Exception as e:
-            out["pair_skills_error"] = str(e)
+        if spec.backend == "codex":
+            out["pair_skills"] = []
+            out["pair_agents"] = []
+            out["pair_skills_error"] = (
+                "codex pairs have no slash-command channel (pair_invoke is unavailable; "
+                "pair_compact runs through the codex app-server; pair_context reads the rollout)"
+            )
+        else:
+            try:
+                events = adapter._run_stream_json(spec, ["/context"], timeout_seconds=30)  # type: ignore[attr-defined]
+                for ev in events:
+                    if ev.get("type") == "system" and ev.get("subtype") == "init":
+                        out["pair_skills"] = ev.get("slash_commands") or []
+                        out["pair_agents"] = ev.get("agents") or []
+                        break
+            except Exception as e:
+                out["pair_skills_error"] = str(e)
         # Surface the allow-list so the agent can see what the structured invoke
         # channel (pair_invoke) will accept. None = allow all; [] = deny all.
         out["allowed_invocations"] = spec.allowed_invocations
@@ -2339,28 +2635,32 @@ def pair_update(
     extra_dirs: str | list[str] | None = None,
     ultracode: bool | None = None,
     fallback_model: str | None = None,
+    context_window: str | None = None,
+    backend_options: dict | str | None = None,
     verbose: bool = False,
 ) -> str:
     """Update mutable settings of an existing pair (per-pair, not defaults —
     use ``pair_settings_set`` for user-wide defaults).
 
-    ``fallback_model`` is pinned at spawn (like ``model``) so changing it evicts
-    the runtime; the next send respawns with the new ``--fallback-model``. Pass
-    an empty string ``""`` to clear an existing fallback.
+    The pair's ``backend`` is fixed: ``model`` must stay on the same backend
+    (a Claude session can't become a Codex thread — create a new pair).
+    ``permission_mode`` takes the neutral levels (read-only | plan | workspace |
+    auto | unrestricted; old spellings accepted). ``context_window`` is
+    ``default`` | ``1m``. ``fallback_model`` is pinned at spawn (like ``model``)
+    so changing it evicts the runtime; pass ``""`` to clear it.
 
     Three field categories with different propagation semantics — see README
     "Mid-flight config changes":
-      - **Per-send** (``model``/``effort``/``permission_mode``/``ultracode``):
-        registry write + runtime eviction → next ``pair_send`` respawns with
-        new values. ``ultracode`` was added as a per-send field in v0.9.10 —
-        toggling it triggers runtime eviction so the spawn args reflect the
-        new ``--settings '{"ultracode": ...}'`` state.
+      - **Per-send** (``model``/``effort``/``permission_mode``/``context_window``/
+        ``ultracode``/``backend_options``): registry write + runtime eviction →
+        next ``pair_send`` respawns with new values (Codex: every send is a
+        fresh process, so they apply immediately).
       - **Server-side** (``allowed_invocations``): MCP-layer only, no eviction;
         takes effect on next ``pair_invoke``. Pass ``[]`` for lockdown.
       - **Pinned-at-create** (``allowed_tools``/``mcp_whitelist``/
         ``system_prompt_append``): registry updated but only takes effect after
         ``pair_clear`` (rotates session). ``cwd``/``extra_dirs`` take effect on
-        next runtime spawn after eviction; ``cwd`` change also moves the session
+        next spawn after eviction; a Claude ``cwd`` change also moves the session
         JSONL across project dirs (rejected with recovery hint if move fails).
     """
     # Hold the cross-process lock for the whole update: cwd-move + registry write
@@ -2369,12 +2669,67 @@ def pair_update(
     try:
         with _with_pair_lock(name):
             fields: dict[str, Any] = {}
+            cur_spec = reg_mod.get_pair(name)
             if model is not None:
+                if infer_backend(model) != cur_spec.backend and (
+                        cur_spec.backend == "codex" or infer_backend(model) == "codex"):
+                    raise PairError(
+                        f"pair '{name}' runs on the {cur_spec.backend} backend; model {model!r} "
+                        f"belongs to {infer_backend(model)}. A pair's backend is fixed — create a "
+                        f"new pair (pair_create backend='{infer_backend(model)}') instead."
+                    )
+                if cur_spec.backend == "codex":
+                    try:
+                        model, _note = codex_models.resolve_codex_model(model)
+                    except ValueError as e:
+                        raise PairError(str(e))
+                    if _note:
+                        transparency_msgs.append(_note)
+                    if model != cur_spec.model:
+                        _up = codex_models.upgrade_note(model)
+                        if _up:
+                            transparency_msgs.append(_up)
                 fields["model"] = model
             if effort is not None:
                 fields["effort"] = effort
             if permission_mode is not None:
-                fields["permission_mode"] = permission_mode
+                try:
+                    _lvl = normalize_permission(permission_mode)
+                except ValueError as e:
+                    raise PairError(str(e))
+                if str(permission_mode) != _lvl:
+                    transparency_msgs.append(
+                        f"permission '{permission_mode}' → neutral level '{_lvl}' "
+                        f"({permission_native(_lvl, cur_spec.backend)} on {cur_spec.backend})."
+                    )
+                fields["permission_mode"] = _lvl
+            if context_window is not None:
+                try:
+                    fields["context_window"] = normalize_context_window(context_window)
+                except ValueError as e:
+                    raise PairError(str(e))
+                if cur_spec.backend == "codex":
+                    _cw = codex_models.context_windows(cur_spec.model)
+                    if _cw:
+                        _usable = _cw[1] if fields["context_window"] == "1m" else _cw[0]
+                        transparency_msgs.append(
+                            f"context window '{fields['context_window']}' → ~{_usable // 1000}k "
+                            f"usable tokens on {cur_spec.model} (applies from the next send)."
+                        )
+            if backend_options is not None:
+                fields["backend_options"] = _coerce_backend_options(backend_options)
+            if cur_spec.backend == "codex":
+                _bo = fields.get("backend_options", cur_spec.backend_options)
+                _lvl = fields.get("permission_mode", cur_spec.permission_mode)
+                if _bo:
+                    try:
+                        CodexAdapter.validate_backend_options(_lvl, _bo)
+                    except ValueError as e:
+                        raise PairError(str(e))
+                if ultracode:
+                    raise PairError("ultracode is Claude-only; on Codex use effort='ultra'.")
+                if fallback_model:
+                    raise PairError("fallback_model is Claude-only (--fallback-model); Codex has no equivalent.")
             if purpose is not None:
                 fields["purpose"] = purpose
             if allowed_tools is not None:
@@ -2425,19 +2780,22 @@ def pair_update(
                 # next send would run opus without --effort (defaults to whatever
                 # CLI uses bare). Surface the auto-reset in transparency_msgs.
                 if "model" in fields and "effort" not in fields:
-                    new_default_effort = default_effort_for_model(effective_model)
-                    if new_default_effort != old_spec.effort:
+                    # Keep the pair's effort when the new model supports it;
+                    # only reset when it doesn't (e.g. → haiku).
+                    _kept, _kept_msg = coerce_effort_for_model(effective_model, old_spec.effort, old_spec.backend)
+                    if _kept != old_spec.effort:
+                        new_default_effort = default_effort_for_model(effective_model, old_spec.backend)
                         fields["effort"] = new_default_effort
                         eff_display = (
                             new_default_effort if new_default_effort is not None else "none"
                         )
                         transparency_msgs.append(
                             f"effort auto-reset to '{eff_display}' for new model "
-                            f"'{effective_model}' (was {old_spec.effort!r})."
+                            f"'{effective_model}' (was {old_spec.effort!r}: {_kept_msg})."
                         )
 
                 effective_effort = fields.get("effort", old_spec.effort)
-                coerced, msg = coerce_effort_for_model(effective_model, effective_effort)
+                coerced, msg = coerce_effort_for_model(effective_model, effective_effort, old_spec.backend)
                 if msg:
                     transparency_msgs.append(msg)
                 # Always write coerced effort to registry if it changed at all
@@ -2453,14 +2811,20 @@ def pair_update(
                 cwd_norm = _normalize_path(cwd)
                 old_spec = reg_mod.get_pair(name)
                 if cwd_norm and cwd_norm != old_spec.cwd:
-                    try:
-                        cwd_move_msg = _move_session_jsonl_for_cwd_change(old_spec, cwd_norm)
-                    except Exception as e:
-                        raise PairError(
-                            f"Could not change cwd for pair '{name}': {e}\n"
-                            f"To change cwd cleanly, run pair_clear (rotates session_id, loses history) "
-                            f"or pair_forget + pair_create (fresh start)."
-                        ) from e
+                    if old_spec.backend == "codex":
+                        # Codex threads aren't cwd-keyed on disk (the rollout
+                        # path is recorded in sqlite); resume with the new -C
+                        # just works. The model is told the new cwd next turn.
+                        cwd_move_msg = "codex thread: no transcript move needed (cwd applies from the next send)"
+                    else:
+                        try:
+                            cwd_move_msg = _move_session_jsonl_for_cwd_change(old_spec, cwd_norm)
+                        except Exception as e:
+                            raise PairError(
+                                f"Could not change cwd for pair '{name}': {e}\n"
+                                f"To change cwd cleanly, run pair_clear (rotates session_id, loses history) "
+                                f"or pair_forget + pair_create (fresh start)."
+                            ) from e
                     fields["cwd"] = cwd_norm
 
             # Changing the model invalidates the drift dedup marker — the pair is
@@ -2474,7 +2838,8 @@ def pair_update(
                 return f"No fields to update for '{name}'."
             spec = reg_mod.update_pair(name, **fields)
             # Material config changes invalidate any live runtime — next send will re-spawn
-            if any(k in fields for k in ("model", "permission_mode", "cwd", "extra_dirs", "allowed_tools", "ultracode", "fallback_model")):
+            if any(k in fields for k in ("model", "effort", "permission_mode", "context_window", "backend_options",
+                                         "cwd", "extra_dirs", "allowed_tools", "ultracode", "fallback_model")):
                 try:
                     runtime_mod.registry().evict(name)
                 except Exception:
@@ -2943,10 +3308,13 @@ def pair_settings_get(verbose: bool = False) -> str:
         return repr(configured)
 
     lines = ["pair MCP settings:", "", "  Writable defaults (set via pair_settings_set):"]
-    lines.append(f"    model           = {_show('model', defaults.model, _HARDCODED_DEFAULTS['model'])}")
+    lines.append(f"    backend         = {_show('backend', defaults.backend, _HARDCODED_DEFAULTS['backend'])}")
+    lines.append(f"    model           = {_show('model', defaults.model, _HARDCODED_DEFAULTS['model'])}"
+                 f"  (codex default: dynamic — {codex_models.codex_default_model()[0] or 'n/a'})")
     eff_fallback = "derived from model" if _HARDCODED_DEFAULTS["effort"] is None else _HARDCODED_DEFAULTS["effort"]
     lines.append(f"    effort          = {_show('effort', defaults.effort, eff_fallback)}")
     lines.append(f"    permission_mode = {_show('permission_mode', defaults.permission_mode, _HARDCODED_DEFAULTS['permission_mode'])}")
+    lines.append(f"    context_window  = {_show('context_window', defaults.context_window, _HARDCODED_DEFAULTS['context_window'])}")
     lines.append(f"    persistent      = {_show('persistent', defaults.persistent, _HARDCODED_DEFAULTS['persistent'])}")
     lines.append(f"    ultracode       = {_show('ultracode', defaults.ultracode, _HARDCODED_DEFAULTS['ultracode'])}")
     lines.append(f"    fallback_model  = {_show('fallback_model', defaults.fallback_model, _HARDCODED_DEFAULTS['fallback_model'])}")
@@ -2961,11 +3329,19 @@ def pair_settings_get(verbose: bool = False) -> str:
     for k, v in env_knobs.items():
         lines.append(f"    {k:30} = {v}")
     lines.append("")
+    lines.append("  Permission levels (backend-neutral; old spellings accepted as aliases):")
+    lines.append(permission_help_text())
+    lines.append("")
     lines.append("  Notes:")
-    lines.append("    - model='match-parent' triggers detection from session JSONL")
-    lines.append("    - bypassPermissions refused as default (foot-gun); pass per-call")
-    lines.append("    - Effort coerced per model: Sonnet xhigh/max→high, Haiku any→None")
+    lines.append("    - model='match-parent' (Claude) triggers detection from session JSONL")
+    lines.append("    - permission 'unrestricted' (bypassPermissions) refused as default (foot-gun); pass per-call")
+    lines.append("    - Effort default 'high'; coerced per model (Sonnet xhigh/max→high, Haiku→None, Codex per models cache)")
+    lines.append("    - Floating aliases (opus / sol / terra / luna) follow generation bumps; numbered ids stay pinned")
+    lines.append("    - Fable (Claude) / Astra (Codex) are never defaults but stick once set")
+    lines.append("    - context_window '1m': Claude [1m] tier; Codex ~828k usable (default ~258k) — pick it for large repos")
     lines.append("    - allowed_invocations=[] (deny-all) refused as default (foot-gun); pass per-pair")
+    lines.append("")
+    lines.append("  " + codex_models.describe_availability())
     return "\n".join(lines)
 
 
@@ -2979,6 +3355,8 @@ def pair_settings_set(
     fallback_model: str | None = None,
     extra_dirs: str | list[str] | None = None,
     allowed_invocations: str | list[str] | None = None,
+    backend: str | None = None,
+    context_window: str | None = None,
     verbose: bool = False,
 ) -> str:
     """Set per-user defaults for new pairs (writable subset of pair_settings_get).
@@ -2989,14 +3367,18 @@ def pair_settings_set(
     use ``pair_settings_reset`` or edit ``defaults.json`` by hand.
 
     Args:
-        model: Default model alias / full name. ``"match-parent"`` triggers JSONL
-            detection on each pair_create.
-        effort: Coerced against model (Sonnet xhigh/max → high, Haiku any → None).
-            If model is changing in the same call without explicit effort, effort
-            auto-resets to the new model's default (Opus→xhigh, Sonnet→high,
-            Haiku→None).
-        permission_mode: ``bypassPermissions`` is REFUSED as a default (foot-gun:
-            every new pair would silently lose guardrails). Pass per-pair instead.
+        model: Default model alias / full name (floating aliases like ``opus`` /
+            ``sol`` follow generation bumps). ``"match-parent"`` triggers JSONL
+            detection on each pair_create (Claude). A Codex id here also makes
+            codex the default backend for pairs created without a model.
+        effort: Default effort (``high`` when unset). Coerced against the model
+            (Sonnet xhigh/max → high, Haiku → None, Codex per the models cache).
+        permission_mode: neutral level (read-only | plan | workspace | auto |
+            unrestricted; old spellings accepted). ``unrestricted`` is REFUSED as
+            a default (foot-gun: every new pair would silently lose guardrails).
+        backend: ``claude`` | ``codex`` — default backend when a pair_create
+            names neither a backend nor a model.
+        context_window: ``default`` | ``1m`` for new pairs.
         persistent: Default persistent flag for new pairs.
         ultracode: Default Ultracode flag for new pairs (v0.9.10+) — when True,
             every fresh pair_create silently adds ``--settings '{"ultracode":
@@ -3025,6 +3407,10 @@ def pair_settings_set(
         fields["effort"] = effort
     if permission_mode is not None:
         fields["permission_mode"] = permission_mode
+    if backend is not None:
+        fields["backend"] = backend
+    if context_window is not None:
+        fields["context_window"] = context_window
     if persistent is not None:
         fields["persistent"] = persistent
     if ultracode is not None:
@@ -3076,9 +3462,10 @@ def pair_settings_set(
 @mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True})
 def pair_settings_reset() -> str:
     """Remove ~/.claude/pairs/defaults.json entirely. Subsequent pair_create calls
-    will use only the hardcoded fallbacks (Opus, xhigh, auto, persistent=False)."""
+    will use only the hardcoded fallbacks (claude / opus, high, auto, default
+    window, persistent=False)."""
     settings_mod.reset_defaults()
-    return "Defaults file removed. New pairs will use hardcoded fallbacks (Opus/xhigh/auto)."
+    return "Defaults file removed. New pairs will use hardcoded fallbacks (claude/opus, high, auto)."
 
 
 @mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False})
@@ -3105,10 +3492,13 @@ def pair_clear(name: str, archive_old: bool = True, verbose: bool = False) -> st
             except Exception:
                 pass
 
-            new_sid = str(uuid.uuid4())
+            # v0.13.0 (historian F1): take the id the BACKEND reports — Claude
+            # honors the pre-generated --session-id, Codex names its own thread.
+            new_sid = str(uuid.uuid4()) if spec.backend == "claude" else "pending-clear"
             new_spec = spec.model_copy(update={"session_id": new_sid, "turn_count": 0})
             # Initialize the new session by sending a minimal probe
-            adapter.create(new_spec)
+            created = adapter.create(new_spec)
+            new_sid = created.session_id
             reg_mod.update_pair(name, session_id=new_sid, turn_count=0, total_cost_usd=0.0,
                                 last_active_at=datetime.utcnow())
 
@@ -3171,6 +3561,7 @@ def pair_fork(name: str, new_name: str | None = None, verbose: bool = False) -> 
             # JSONL via a separate --resume subprocess and never modifies the
             # source. Holding the lock guarantees the JSONL is consistent (no
             # in-flight turn). The source pair keeps its warm runtime.
+            # Codex: native ``exec fork`` needs no sentinel turn at all.
             new_sid = adapter.fork(spec, sentinel=_FORK_SENTINEL)
             new_spec = spec.model_copy(update={
                 "name": target,
@@ -3181,8 +3572,8 @@ def pair_fork(name: str, new_name: str | None = None, verbose: bool = False) -> 
             })
             # Truncate the sentinel fork-init turn off the new JSONL's tip.
             new_path = adapter.transcript_path(new_spec)
-            truncated = False
-            if new_path and new_path.exists():
+            truncated = spec.backend == "codex"
+            if spec.backend == "claude" and new_path and new_path.exists():
                 cut = find_sentinel_line(new_path, _FORK_SENTINEL)
                 if cut is not None:
                     truncate_jsonl_before_line(new_path, cut)
@@ -3217,7 +3608,10 @@ def pair_rewind_points(name: str, last_n: int = 20, verbose: bool = False) -> st
     spec = reg_mod.get_pair(name)
     adapter = _adapter_for(spec)
     path = adapter.transcript_path(spec)
-    points = list_user_turn_points(path) if path and path.exists() else []
+    if spec.backend == "codex":
+        points = codex_adapter_mod.list_turn_points_codex(path) if path and path.exists() else []
+    else:
+        points = list_user_turn_points(path) if path and path.exists() else []
     if verbose:
         return json.dumps(points, indent=2, default=str)
     if not points:
@@ -3269,7 +3663,14 @@ def pair_rewind(name: str, to_point: int, archive: bool = True, verbose: bool = 
             path = adapter.transcript_path(spec)
             if not path or not path.exists():
                 raise PairError(f"Pair '{name}' has no transcript to rewind.")
-            points = list_user_turn_points(path)
+            if spec.backend == "codex":
+                # Verified 2026-09-07: ``exec resume`` reads the rollout JSONL,
+                # so truncating it at a turn boundary rewinds the thread. The
+                # sqlite history table keeps the dropped turns (the Codex app's
+                # history view may still list them) — harmless to the thread.
+                points = codex_adapter_mod.list_turn_points_codex(path)
+            else:
+                points = list_user_turn_points(path)
             match = next((p for p in points if p["point"] == to_point), None)
             if match is None:
                 valid = f"1..{len(points)}" if points else "(none)"
@@ -3290,8 +3691,16 @@ def pair_rewind(name: str, to_point: int, archive: bool = True, verbose: bool = 
                 dst = reg_mod.archive_dir() / f"{name}-{ts}-prerewind.jsonl"
                 shutil.copy2(path, dst)
                 archived = str(dst)
-            dropped = truncate_jsonl_before_line(path, match["raw_line_index"])
-            dropped_files = files_written_in_events(dropped)
+            codex_note: str | None = None
+            if spec.backend == "codex":
+                _n, codex_note = codex_adapter_mod.truncate_rollout_before_line(
+                    path, match["raw_line_index"], thread_id=spec.session_id,
+                )
+                dropped = [{}] * _n
+                dropped_files = [f for p in points if p["point"] >= to_point for f in p.get("after_files", [])]
+            else:
+                dropped = truncate_jsonl_before_line(path, match["raw_line_index"])
+                dropped_files = files_written_in_events(dropped)
             reg_mod.update_pair(name, turn_count=max(0, to_point - 1),
                                 last_active_at=datetime.utcnow())
     except FileLockTimeout:
@@ -3305,6 +3714,8 @@ def pair_rewind(name: str, to_point: int, archive: bool = True, verbose: bool = 
         }, indent=2, default=str)
     lines = [f"Rewound '{name}' to before point {to_point}: \"{match['preview']}\""]
     lines.append(f"  Dropped {len(dropped)} event(s); the pair now continues from there on next send.")
+    if codex_note:
+        lines.append(f"  {codex_note}")
     if archived:
         lines.append(f"  Pre-rewind transcript archived to: {archived}")
         lines.append(f"  (restore it over the live session JSONL to undo the rewind.)")
@@ -3357,7 +3768,9 @@ def pair_compact(
             marked failed. Long sessions can legitimately take minutes to
             compact.
     """
-    # Sanity: pair must exist (raises PairNotFound if not).
+    # Sanity: pair must exist (raises PairNotFound if not). Codex pairs compact
+    # through the app-server (CodexAdapter.compact); steering text is ignored
+    # there with a note in the result.
     reg_mod.get_pair(name)
 
     # Decouple stated patience (agent's "how long I'll wait inline") from the
@@ -3475,6 +3888,29 @@ def pair_stop(
     for tid in running_task_ids:
         async_tasks.mark_task_stopped(tid)
 
+    # v0.13.0 Codex: no warm runtime and no in-band interrupt — the turn is a
+    # one-shot process. In THIS process: tree-kill it (the thread resumes
+    # cleanly next send — verified). In another process: write the same stop
+    # marker the terminal `stop` command uses; its send loop polls it ~1/s.
+    if spec.backend == "codex":
+        outcome = codex_adapter_mod.stop_inflight(name)
+        if outcome:
+            actions.append(f"{outcome} the in-flight codex turn (thread intact; next send resumes it)")
+        elif running_task_ids:
+            try:
+                sd = reg_mod.pairs_dir() / "stop-requests"
+                sd.mkdir(parents=True, exist_ok=True)
+                marker = sd / f"{name}.json"
+                tmp = marker.with_suffix(".tmp")
+                tmp.write_text(json.dumps({"pair_name": name, "requested_at": time.time(),
+                                           "requested_by_pid": os.getpid()}), encoding="utf-8")
+                tmp.replace(marker)
+                actions.append("stop marker written (the codex turn runs in another MCP process; "
+                               "it tree-kills within ~1s)")
+            except Exception as e:
+                actions.append(f"could not write stop marker: {e}")
+        force = False  # nothing to tree-kill via the runtime registry
+
     runtime_alive = runtime_obj is not None and runtime_obj.is_alive()
     has_inflight = len(running_task_ids) > 0
 
@@ -3531,9 +3967,10 @@ def pair_stop(
                     pass
                 cur_spec = reg_mod.get_pair(name)
                 adapter = _adapter_for(cur_spec)
-                new_sid = str(uuid.uuid4())
+                # v0.13.0 (historian F1): use the id the backend reports.
+                new_sid = str(uuid.uuid4()) if cur_spec.backend == "claude" else "pending-hard-stop"
                 new_spec = cur_spec.model_copy(update={"session_id": new_sid, "turn_count": 0})
-                adapter.create(new_spec)
+                new_sid = adapter.create(new_spec).session_id
                 reg_mod.update_pair(
                     name, session_id=new_sid, turn_count=0, total_cost_usd=0.0,
                     last_active_at=datetime.utcnow(),
@@ -3578,6 +4015,9 @@ def pair_status(name: str, last_n_log: int = 5, verbose: bool = False) -> str:
     spec = reg_mod.get_pair(name)
     runtime_obj = runtime_mod.registry().get_or_none(name)
     now = datetime.utcnow()
+
+    if spec.backend == "codex":
+        return _codex_status(spec, last_n_log=last_n_log, verbose=verbose)
 
     runtime_alive = runtime_obj is not None and runtime_obj.is_alive()
     started_at = runtime_obj.started_at if runtime_obj else None
@@ -3816,6 +4256,76 @@ def pair_status(name: str, last_n_log: int = 5, verbose: bool = False) -> str:
     return "\n".join(lines)
 
 
+def _codex_status(spec: PairSpec, *, last_n_log: int, verbose: bool) -> str:
+    """pair_status for a Codex pair: one process per turn, so liveness = the
+    adapter's in-flight table (this process) or the task file + main.log
+    mtime (another process). No warm runtime, no self-woken turns."""
+    name = spec.name
+    now = datetime.utcnow()
+    info = codex_adapter_mod.inflight_info(name)
+    inflight_tasks = async_tasks.list_running_task_ids_for_pair(name)
+    main_log = runtime_mod.logs_dir() / name / "main.log"
+    last_activity: datetime | None = None
+    if info and info.get("last_activity") is not None:
+        last_activity = info["last_activity"]
+    elif main_log.exists():
+        try:
+            last_activity = datetime.utcfromtimestamp(main_log.stat().st_mtime)
+        except Exception:
+            last_activity = None
+    idle_seconds = (now - last_activity).total_seconds() if last_activity else None
+    if info:
+        age = (now - info["started_at"]).total_seconds() if info.get("started_at") else 0
+        if idle_seconds is None or idle_seconds < 30:
+            heuristic = f"active — codex turn running in this process for {age:.0f}s"
+        elif idle_seconds < 120:
+            heuristic = f"slow — codex turn running for {age:.0f}s, {idle_seconds:.0f}s since the last event"
+        else:
+            heuristic = (f"likely-hung — codex turn running for {age:.0f}s with no event for "
+                         f"{idle_seconds:.0f}s (pair_log to inspect, pair_stop to tree-kill)")
+    elif inflight_tasks:
+        heuristic = (f"codex turn in flight in ANOTHER MCP process"
+                     f"{f' ({idle_seconds:.0f}s since last log line)' if idle_seconds is not None else ''}; "
+                     f"pair_poll(<task_id>) for its state, pair_stop writes a cross-process stop marker")
+    else:
+        heuristic = ("idle (codex pairs have no warm runtime — every send is a fresh "
+                     "`codex exec resume`; nothing in flight)")
+    recent_lines: list[str] = []
+    if main_log.exists():
+        try:
+            with open(main_log, "r", encoding="utf-8") as f:
+                all_lines = f.readlines()
+            recent_lines = [l.rstrip("\n") for l in all_lines[-max(1, int(last_n_log)):]]
+        except Exception:
+            pass
+    if verbose:
+        return json.dumps({
+            "name": name, "backend": "codex",
+            "runtime_alive": bool(info),
+            "started_at": info["started_at"].isoformat() if info and info.get("started_at") else None,
+            "last_log_activity_at": last_activity.isoformat() if last_activity else None,
+            "idle_seconds": idle_seconds,
+            "heuristic": heuristic,
+            "inflight_async_tasks": inflight_tasks,
+            "recent_log_lines": recent_lines,
+            "persistent": spec.persistent,
+        }, indent=2, default=str)
+    lines = [f"Pair '{name}' status (codex):"]
+    lines.append(f"  turn process: {'running' if info else 'none'}")
+    lines.append(f"  liveness: {heuristic}")
+    if inflight_tasks:
+        ids_str = ", ".join(inflight_tasks) if len(inflight_tasks) <= 2 else ", ".join(t[:8] for t in inflight_tasks[:3]) + "..."
+        lines.append(f"  in-flight async tasks: {len(inflight_tasks)} ({ids_str})")
+        lines.append(f"  -> pair_poll('{inflight_tasks[0]}', with_turn_log=True) for its content")
+    else:
+        lines.append("  in-flight async tasks: none")
+    if recent_lines:
+        lines.append(f"  last {len(recent_lines)} log line(s):")
+        for l in recent_lines:
+            lines.append(f"    {l}")
+    return "\n".join(lines)
+
+
 # ============================================================================
 # Skill / command invocation
 # ============================================================================
@@ -3889,10 +4399,10 @@ def pair_invoke(
 def pair_context(name: str, timeout_seconds: int = 60, verbose: bool = False) -> str:
     """Invoke /context in the pair and return its rich token-usage breakdown.
 
-    Costs one inference. For free context tracking, every pair_send response already
-    includes a `context` block computed from the result's usage data — only use this when
-    you want the full categorized breakdown (system prompt, system tools, memory, skills,
-    free space, autocompact buffer).
+    Claude: costs one inference. Codex: zero inference — reads the thread's
+    rollout (last call size, effective window, thread totals, plan usage).
+    For free context tracking, every pair_send response already includes a
+    `context` block — only use this when you want the full breakdown.
 
     Default: returns just the markdown body (which is already human-readable).
     Pass verbose=True for the full JSON wrapper (model, tokens_used, tokens_max, percent + markdown).

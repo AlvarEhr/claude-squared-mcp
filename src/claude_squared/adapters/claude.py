@@ -15,6 +15,7 @@ from claude_squared.adapters.base import PairAdapter
 from claude_squared.cli_paths import encode_cwd_for_project as _encode_cwd_for_project
 from claude_squared.errors import CLIError, CommandTimeout, SessionMissing
 from claude_squared.models import (
+    CLAUDE_PERMISSION_MAP,
     HEADLESS_INCOMPATIBLE_TOOLS,
     CompactResult,
     ContextReport,
@@ -25,7 +26,9 @@ from claude_squared.models import (
     SendResult,
     model_substitution_note,
     normalize_model_id,
+    normalize_permission,
     parse_model_id,
+    split_model_tier,
 )
 from claude_squared.registry import claude_home, profiles_dir
 
@@ -66,6 +69,31 @@ def _claude_executable() -> str:
         if c.exists():
             return str(c)
     return "claude"
+
+
+_PERM_CHOICES_CACHE: dict[str, tuple[str, ...]] = {}
+
+
+def _cli_permission_choices() -> tuple[str, ...]:
+    """The ``--permission-mode`` choices the installed CLI advertises in
+    ``--help`` (e.g. acceptEdits, auto, bypassPermissions, manual, dontAsk,
+    plan on 2.1.258). Empty tuple when it can't be read — callers then fall
+    back to the static map. One subprocess per MCP process lifetime."""
+    if "choices" in _PERM_CHOICES_CACHE:
+        return _PERM_CHOICES_CACHE["choices"]
+    choices: tuple[str, ...] = ()
+    try:
+        out = subprocess.run([_claude_executable(), "--help"], capture_output=True, text=True,
+                             timeout=20, stdin=subprocess.DEVNULL).stdout
+        i = out.find("--permission-mode")
+        seg = out[i:i + 600] if i >= 0 else ""
+        m = re.search(r"choices:\s*(.*?)\)", seg, re.S)
+        if m:
+            choices = tuple(re.findall(r'"([A-Za-z]+)"', m.group(1)))
+    except Exception:
+        choices = ()
+    _PERM_CHOICES_CACHE["choices"] = choices
+    return choices
 
 
 def _extract_stop_details(result_json: dict) -> dict | None:
@@ -125,6 +153,40 @@ def _select_primary_model(model_usage: dict, requested: str) -> str:
 class ClaudeAdapter(PairAdapter):
     backend_name = "claude"
 
+    # ---- neutral → native translation ----------------------------------
+
+    @staticmethod
+    def cli_model(spec: PairSpec, override: str | None = None) -> str:
+        """The ``--model`` value: the bare id plus ``[1m]`` when the pair's
+        ``context_window`` is ``"1m"`` (or the override itself carries a
+        suffix). v0.13.0: the suffix lives in ``context_window``, never in
+        ``spec.model`` — the registry validator strips it on load. Redundant
+        on Opus 5 / Fable (1M bare, verified 2026-08-07) and harmless."""
+        bare, cw = split_model_tier(override or spec.model)
+        if cw == "1m" or spec.context_window == "1m":
+            return f"{bare}[1m]"
+        return bare
+
+    @staticmethod
+    def native_permission(level: str | None) -> str:
+        """Neutral level (or any accepted alias) → ``--permission-mode`` value.
+
+        The CLI renamed ``default`` to ``manual`` in 2.1.258 (``--help`` lists
+        manual; ``default`` is still accepted but undocumented — verified
+        2026-09-07). The installed CLI's own ``--help`` decides which spelling
+        we emit for ``read-only``, so neither an older nor a future CLI
+        breaks read-only pairs. Cached per process.
+        """
+        native = CLAUDE_PERMISSION_MAP[normalize_permission(level)]
+        if native in ("manual", "default"):
+            choices = _cli_permission_choices()
+            if choices:
+                if "manual" in choices:
+                    return "manual"
+                if "default" in choices:
+                    return "default"
+        return native
+
     # ---- public surface ------------------------------------------------
 
     def create(self, spec: PairSpec, initial_message: str | None = None) -> CreateResult:
@@ -141,8 +203,8 @@ class ClaudeAdapter(PairAdapter):
         prompt = initial_message or "Reply with exactly: pair-ready"
         args += ["--print", "--output-format", "json",
                  "--session-id", spec.session_id,
-                 "--model", spec.model,
-                 "--permission-mode", spec.permission_mode,
+                 "--model", self.cli_model(spec),
+                 "--permission-mode", self.native_permission(spec.permission_mode),
                  "-p", prompt]
 
         result_json = self._run_print(args, timeout_seconds=300, pair_name=spec.name, cwd=spec.cwd)
@@ -155,9 +217,13 @@ class ClaudeAdapter(PairAdapter):
 
     def send(self, spec: PairSpec, message: str, *, model: str | None = None,
              effort: str | None = None, permission_mode: str | None = None,
-             timeout_seconds: int = 300,
+             timeout_seconds: int | None = 300,
              on_event: "callable | None" = None,
-             should_stop: "callable | None" = None) -> SendResult:
+             should_stop: "callable | None" = None,
+             task_id: str | None = None) -> SendResult:
+        # task_id is accepted for signature parity with CodexAdapter (which
+        # registers its in-flight process under it); the Claude runtime path
+        # tracks the task through should_stop instead.
         if not self.session_exists(spec):
             raise SessionMissing(spec.name, spec.session_id)
 
@@ -196,13 +262,13 @@ class ClaudeAdapter(PairAdapter):
         args = [
             "--print", "--output-format", "json",
             "--resume", spec.session_id,
-            "--model", model or spec.model,
+            "--model", self.cli_model(spec, model),
         ]
         args += self._fallback_args(spec)
         if eff is not None:
             args += ["--effort", eff]
         args += [
-            "--permission-mode", permission_mode or spec.permission_mode,
+            "--permission-mode", self.native_permission(permission_mode or spec.permission_mode),
             "-p", message,
         ]
         result_json = self._run_print(args, timeout_seconds=timeout_seconds,
@@ -243,9 +309,9 @@ class ClaudeAdapter(PairAdapter):
         args = [
             "--print", "--output-format", "json",
             "--resume", spec.session_id, "--fork-session",
-            "--model", spec.model,
+            "--model", self.cli_model(spec),
             *self._fallback_args(spec),
-            "--permission-mode", spec.permission_mode,
+            "--permission-mode", self.native_permission(spec.permission_mode),
             "-p", sentinel,
         ]
         result_json = self._run_print(
@@ -475,9 +541,9 @@ class ClaudeAdapter(PairAdapter):
         cli = _claude_executable()
         args = [cli, "--print", "--verbose",
                 "--resume", spec.session_id,
-                "--model", spec.model,
+                "--model", self.cli_model(spec),
                 *self._fallback_args(spec),
-                "--permission-mode", spec.permission_mode,
+                "--permission-mode", self.native_permission(spec.permission_mode),
                 "--input-format", "stream-json",
                 "--output-format", "stream-json"]
 
@@ -575,7 +641,8 @@ class ClaudeAdapter(PairAdapter):
         # CLI omits contextWindow from modelUsage.
         ctx_window = model_usage.get(model_used, {}).get("contextWindow")
         if not ctx_window:
-            ctx_window = 1_000_000 if "1m" in (model_used or "").lower() else 200_000
+            ctx_window = (1_000_000 if ("1m" in (model_used or "").lower()
+                                        or spec.context_window == "1m") else 200_000)
         # True context fill = the LAST assistant sub-call's prompt size, NOT the
         # cumulative across the agentic loop. The stream-json `result` event's
         # usage block sums every sub-call's input — useful for billing but
@@ -705,6 +772,7 @@ class ClaudeAdapter(PairAdapter):
             self_woken_completed=list(self_woken.get("completed") or []),
             self_woken_waited_s=waited_s,
             terminal_reason=result_json.get("terminal_reason"),
+            backend="claude",
         )
 
 

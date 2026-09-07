@@ -76,12 +76,12 @@ def test_handoff_interactive_tool():
     try:
         out = _fmt_send_result(_send_result("hpair", [PermissionDenial(tool_name="AskUserQuestion")]))
         # Reports the ACTUAL mode, not hardcoded "auto-mode"
-        assert_in("permission_mode=bypassPermissions", out, "reports actual permission_mode")
+        assert_in("permission level 'unrestricted'", out, "reports actual permission level (neutral name)")
         assert_not_in("blocked by auto-mode", out, "no hardcoded 'blocked by auto-mode'")
         # Structural remedy, not the bypass loop
         assert_in("cannot run in headless mode", out, "structural-remedy framing")
         assert_in("PLAIN TEXT", out, "tells orchestrator to re-request as plain text")
-        assert_in("bypassPermissions will NOT help", out, "explicitly says bypass won't help")
+        assert_in("'unrestricted' will NOT help", out, "explicitly says unrestricted won't help")
     finally:
         reg_mod.remove_pair("hpair")
 
@@ -92,8 +92,8 @@ def test_handoff_permission_tool():
                               permission_mode="auto"))
     try:
         out = _fmt_send_result(_send_result("ppair", [PermissionDenial(tool_name="Bash")]))
-        assert_in("permission_mode=auto", out, "reports auto mode")
-        assert_in("override_permission_mode=\"bypassPermissions\"", out, "bypass remedy for real denial")
+        assert_in("permission level 'auto'", out, "reports auto level")
+        assert_in("override_permission_mode=\"unrestricted\"", out, "unrestricted remedy for real denial")
         assert_in("Bash", out, "names the denied tool")
         # Bash is not interactive, so no structural framing
         assert_not_in("cannot run in headless mode", out, "no structural framing for Bash")
@@ -111,7 +111,7 @@ def test_handoff_mixed():
             PermissionDenial(tool_name="Bash"),
         ]))
         assert_in("cannot run in headless mode", out, "structural remedy present")
-        assert_in("override_permission_mode=\"bypassPermissions\"", out, "permission remedy present")
+        assert_in("override_permission_mode=\"unrestricted\"", out, "permission remedy present")
     finally:
         reg_mod.remove_pair("mpair")
 

@@ -36,13 +36,13 @@ def assert_eq(actual, expected, label):
 
 def test_per_model_effort_defaults():
     print("=== Per-model effort defaults ===")
-    assert_eq(default_effort_for_model("opus"), "xhigh", "opus defaults to xhigh")
-    assert_eq(default_effort_for_model("claude-opus-4-7"), "xhigh", "full opus name still xhigh")
+    assert_eq(default_effort_for_model("opus"), "high", "opus defaults to high (v0.13.0 policy)")
+    assert_eq(default_effort_for_model("claude-opus-4-7"), "high", "full opus name still high")
     assert_eq(default_effort_for_model("sonnet"), "high", "sonnet defaults to high")
     assert_eq(default_effort_for_model("claude-sonnet-4-6"), "high", "full sonnet name still high")
     assert_eq(default_effort_for_model("haiku"), None, "haiku defaults to None")
     assert_eq(default_effort_for_model("claude-haiku-4-5"), None, "full haiku name still None")
-    assert_eq(default_effort_for_model("unknown-model"), "xhigh", "unknown family -> xhigh fallback")
+    assert_eq(default_effort_for_model("unknown-model"), "high", "unknown family -> high fallback")
 
 
 def test_effort_coercion():
@@ -129,7 +129,7 @@ def test_settings_bypass_permissions_guard():
 
     # Other valid permission modes should work
     new_d, _ = settings_mod.update_defaults(permission_mode="acceptEdits")
-    assert_eq(new_d.permission_mode, "acceptEdits", "acceptEdits accepted as default")
+    assert_eq(new_d.permission_mode, "workspace", "acceptEdits accepted as default (stored as neutral 'workspace', v0.13.0)")
 
 
 def test_settings_unknown_field_rejection():

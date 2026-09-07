@@ -122,7 +122,7 @@ def test_info_basic():
     assert_eq(code, 0, "exit 0")
     assert_true("gamma" in out, "pair name shown")
     assert_true(spec.session_id in out, "session id shown")
-    assert_true("claude-opus-4-8[1m]" in out, "model shown")
+    assert_true("claude-opus-4-8" in out and "context_window: 1m" in out, "model + context_window shown (v0.13.0: [1m] lives in context_window)")
     assert_true("the gamma pair" in out, "purpose shown")
     assert_true("transcript:" in out, "transcript path line shown")
 

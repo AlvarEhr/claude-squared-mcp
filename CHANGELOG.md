@@ -4,6 +4,142 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] — 2026-09-07
+
+A second backend — **OpenAI Codex CLI** pairs — behind the same tools, plus one
+backend-neutral vocabulary for everything a caller types. One package: the
+adapter, the shared-layer fixes its design review surfaced, and a full
+re-verification of the Claude quirks on CLI 2.1.258.
+
+### Added
+
+- **Codex backend** (`pair_create(backend="codex")`, or any `gpt-*` slug /
+  `sol` | `terra` | `luna` | `astra` alias). One `codex exec --json … resume
+  <thread-id>` process per turn with stdin closed, options before the
+  subcommand, `--skip-git-repo-check -C <cwd>` and model/effort/sandbox
+  re-passed on every call (Codex never inherits them from the thread).
+  Eager create takes the thread id from `thread.started`. Runs under
+  `--ignore-user-config` (the user's config mounts this MCP itself → recursion,
+  plus Desktop plugins/hooks) and re-adds a whitelist of keys the sandbox needs
+  (`windows.sandbox`, `sandbox_workspace_write`, `model_provider(s)`,
+  `web_search`, `shell_environment_policy`). Threads are tagged
+  `--thread-source claude-squared`. `system_prompt_append` / profiles are
+  delivered as the thread's first user message (exec has no system-prompt flag).
+- Codex turn parsing: `agent_message` → reply, `command_execution` /
+  `file_change` / other items → `[T-N]` main.log lines (`main.idx.json` shared
+  with Claude), `turn.completed/failed` → TURN markers; context from the
+  rollout's last `token_count` (effective window + last-call size — 258,400
+  default, 828,400 with `1m`); `📊 plan usage` footer from the rollout's
+  `rate_limits` (weekly quota %, reset time, plan); `⛔ MODEL UNAVAILABLE` on
+  the API's HTTP 400 for models not on the plan; sandbox/approval denials from
+  stderr AND from commands that failed with an OS permission error → the
+  `⛔ PAIR HANDOFF` block; `🛡 guardian review: allow|deny — rationale` from
+  the `codex-auto-review` threads the `auto` level spawns.
+- Codex lifecycle: native `exec fork` (no sentinel turn needed); `pair_rewind`
+  by truncating the rollout at a `turn_context` boundary + re-syncing Codex's
+  sqlite history projection (`thread_history_projection_state`, projected
+  turns/items) so fork keeps working; `pair_stop` tree-kills the in-flight
+  process in this MCP process (thread resumes cleanly) or writes the terminal
+  `stop` marker for another process; `pair_status` codex branch (in-flight
+  process table); `pair_context` zero-inference from the rollout; `pair_adopt`
+  of an existing thread; `pair_transcript` reads rollouts. `pair_compact` /
+  `pair_invoke` hard-error with the reason.
+- **Dynamic Codex model policy** from `~/.codex/models_cache.json`: default =
+  the current numbered generation, Sol > Terra > Luna (Astra never a default,
+  retiring models never a default); tier aliases float with generation bumps;
+  pinned slugs get a one-time `🆕` nudge; the cache's `upgrade` notices
+  surface; per-model effort levels (Luna has no `ultra`; Sol/Terra/Astra do)
+  and windows are read live. `pair_settings_get` lists what the plan has.
+- **`context_window`** (`default` | `1m`) on pairs, defaults and `pair_update`.
+  Claude: `1m` = the `[1m]` tier (already the bare default on Opus 5 / Fable).
+  Codex: passes `model_context_window=1000000` (what the Codex app writes; the
+  server clamps to the model's ceiling, 828,400 usable on the 5.6 family) with
+  `model_auto_compact_token_limit` derived as 90% of that effective window (the
+  documented 900,000 would never fire under the clamp). A Codex pair created
+  with the default window gets a hint to pick `1m` for large files/repos.
+- `backend_options.sandbox` is refused at the `auto` level (the CLI rejects
+  `-s` next to `--approve-for-me`, which already implies workspace-write).
+- **`backend_options`** escape hatch (dict or JSON string). Codex: `config`
+  (extra `-c` overrides), `args`, `sandbox` / `approval` native overrides.
+- **`pair_compact` on Codex** via `codex app-server` (stdio JSON-RPC:
+  `initialize` → `thread/resume` with a per-thread config that blanks
+  `mcp_servers` → `thread/compact/start` → `contextCompaction` item +
+  `turn/completed`). `codex exec` has no compaction command (a literal
+  `/compact` prompt is answered as text). Steering text is ignored with a
+  note; the post-compaction size is estimated from the compaction record
+  because Codex's own post-compaction `token_count` reports zeros. Verified
+  on a 164k-token Sol thread (→ 17k on the next turn, summary retained).
+- **Corrupt `registry.json` can no longer wipe the registry** (caught by the
+  first Codex pair's review): a file that isn't valid JSON reads as empty
+  (copy kept as `registry.corrupt-<ts>.json`) and every write is refused with
+  the remedy until it is fixed or restored — previously the next mutation
+  replaced it with the empty view.
+- `backend` and `context_window` per-user defaults (`pair_settings_set`).
+- `tests/smoke_codex.py` — 75 unit checks + a `--live` half (temp
+  CLAUDE_HOME, luna/low) covering create, send, in-workspace write, denial
+  handoff, guardian, status/info/transcript/context, rewind (MANGO/PAPAYA),
+  fork after rewind, async + stop + resume, clear, update, compact/invoke
+  errors, adopt, forget (38 checks).
+
+### Changed
+
+- **Permission levels are backend-neutral**: `read-only` | `plan` |
+  `workspace` | `auto` | `unrestricted` (loosest last). Old spellings
+  (`default`, `dontAsk`, `acceptEdits`, `bypassPermissions`, and Codex's
+  `workspace-write` / `approve-for-me` / `danger-full-access`) are accepted as
+  input aliases forever; outputs, footers and the registry use the neutral
+  names, with the native mapping shown in `pair_settings_get` and the
+  `pair_create` docstring. Claude's `read-only` emits `manual` — CLI 2.1.258
+  renamed `default` (still accepted, undocumented) — chosen by reading the
+  installed CLI's `--help`, so older CLIs keep getting `default`.
+- **Default effort is `high`** on both backends (was xhigh / CLI default).
+  Effort is validated per backend + model (nearest supported level, with a
+  message) instead of a hard `Literal` — a Codex pair with `ultra` can no
+  longer make the whole registry file unparseable.
+- **Default model is the floating `opus` alias** (verified: the alias resolves
+  to `claude-opus-5` with the 1M window on 2.1.258). Numbered ids stay pinned;
+  the drift notice tells you when a newer generation is listed.
+- **Registry v3**: the `[1m]` suffix moved out of `model` into
+  `context_window`; legacy permission spellings normalized; `backend`
+  recorded. Migrated in place on first load, with `registry.v2.backup.json`
+  kept. **Restart every open Claude session after installing** — an MCP
+  process still running pre-0.13 code cannot parse the neutral spellings and
+  would drop those pairs if it wrote the registry back.
+- `pair_clear` and `pair_stop(hard=True)` now register the session id the
+  backend REPORTS (`CreateResult.session_id`) instead of a pre-generated uuid —
+  latent for Claude (which honors `--session-id`), a phantom for Codex.
+- `pair_update`: refuses a model from the other backend (the backend is
+  fixed), keeps the pair's effort when the new model supports it (only resets
+  when it doesn't), takes `context_window` / `backend_options`, evicts on
+  effort changes too; Codex cwd changes need no transcript move.
+- `SendResult.cost_usd` is nullable (Codex bills by plan quota); footers label
+  Codex turns `codex/<tier>`; `pair_list` / `pair_info` / the terminal `list`
+  / `info` show backend and window.
+- `match-parent`, `ultracode`, `fallback_model` are refused on Codex pairs with
+  the reason (Codex's multi-agent opt-in is `effort="ultra"`).
+
+### Claude re-verification (CLI 2.1.258, 2026-09-07)
+
+- Still true and still handled: the 3-second stdin wait (spawn with
+  `stdin=DEVNULL`); `--bare` breaks OAuth auth; the "issue with the selected
+  model" marker + `api_error_status 404` for a missing model; `--fallback-model`
+  serves the fallback; sub-agent events stream through the parent with
+  `parent_tool_use_id`; JSONLs record the bare model id; `--fork-session`; bare
+  `opus` / `claude-opus-5` / `claude-fable-5-1` all report the 1M window.
+- Changed upstream: `--permission-mode` choices are now `acceptEdits`, `auto`,
+  `bypassPermissions`, `manual`, `dontAsk`, `plan` (`default` accepted but
+  undocumented); `--effort ultracode` is accepted silently (no warning) — the
+  `--settings '{"ultracode": true}'` key remains the mechanism; `--print`
+  sessions no longer list `AskUserQuestion` or cloud-MCP tools even without the
+  disallow flags (ours stay, harmless); a new `task_summary` system event
+  accompanies the task lifecycle events; `/compact` on a tiny session emits no
+  `compact_boundary` (the adapter reports that as "did not compact").
+- Legacy tests that predate the v0.10 string-returning tool API
+  (`smoke.py`, `smoke_runtime.py`, `smoke_streamjson.py`, `smoke_v05.py`) fail
+  for those unrelated reasons; the maintained suite (`smoke_listparse`,
+  `smoke_crossproc_lock`, `smoke_selfwoken`, `smoke_v08`…`smoke_v0120`,
+  `smoke_log`, `smoke_v06`, `smoke_codex`) passes.
+
 ## [0.12.1] — 2026-08-22
 
 Two gaps the v0.12.0 live test exposed, both in the window between a

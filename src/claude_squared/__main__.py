@@ -72,11 +72,26 @@ def _context_fill(spec) -> "tuple[int, int, float] | None":
     200k), matching the adapter's own fallback.
     """
     try:
+        if getattr(spec, "backend", "claude") == "codex":
+            # Codex: the rollout's last token_count carries the EFFECTIVE
+            # window + the last call's prompt size — zero inference as well.
+            from claude_squared.adapters.codex import CodexAdapter, read_last_token_count
+            tc = read_last_token_count(CodexAdapter().transcript_path(spec))
+            if not tc:
+                return None
+            info = tc.get("info") or {}
+            last = info.get("last_token_usage") or {}
+            window = int(info.get("model_context_window") or 0)
+            used = int(last.get("input_tokens") or 0)
+            pct = (used / window * 100) if window else 0.0
+            return (used, window, pct)
         from claude_squared.adapters.claude import ClaudeAdapter
         used = ClaudeAdapter()._read_last_turn_context_fill(spec)  # noqa: SLF001
         if used is None:
             return None
-        window = 1_000_000 if "1m" in (spec.model or "").lower() else 200_000
+        window = (1_000_000 if ("1m" in (spec.model or "").lower()
+                                or getattr(spec, "context_window", "default") == "1m")
+                  else 200_000)
         pct = (used / window * 100) if window else 0.0
         return (used, window, pct)
     except Exception:
@@ -85,6 +100,9 @@ def _context_fill(spec) -> "tuple[int, int, float] | None":
 
 def _transcript_path(spec):
     try:
+        if getattr(spec, "backend", "claude") == "codex":
+            from claude_squared.adapters.codex import CodexAdapter
+            return CodexAdapter().transcript_path(spec)
         from claude_squared.adapters.claude import ClaudeAdapter
         return ClaudeAdapter().transcript_path(spec)
     except Exception:
@@ -109,8 +127,13 @@ def _cmd_list(argv: list[str]) -> int:
         if len(purpose) > 64:
             purpose = purpose[:61] + "..."
         tail = f"  - {purpose}" if purpose else ""
+        model_disp = spec.model
+        if getattr(spec, "backend", "claude") == "codex":
+            model_disp = f"codex:{spec.model}"
+        if getattr(spec, "context_window", "default") == "1m":
+            model_disp += " [1m]"
         print(
-            f"  {name:<16} {spec.model:<24} {spec.turn_count:>4} turns  "
+            f"  {name:<16} {model_disp:<24} {spec.turn_count:>4} turns  "
             f"last {_fmt_local(spec.last_active_at)}{tail}"
         )
     return 0
@@ -132,9 +155,11 @@ def _cmd_info(argv: list[str]) -> int:
     eff = spec.effort if spec.effort is not None else "none"
     uc = "    ultracode: on" if getattr(spec, "ultracode", False) else ""
     print(f"Pair '{name}':")
+    print(f"  backend:     {getattr(spec, 'backend', 'claude')}")
     print(f"  session:     {spec.session_id}")
     print(f"  model:       {spec.model}    effort: {eff}    "
-          f"permissions: {spec.permission_mode}{uc}")
+          f"permissions: {spec.permission_mode}    "
+          f"context_window: {getattr(spec, 'context_window', 'default')}{uc}")
     print(f"  turns:       {spec.turn_count}    last active: {_fmt_local(spec.last_active_at)}")
     print(f"  cwd:         {spec.cwd or '(server cwd)'}")
     fill = _context_fill(spec)

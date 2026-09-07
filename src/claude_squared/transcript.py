@@ -16,6 +16,15 @@ def tail_turns(jsonl_path: Path, last_n: int = 10) -> list[dict[str, Any]]:
     if not jsonl_path.exists():
         return []
 
+    # v0.13.0: a Codex rollout (first line ``session_meta``) has a different
+    # shape — delegate. Lazy import keeps this module dependency-free.
+    try:
+        from claude_squared.adapters.codex import is_codex_rollout, tail_turns_codex
+        if is_codex_rollout(jsonl_path):
+            return tail_turns_codex(jsonl_path, last_n=last_n)
+    except Exception:
+        pass
+
     raw_lines = jsonl_path.read_text(encoding="utf-8", errors="replace").splitlines()
     turns: list[dict[str, Any]] = []
     for line in raw_lines:
