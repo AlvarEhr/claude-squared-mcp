@@ -2751,7 +2751,11 @@ def pair_update(
                 except ValueError as e:
                     raise PairError(str(e))
                 if cur_spec.backend == "codex":
-                    _cw = codex_models.context_windows(cur_spec.model)
+                    try:
+                        _cw_slug = codex_models.resolve_codex_model(fields.get("model", cur_spec.model))[0]
+                    except Exception:
+                        _cw_slug = cur_spec.model
+                    _cw = codex_models.context_windows(_cw_slug)
                     if _cw:
                         _usable = _cw[1] if fields["context_window"] == "1m" else _cw[0]
                         transparency_msgs.append(
