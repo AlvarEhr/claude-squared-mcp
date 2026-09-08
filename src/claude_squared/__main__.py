@@ -62,8 +62,13 @@ def _fmt_local(dt) -> str:
         return str(dt)
 
 
-def _observed_claude_window(spec) -> int | None:
-    """Reuse a native window only if it covers the latest transcript usage."""
+def _observed_claude_window(spec, used: int) -> int | None:
+    """Reuse a native window only if it was captured for the latest transcript
+    usage: same session and model, captured no earlier than that usage, AND the
+    captured ``tokens_used`` equals the JSONL-derived ``used`` (both come from
+    the same last assistant usage block). The fingerprint is what survives a
+    rewind — a result from a discarded turn is newer than the retained usage
+    but its token count no longer matches (v0.14.0 review catch)."""
     import json
     path = _transcript_path(spec)
     latest_model = None
@@ -95,6 +100,8 @@ def _observed_claude_window(spec) -> int | None:
             if context.get("window_source") != "reported":
                 continue
             if latest_model and latest_model != result.get("model_used"):
+                continue
+            if int(context.get("tokens_used") or -1) != int(used):
                 continue
             window = int(context.get("tokens_max") or 0)
             stamp = str(task.get("finished_at") or task.get("started_at") or "")
@@ -137,7 +144,7 @@ def _context_fill(spec, *, provenance: dict | None = None) -> "tuple[int, int, f
         used = ClaudeAdapter()._read_last_turn_context_fill(spec)  # noqa: SLF001
         if used is None:
             return None
-        observed = _observed_claude_window(spec)
+        observed = _observed_claude_window(spec, used)
         window = observed or (1_000_000 if ("1m" in (spec.model or "").lower()
                                 or getattr(spec, "context_window", "default") == "1m")
                   else 200_000)

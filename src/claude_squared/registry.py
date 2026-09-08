@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -22,6 +23,14 @@ logger = logging.getLogger(__name__)
 # in here — see ``_load_unlocked``.
 _CORRUPT: set[str] = set()
 _READ_ONLY_REASONS: dict[str, str] = {}
+# v0.14.0: entries that failed validation, per registry path → {key: (raw
+# JSON value, reason)}. They are kept VERBATIM and written back untouched on
+# every save, so one unreadable pair never freezes writes for the rest
+# (preserve AND stay available — review decision on the maintenance branch,
+# which refused all writes instead). Root-level damage — unparseable file,
+# non-object root/pairs, bad or newer ``version`` — still makes the file
+# read-only via ``_unsafe_registry``.
+_QUARANTINE: dict[str, dict[str, tuple[object, str]]] = {}
 
 
 def claude_home() -> Path:
@@ -83,8 +92,13 @@ def _unsafe_registry(path: Path, reason: str) -> None:
     """Keep the original bytes and prevent a partial view from being saved."""
     if str(path) not in _CORRUPT:
         try:
-            stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
-            path.with_name(f"registry.corrupt-{stamp}.json").write_bytes(path.read_bytes())
+            # Named by content, so every MCP process that loads the same bad
+            # file keeps ONE copy between them (review catch: a per-process
+            # timestamp name wrote a full copy per process).
+            raw = path.read_bytes()
+            copy = path.with_name(f"registry.corrupt-{hashlib.sha256(raw).hexdigest()[:12]}.json")
+            if not copy.exists():
+                copy.write_bytes(raw)
         except OSError:
             pass
     _CORRUPT.add(str(path))
@@ -116,14 +130,10 @@ def _load_unlocked() -> Registry:
     if not isinstance(data, dict):
         _unsafe_registry(path, "the registry root must be an object")
         return Registry()
-    # Migration: inject dict-key as `name` for legacy entries that omit it.
     pairs_obj = data.get("pairs", {})
     if not isinstance(pairs_obj, dict):
         _unsafe_registry(path, "pairs must be an object")
         return Registry()
-    for key, val in pairs_obj.items():
-        if isinstance(val, dict) and "name" not in val:
-            val["name"] = key
     reasons: list[str] = []
     try:
         raw_version = data.get("version", 2)
@@ -138,20 +148,31 @@ def _load_unlocked() -> Registry:
     if on_disk_version > REGISTRY_VERSION:
         reasons.append(f"version {on_disk_version} is newer than supported version {REGISTRY_VERSION}")
     cleaned: dict[str, PairSpec] = {}
+    held: dict[str, tuple[object, str]] = {}
     for key, val in pairs_obj.items():
         try:
-            spec = PairSpec.model_validate(val)
+            if not isinstance(val, dict):
+                raise ValueError("entry is not an object")
+            # Legacy entries omit ``name``: validate with the dict key injected,
+            # without mutating the raw value (a quarantined raw stays verbatim).
+            spec = PairSpec.model_validate({**val, "name": val.get("name", key)})
             if spec.name != key:
                 raise ValueError("pair name does not match its registry key")
             cleaned[key] = spec
-        except (TypeError, ValueError):
-            reasons.append(f"invalid pair entry {key!r}")
+        except (TypeError, ValueError) as e:
+            held[key] = (val, _short_reason(e))
     reg = Registry.model_validate({**data, "version": on_disk_version, "pairs": cleaned})
     if reasons:
         _unsafe_registry(path, "; ".join(reasons))
         return reg
     _CORRUPT.discard(str(path))
     _READ_ONLY_REASONS.pop(str(path), None)
+    previous = _QUARANTINE.get(str(path), {})
+    _QUARANTINE[str(path)] = held
+    for key, (_raw, why) in held.items():
+        if key not in previous:
+            logger.warning("Registry %s: entry %r is unreadable (%s); kept verbatim on disk and "
+                           "hidden from the tools until repaired", path, key, why)
     if on_disk_version < REGISTRY_VERSION:
         reg.version = REGISTRY_VERSION
         try:
@@ -182,8 +203,39 @@ def _save_unlocked(reg: Registry) -> None:
     for name, spec in reg.pairs.items():
         for key in spec.model_extra or {}:
             data["pairs"][name][key] = full["pairs"][name][key]
+    # Quarantined entries ride along untouched. A live pair under the same
+    # name wins (the only way to get one is repairing the entry by hand, or
+    # deleting it and re-creating the pair).
+    for key, (raw, _why) in _QUARANTINE.get(str(path), {}).items():
+        data["pairs"].setdefault(key, raw)
     tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
     os.replace(tmp, path)
+
+
+def _short_reason(exc: BaseException) -> str:
+    text = str(exc).strip().splitlines()
+    first = text[0] if text else type(exc).__name__
+    # pydantic's first line is "N validation error(s) for PairSpec" — the field
+    # detail is on the next lines; keep a compact "field: message" when present.
+    if len(text) >= 3 and "validation error" in first:
+        first = f"{text[1].strip()}: {text[2].strip()}"
+    return first[:160]
+
+
+def quarantined() -> dict[str, str]:
+    """Entries of the current registry this process could not validate:
+    name → reason. They stay on disk verbatim and are invisible to every tool
+    until repaired (edit ``registry.json`` by hand, or delete the entry)."""
+    return {key: why for key, (_raw, why) in _QUARANTINE.get(str(registry_path()), {}).items()}
+
+
+def _quarantine_error(name: str) -> PairError:
+    why = quarantined().get(name, "unknown")
+    return PairError(
+        f"Pair '{name}' exists in {registry_path()} but its entry is unreadable ({why}). "
+        "It was kept verbatim; repair the entry by hand (then any tool call re-reads it), "
+        "or delete it from the file to reuse the name."
+    )
 
 
 @contextmanager
@@ -221,6 +273,8 @@ def assert_writable() -> None:
 def get_pair(name: str) -> PairSpec:
     reg = load()
     if name not in reg.pairs:
+        if name in quarantined():
+            raise _quarantine_error(name)
         raise PairNotFound(name)
     return reg.pairs[name]
 
@@ -229,6 +283,8 @@ def add_pair(spec: PairSpec) -> None:
     with locked_registry() as reg:
         if spec.name in reg.pairs:
             raise PairAlreadyExists(spec.name)
+        if spec.name in quarantined():
+            raise _quarantine_error(spec.name)
         reg.pairs[spec.name] = spec
 
 

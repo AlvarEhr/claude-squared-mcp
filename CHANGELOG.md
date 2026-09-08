@@ -4,6 +4,100 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] — 2026-09-08
+
+Maintenance release. Merges the Codex-app agent's `codex/maintenance-2026-09-08`
+branch — registry preservation, a cancellation rework, Codex `pair_tool_detail`,
+hermetic offline tests with a CI runner, bundle verification, and a documented
+Desktop-callback prototype — after review by the main session, the historian
+pair and an independent Astra pass, with the reviews' fixes on top (its own
+account: `docs/codex-maintenance-2026-09-08.md`).
+
+**Restart every open Claude and Codex session after installing.** The
+cancellation protocol changed (per-task `<task_id>.cancel` files next to the
+async task state); a pre-0.14 process only understands the compatibility stop
+marker, and mixed fleets are otherwise unsupported.
+
+### Added
+
+- **Codex `pair_tool_detail`.** Every Codex item's started and completed events
+  are saved under `logs/<pair>/codex-tool-items/T-N.json`, tagged with the
+  run/task id so a repeated CLI item id in a later exec never reuses an
+  earlier T-N; `pair_tool_detail(name, "T-N")` renders them. Turns run before
+  0.14.0 only have log previews and say so.
+- **`pair_stop(drain_queue=True)`** cancels queued sends too; the default stops
+  executing work only. Queued tasks show as `queued for Ns (waiting for the
+  pair lock)` in `pair_poll`, never borrow another task's live log, and when
+  cancelled are reported `stopped` without ever reaching the backend.
+- **Cross-process cancellation.** `pair_stop` from any MCP process cancels a
+  task owned by another (the owner's turn polls `<task_id>.cancel` ~1/s),
+  Claude turns included. Foreign self-woken turns are the exception: their
+  owner must stop them, and `pair_stop` says so instead of pretending. For a
+  foreign executing task the per-pair stop marker is still written, so a
+  pre-0.14 owner stops as well.
+- **Results survive races.** A turn that completes while being stopped keeps
+  its result (`pair_poll` shows "Result captured around cancellation"); a
+  terminal state write that fails is served from memory and retried in the
+  background (~5 min of backoff) so other processes and `wait.py` see the
+  completion; registry bookkeeping failing after a reply attaches a note to
+  the result instead of discarding the reply.
+- `scripts/run_offline_tests.py` runs the 17 maintained offline suites plus
+  `tests/test_maintenance*.py` (53 tests) in isolated processes with a temp
+  `CLAUDE_HOME`; CI runs it on the OS/Python matrix. The offline half of
+  `tests/smoke_codex.py` uses synthetic fixtures (no real models cache or
+  registry needed); `--live` is unchanged.
+- `scripts/build_and_install_extension.py` validates source/manifest version
+  agreement, verifies the packed bundle byte-for-byte against `src/` (modulo
+  Python CRLF/LF), refuses to replace a bundle with a failed build, and
+  `--verify BUNDLE` checks an existing one.
+- `experiments/`: an opt-in, isolated prototype of a Codex Desktop completion
+  callback over the Desktop's app-tools named pipe (`codex_desktop_bridge.py`)
+  plus its smoke results. Not imported by the server; a private,
+  version-specific protocol, kept as documentation of what was proven.
+
+### Changed
+
+- **Registry: preserve AND stay available.** An entry that fails validation
+  (an unknown permission spelling, a missing session id, a value a newer
+  version wrote) is quarantined: kept on disk verbatim, hidden from the
+  tools, listed by `pair_list` as `UNREADABLE`, and written back untouched on
+  every save — the other pairs keep working. `pair_create` / `get_pair` on a
+  quarantined name explain the repair. Root-level damage (unparseable file,
+  non-object root, bad or newer `version`) still makes the file read-only for
+  that process, and mutating tools preflight writability before spawning any
+  work. The corrupt copy is named by content hash
+  (`registry.corrupt-<sha>.json`), so many processes keep one copy. Unknown
+  permission spellings no longer degrade to `auto`; additive unknown fields
+  (including nulls) survive read-modify-write.
+- **`pair_stop` identity checks.** Only the runtime or process that was
+  executing a *selected* task is interrupted or killed: never a successor
+  promoted after the selected turn ended, never an untagged Codex
+  create/fork/clear probe. `force=True` still tears down a runtime holding an
+  untracked turn (a self-woken turn whose task registration failed). A turn is
+  interrupted at most once, and never after its result was attributed — the
+  worker's stop poll and `pair_stop` used to both write, and a late interrupt
+  could cancel the *next* self-woken turn.
+- **Lock discipline.** The reader thread of a Claude runtime never waits on
+  the cross-process control lock (self-woken open vs. queued-send promotion is
+  serialized in-process); `pair_stop` holds that lock while waiting for an
+  interrupt ack that only the reader can deliver. Pair lock → registry lock →
+  control lock is the order; nothing acquires a pair lock under the registry
+  lock.
+- Live turn-log scoping recognizes Codex turn markers (token counts,
+  `FAILED:`), not only Claude's `(Nms)`. `pair_rewind(verbose=True)` includes
+  the projection-repair note, and a failed sqlite projection repair rolls back
+  every delete instead of advancing the cursor after a partial failure.
+- `python -m claude_squared info` / `context` label the Claude context window
+  as an estimate unless a backend-reported window was captured for the same
+  session, model and last usage (`ContextStatus.window_source`); a captured
+  window from a turn later rewound away is not reused.
+- The root `claude-squared.mcpb` is no longer tracked in git (it was 25 MB per
+  release; the bundle is a Releases asset — download it there or build it).
+- Docs corrected: Codex compaction works (0.13.0 text said it did not in two
+  places), Codex prompts go over a pipe closed after writing (not `DEVNULL`),
+  and the inspection commands are read-only except for the one-time registry
+  migration on a version bump.
+
 ## [0.13.0] — 2026-09-07
 
 A second backend — **OpenAI Codex CLI** pairs — behind the same tools, plus one

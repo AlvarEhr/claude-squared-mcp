@@ -1,8 +1,5 @@
 # claude-squared
 
-Maintenance work and callback experiments after v0.13.0 are documented in
-[the Codex maintenance handoff](docs/codex-maintenance-2026-09-08.md).
-
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.txt)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![CI](https://github.com/AlvarEhr/claude-squared-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/AlvarEhr/claude-squared-mcp/actions/workflows/ci.yml)
@@ -43,21 +40,24 @@ In a fresh Claude Code session, you'll see `mcp__pair__*` tools available. A use
 
 ### As a Claude Desktop extension (MCPB bundle)
 
-Build and install:
+Download `claude-squared-<version>.mcpb` from the
+[Releases page](https://github.com/AlvarEhr/claude-squared-mcp/releases) and open
+it with Claude Desktop, or build and install it yourself:
 
 ```bash
 python scripts/build_and_install_extension.py --install
 ```
 
-This packs an `.mcpb` to `dist/claude-squared-<version>.mcpb` and extracts it into
-your platform's Claude Extensions directory:
+This packs an `.mcpb` to `dist/claude-squared-<version>.mcpb` (verified
+byte-for-byte against `src/`; `--verify BUNDLE` checks an existing one) and
+extracts it into your platform's Claude Extensions directory:
 - Windows: `%APPDATA%\Claude\Claude Extensions\local.claude-squared\`
 - macOS: `~/Library/Application Support/Claude/Claude Extensions/local.claude-squared/`
 - Linux: `~/.config/Claude/Claude Extensions/local.claude-squared/`
 
 Restart Claude Desktop after installing. (Don't install both paths — you'd get duplicate tools.)
 
-> **Upgrading to v0.13.0**: the registry migrates in place to the backend-neutral vocabulary (a `registry.v2.backup.json` is kept). **Restart every open Claude session after installing** — an MCP process still running pre-0.13 code can't parse the new spellings and would drop those pairs if it ever wrote the registry back.
+> **Upgrading**: **restart every open Claude and Codex session after installing** any version. v0.13.0 migrated the registry in place to the backend-neutral vocabulary (a `registry.v2.backup.json` is kept) and a pre-0.13 process would drop the new spellings; v0.14.0 changed the cancellation protocol (per-task `<task_id>.cancel` files) and a pre-0.14 process only understands the compatibility stop marker. An MCP process keeps the code it loaded until it exits.
 
 ## Quick start
 
@@ -122,7 +122,8 @@ A denied action produces a `⛔ PAIR HANDOFF` block in the reply with the pair's
 - **Threads are tagged** `thread_source = claude-squared` in Codex's own store, so they're distinguishable in the Codex app.
 - **`pair_rewind` works** (Codex resumes from the rollout JSONL); the adapter re-syncs Codex's sqlite history projection so `pair_fork` keeps working afterwards.
 - **`pair_compact` works** through `codex app-server` (stdio JSON-RPC: `thread/resume` → `thread/compact/start`); `codex exec` itself has no compaction command (a literal `/compact` is just text to the model). The daemon starts the Desktop's plugin MCP servers first (~10 s); this MCP is excluded so nothing recurses. Codex compaction takes no steering text, and its post-compaction size is an estimate until the next reply's footer.
-- **`pair_stop`** tree-kills the in-flight turn (the thread resumes cleanly on the next send); from another MCP process it writes the same stop marker the terminal `stop` command uses.
+- **`pair_stop`** tree-kills the in-flight turn (the thread resumes cleanly on the next send). From another MCP process it writes the task's `<task_id>.cancel` file (the owner's turn polls it ~1/s and tree-kills itself) plus the per-pair marker the terminal `stop` command uses, for owners still on pre-0.14 code.
+- **`pair_tool_detail` works** for turns run since 0.14.0: each item's full started/completed events are kept under `logs/<pair>/codex-tool-items/T-N.json`. Older turns only have the log previews and say so.
 - **Unavailable models** (not on your ChatGPT plan) are refused by the API with HTTP 400 — `pair_create` warns when a slug isn't listed in the cache, and a failed turn is labeled `⛔ MODEL UNAVAILABLE`.
 
 ## Tools
@@ -143,8 +144,10 @@ A denied action produces a `⛔ PAIR HANDOFF` block in the reply with the pair's
 - `pair_transcript(name, last_n=10)` — tail recent turns (Claude JSONL or Codex rollout)
 - `pair_status(name)` — liveness (active / slow / likely-hung; Codex: in-flight process)
 - `pair_actions(name?)` — discoverability: curated commands + (if name) pair-installed skills (Claude)
+- `pair_tool_detail(name, tool_id, subagent?, max_chars?)` — full input + output of one `[T-N]` log line (Claude: from the session JSONL, sub-agents too; Codex: from the per-turn item sidecar, turns since 0.14.0)
 
 ### Mutation
+- `pair_stop(name, force?, hard?, drain_queue?)` — cancel the executing turn (Claude: in-band interrupt, the pair stays alive; Codex: tree-kill, the thread resumes). Works across MCP processes (per-task cancel file; foreign self-woken turns must be stopped by their owner). `force` tree-kills a wedged runtime, `hard` also rotates the session (context gone), `drain_queue` cancels queued sends too (default: they still run)
 - `pair_update(name, model?, effort?, permission_mode?, context_window?, backend_options?, allowed_tools?, allowed_invocations?, cwd?, extra_dirs?, ultracode?, fallback_model?, purpose?)` — the backend is fixed; a model from the other backend is refused
 - `pair_clear(name, archive_old=True)` — rotate to a fresh session/thread; pinned config preserved
 - `pair_compact(name, steering_prompt?, timeout_seconds=45, compact_timeout_seconds=600)` — Claude: native /compact via stream-json; Codex: `codex app-server` `thread/compact/start` (steering ignored). Async-wrapped, degrades gracefully to an async handle past the sync cap.
@@ -196,10 +199,14 @@ alive; Codex: the one-shot turn process is tree-killed, the thread resumes on
 the next send). It confirms with Y/N unless you pass `-y`, and only stops the
 *current* turn (queued sends still run).
 
-`list` / `info` / `context` are pure disk reads (the context % comes from the
+`list` / `info` / `context` are disk reads (the context % comes from the
 session JSONL's last turn or the Codex rollout's last `token_count`, so it's
-free). The full categorized `/context` breakdown is only available through the
-MCP `pair_context` tool (a small inference on a Claude pair; free on Codex).
+free; the only write any of them can do is the one-time in-place registry
+migration after a version bump). For Claude pairs the window is labelled an
+estimate unless a backend-reported window was captured for that session's
+latest turn. The full categorized `/context` breakdown is only available
+through the MCP `pair_context` tool (a small inference on a Claude pair; free
+on Codex).
 
 > **Why not an in-chat `/pair-info` slash command?** A Claude Code plugin
 > *can't* add a true client-side, model-free slash command like the built-in
@@ -216,8 +223,11 @@ MCP `pair_context` tool (a small inference on a Claude pair; free on Codex).
 | `~/.claude/pairs/defaults.json` | Per-user defaults for new pairs |
 | `~/.claude/pairs/profiles/<name>.md` | Reusable system-prompt profiles for `pair_create(profile_name=...)` |
 | `~/.claude/pairs/archive/<name>-<ts>.jsonl` | Archived transcripts on `pair_forget(archive=True)`, `pair_clear`, `pair_rewind` |
-| `~/.claude/pairs/async/<task_id>.json` | Async task state (poll-able across process restarts) |
+| `~/.claude/pairs/async/<task_id>.json` | Async task state (poll-able across process restarts); `<task_id>.cancel` next to it = a stop request any process can honor (0.14.0) |
+| `~/.claude/pairs/async/control/<name>.lock` | Short per-pair control lock: stop selection vs. queued-task promotion (0.14.0) |
+| `~/.claude/pairs/registry.corrupt-<sha>.json` | Verbatim copy of a registry whose root could not be read (writes refused until repaired) |
 | `~/.claude/pairs/logs/<name>/main.log` | The pair's activity log (both backends) + `main.idx.json` T-N index |
+| `~/.claude/pairs/logs/<name>/codex-tool-items/T-N.json` | Full Codex item events behind each T-N (`pair_tool_detail`, 0.14.0) |
 | `~/.claude/agents/<name>.md` | Custom agent definitions (visible to all Claude sessions globally) |
 | `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` | Claude session transcripts (managed by the claude CLI, not us) |
 | `~/.codex/sessions/YYYY/MM/DD/rollout-*-<thread-id>.jsonl` | Codex thread rollouts (managed by the codex CLI; what `exec resume` reads) |
@@ -351,13 +361,16 @@ Mutable via `pair_update(allowed_invocations=...)` **without runtime eviction** 
 - **Dynamic model availability.** The Claude CLI is the authority for Claude ids (unknown families pass through); `~/.codex/models_cache.json` is the authority for Codex (default choice, aliases, effort levels, windows, deprecations) — nothing model-specific is hardcoded beyond the never-default policy.
 - **Path encoding** for `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` lookups uses a single source: `cli_paths.encode_cwd_for_project()`.
 - **CCD/Cowork users**: this MCP is intended to be loaded by vanilla `claude` CLI sessions. The CCD harness loads MCPs differently and may or may not surface these tools.
+- **Further reading**: `docs/design-2026-05.md` (the original design plan, historical) and `docs/codex-maintenance-2026-09-08.md` (the Codex agent's account of the 0.14.0 maintenance branch, including the Desktop-callback prototype under `experiments/`).
 
 ## Limits / known issues
 
 - **Idle Claude pairs expire: the Claude CLI deletes old session transcripts.** Claude Code runs a transcript-retention cleanup governed by `cleanupPeriodDays` in `~/.claude/settings.json` (unset → 30 days). It deletes exactly the session JSONLs a pair resumes from. **If you rely on long-lived pairs, set `cleanupPeriodDays` to a large value** (e.g. `36500`) — this MCP never writes your `settings.json`. It cannot be disabled (`0` is a trap: it fails validation and historically disabled transcript *writing*). The sweep runs on interactive/desktop startup, not on the headless calls pairs use. Recovery: the pair's own `main.log` survives; `pair_clear(name)` rotates onto a fresh session with all pinned config.
 - **Premium models warn, they don't block.** Plan-gated models (Claude Fable — own weekly limit, faster burn; Codex Astra — frontier tier, most usage-hungry) raise a `💳 PREMIUM MODEL` notice whenever a pair is *switched* onto one, and are never chosen as defaults, but stick once set. The table encodes commercial terms and is dated in-source; verify before trusting it.
 - **Codex has no slash-command channel** (`pair_invoke` hard-errors with the reason); `pair_compact` works via the app-server but costs a full-context turn and loses detail — pick `context_window="1m"` for large work.
-- **A corrupt `registry.json` is refused for writes.** It reads as empty (a copy is kept as `registry.corrupt-<ts>.json`) and any mutation raises until the file is fixed or restored — previously the next mutation would have overwritten every pair with the empty view.
+- **Registry damage is preserved, never overwritten.** An entry that fails validation (an unknown permission spelling, a missing field, something a newer version wrote) is quarantined: kept verbatim on disk, hidden from the tools, listed by `pair_list` as `UNREADABLE`, and carried through every save while the other pairs keep working — repair or delete it by hand. If the file's root is unreadable (invalid JSON, non-object root, a bad or newer `version`) it reads as empty, a copy is kept as `registry.corrupt-<sha>.json`, and every mutation raises until the file is fixed or restored.
+- **Codex `pair_tool_detail` covers turns run since 0.14.0** (the item sidecar); older turns only have the main.log previews.
+- **Mixed-version MCP processes are unsupported.** Restart every session after installing; a pre-0.14 process can only be stopped through the compatibility marker, and a pre-0.13 process can't read the neutral vocabulary at all.
 - **Codex `queue`** (Codex's native message queue) is deliberately not exposed: a message queued by one MCP process would be consumed by another process's send.
 - Gemini adapter not implemented (Gemini's `--resume` uses index, not UUID — needs more design work).
 - Permission denials are surfaced but not retried automatically; the calling agent decides what to do.

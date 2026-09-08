@@ -399,6 +399,13 @@ class TurnLogScope:
         # event was attributed (exact end_line). send() prefers it over the
         # live fields, which a self-woken continuation may already have moved.
         self.result_snapshot: dict[str, Any] | None = None
+        # v0.14.0: the async task this solicited turn executes (None for an
+        # untracked send) and whether an in-band interrupt was already written
+        # for it. pair_stop's direct interrupt and the worker's should_stop
+        # poll both go through ``PairRuntime._claim_interrupt`` so a turn is
+        # interrupted at most once, and never after its result was attributed.
+        self.task_id: str | None = None
+        self.interrupt_sent: bool = False
 
 
 class PairRuntime:
@@ -488,6 +495,13 @@ class PairRuntime:
         # order where both are needed: _scope_lock → _main_log_lock, never the
         # reverse.
         self._scope_lock = threading.Lock()
+        # v0.14.0: serializes the reader opening a self-woken turn against
+        # send() promoting a queued task and opening its solicited scope
+        # (check-then-set across task-file I/O). In-process on purpose — the
+        # reader must never wait on the cross-process control FileLock (see
+        # _open_implicit_turn). Order: _promote_lock → control FileLock (send
+        # thread only, inside mark_task_executing) → _scope_lock.
+        self._promote_lock = threading.Lock()
         self._implicit_scope: TurnLogScope | None = None
         self._implicit_task: AsyncTaskState | None = None
         self._implicit_done = threading.Event()
@@ -685,17 +699,26 @@ class PairRuntime:
         """
         if not self.is_alive() or self.proc is None or self.proc.stdin is None:
             return False
-        request_id = f"req_int_{int(time.time())}_{os.urandom(3).hex()}"
-        payload = json.dumps({
-            "type": "control_request",
-            "request_id": request_id,
-            "request": {"subtype": "interrupt"},
-        }) + "\n"
-        try:
-            self.proc.stdin.write(payload.encode("utf-8"))
-            self.proc.stdin.flush()
-        except (BrokenPipeError, OSError):
-            return False
+        claim = self._claim_interrupt()
+        if claim is None:
+            # Nothing left to interrupt — the turn's result is already
+            # attributed (or no turn is open). Count that as acknowledged so
+            # the caller doesn't escalate to a tree-kill over a finished turn.
+            return True
+        if claim:
+            request_id = f"req_int_{int(time.time())}_{os.urandom(3).hex()}"
+            payload = json.dumps({
+                "type": "control_request",
+                "request_id": request_id,
+                "request": {"subtype": "interrupt"},
+            }) + "\n"
+            try:
+                self.proc.stdin.write(payload.encode("utf-8"))
+                self.proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                return False
+        # else: the worker's should_stop poll already wrote the interrupt for
+        # this turn — don't write a second one; just wait for the ack below.
         # Wait for a RESULT event (any subtype — typically error_during_execution).
         # v0.12.0: the reader bumps ``_result_seq`` on every result, solicited
         # or self-woken, so we don't have to fight send() for the stdout queue.
@@ -1067,8 +1090,15 @@ class PairRuntime:
         )
 
     def _open_implicit_turn(self) -> None:
-        """Reader thread. Open a self-woken turn: log scope + on-disk async task."""
-        with _async_tasks.control_lock(self.spec.name):
+        """Reader thread. Open a self-woken turn: log scope + on-disk async task.
+
+        Serialized against ``_prepare_solicited_turn`` by the IN-PROCESS
+        ``_promote_lock`` only. The reader must never wait on the cross-process
+        control FileLock: ``pair_stop`` holds that lock while waiting for an
+        interrupt ack that only this thread can deliver (v0.14.0 review; the
+        v0.12 rule that reader-side scope transitions take no I/O locks).
+        """
+        with self._promote_lock:
             self._open_implicit_turn_locked()
 
     def _open_implicit_turn_locked(self) -> None:
@@ -1313,9 +1343,12 @@ class PairRuntime:
         waited = 0.0
         while True:
             waited += self.wait_for_implicit_idle(timeout_seconds, should_stop)
-            # Same order as implicit opening: control -> scope. Never hold
-            # scope across task-file I/O or while acquiring the control lock.
-            with _async_tasks.control_lock(self.spec.name):
+            # Same order as implicit opening: promote -> scope. Never hold
+            # scope across task-file I/O. ``mark_task_executing`` takes the
+            # cross-process control lock itself (stop-vs-promotion), so the
+            # order is promote -> control -> scope on this thread; the reader
+            # takes promote -> scope and never the control lock.
+            with self._promote_lock:
                 with self._scope_lock:
                     if self._implicit_scope is not None:
                         continue  # opened in the gap — wait again
@@ -1348,6 +1381,39 @@ class PairRuntime:
                     ids.add(task_id)
             return ids
 
+    def has_untracked_turn(self) -> bool:
+        """A scope is open with no task identity behind it: a self-woken turn
+        whose task registration failed, or a send without a task id. No id can
+        select such a turn, so ``pair_stop(force=True)`` must still be allowed
+        to tear the runtime down (v0.14.0 review catch)."""
+        with self._scope_lock:
+            if self._implicit_scope is not None and self._implicit_task is None:
+                return True
+            scope = self._current_scope
+            return (scope is not None and scope.result_snapshot is None
+                    and not getattr(scope, "task_id", None))
+
+    def _claim_interrupt(self) -> bool | None:
+        """Decide whether an interrupt may be written for the turn in progress.
+
+        Returns True when the caller should write it (first claim on a live
+        turn), False when one was already written for this turn (the ack is on
+        its way — just wait for it), and None when there is nothing left to
+        interrupt: no open scope, or the scope's result is already attributed
+        and only waiting for send() to consume it. v0.14.0 review catch: the
+        worker's should_stop poll and pair_stop's direct interrupt used to both
+        write, and a write landing after the result could cancel the NEXT
+        self-woken turn instead of this one.
+        """
+        with self._scope_lock:
+            scope = self._current_scope if self._current_scope is not None else self._implicit_scope
+            if scope is None or scope.result_snapshot is not None:
+                return None
+            if getattr(scope, "interrupt_sent", False):
+                return False
+            scope.interrupt_sent = True
+            return True
+
     # ---- send ----
 
     def _write_interrupt_nowait(self) -> None:
@@ -1363,6 +1429,8 @@ class PairRuntime:
         never blocks (pipe buffer), so there's no deadlock the other way."""
         if not self.is_alive() or self.proc is None or self.proc.stdin is None:
             return
+        if self._claim_interrupt() is not True:
+            return  # already interrupted, or the result is already in
         request_id = f"req_int_{int(time.time())}_{os.urandom(3).hex()}"
         payload = json.dumps({
             "type": "control_request",

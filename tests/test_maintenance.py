@@ -67,14 +67,31 @@ class RegistryTests(IsolatedCase):
         self.assertTrue(backups)
         self.assertTrue(any(p.read_bytes() == original for p in backups))
 
-    def test_schema_errors_never_migrate_or_disappear(self):
+    def test_unreadable_entries_are_quarantined_verbatim_and_writes_continue(self):
+        # v0.14.0 review decision: an entry that fails validation is kept on
+        # disk untouched and hidden from the tools; the REST of the registry
+        # keeps working (the maintenance branch froze every write instead).
         for version in (2, 3):
             with self.subTest(version=version):
-                self.assert_preserved({"version": version, "pairs": {
-                    "good": {"session_id": "s"}, "bad": {"model": "opus"}}})
-                # A repaired file clears the write guard before the next case.
-                R.registry_path().write_text('{"version":3,"pairs":{}}', encoding="utf-8")
+                bad = {"model": "opus", "future_field": [1, 2]}
+                path, _ = self.write_registry({"version": version, "pairs": {
+                    "good": {"session_id": "s"}, "bad": bad}})
+                loaded = R.load()
+                self.assertEqual(set(loaded.pairs), {"good"})
+                self.assertIn("bad", R.quarantined())
+                R.add_pair(self.spec("new"))  # writes are not frozen
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(raw["version"], 3)
+                self.assertEqual(set(raw["pairs"]), {"good", "bad", "new"})
+                self.assertEqual(raw["pairs"]["bad"], bad)  # verbatim, no injected name
+                with self.assertRaisesRegex(PairError, "unreadable"):
+                    R.get_pair("bad")
+                with self.assertRaisesRegex(PairError, "unreadable"):
+                    R.add_pair(self.spec("bad"))
+                # Repairing the file by hand clears the quarantine on the next load.
+                path.write_text('{"version":3,"pairs":{}}', encoding="utf-8")
                 R.load()
+                self.assertEqual(R.quarantined(), {})
 
     def test_future_version_is_readable_but_never_written(self):
         self.assert_preserved({"version": 99, "pairs": {"good": {"session_id": "s"}}})
@@ -92,8 +109,11 @@ class RegistryTests(IsolatedCase):
     def test_unknown_permission_does_not_become_auto(self):
         with self.assertRaises(ValueError):
             PairSpec(name="bad", session_id="s", permission_mode="read-onyl")
-        self.assert_preserved({"version": 3, "pairs": {
-            "bad": {"session_id": "s", "permission_mode": "read-onyl"}}})
+        bad = {"session_id": "s", "permission_mode": "read-onyl"}
+        path, _ = self.write_registry({"version": 3, "pairs": {"bad": bad}})
+        self.assertNotIn("bad", R.load().pairs)  # never widened to auto
+        R.add_pair(self.spec("new"))
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["pairs"]["bad"], bad)
 
     def test_additive_fields_survive_mutation_including_null(self):
         self.write_registry({"version": 3, "future_root": None, "pairs": {
@@ -114,8 +134,9 @@ class RegistryTests(IsolatedCase):
         self.assertEqual(path.with_name("registry.v2.backup.json").read_bytes(), original)
 
     def test_unsafe_registry_blocks_backend_work_and_releases_pair_lock(self):
-        path, _ = self.write_registry({"version": 3, "pairs": {
-            "pair": {"session_id": "s"}, "bad": {"permission_mode": "read-onyl"}}})
+        # Root-level damage (here: a newer version) still refuses all writes
+        # BEFORE any backend work starts, and the pair lock is released.
+        path, _ = self.write_registry({"version": 99, "pairs": {"pair": {"session_id": "s"}}})
         runner = S._build_send_runner("pair", "must not execute", hard_timeout_seconds=None,
             override_model=None, override_effort=None, override_permission_mode=None)
         with patch.object(S, "_adapter_for") as adapter:
@@ -125,6 +146,19 @@ class RegistryTests(IsolatedCase):
         path.write_text('{"version":3,"pairs":{}}', encoding="utf-8")
         with S._with_pair_lock("pair", timeout_s=0.2):
             pass
+
+    def test_quarantined_entry_does_not_block_other_pairs(self):
+        bad = {"permission_mode": "read-onyl"}
+        path, _ = self.write_registry({"version": 3, "pairs": {
+            "pair": {"session_id": "s"}, "bad": bad}})
+        with S._with_pair_lock("pair", timeout_s=0.2):
+            pass  # the writability preflight passes
+        R.update_pair("pair", purpose="still works")
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(raw["pairs"]["pair"]["purpose"], "still works")
+        self.assertEqual(raw["pairs"]["bad"], bad)
+        listing = tool(S.pair_list)()
+        self.assertIn("bad (UNREADABLE", listing)
 
 
 class CancellationTests(IsolatedCase):
@@ -315,7 +349,7 @@ class CodexInspectionTests(IsolatedCase):
             "message": {"model": "claude-opus-5", "usage": {"input_tokens": 180000}}}), encoding="utf-8")
         (R.async_dir() / "captured.json").write_text(json.dumps({"pair_name": "pair",
             "finished_at": "2026-09-08T12:00:00", "result": {"session_id": spec.session_id,
-                "model_used": "claude-opus-5", "context": {"tokens_max": 1000000,
+                "model_used": "claude-opus-5", "context": {"tokens_used": 180000, "tokens_max": 1000000,
                 "window_source": "reported"}}}), encoding="utf-8")
         with patch("claude_squared.adapters.claude.ClaudeAdapter._read_last_turn_context_fill", return_value=180000):
             source = {}
@@ -330,15 +364,15 @@ class CodexInspectionTests(IsolatedCase):
             "message": {"model": "claude-opus-5", "usage": {"input_tokens": 500000}}}), encoding="utf-8")
         data = {"pair_name": "pair", "finished_at": "2026-09-08T12:00:00", "result": {
             "session_id": spec.session_id, "model_used": "claude-opus-5",
-            "context": {"tokens_max": 200000, "window_source": "reported"}}}
+            "context": {"tokens_used": 500000, "tokens_max": 200000, "window_source": "reported"}}}
         record = R.async_dir() / "captured.json"
         record.write_text(json.dumps(data), encoding="utf-8")
-        self.assertIsNone(CLI._observed_claude_window(spec))
+        self.assertIsNone(CLI._observed_claude_window(spec, 500000))
         data["finished_at"] = "2026-09-08T12:02:00"
         for source in (None, "estimated"):
             data["result"]["context"]["window_source"] = source
             record.write_text(json.dumps(data), encoding="utf-8")
-            self.assertIsNone(CLI._observed_claude_window(spec))
+            self.assertIsNone(CLI._observed_claude_window(spec, 500000))
 
     def test_malformed_detail_sidecar_does_not_suppress_completion(self):
         directory = R.logs_dir() / "pair"

@@ -31,26 +31,33 @@ python scripts/build_and_install_extension.py --install --clean
 ```
 
 This vendors the Python deps into `extension/server/lib/`, packs the
-`.mcpb` to `dist/claude-squared-<version>.mcpb`, and unpacks it into the
-per-OS Claude Extensions directory. Restart Claude Desktop to pick up the new
-bundle.
+`.mcpb` to `dist/claude-squared-<version>.mcpb` (verified against `src/`
+before it replaces anything), and unpacks it into the per-OS Claude
+Extensions directory. Restart Claude Desktop to pick up the new bundle. The
+bundle is a release artifact (GitHub Releases), not tracked in git.
 
 ## Running tests
 
-The smoke tests are pure-stdlib unit tests on the resolution / coercion /
-storage logic — no MCP server or `claude` CLI needed:
+The maintained offline tests need no MCP server, no `claude` and no `codex`
+CLI, and never touch your real `~/.claude/pairs` (each suite runs in its own
+process with a temporary `CLAUDE_HOME`):
 
 ```bash
-PYTHONIOENCODING=utf-8 python tests/smoke_v08.py
-PYTHONIOENCODING=utf-8 python tests/smoke_v081.py
+python scripts/run_offline_tests.py
 ```
 
-Each smoke script exits with a clear `PASS:` line on success and propagates
-non-zero on any failed assertion. CI runs both on every push.
+That runs the 17 maintained `tests/smoke_*.py` scripts (each prints `PASS:`
+and exits non-zero on any failed assertion) plus the `unittest` suites in
+`tests/test_maintenance*.py`. CI runs the same command on every push across
+the OS/Python matrix. Four legacy scripts (`smoke.py`, `smoke_runtime.py`,
+`smoke_streamjson.py`, `smoke_v05.py`) predate the v0.10 API and are not part
+of the run.
 
-End-to-end testing requires a live `claude` CLI install. There's no automated
-harness for that yet — manual test pass via the actual MCP tools is the
-current pattern (see commit messages around v0.8.2 / v0.9.0 for examples).
+Live tests exist for the Codex backend — `python tests/smoke_codex.py --live`
+(a temporary `CLAUDE_HOME`, real `codex` auth, ~15 calls on the cheapest
+model) — and for Claude lifecycle races, `python tests/smoke_live_0140.py`
+(a handful of short Opus turns). Both cost real usage; run them before a
+release, not in CI.
 
 ## Code organization
 
@@ -60,9 +67,16 @@ layout under `src/claude_squared/`:
 - `server.py` — FastMCP server, all `@mcp.tool` registrations
 - `runtime.py` — `PairRuntime` long-running subprocess + idle eviction
 - `adapters/claude.py` — wraps the `claude` CLI (one-shot + stream-json paths)
-- `models.py` — Pydantic schemas (`PairSpec`, `SendResult`, etc.) +
-  per-model effort coercion
-- `registry.py` — JSON registry on disk + filelock concurrency
+- `adapters/codex.py` — wraps `codex exec --json` (one process per turn),
+  rollout/sqlite readers, the app-server compaction client, rewind re-sync
+- `codex_models.py` — Codex model policy from `~/.codex/models_cache.json`
+  (defaults, floating aliases, effort levels, windows, deprecations)
+- `tool_details.py` — per-T-N sidecar of full Codex item events behind
+  `pair_tool_detail`
+- `models.py` — Pydantic schemas (`PairSpec`, `SendResult`, etc.), the
+  backend-neutral vocabularies + per-model effort coercion
+- `registry.py` — JSON registry on disk + filelock concurrency, quarantine of
+  unreadable entries
 - `settings.py` — user-configurable defaults (`PairDefaults`)
 - `cli_paths.py` — single source for the `claude` CLI's path-encoding regex
 - `transcript.py` — JSONL → structured turns parser
@@ -75,7 +89,9 @@ layout under `src/claude_squared/`:
 ## Pull request checklist
 
 Before opening a PR:
-- [ ] Smoke tests pass (`smoke_v08.py` + `smoke_v081.py`)
+- [ ] `python scripts/run_offline_tests.py` passes (add a regression to
+      `tests/test_maintenance*.py` or a new `tests/smoke_*.py` for behavior
+      you changed)
 - [ ] If you added a public-facing tool or arg, README + CHANGELOG updated
 - [ ] If you touched a docstring, the first line is ≤ 80 chars (the deferred
       tool stub Claude Code shows)

@@ -237,6 +237,7 @@ def reap_orphan(task_id: str) -> AsyncTaskState | None:
         ev = _task_events.get(task_id)
     if ev is not None:
         ev.set()
+    _clear_stopped(task_id)  # drop a <task>.cancel the dead owner never consumed
     return state
 
 
@@ -335,11 +336,42 @@ def _finish_task(state: AsyncTaskState, event: threading.Event) -> None:
         with _states_guard:
             _unsaved_results[state.task_id] = state.model_copy(deep=True)
         logger.warning("Task %s completed but state persistence failed: %s", state.task_id, exc)
+        _retry_persist_in_background(state.task_id)
     finally:
         with _states_guard:
             _local_states.pop(state.task_id, None)
         event.set()
         _clear_stopped(state.task_id)
+
+
+_PERSIST_RETRY_DELAYS = (1, 2, 4, 8, 16, 32, 60, 60, 60, 60)
+
+
+def _retry_persist_in_background(task_id: str) -> None:
+    """Keep trying to publish a finished task whose terminal write failed.
+
+    Without this, observers in OTHER processes (wait.py, pair_poll from another
+    MCP process) see the task "running" forever: the owner is alive, so orphan
+    reaping never fires, and ``load_task``'s on-observation retry only runs
+    when this process reads the task again (v0.14.0 review catch). Bounded
+    (~5 min of backoff); the in-memory fallback stays until it succeeds.
+    """
+    def _go() -> None:
+        for delay in _PERSIST_RETRY_DELAYS:
+            time.sleep(delay)
+            with _states_guard:
+                pending = _unsaved_results.get(task_id)
+            if pending is None:
+                return  # persisted by load_task in the meantime
+            try:
+                _save(pending)
+            except (OSError, ValueError):
+                continue
+            with _states_guard:
+                _unsaved_results.pop(task_id, None)
+            return
+
+    threading.Thread(target=_go, daemon=True, name=f"persist-retry-{task_id[:8]}").start()
 
 
 def _clear_stopped(task_id: str) -> None:

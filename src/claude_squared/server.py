@@ -1435,21 +1435,30 @@ def _build_send_runner(
             # Re-read the spec for the totals too: the self-woken turns bumped
             # turn_count / cost since ``current`` was read at runner start, and
             # writing current+1 would clobber those increments.
-            pending = _take_self_woken_pending(name)
-            if pending:
-                result.self_woken_completed = pending
+            # v0.14.0 review catch: bookkeeping failures (registry refused,
+            # disk error) must not discard a reply the backend already
+            # produced — note them on the result instead of raising.
             try:
-                fresh = reg_mod.get_pair(name)
-            except Exception:
-                fresh = current
-            update_fields: dict[str, Any] = dict(
-                last_active_at=datetime.utcnow(),
-                turn_count=fresh.turn_count + 1,
-                total_cost_usd=fresh.total_cost_usd + float(result.cost_usd or 0.0),
-            )
-            if drift_persist is not None:
-                update_fields["last_drift_notice"] = drift_persist
-            reg_mod.update_pair(name, **update_fields)
+                pending = _take_self_woken_pending(name)
+                if pending:
+                    result.self_woken_completed = pending
+                try:
+                    fresh = reg_mod.get_pair(name)
+                except Exception:
+                    fresh = current
+                update_fields: dict[str, Any] = dict(
+                    last_active_at=datetime.utcnow(),
+                    turn_count=fresh.turn_count + 1,
+                    total_cost_usd=fresh.total_cost_usd + float(result.cost_usd or 0.0),
+                )
+                if drift_persist is not None:
+                    update_fields["last_drift_notice"] = drift_persist
+                reg_mod.update_pair(name, **update_fields)
+            except Exception as exc:
+                result.notes.append(
+                    f"registry bookkeeping failed after the turn completed ({exc}); "
+                    "turn_count / cost were not updated for this turn"
+                )
             return result
 
     return _run
@@ -2522,6 +2531,10 @@ def pair_list(verbose: bool = False) -> str:
         if s.context_window == "1m":
             model_disp += " [1m]"
         lines.append(f"  {s.name} ({model_disp}, {s.turn_count} turns, last {last}){purpose}")
+    # v0.14.0: entries this process could not validate are preserved on disk
+    # but unreachable — say so, or they'd look silently gone.
+    for qname, why in reg_mod.quarantined().items():
+        lines.append(f"  {qname} (UNREADABLE entry kept verbatim in registry.json — {why}; repair or delete it by hand)")
     # Defaults header — surfaces what NEW pairs would inherit so agents picking
     # up mid-session can see the configured state at a glance. Cheap; no I/O
     # beyond the defaults.json read (cached by OS, sub-millisecond).
@@ -3991,6 +4004,7 @@ def pair_stop(
         executing = {tid: state for tid, state in states.items() if not state.queued}
         selected = states if drain_queue else executing
         local_ids = {tid for tid, state in executing.items() if state.owner_pid == os.getpid()}
+        foreign_executing = False
         for tid, state in selected.items():
             if (async_tasks.is_self_woken_task(state) and state.owner_pid != os.getpid()):
                 foreign_implicit = True
@@ -4002,34 +4016,60 @@ def pair_stop(
             try:
                 if async_tasks.request_task_stop(tid):
                     actions.append(f"cancellation requested for {'queued' if state.queued else 'executing'} task {tid}")
+                    if not state.queued and state.owner_pid != os.getpid():
+                        foreign_executing = True
             except (OSError, ValueError) as exc:
                 if state.owner_pid == os.getpid():
                     async_tasks.mark_task_stopped(tid)
                 actions.append(f"could not persist cancellation for task {tid}: {exc}")
+        if foreign_executing:
+            # v0.14.0 compatibility shim (review catch): a worker still running
+            # pre-0.14 code polls only the per-pair stop marker, never
+            # <task>.cancel — without this the stop silently no-ops while we
+            # report it requested. Newer workers see both and interrupt once.
+            # A marker older than a turn's start is ignored, so it cannot hit
+            # a later turn; queued waiters ignore it by design.
+            try:
+                _write_stop_marker(name)
+                actions.append("stop marker written for the owning MCP process (its turn polls it ~1/s)")
+            except Exception as exc:
+                actions.append(f"could not write the stop marker: {exc}")
 
         # Promotion cannot race this physical interruption. Recheck the active
         # identity as the selected task may have completed after the snapshot.
         if spec.backend == "codex":
             info = codex_adapter_mod.inflight_info(name)
-            if info and (info.get("task_id") in local_ids or info.get("task_id") is None):
+            # Only a process whose task we selected. An untagged process is a
+            # synchronous create/fork/clear probe that may have started after
+            # the selected turn finished — never kill a successor (review catch).
+            if info and info.get("task_id") in local_ids:
                 outcome = codex_adapter_mod._tree_kill(info["proc"])
                 if outcome:
                     actions.append(f"{outcome} the in-flight codex turn (thread intact; next send resumes it)")
         elif runtime_obj is not None and runtime_obj.is_alive():
             active = runtime_obj.active_task_ids()
-            interrupt_current = bool(active & local_ids)
+            untracked = runtime_obj.has_untracked_turn()
+            interrupt_current = bool(active & local_ids) or untracked
             if interrupt_current and not force:
                 if runtime_obj.send_interrupt(wait_for_result_seconds=3.0):
                     actions.append("sent in-band interrupt (pair stays alive)")
                 else:
                     actions.append("in-band interrupt did not ack within 3s")
                     force = True
-            if (force and (interrupt_current or not states)):
-                # Recheck after waiting for an ack: never evict a replacement
-                # continuation just because a selected turn has already ended.
-                if not states or runtime_obj.active_task_ids() & local_ids:
+            if force:
+                # Identity-checked eviction: only the runtime captured above,
+                # never a replacement (evict_if_current). Allowed when nothing
+                # was selected (explicit force on an idle/wedged runtime), when
+                # a selected local turn is still executing, or when the runtime
+                # holds an untracked turn no id can select (review catch) —
+                # but never just because a selected turn already ended and a
+                # successor is now running in the same runtime.
+                if (not states or (runtime_obj.active_task_ids() & local_ids)
+                        or runtime_obj.has_untracked_turn()):
                     if runtime_mod.registry().evict_if_current(name, runtime_obj):
                         actions.append("tree-killed runtime subprocess (and descendants)")
+                else:
+                    actions.append("selected turn already ended; runtime left alive for its successor")
 
     if hard and foreign_implicit:
         actions.append("hard reset skipped: self-woken work must first be stopped by its owner")
@@ -4062,7 +4102,7 @@ def pair_stop(
 
     if not actions:
         return f"Pair '{name}': nothing to stop (no live runtime or in-flight tasks)"
-    return f"Stop '{name}': " + "; ".join(actions)
+    return f"Stopped '{name}': " + "; ".join(actions)
 
 
 @mcp.tool(output_schema=None, annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True})

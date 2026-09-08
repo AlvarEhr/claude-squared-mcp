@@ -231,7 +231,8 @@ class AsyncReviewTests(unittest.TestCase):
 
         task = A.start_task("pair", "running", runner)
         self.assertTrue(entered.wait(5))
-        runtime = SimpleNamespace(is_alive=lambda: True, active_task_ids=lambda: {task.task_id})
+        runtime = SimpleNamespace(is_alive=lambda: True, active_task_ids=lambda: {task.task_id},
+                                  has_untracked_turn=lambda: False)
         registry = SimpleNamespace(get_or_none=lambda name: runtime,
             evict_if_current=lambda name, expected: killed.set() or True)
         original_write = Path.write_text

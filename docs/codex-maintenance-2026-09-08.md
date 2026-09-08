@@ -1,5 +1,12 @@
 # Codex maintenance handoff — 8 September 2026
 
+> **Review outcome (v0.14.0):** merged into `main` after review by the main Claude
+> session, the historian pair and an independent Astra pass. The review fixes and
+> the decisions that differ from this account (registry quarantine instead of
+> write refusal, interrupt-once, the compatibility stop marker, identity-checked
+> stops) are recorded in `CHANGELOG.md` 0.14.0 and the engineering handoff. This
+> document is kept as the Codex agent's own account of the branch.
+
 ## Ownership and current review state
 
 This document records Codex's work after Claude released v0.13.0. The base is
@@ -93,7 +100,9 @@ interpreter, because Python execution was unavailable in the pair's sandbox.
 
 ## Validation
 
-- Before edits: all **17 existing offline suites passed**.
+- Before edits: all **17 maintained offline suites passed** (the runner's allow-list;
+  `smoke.py`, `smoke_runtime.py`, `smoke_streamjson.py` and `smoke_v05.py` are legacy
+  pre-v0.10 scripts that fail for unrelated reasons and are not part of it).
 - At the first pause: 18 suites passed, including 15 maintenance tests.
 - Final offline run: **18 suites passed, 0 failed**, including **40 maintenance
   tests**. No live Claude calls were made. The full latest log is in the
