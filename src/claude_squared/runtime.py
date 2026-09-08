@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING
 
 from claude_squared.cli_paths import encode_cwd_for_project as _encode_cwd_for_project
-from claude_squared.errors import CLIError, CommandTimeout
+from claude_squared.errors import CLIError, CommandTimeout, TaskStopped
 from claude_squared import async_tasks as _async_tasks
 from claude_squared.models import AsyncTaskState, PairSpec
 from claude_squared.registry import claude_home, logs_dir
@@ -1068,6 +1068,10 @@ class PairRuntime:
 
     def _open_implicit_turn(self) -> None:
         """Reader thread. Open a self-woken turn: log scope + on-disk async task."""
+        with _async_tasks.control_lock(self.spec.name):
+            self._open_implicit_turn_locked()
+
+    def _open_implicit_turn_locked(self) -> None:
         with self._scope_lock:
             if self._current_scope is not None or self._implicit_scope is not None:
                 return
@@ -1257,7 +1261,7 @@ class PairRuntime:
         Called by the adapter BEFORE its stale check (so a self-woken turn is
         never evicted mid-flight) and again at send() entry as the belt. Bounded
         exactly like the read loop: timeout_seconds → CommandTimeout, should_stop
-        → in-band interrupt then CLIError once the turn has ended, proc death →
+        → cancel this waiting send (leave the implicit turn alone), proc death →
         the implicit task is finalized CRASHED and CLIError is raised.
 
         Why wait rather than interleave: a message written while the CLI is
@@ -1268,16 +1272,10 @@ class PairRuntime:
         t0 = time.monotonic()
         end = (t0 + timeout_seconds) if timeout_seconds is not None else None
         last_stop_check = 0.0
-        interrupted = False
         while True:
             with self._scope_lock:
                 open_now = self._implicit_scope is not None
             if not open_now:
-                if interrupted:
-                    raise CLIError(
-                        "send cancelled by pair_stop before the message was written",
-                        stderr=self._collect_stderr(),
-                    )
                 return time.monotonic() - t0
             if end is not None and time.monotonic() >= end:
                 raise CommandTimeout(self.spec.name, timeout_seconds)
@@ -1296,15 +1294,16 @@ class PairRuntime:
                 if now_m - last_stop_check >= 1.0:
                     last_stop_check = now_m
                     try:
-                        if should_stop() and not interrupted:
-                            interrupted = True
-                            self._write_interrupt_nowait()
+                        cancelled = should_stop()
                     except Exception:
-                        pass
+                        cancelled = False
+                    if cancelled:
+                        raise TaskStopped("send cancelled while waiting for a self-woken turn")
             self._implicit_done.wait(timeout=1.0)
 
     def _prepare_solicited_turn(
         self, timeout_seconds: int | None, should_stop: "Callable[[], bool] | None",
+        task_id: str | None = None,
     ) -> float:
         """send() entry. Wait out any self-woken turn (belt — the adapter
         already did), then drain stale stdout and open this turn's scope
@@ -1314,9 +1313,13 @@ class PairRuntime:
         waited = 0.0
         while True:
             waited += self.wait_for_implicit_idle(timeout_seconds, should_stop)
-            with self._scope_lock:
-                if self._implicit_scope is not None:
-                    continue  # opened in the gap — wait again
+            # Same order as implicit opening: control -> scope. Never hold
+            # scope across task-file I/O or while acquiring the control lock.
+            with _async_tasks.control_lock(self.spec.name):
+                with self._scope_lock:
+                    if self._implicit_scope is not None:
+                        continue  # opened in the gap — wait again
+                _async_tasks.mark_task_executing(task_id)
                 # Belt: every queued line was attributed by the reader before
                 # it was queued (and lines with no scope open aren't queued at
                 # all), so anything here belongs to a finished turn.
@@ -1326,10 +1329,24 @@ class PairRuntime:
                     except queue.Empty:
                         break
                 with self._main_log_lock:
-                    self._current_scope = TurnLogScope(
-                        self.main_log_path, self._main_log_lines + 1,
-                    )
+                    scope = TurnLogScope(self.main_log_path, self._main_log_lines + 1)
+                with self._scope_lock:
+                    scope.task_id = task_id
+                    self._current_scope = scope
                 return waited
+
+    def active_task_ids(self) -> set[str]:
+        """Task identities still executing in this runtime (not an old result)."""
+        with self._scope_lock:
+            ids = set()
+            if self._implicit_task is not None:
+                ids.add(self._implicit_task.task_id)
+            scope = self._current_scope
+            if scope is not None and scope.result_snapshot is None:
+                task_id = getattr(scope, "task_id", None)
+                if task_id:
+                    ids.add(task_id)
+            return ids
 
     # ---- send ----
 
@@ -1360,7 +1377,8 @@ class PairRuntime:
 
     def send(self, message: str, timeout_seconds: int | None = 300,
              on_event: Callable[[dict], None] | None = None,
-             should_stop: "Callable[[], bool] | None" = None) -> dict[str, Any]:
+             should_stop: "Callable[[], bool] | None" = None,
+             task_id: str | None = None) -> dict[str, Any]:
         """Push a user message; return the result event dict (mirrors --print JSON).
 
         Augments the result dict with `_log_scope` containing this turn's main.log
@@ -1395,7 +1413,7 @@ class PairRuntime:
             # stale stdout, then open this turn's scope atomically w.r.t. the
             # reader's scope transitions. Returns how long we waited + the
             # self-woken turns that completed since the previous send (footer).
-            waited_s = self._prepare_solicited_turn(timeout_seconds, should_stop)
+            waited_s = self._prepare_solicited_turn(timeout_seconds, should_stop, task_id)
 
             payload = json.dumps({
                 "type": "user",
@@ -1559,6 +1577,14 @@ class RuntimeRegistry:
     def evict(self, name: str) -> None:
         with self._lock:
             self._stop_unlocked(name)
+
+    def evict_if_current(self, name: str, expected: PairRuntime) -> bool:
+        """Stop only the runtime selected by the caller, never its replacement."""
+        with self._lock:
+            if self._runtimes.get(name) is not expected:
+                return False
+            self._stop_unlocked(name)
+            return True
 
     def _stop_unlocked(self, name: str) -> None:
         rt = self._runtimes.pop(name, None)

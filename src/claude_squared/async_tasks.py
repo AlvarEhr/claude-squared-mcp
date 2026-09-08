@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import logging
 import os
 import sys
 import threading
@@ -26,8 +27,42 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from filelock import FileLock
+
 from claude_squared.models import AsyncTaskState, SendResult
+from claude_squared.errors import TaskStopped
 from claude_squared.registry import async_dir
+
+
+logger = logging.getLogger(__name__)
+_control_locks: dict[str, FileLock] = {}
+_control_locks_guard = threading.Lock()
+_local_states: dict[str, AsyncTaskState] = {}
+_unsaved_results: dict[str, AsyncTaskState] = {}
+_states_guard = threading.Lock()
+
+
+def control_lock(pair_name: str) -> FileLock:
+    """Short stop/promotion lock; never acquire the pair's send lock under it.
+
+    Cache by absolute path so nested request_task_stop/mark_task_executing
+    calls are reentrant in one thread, without mixing temporary test homes.
+    """
+    directory = async_dir() / "control"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = str((directory / f"{pair_name}.lock").absolute())
+    with _control_locks_guard:
+        if path not in _control_locks:
+            _control_locks[path] = FileLock(path, timeout=30)
+        return _control_locks[path]
+
+
+def local_running_tasks(pair_name: str) -> dict[str, AsyncTaskState]:
+    """Local identities remain available for stopping when task-file reads fail."""
+    with _states_guard:
+        return {tid: state.model_copy() for tid, state in _local_states.items()
+                if state.pair_name == pair_name and state.owner_pid == os.getpid()
+                and state.status == "running"}
 
 
 def _is_pid_alive(pid: int) -> bool:
@@ -129,12 +164,40 @@ def _task_path(task_id: str) -> Path:
 
 def _save(state: AsyncTaskState) -> None:
     p = _task_path(state.task_id)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(state.model_dump_json(indent=2, exclude_none=True), encoding="utf-8")
-    tmp.replace(p)
+    tmp = p.with_name(f".{p.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(state.model_dump_json(indent=2, exclude_none=True), encoding="utf-8")
+        for attempt in range(4):
+            try:
+                tmp.replace(p)
+                break
+            except PermissionError:
+                if attempt == 3:
+                    raise
+                # Windows readers can briefly prevent replacement of the
+                # state file. Retry here so file-only watchers still see done.
+                time.sleep(0.02 * (attempt + 1))
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def load_task(task_id: str) -> AsyncTaskState | None:
+    # A disk failure must not hide a completed local result. Retry persistence
+    # on observation; another process cannot see this fallback until it saves.
+    with _states_guard:
+        pending = _unsaved_results.get(task_id)
+    if pending is not None:
+        try:
+            _save(pending)
+        except (OSError, ValueError):
+            pass
+        else:
+            with _states_guard:
+                _unsaved_results.pop(task_id, None)
+        return pending.model_copy(deep=True)
     p = _task_path(task_id)
     if not p.exists():
         return None
@@ -183,11 +246,8 @@ def reap_orphan(task_id: str) -> AsyncTaskState | None:
 _task_events: dict[str, threading.Event] = {}
 _task_events_lock = threading.Lock()
 
-# In-memory set of task IDs that have been deliberately stopped via pair_stop.
-# The worker thread checks this on exception to distinguish "stopped" from
-# "failed" in the AsyncTaskState. In-process only (a separate MCP subprocess
-# can't tell another process to flip its in-memory flag — and that's fine,
-# since pair_stop only operates on the pair's local runtime).
+# Local flags survive cancellation-file failures. Foreign owners observe the
+# matching .cancel file; workers use both to distinguish stopped from failed.
 _stopped_task_ids: set[str] = set()
 _stopped_task_ids_lock = threading.Lock()
 
@@ -199,12 +259,96 @@ def mark_task_stopped(task_id: str) -> None:
 
 def _was_stopped(task_id: str) -> bool:
     with _stopped_task_ids_lock:
-        return task_id in _stopped_task_ids
+        local = task_id in _stopped_task_ids
+    if local:
+        return True
+    try:
+        return cancellation_requested(task_id)
+    except OSError:
+        return False
+
+
+def cancellation_requested(task_id: str) -> bool:
+    try:
+        return (async_dir() / f"{task_id}.cancel").exists()
+    except OSError:
+        return False
+
+
+def request_task_stop(task_id: str) -> bool:
+    """Request cancellation of exactly one task, including in another process."""
+    with _states_guard:
+        state = _local_states.get(task_id)
+    state = state or load_task(task_id)
+    if state is None or state.status != "running":
+        return False
+    with control_lock(state.pair_name):
+        # Recheck after waiting for a promotion or an earlier stop to finish.
+        with _states_guard:
+            current = _local_states.get(task_id)
+        current = current or load_task(task_id)
+        if current is None or current.status != "running":
+            return False
+        if current.owner_pid == os.getpid():
+            mark_task_stopped(task_id)  # local cancellation survives write failure
+        path = async_dir() / f"{task_id}.cancel"
+        tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp.write_text("stop requested", encoding="utf-8")
+            tmp.replace(path)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return True
+
+
+def raise_if_stopped(task_id: str | None) -> None:
+    if task_id and _was_stopped(task_id):
+        raise TaskStopped("stopped before backend execution")
+
+
+def mark_task_executing(task_id: str | None) -> None:
+    """Called under the pair lock immediately before invoking the backend."""
+    if task_id:
+        with _states_guard:
+            state = _local_states.get(task_id)
+        state = state or load_task(task_id)
+        if state is None:
+            raise TaskStopped("task disappeared before backend execution")
+        with control_lock(state.pair_name):
+            raise_if_stopped(task_id)
+            if state.status != "running":
+                raise TaskStopped("task is already terminal")
+            state.queued = False
+            state.execution_started_at = datetime.utcnow()
+            _save(state)
+
+
+def _finish_task(state: AsyncTaskState, event: threading.Event) -> None:
+    """Finalize without reading metadata back from disk, and always wake waiters."""
+    state.finished_at = datetime.utcnow()
+    try:
+        _save(state)
+    except (OSError, ValueError) as exc:
+        with _states_guard:
+            _unsaved_results[state.task_id] = state.model_copy(deep=True)
+        logger.warning("Task %s completed but state persistence failed: %s", state.task_id, exc)
+    finally:
+        with _states_guard:
+            _local_states.pop(state.task_id, None)
+        event.set()
+        _clear_stopped(state.task_id)
 
 
 def _clear_stopped(task_id: str) -> None:
     with _stopped_task_ids_lock:
         _stopped_task_ids.discard(task_id)
+    try:
+        (async_dir() / f"{task_id}.cancel").unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def list_running_task_ids_for_pair(pair_name: str) -> list[str]:
@@ -241,7 +385,8 @@ def _drop_event(task_id: str) -> None:
 
 
 def start_task(pair_name: str, message: str,
-               runner: "Callable[[str], SendResult] | Callable[[], SendResult]") -> AsyncTaskState:
+               runner: "Callable[[str], SendResult] | Callable[[], SendResult]",
+               *, queued: bool = False) -> AsyncTaskState:
     """Spawn a daemon thread that runs the runner and writes the result.
 
     Sets an in-memory threading.Event on completion so ``wait_for_task`` can wake
@@ -261,17 +406,24 @@ def start_task(pair_name: str, message: str,
         status="running",
         started_at=datetime.utcnow(),
         owner_pid=os.getpid(),
+        queued=queued,
+        execution_started_at=None if queued else datetime.utcnow(),
     )
     _save(state)
     event = _get_or_create_event(task_id)
+    with _states_guard:
+        _local_states[task_id] = state
 
     def _go() -> None:
         try:
+            raise_if_stopped(task_id)
             # v0.10.0: pass the task_id so the runner can bind a should_stop
             # closure to THIS task (terminal stop marks the correct task). All
             # runners (built by _build_send_runner / _build_compact_runner)
             # accept it.
             result = runner(task_id)
+            # Preserve a result even when completion races a stop request.
+            state.result = result
             # If the task was stopped just before the result came back (the
             # interrupt acknowledged via error_during_execution result event),
             # report "stopped" rather than "done."
@@ -280,11 +432,10 @@ def start_task(pair_name: str, message: str,
                 state.error = "stopped by pair_stop"
             else:
                 state.status = "done"
-                state.result = result
         except Exception as e:
             # Distinguish deliberate stop (interrupt-induced CLIError, or
             # tree-kill while the worker was waiting) from a real failure.
-            if _was_stopped(task_id):
+            if isinstance(e, TaskStopped) or _was_stopped(task_id):
                 state.status = "stopped"
                 state.error = "stopped by pair_stop"
             else:
@@ -296,10 +447,7 @@ def start_task(pair_name: str, message: str,
                 # conventional ``"<TypeName>: <message>"`` wrapping for clarity.
                 state.error = _format_task_error(e)
         finally:
-            state.finished_at = datetime.utcnow()
-            _save(state)
-            event.set()
-            _clear_stopped(task_id)
+            _finish_task(state, event)
 
     threading.Thread(target=_go, daemon=True).start()
     return state
@@ -315,16 +463,18 @@ def wait_for_task(task_id: str, timeout_s: float) -> AsyncTaskState | None:
     state-file load on Event timeout. Cross-process waiters should call
     ``load_task`` directly in a poll loop or use ``python -m claude_squared wait``.
     """
-    event = _get_or_create_event(task_id)
-    fired = event.wait(timeout_s)
     state = load_task(task_id)
-    if state is None:
-        return None
-    if state.status in ("done", "failed", "stopped"):
-        # Free the event now that the task is observed terminal — don't leak
-        # entries indefinitely. Subsequent waiters that arrive AFTER completion
-        # will find load_task already returns the terminal state synchronously.
-        # (v0.12.0: "stopped" added — it leaked an entry per pair_stop before.)
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    event = _get_or_create_event(task_id)
+    while state is not None and state.status == "running":
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        # Local completion signals instantly; bounded disk checks also see a
+        # task completed by a different MCP process, whose Event is private.
+        event.wait(min(remaining, 0.5))
+        state = load_task(task_id)
+    if state is None or state.status != "running":
         _drop_event(task_id)
     return state
 
@@ -380,6 +530,8 @@ def register_external_task(pair_name: str, message: str) -> AsyncTaskState:
     )
     _save(state)
     _get_or_create_event(state.task_id)
+    with _states_guard:
+        _local_states[state.task_id] = state
     return state
 
 
@@ -396,12 +548,9 @@ def finalize_external_task(
     if state.status != "running":
         return state
     state.status = status  # type: ignore[assignment]
-    state.result = result if status == "done" else None
+    state.result = result
     state.error = error
-    state.finished_at = datetime.utcnow()
-    _save(state)
-    _get_or_create_event(state.task_id).set()
-    _clear_stopped(state.task_id)
+    _finish_task(state, _get_or_create_event(state.task_id))
     return state
 
 

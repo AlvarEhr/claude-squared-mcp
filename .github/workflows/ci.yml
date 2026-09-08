@@ -27,12 +27,7 @@ jobs:
       - name: Install package (editable)
         run: pip install -e .
 
-      - name: Run v0.8 smoke tests
+      - name: Run offline smoke and maintenance tests
         env:
           PYTHONIOENCODING: utf-8
-        run: python tests/smoke_v08.py
-
-      - name: Run v0.8.1 + v0.8.2 smoke tests
-        env:
-          PYTHONIOENCODING: utf-8
-        run: python tests/smoke_v081.py
+        run: python scripts/run_offline_tests.py

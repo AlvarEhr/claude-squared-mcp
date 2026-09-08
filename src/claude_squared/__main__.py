@@ -62,14 +62,62 @@ def _fmt_local(dt) -> str:
         return str(dt)
 
 
-def _context_fill(spec) -> "tuple[int, int, float] | None":
+def _observed_claude_window(spec) -> int | None:
+    """Reuse a native window only if it covers the latest transcript usage."""
+    import json
+    path = _transcript_path(spec)
+    latest_model = None
+    usage_at = None
+    try:
+        with open(path, encoding="utf-8") as transcript:
+            for line in transcript:
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                message = event.get("message") or {}
+                if event.get("type") == "assistant" and isinstance(message.get("usage"), dict):
+                    latest_model = message.get("model")
+                    usage_at = event.get("timestamp")
+        usage_time = datetime.fromisoformat(usage_at.replace("Z", "+00:00"))
+        if usage_time.tzinfo is None:
+            usage_time = usage_time.replace(tzinfo=timezone.utc)
+    except (OSError, TypeError, ValueError, AttributeError):
+        return None  # no way to associate a captured window with this usage
+    best = ("", 0)
+    for path in _async_dir().glob("*.json"):
+        try:
+            task = json.loads(path.read_text(encoding="utf-8"))
+            result = task.get("result") or {}
+            if task.get("pair_name") != spec.name or result.get("session_id") != spec.session_id:
+                continue
+            context = result.get("context") or {}
+            if context.get("window_source") != "reported":
+                continue
+            if latest_model and latest_model != result.get("model_used"):
+                continue
+            window = int(context.get("tokens_max") or 0)
+            stamp = str(task.get("finished_at") or task.get("started_at") or "")
+            finished = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            if finished.tzinfo is None:
+                finished = finished.replace(tzinfo=timezone.utc)
+            if finished < usage_time:
+                continue
+            if window > 0 and stamp >= best[0]:
+                best = (stamp, window)
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    return best[1] or None
+
+
+def _context_fill(spec, *, provenance: dict | None = None) -> "tuple[int, int, float] | None":
     """Return ``(used_tokens, window, percent)`` for a pair from its session
     JSONL, or None if there are no turns yet.
 
     ZERO inference — reuses the adapter's ``_read_last_turn_context_fill`` which
     reads the last assistant message's usage block straight from disk. The
-    context window is inferred from the model name (1M for ``1m`` variants, else
-    200k), matching the adapter's own fallback.
+    context window comes from a captured backend result when available;
+    otherwise the historical fallback is explicitly labelled an estimate.
     """
     try:
         if getattr(spec, "backend", "claude") == "codex":
@@ -89,9 +137,12 @@ def _context_fill(spec) -> "tuple[int, int, float] | None":
         used = ClaudeAdapter()._read_last_turn_context_fill(spec)  # noqa: SLF001
         if used is None:
             return None
-        window = (1_000_000 if ("1m" in (spec.model or "").lower()
+        observed = _observed_claude_window(spec)
+        window = observed or (1_000_000 if ("1m" in (spec.model or "").lower()
                                 or getattr(spec, "context_window", "default") == "1m")
                   else 200_000)
+        if provenance is not None:
+            provenance["estimated_window"] = observed is None
         pct = (used / window * 100) if window else 0.0
         return (used, window, pct)
     except Exception:
@@ -162,11 +213,13 @@ def _cmd_info(argv: list[str]) -> int:
           f"context_window: {getattr(spec, 'context_window', 'default')}{uc}")
     print(f"  turns:       {spec.turn_count}    last active: {_fmt_local(spec.last_active_at)}")
     print(f"  cwd:         {spec.cwd or '(server cwd)'}")
-    fill = _context_fill(spec)
+    provenance: dict = {}
+    fill = _context_fill(spec, provenance=provenance)
     if fill:
         used, window, pct = fill
         print(f"  context:     {pct:.0f}% ({used:,} / {window:,} tokens)   "
-              f"[zero-inference, from JSONL]")
+              f"[zero-inference, from JSONL"
+              f"{'; estimated window' if provenance.get('estimated_window') else ''}]")
     else:
         print("  context:     (no turns yet)")
     if spec.persistent:
@@ -191,7 +244,8 @@ def _cmd_context(argv: list[str]) -> int:
     except PairNotFound as e:
         print(str(e), file=sys.stderr)
         return 2
-    fill = _context_fill(spec)
+    provenance: dict = {}
+    fill = _context_fill(spec, provenance=provenance)
     if not fill:
         print(f"Pair '{name}': no turns yet (context ~0%).")
         return 0
@@ -199,6 +253,8 @@ def _cmd_context(argv: list[str]) -> int:
     print(f"Pair '{name}' context: {pct:.0f}% ({used:,} / {window:,} tokens)")
     print("  Source: last assistant turn in the session JSONL "
           "(zero inference, no agent).")
+    if provenance.get("estimated_window"):
+        print("  Window is an estimate; no backend-reported window has been captured for this session.")
     if pct >= 85:
         print("  [!] Near limit - strongly consider pair_compact.")
     elif pct >= 60:

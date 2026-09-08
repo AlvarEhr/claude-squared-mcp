@@ -1,5 +1,8 @@
 # claude-squared
 
+Maintenance work and callback experiments after v0.13.0 are documented in
+[the Codex maintenance handoff](docs/codex-maintenance-2026-09-08.md).
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.txt)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![CI](https://github.com/AlvarEhr/claude-squared-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/AlvarEhr/claude-squared-mcp/actions/workflows/ci.yml)
