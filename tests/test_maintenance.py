@@ -21,6 +21,7 @@ os.environ["CLAUDE_HOME"] = TEST_HOME.name
 
 from claude_squared import async_tasks as A, registry as R, server as S
 from claude_squared import __main__ as CLI
+from claude_squared import codex_models as CM
 from claude_squared.adapters import codex as C
 from claude_squared.errors import PairError, TaskStopped
 from claude_squared.models import AsyncTaskState, PairSpec, SendResult
@@ -38,6 +39,12 @@ class IsolatedCase(unittest.TestCase):
         self.environment = patch.dict(os.environ, {"CLAUDE_HOME": str(self.directory)})
         self.environment.start()
         self.addCleanup(self.environment.stop)
+        codex_home = self.directory / "codex-fixture"
+        codex_home.mkdir()
+        for module in (CM, C):
+            home_patch = patch.object(module, "codex_home", return_value=codex_home)
+            home_patch.start()
+            self.addCleanup(home_patch.stop)
 
     def spec(self, name="pair"):
         return PairSpec(name=name, session_id="session-1", cwd=str(self.directory))
@@ -106,8 +113,49 @@ class RegistryTests(IsolatedCase):
         self.assertEqual(json.loads(path.read_text())["version"], 3)
         self.assertEqual(path.with_name("registry.v2.backup.json").read_bytes(), original)
 
+    def test_unsafe_registry_blocks_backend_work_and_releases_pair_lock(self):
+        path, _ = self.write_registry({"version": 3, "pairs": {
+            "pair": {"session_id": "s"}, "bad": {"permission_mode": "read-onyl"}}})
+        runner = S._build_send_runner("pair", "must not execute", hard_timeout_seconds=None,
+            override_model=None, override_effort=None, override_permission_mode=None)
+        with patch.object(S, "_adapter_for") as adapter:
+            with self.assertRaisesRegex(PairError, "refusing to write"):
+                runner()
+            adapter.assert_not_called()
+        path.write_text('{"version":3,"pairs":{}}', encoding="utf-8")
+        with S._with_pair_lock("pair", timeout_s=0.2):
+            pass
+
 
 class CancellationTests(IsolatedCase):
+    def test_transient_replace_denial_still_publishes_terminal_state(self):
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        def runner(tid):
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("test runner not released")
+            return SendResult(name="pair", session_id="s", response="durable completion",
+                              model_used="opus", duration_ms=1)
+        task = A.start_task("pair", "test", runner)
+        self.assertTrue(entered.wait(5))
+        denied = []
+        replace = Path.replace
+        def once(path, target):
+            if str(target).endswith(task.task_id + ".json") and not denied:
+                denied.append(True)
+                raise PermissionError("simulated Windows reader sharing conflict")
+            return replace(path, target)
+        event = A._get_or_create_event(task.task_id)
+        with patch.object(Path, "replace", once):
+            release.set()
+            self.assertTrue(event.wait(5))
+        self.assertTrue(denied)
+        # Read the file itself, not the local unsaved-result fallback.
+        disk = json.loads(A._task_path(task.task_id).read_text(encoding="utf-8"))
+        self.assertEqual(disk["status"], "done")
+        self.assertEqual(disk["result"]["response"], "durable completion")
+
     def run_queue_case(self, drain):
         spec = self.spec()
         R.add_pair(spec)
@@ -197,6 +245,17 @@ class CancellationTests(IsolatedCase):
 
 
 class CodexInspectionTests(IsolatedCase):
+    def test_claude_result_distinguishes_native_and_fallback_windows(self):
+        from claude_squared.adapters.claude import ClaudeAdapter
+        adapter = ClaudeAdapter()
+        with patch.object(adapter, "_read_last_turn_context_fill", return_value=123):
+            native = adapter._build_send_result(self.spec(), {"result": "ok", "modelUsage": {
+                "claude-opus-5": {"contextWindow": 1000000}}})
+            fallback = adapter._build_send_result(self.spec(), {"result": "ok", "modelUsage": {
+                "claude-opus-5": {}}})
+        self.assertEqual(native.context.window_source, "reported")
+        self.assertEqual(fallback.context.window_source, "estimated")
+
     def test_codex_markers_scope_the_next_live_turn(self):
         directory = R.logs_dir() / "pair"
         directory.mkdir()
@@ -250,13 +309,66 @@ class CodexInspectionTests(IsolatedCase):
 
     def test_captured_claude_window_overrides_old_200k_assumption(self):
         spec = self.spec()
+        path = Path(CLI._transcript_path(spec))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"type": "assistant", "timestamp": "2026-09-08T11:59:59Z",
+            "message": {"model": "claude-opus-5", "usage": {"input_tokens": 180000}}}), encoding="utf-8")
         (R.async_dir() / "captured.json").write_text(json.dumps({"pair_name": "pair",
             "finished_at": "2026-09-08T12:00:00", "result": {"session_id": spec.session_id,
-                "context": {"tokens_max": 1000000}}}), encoding="utf-8")
+                "model_used": "claude-opus-5", "context": {"tokens_max": 1000000,
+                "window_source": "reported"}}}), encoding="utf-8")
         with patch("claude_squared.adapters.claude.ClaudeAdapter._read_last_turn_context_fill", return_value=180000):
             source = {}
             self.assertEqual(CLI._context_fill(spec, provenance=source), (180000, 1000000, 18.0))
             self.assertFalse(source["estimated_window"])
+
+    def test_old_or_estimated_window_is_not_reported_as_observed(self):
+        spec = self.spec()
+        path = Path(CLI._transcript_path(spec))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"type": "assistant", "timestamp": "2026-09-08T12:01:00Z",
+            "message": {"model": "claude-opus-5", "usage": {"input_tokens": 500000}}}), encoding="utf-8")
+        data = {"pair_name": "pair", "finished_at": "2026-09-08T12:00:00", "result": {
+            "session_id": spec.session_id, "model_used": "claude-opus-5",
+            "context": {"tokens_max": 200000, "window_source": "reported"}}}
+        record = R.async_dir() / "captured.json"
+        record.write_text(json.dumps(data), encoding="utf-8")
+        self.assertIsNone(CLI._observed_claude_window(spec))
+        data["finished_at"] = "2026-09-08T12:02:00"
+        for source in (None, "estimated"):
+            data["result"]["context"]["window_source"] = source
+            record.write_text(json.dumps(data), encoding="utf-8")
+            self.assertIsNone(CLI._observed_claude_window(spec))
+
+    def test_malformed_detail_sidecar_does_not_suppress_completion(self):
+        directory = R.logs_dir() / "pair"
+        directory.mkdir()
+        for malformed in ([], None, 123):
+            with self.subTest(root=malformed):
+                counter = ToolCounter(directory / "main.idx.json")
+                tags = {}
+                item = {"id": "item_0", "type": "command_execution", "command": "test"}
+                C.CodexAdapter._format_event({"type": "item.started", "item": item}, counter, tags,
+                                            detail_dir=directory, run_id="run")
+                tag = tags["item_0"]
+                sidecar = directory / "codex-tool-items" / (tag + ".json")
+                sidecar.write_text(json.dumps(malformed), encoding="utf-8")
+                with self.assertRaisesRegex(PairError, "JSON object"):
+                    codex_tool_detail(directory, tag)
+                lines = C.CodexAdapter._format_event({"type": "item.completed", "item": {
+                    **item, "status": "completed", "exit_code": 0, "aggregated_output": "COMPLETE"}},
+                    counter, tags, detail_dir=directory, run_id="run")
+                self.assertIn("COMPLETE", "\n".join(lines))
+                self.assertIn("COMPLETE", codex_tool_detail(directory, tag))
+
+    def test_detail_write_failure_does_not_suppress_normal_logging(self):
+        event = {"type": "item.completed", "item": {"id": "item_0", "type": "command_execution",
+                 "command": "test", "status": "completed", "exit_code": 0, "aggregated_output": "COMPLETE"}}
+        for error in (PermissionError("fixture"), ValueError("fixture")):
+            with self.subTest(error=type(error).__name__), patch.object(C, "save_codex_item", side_effect=error):
+                lines = C.CodexAdapter._format_event(event, ToolCounter(None), {}, detail_dir=self.directory)
+                self.assertIn("COMPLETE", "\n".join(lines))
+                self.assertIn("tool detail unavailable", "\n".join(lines))
 
 
 if __name__ == "__main__":

@@ -221,9 +221,7 @@ class ClaudeAdapter(PairAdapter):
              on_event: "callable | None" = None,
              should_stop: "callable | None" = None,
              task_id: str | None = None) -> SendResult:
-        # task_id is accepted for signature parity with CodexAdapter (which
-        # registers its in-flight process under it); the Claude runtime path
-        # tracks the task through should_stop instead.
+        # Warm sends are promoted by the runtime only after implicit work ends.
         if not self.session_exists(spec):
             raise SessionMissing(spec.name, spec.session_id)
 
@@ -249,7 +247,7 @@ class ClaudeAdapter(PairAdapter):
                 reg.evict(spec.name)
                 rt = reg.get_or_start(spec, self)
             result_json = rt.send(message, timeout_seconds=timeout_seconds,
-                                  on_event=on_event, should_stop=should_stop)
+                                  on_event=on_event, should_stop=should_stop, task_id=task_id)
             if pre_wait_s:
                 sw = result_json.setdefault("_self_woken", {})
                 sw["waited_s"] = float(sw.get("waited_s") or 0.0) + pre_wait_s
@@ -271,6 +269,8 @@ class ClaudeAdapter(PairAdapter):
             "--permission-mode", self.native_permission(permission_mode or spec.permission_mode),
             "-p", message,
         ]
+        from claude_squared.async_tasks import mark_task_executing
+        mark_task_executing(task_id)
         result_json = self._run_print(args, timeout_seconds=timeout_seconds,
                                       pair_name=spec.name, cwd=spec.cwd)
         return self._build_send_result(spec, result_json)
@@ -642,6 +642,7 @@ class ClaudeAdapter(PairAdapter):
         # the context-fill % honest on million-context pairs even if a future
         # CLI omits contextWindow from modelUsage.
         ctx_window = model_usage.get(model_used, {}).get("contextWindow")
+        window_source = "reported" if ctx_window else "estimated"
         if not ctx_window:
             ctx_window = (1_000_000 if ("1m" in (model_used or "").lower()
                                         or spec.context_window == "1m") else 200_000)
@@ -760,7 +761,8 @@ class ClaudeAdapter(PairAdapter):
             cost_usd=result_json.get("total_cost_usd", 0.0),
             duration_ms=result_json.get("duration_ms", 0),
             permission_denials=denials,
-            context=ContextStatus(tokens_used=used, tokens_max=ctx_window, percent=pct, warning=warning),
+            context=ContextStatus(tokens_used=used, tokens_max=ctx_window, percent=pct,
+                                  warning=warning, window_source=window_source),
             cache_read_tokens=usage.get("cache_read_input_tokens", 0),
             log_path=scope.get("log_path"),
             log_line_start=scope.get("start_line"),

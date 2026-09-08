@@ -1,0 +1,44 @@
+{
+  "date": "2026-09-08",
+  "desktop_build": "26.901.6511.0",
+  "codex_cli_version": "0.153.4",
+  "transport": "explicitly identified Desktop app-tools named pipe; private protocol",
+  "model": "gpt-5.6-luna",
+  "sandbox": "read-only",
+  "approval_policy": "never",
+  "cases": [
+    {
+      "name": "initial_exact_reply_probe",
+      "woke_idle_thread": true,
+      "callback_present_as_function_call_output": true,
+      "reply": "pair-ready",
+      "expected_reply_achieved": false
+    },
+    {
+      "name": "explicit_completion_contract",
+      "initial_user_instruction_anticipates_later_tool_completion": true,
+      "initial_reply": "READY_FOR_CALLBACK",
+      "uses_completed_source_turn_id": true,
+      "woke_idle_thread": true,
+      "callback_present_as_function_call_output": true,
+      "expected_reply": "DESKTOP_CALLBACK_CONTRACT_OK",
+      "actual_reply": "DESKTOP_CALLBACK_CONTRACT_OK"
+    },
+    {
+      "name": "rapid_active_delivery_over_fresh_connections",
+      "payloads": ["DESKTOP_CALLBACK_ACTIVE_A", "DESKTOP_CALLBACK_ACTIVE_B"],
+      "both_payloads_present": true,
+      "new_turn_count": 1,
+      "actual_reply": "DESKTOP_CALLBACK_ACTIVE_B"
+    }
+  ],
+  "settings_preserved": true,
+  "all_test_pairs_forgotten_and_threads_archived": true,
+  "reply_verification_source": "actual task rollouts, not the pipe acknowledgement",
+  "known_limitations": [
+    "Pipe identity changes across Desktop restarts; production discovery is unimplemented.",
+    "No durable retry or duplicate suppression has been implemented.",
+    "Projected thread message items were empty although rollouts contained the replies.",
+    "Private protocol; no production MCP callback integration is enabled."
+  ]
+}

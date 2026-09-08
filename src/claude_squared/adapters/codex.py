@@ -1363,7 +1363,7 @@ class CodexAdapter(PairAdapter):
                 if detail_dir is not None and tag != "T-?":
                     try:
                         save_codex_item(detail_dir, tag, it, completed=t == "item.completed", run_id=run_id)
-                    except OSError as exc:
+                    except (OSError, ValueError, TypeError) as exc:
                         out.append(f"[{ts}] [tool detail unavailable] {type(exc).__name__}")
         elif t == "turn.completed":
             u = ev.get("usage") or {}

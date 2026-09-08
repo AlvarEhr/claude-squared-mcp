@@ -638,6 +638,8 @@ class ContextStatus(BaseModel):
     tokens_max: int
     percent: float
     warning: str | None = None
+    # Absent on older stored results: do not assume their fallback was native.
+    window_source: Literal["reported", "estimated"] | None = None
 
 
 class PermissionDenial(BaseModel):

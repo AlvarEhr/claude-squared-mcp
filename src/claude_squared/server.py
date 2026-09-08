@@ -605,9 +605,14 @@ class _PairLock:
 
     def __enter__(self) -> "_PairLock":
         self._file_lock.__enter__()
+        acquired = False
         try:
             self._thread_lock.acquire()
+            acquired = True
+            reg_mod.assert_writable()
         except BaseException:
+            if acquired:
+                self._thread_lock.release()
             # Roll back the file lock so we don't strand the cross-process lock
             self._file_lock.__exit__(None, None, None)
             raise
@@ -1090,6 +1095,7 @@ def pair_forget(name: str, archive: bool = True) -> str:
         archive: If True, copy the pair's JSONL transcript to ~/.claude/pairs/archive/
             before removal. Default True.
     """
+    reg_mod.assert_writable()
     # Stop any live runtime / in-flight turn for this pair before removing it
     # (a Codex turn is a one-shot process with no runtime — tree-kill it here,
     # or leave the cross-process stop marker; once the pair is forgotten,
@@ -1158,21 +1164,30 @@ def _make_stop_checker(pair_name: str, task_id: str) -> "Callable[[], bool]":
     """
     turn_start = time.time()
     marker_path = _stop_marker_path(pair_name)
-    state = {"high_water": 0.0}
+    state = {"high_water": 0.0, "task_stop_seen": False}
 
     def _check() -> bool:
-        if async_tasks.cancellation_requested(task_id):
+        if not state["task_stop_seen"] and async_tasks.was_stopped(task_id):
+            state["task_stop_seen"] = True
             async_tasks.mark_task_stopped(task_id)
             return True
         try:
             if not marker_path.exists():
                 return False
             ts = float(json.loads(marker_path.read_text(encoding="utf-8")).get("requested_at") or 0.0)
+            task = async_tasks.load_task(task_id)
+            if task is not None and task.queued:
+                return False  # terminal stop belongs to executing work, not this waiter
+            began = task.execution_started_at if task is not None else None
+            if began is not None and began.tzinfo is None:
+                began = began.replace(tzinfo=timezone.utc)
+            threshold = max(turn_start, began.timestamp()) if began else turn_start
         except Exception:
             return False
-        if ts < turn_start or ts <= state["high_water"]:
+        if ts < threshold or ts <= state["high_water"]:
             return False
         state["high_water"] = ts
+        state["task_stop_seen"] = True
         try:
             async_tasks.mark_task_stopped(task_id)
         except Exception:
@@ -1331,8 +1346,11 @@ def _build_send_runner(
             # behind it), so without this we'd spawn our own claude on a JSONL
             # that process is mid-writing. Its on-disk task is the signal.
             _wait_for_foreign_self_woken(name, hard_timeout_seconds, should_stop)
-            async_tasks.mark_task_executing(task_id)
             adapter = _adapter_for(current)
+            # Claude promotes immediately before opening its solicited scope,
+            # after any local self-woken turn. Other adapters start here.
+            if not isinstance(adapter, ClaudeAdapter):
+                async_tasks.mark_task_executing(task_id)
             # v0.13.0: neutral permission override → validated here so a typo
             # fails fast instead of reaching the CLI. (Bound to a NEW name —
             # assigning the closed-over parameter would make it a local of
@@ -3951,67 +3969,72 @@ def pair_stop(
     spec = reg_mod.get_pair(name)
 
     actions: list[str] = []
-    runtime_obj = runtime_mod.registry().get_or_none(name)
-
-    # Find any in-flight async task IDs for this pair BEFORE we tear anything down
-    all_task_ids = async_tasks.list_running_task_ids_for_pair(name)
-    states = {tid: async_tasks.load_task(tid) for tid in all_task_ids}
-    running_task_ids = [tid for tid, state in states.items() if state is not None and not state.queued]
-    queued_task_ids = [tid for tid, state in states.items() if state is not None and state.queued]
-    for tid in running_task_ids + (queued_task_ids if drain_queue else []):
-        async_tasks.request_task_stop(tid)
-
-    # v0.13.0 Codex: no warm runtime and no in-band interrupt — the turn is a
-    # one-shot process. In THIS process: tree-kill it (the thread resumes
-    # cleanly next send — verified). In another process: write the same stop
-    # marker the terminal `stop` command uses; its send loop polls it ~1/s.
-    if spec.backend == "codex":
-        outcome = codex_adapter_mod.stop_inflight(name)
-        if outcome:
-            actions.append(f"{outcome} the in-flight codex turn (thread intact; next send resumes it)")
-        elif running_task_ids:
-            try:
-                _write_stop_marker(name)
-                actions.append("stop marker written (the codex turn runs in another MCP process; "
-                               "it tree-kills within ~1s)")
-            except Exception as e:
-                actions.append(f"could not write stop marker: {e}")
-        force = False  # nothing to tree-kill via the runtime registry
-
-    runtime_alive = runtime_obj is not None and runtime_obj.is_alive()
-    has_inflight = len(running_task_ids) > 0
-    if spec.backend == "claude" and not runtime_alive and has_inflight:
-        _write_stop_marker(name)
-        actions.append("stop requested for the turn owned by another MCP process")
-
-    # Soft path: only attempt the in-band interrupt if there's ACTUAL in-flight
-    # work to cancel. Sending interrupt to an idle warm runtime just times out
-    # at 3s waiting for a result event that never comes (no turn in progress).
-    if runtime_alive and not force and has_inflight:
-        soft_succeeded = runtime_obj.send_interrupt(wait_for_result_seconds=3.0)
-        if soft_succeeded:
-            actions.append("sent in-band interrupt (pair stays alive)")
-        else:
-            actions.append("in-band interrupt didn't ack within 3s — escalating to tree-kill")
-            force = True
-
-    # Force path: tree-kill the runtime. Skipped if no runtime is alive.
-    if force and runtime_alive:
+    foreign_implicit = False
+    # Send paths hold pair-lock -> control-lock. Stop must release control
+    # before the hard-reset path acquires the pair lock (no inversion).
+    with async_tasks.control_lock(name):
+        runtime_obj = runtime_mod.registry().get_or_none(name)
+        states = async_tasks.local_running_tasks(name)
         try:
-            runtime_mod.registry().evict(name)
-            actions.append("tree-killed runtime subprocess (and descendants)")
-        except Exception as e:
-            actions.append(f"evict error: {e}")
+            task_ids = async_tasks.list_running_task_ids_for_pair(name)
+        except OSError as exc:
+            task_ids = []
+            actions.append(f"could not list task files: {exc}")
+        for tid in task_ids:
+            try:
+                state = async_tasks.load_task(tid)
+            except (OSError, ValueError) as exc:
+                actions.append(f"could not inspect task {tid}: {exc}")
+                continue
+            if state is not None and state.status == "running":
+                states[tid] = state
+        executing = {tid: state for tid, state in states.items() if not state.queued}
+        selected = states if drain_queue else executing
+        local_ids = {tid for tid, state in executing.items() if state.owner_pid == os.getpid()}
+        for tid, state in selected.items():
+            if (async_tasks.is_self_woken_task(state) and state.owner_pid != os.getpid()):
+                foreign_implicit = True
+                actions.append(
+                    f"owner handoff required for self-woken task {tid} (MCP PID {state.owner_pid}); "
+                    "stop it from that owner. No safe cross-process implicit-turn interrupt is available"
+                )
+                continue
+            try:
+                if async_tasks.request_task_stop(tid):
+                    actions.append(f"cancellation requested for {'queued' if state.queued else 'executing'} task {tid}")
+            except (OSError, ValueError) as exc:
+                if state.owner_pid == os.getpid():
+                    async_tasks.mark_task_stopped(tid)
+                actions.append(f"could not persist cancellation for task {tid}: {exc}")
 
-    if running_task_ids:
-        actions.append(
-            f"marked {len(running_task_ids)} in-flight async task(s) as stopped"
-        )
+        # Promotion cannot race this physical interruption. Recheck the active
+        # identity as the selected task may have completed after the snapshot.
+        if spec.backend == "codex":
+            info = codex_adapter_mod.inflight_info(name)
+            if info and (info.get("task_id") in local_ids or info.get("task_id") is None):
+                outcome = codex_adapter_mod._tree_kill(info["proc"])
+                if outcome:
+                    actions.append(f"{outcome} the in-flight codex turn (thread intact; next send resumes it)")
+        elif runtime_obj is not None and runtime_obj.is_alive():
+            active = runtime_obj.active_task_ids()
+            interrupt_current = bool(active & local_ids)
+            if interrupt_current and not force:
+                if runtime_obj.send_interrupt(wait_for_result_seconds=3.0):
+                    actions.append("sent in-band interrupt (pair stays alive)")
+                else:
+                    actions.append("in-band interrupt did not ack within 3s")
+                    force = True
+            if (force and (interrupt_current or not states)):
+                # Recheck after waiting for an ack: never evict a replacement
+                # continuation just because a selected turn has already ended.
+                if not states or runtime_obj.active_task_ids() & local_ids:
+                    if runtime_mod.registry().evict_if_current(name, runtime_obj):
+                        actions.append("tree-killed runtime subprocess (and descendants)")
 
-    if drain_queue and queued_task_ids:
-        actions.append(f"drained {len(queued_task_ids)} queued task(s)")
+    if hard and foreign_implicit:
+        actions.append("hard reset skipped: self-woken work must first be stopped by its owner")
 
-    if hard:
+    if hard and not foreign_implicit:
         # Rotate session: pair_clear logic inline. Don't call pair_clear via
         # mcp.call_tool to avoid extra lock-acquire choreography — just do it
         # directly. We acquire the lock briefly; should succeed quickly since
@@ -4039,7 +4062,7 @@ def pair_stop(
 
     if not actions:
         return f"Pair '{name}': nothing to stop (no live runtime or in-flight tasks)"
-    return f"Stopped '{name}': " + "; ".join(actions)
+    return f"Stop '{name}': " + "; ".join(actions)
 
 
 @mcp.tool(output_schema=None, annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True})

@@ -212,6 +212,12 @@ def load() -> Registry:
         return _load_unlocked()
 
 
+def assert_writable() -> None:
+    """Preflight mutating backend work before any process or transcript changes."""
+    with locked_registry():
+        pass
+
+
 def get_pair(name: str) -> PairSpec:
     reg = load()
     if name not in reg.pairs:

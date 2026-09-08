@@ -63,8 +63,27 @@ def _fmt_local(dt) -> str:
 
 
 def _observed_claude_window(spec) -> int | None:
-    """Reuse the last captured backend window for this exact session."""
+    """Reuse a native window only if it covers the latest transcript usage."""
     import json
+    path = _transcript_path(spec)
+    latest_model = None
+    usage_at = None
+    try:
+        with open(path, encoding="utf-8") as transcript:
+            for line in transcript:
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                message = event.get("message") or {}
+                if event.get("type") == "assistant" and isinstance(message.get("usage"), dict):
+                    latest_model = message.get("model")
+                    usage_at = event.get("timestamp")
+        usage_time = datetime.fromisoformat(usage_at.replace("Z", "+00:00"))
+        if usage_time.tzinfo is None:
+            usage_time = usage_time.replace(tzinfo=timezone.utc)
+    except (OSError, TypeError, ValueError, AttributeError):
+        return None  # no way to associate a captured window with this usage
     best = ("", 0)
     for path in _async_dir().glob("*.json"):
         try:
@@ -72,8 +91,18 @@ def _observed_claude_window(spec) -> int | None:
             result = task.get("result") or {}
             if task.get("pair_name") != spec.name or result.get("session_id") != spec.session_id:
                 continue
-            window = int((result.get("context") or {}).get("tokens_max") or 0)
+            context = result.get("context") or {}
+            if context.get("window_source") != "reported":
+                continue
+            if latest_model and latest_model != result.get("model_used"):
+                continue
+            window = int(context.get("tokens_max") or 0)
             stamp = str(task.get("finished_at") or task.get("started_at") or "")
+            finished = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            if finished.tzinfo is None:
+                finished = finished.replace(tzinfo=timezone.utc)
+            if finished < usage_time:
+                continue
             if window > 0 and stamp >= best[0]:
                 best = (stamp, window)
         except (OSError, ValueError, TypeError, AttributeError):

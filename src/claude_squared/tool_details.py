@@ -25,6 +25,8 @@ def save_codex_item(log_dir: Path, tag: str, item: dict, *, completed: bool, run
             record = json.loads(path.read_text(encoding="utf-8"))
         except (ValueError, OSError):
             pass
+    if not isinstance(record, dict):
+        record = {}
     if record.get("run_id") != run_id:
         record = {}
     record.update(tag=tag, run_id=run_id, item_id=item.get("id"), tool_name=item.get("type"))
@@ -46,6 +48,8 @@ def codex_tool_detail(log_dir: Path, tool_id: str, *, max_chars: int = 50_000) -
         record = json.loads(path.read_text(encoding="utf-8"))
     except (ValueError, OSError) as exc:
         raise PairError(f"Cannot read Codex detail for {tag}: {exc}") from exc
+    if not isinstance(record, dict):
+        raise PairError(f"Cannot read Codex detail for {tag}: record must be a JSON object")
     lines = [f"=== {tag} (Codex) ===", f"Tool: {record.get('tool_name', '?')}",
              f"Task/run: {record.get('run_id', '?')}", f"Item: {record.get('item_id', '?')}"]
     for key, label in (("started", "Input (started event)"), ("completed", "Result (completed event)")):

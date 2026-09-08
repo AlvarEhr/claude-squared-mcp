@@ -105,8 +105,7 @@ for pipe in [options.pipe]:
                 k.CloseHandle(process)
         # Don't send protocol data to unrelated or unidentified applications.
         if "openai.codex" not in path.value.lower() and "\\openai\\codex\\" not in path.value.lower():
-            print(json.dumps({"pipe": pipe, "pid": pid.value, "image": path.value, "skipped": True}), flush=True)
-            continue
+            raise RuntimeError("Pipe owner is not the identified Codex application")
         request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list",
                    "params": {"threadStartKind": "all"}}
         if options.send_smoke:
@@ -126,7 +125,7 @@ for pipe in [options.pipe]:
         tools = response.get("result", {}).get("tools", [])
         if options.send_smoke:
             print(json.dumps({"thread_id": options.thread_id, "expected_reply": options.token,
-                              "response": response}), flush=True)
+                              "model_reply_verified": False, "response": response}), flush=True)
             if "error" in response or response.get("result", {}).get("success") is False:
                 sys.exit(1)
             continue
