@@ -992,7 +992,7 @@ def pair_create(
                 on_event=None,
                 lock_acquire_timeout_s=3600.0,
             )
-            state = async_tasks.start_task(name, initial_message, runner)
+            state = async_tasks.start_task(name, initial_message, runner, queued=True)
             # Reuse the standard async-handle framing so initial-message guidance
             # matches what agents see from pair_send / pair_send_async — keeps
             # the imperative "RUN THIS NOW" wording consistent across all paths.
@@ -1161,6 +1161,9 @@ def _make_stop_checker(pair_name: str, task_id: str) -> "Callable[[], bool]":
     state = {"high_water": 0.0}
 
     def _check() -> bool:
+        if async_tasks.cancellation_requested(task_id):
+            async_tasks.mark_task_stopped(task_id)
+            return True
         try:
             if not marker_path.exists():
                 return False
@@ -1319,14 +1322,16 @@ def _build_send_runner(
         # `stop <pair>` marker interrupts this turn and reports it as stopped.
         # task_id is always passed by async_tasks._go; default None keeps the
         # runner callable directly in any edge path (then no stop polling).
-        should_stop = _make_stop_checker(name, task_id) if task_id else None
         with _with_pair_lock(name, timeout_s=lock_acquire_timeout_s):
+            async_tasks.raise_if_stopped(task_id)
+            should_stop = _make_stop_checker(name, task_id) if task_id else None
             current = reg_mod.get_pair(name)
             # v0.12.0 cross-process FIFO for self-woken turns: a self-woken turn
             # in ANOTHER MCP process doesn't hold this pair's lock (no send
             # behind it), so without this we'd spawn our own claude on a JSONL
             # that process is mid-writing. Its on-disk task is the signal.
             _wait_for_foreign_self_woken(name, hard_timeout_seconds, should_stop)
+            async_tasks.mark_task_executing(task_id)
             adapter = _adapter_for(current)
             # v0.13.0: neutral permission override → validated here so a typo
             # fails fast instead of reaching the CLI. (Bound to a NEW name —
@@ -1470,8 +1475,10 @@ def _build_compact_runner(
         # terminal stop marker can cancel a Codex app-server compaction from
         # any process (the Claude path runs a one-shot subprocess and ignores
         # it). Astra catch.
-        should_stop = _make_stop_checker(name, task_id) if task_id else None
         with _with_pair_lock(name, timeout_s=lock_acquire_timeout_s):
+            async_tasks.raise_if_stopped(task_id)
+            should_stop = _make_stop_checker(name, task_id) if task_id else None
+            async_tasks.mark_task_executing(task_id)
             current = reg_mod.get_pair(name)
             # Compaction rewrites the session JSONL — any warm runtime has
             # stale in-memory state and would write a turn against a JSONL
@@ -1990,7 +1997,7 @@ async def pair_send(
         on_event=progress_cb,
     )
 
-    state = async_tasks.start_task(name, message, runner)
+    state = async_tasks.start_task(name, message, runner, queued=True)
     final = async_tasks.wait_for_task(state.task_id, timeout_s=float(rpc_hold_s))
 
     if final is None:
@@ -2089,7 +2096,7 @@ def pair_send_async(
             if hard_timeout_seconds is not None else 3600.0
         ),
     )
-    state = async_tasks.start_task(name, message, runner)
+    state = async_tasks.start_task(name, message, runner, queued=True)
     return _format_async_handle(state.task_id, f"Started async task for pair '{name}'.", pair_name=name)
 
 
@@ -2124,7 +2131,9 @@ def _read_current_or_last_turn_log(
     except Exception:
         return [], "log read error"
     import re as _re
-    turn_marker_re = _re.compile(r"=== TURN .* \(\d+ms\) ===")
+    # Both backends use TURN delimiters; Codex records token counts rather
+    # than milliseconds, and a failed turn may have neither.
+    turn_marker_re = _re.compile(r"=== TURN (?:SUCCESS|COMPLETED|FAILED|ERROR|STOPPED|TIMEOUT|[A-Z_]+)(?:\b|:).* ===$")
     marker_indices = [i for i, l in enumerate(all_lines) if turn_marker_re.search(l)]
     if not marker_indices:
         # No turn has completed yet — everything in the log is the first in-flight turn
@@ -2320,7 +2329,8 @@ def pair_poll(
     # Build the headline status
     if state.status == "running":
         dur_s = (datetime.utcnow() - state.started_at).total_seconds()
-        headline = (
+        headline = (f"queued for {dur_s:.0f}s on pair '{state.pair_name}' (waiting for the pair lock)"
+                    if state.queued else
             f"running for {dur_s:.0f}s on pair '{state.pair_name}' "
             f"(started {_fmt_local(state.started_at)})"
         )
@@ -2358,6 +2368,10 @@ def pair_poll(
             headline = f"failed: {state.error}"
     elif state.status == "stopped":
         headline = f"stopped: {state.error or 'stopped by pair_stop'}"
+        if state.result is not None:
+            rendered = (_fmt_compact_result(state.result) if isinstance(state.result, CompactResult)
+                        else _fmt_send_result(state.result))
+            headline += "\nResult captured around cancellation:\n" + rendered
     elif state.status == "done":
         # v0.9.8: polymorphic render. pair_compact tasks land here with a
         # CompactResult; pair_send / pair_send_async with a SendResult. Pick
@@ -2386,7 +2400,7 @@ def pair_poll(
         lines.append(f"  {wake_note}")
 
     # Auto hang-warning for running tasks — always shown, even without with_turn_log
-    if state.status == "running":
+    if state.status == "running" and not state.queued:
         runtime_obj = runtime_mod.registry().get_or_none(state.pair_name)
         _last_act = None
         if runtime_obj is not None and runtime_obj._last_log_activity_at is not None:  # noqa: SLF001
@@ -2408,6 +2422,9 @@ def pair_poll(
                 lines.append(f"  (last log activity {idle_s:.0f}s ago — still working)")
 
     # Opt-in turn log
+    if with_turn_log and state.queued:
+        lines.append("  (backend execution has not started; this task has no turn log)")
+        with_turn_log = False
     if with_turn_log:
         # For terminal tasks, prefer the SendResult's recorded log line range
         # (which precisely scopes to THIS task's turn). Falling back to the
@@ -3030,6 +3047,12 @@ def pair_tool_detail(
     """
     spec = reg_mod.get_pair(name)
     log_dir = reg_mod.logs_dir() / name
+
+    if spec.backend == "codex":
+        if subagent is not None:
+            raise PairError("Codex sub-agent tool details are not indexed; omit subagent for the main turn.")
+        from claude_squared.tool_details import codex_tool_detail
+        return codex_tool_detail(log_dir, tool_id, max_chars=max_chars)
 
     # Resolve the index file path
     if subagent is None:
@@ -3757,6 +3780,7 @@ def pair_rewind(name: str, to_point: int, archive: bool = True, verbose: bool = 
             "name": name, "rewound_to_point": to_point,
             "preview": match["preview"], "archived_to": archived,
             "dropped_events": len(dropped), "files_modified_in_dropped_range": dropped_files,
+            "projection_note": codex_note,
         }, indent=2, default=str)
     lines = [f"Rewound '{name}' to before point {to_point}: \"{match['preview']}\""]
     lines.append(f"  Dropped {len(dropped)} event(s); the pair now continues from there on next send.")
@@ -3836,7 +3860,7 @@ def pair_compact(
         f"/compact (steering: {steering_prompt[:80]}...)"
         if steering_prompt else "/compact"
     )
-    state = async_tasks.start_task(name, msg_desc, runner)
+    state = async_tasks.start_task(name, msg_desc, runner, queued=True)
     final = async_tasks.wait_for_task(state.task_id, timeout_s=float(rpc_hold_s))
 
     if final is None:
@@ -3930,9 +3954,12 @@ def pair_stop(
     runtime_obj = runtime_mod.registry().get_or_none(name)
 
     # Find any in-flight async task IDs for this pair BEFORE we tear anything down
-    running_task_ids = async_tasks.list_running_task_ids_for_pair(name)
-    for tid in running_task_ids:
-        async_tasks.mark_task_stopped(tid)
+    all_task_ids = async_tasks.list_running_task_ids_for_pair(name)
+    states = {tid: async_tasks.load_task(tid) for tid in all_task_ids}
+    running_task_ids = [tid for tid, state in states.items() if state is not None and not state.queued]
+    queued_task_ids = [tid for tid, state in states.items() if state is not None and state.queued]
+    for tid in running_task_ids + (queued_task_ids if drain_queue else []):
+        async_tasks.request_task_stop(tid)
 
     # v0.13.0 Codex: no warm runtime and no in-band interrupt — the turn is a
     # one-shot process. In THIS process: tree-kill it (the thread resumes
@@ -3953,6 +3980,9 @@ def pair_stop(
 
     runtime_alive = runtime_obj is not None and runtime_obj.is_alive()
     has_inflight = len(running_task_ids) > 0
+    if spec.backend == "claude" and not runtime_alive and has_inflight:
+        _write_stop_marker(name)
+        actions.append("stop requested for the turn owned by another MCP process")
 
     # Soft path: only attempt the in-band interrupt if there's ACTUAL in-flight
     # work to cancel. Sending interrupt to an idle warm runtime just times out
@@ -3978,20 +4008,8 @@ def pair_stop(
             f"marked {len(running_task_ids)} in-flight async task(s) as stopped"
         )
 
-    if drain_queue:
-        # Best-effort: search async_dir for tasks with status=running for this
-        # pair that we didn't already mark. The cross-process file lock keeps
-        # additional waiters from advancing; if a queued task was about to
-        # start, we want it to abort instead.
-        # Reload list now that we've marked the current ones.
-        still_queued = [
-            tid for tid in async_tasks.list_running_task_ids_for_pair(name)
-            if tid not in set(running_task_ids)
-        ]
-        for tid in still_queued:
-            async_tasks.mark_task_stopped(tid)
-        if still_queued:
-            actions.append(f"drained {len(still_queued)} queued task(s)")
+    if drain_queue and queued_task_ids:
+        actions.append(f"drained {len(queued_task_ids)} queued task(s)")
 
     if hard:
         # Rotate session: pair_clear logic inline. Don't call pair_clear via

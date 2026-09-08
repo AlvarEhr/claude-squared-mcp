@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Callable
 
 from claude_squared.models import AsyncTaskState, SendResult
+from claude_squared.errors import TaskStopped
 from claude_squared.registry import async_dir
 
 
@@ -199,12 +200,52 @@ def mark_task_stopped(task_id: str) -> None:
 
 def _was_stopped(task_id: str) -> bool:
     with _stopped_task_ids_lock:
-        return task_id in _stopped_task_ids
+        local = task_id in _stopped_task_ids
+    return local or cancellation_requested(task_id)
+
+
+def cancellation_requested(task_id: str) -> bool:
+    return (async_dir() / f"{task_id}.cancel").exists()
+
+
+def request_task_stop(task_id: str) -> bool:
+    """Request cancellation of exactly one task, including in another process."""
+    state = load_task(task_id)
+    if state is None or state.status != "running":
+        return False
+    path = async_dir() / f"{task_id}.cancel"
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text("stop requested", encoding="utf-8")
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return True
+
+
+def raise_if_stopped(task_id: str | None) -> None:
+    if task_id and _was_stopped(task_id):
+        raise TaskStopped("stopped before backend execution")
+
+
+def mark_task_executing(task_id: str | None) -> None:
+    """Called under the pair lock immediately before invoking the backend."""
+    raise_if_stopped(task_id)
+    if task_id:
+        state = load_task(task_id)
+        if state is not None:
+            state.queued = False
+            state.execution_started_at = datetime.utcnow()
+            _save(state)
 
 
 def _clear_stopped(task_id: str) -> None:
     with _stopped_task_ids_lock:
         _stopped_task_ids.discard(task_id)
+    try:
+        (async_dir() / f"{task_id}.cancel").unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def list_running_task_ids_for_pair(pair_name: str) -> list[str]:
@@ -241,7 +282,8 @@ def _drop_event(task_id: str) -> None:
 
 
 def start_task(pair_name: str, message: str,
-               runner: "Callable[[str], SendResult] | Callable[[], SendResult]") -> AsyncTaskState:
+               runner: "Callable[[str], SendResult] | Callable[[], SendResult]",
+               *, queued: bool = False) -> AsyncTaskState:
     """Spawn a daemon thread that runs the runner and writes the result.
 
     Sets an in-memory threading.Event on completion so ``wait_for_task`` can wake
@@ -261,17 +303,22 @@ def start_task(pair_name: str, message: str,
         status="running",
         started_at=datetime.utcnow(),
         owner_pid=os.getpid(),
+        queued=queued,
+        execution_started_at=None if queued else datetime.utcnow(),
     )
     _save(state)
     event = _get_or_create_event(task_id)
 
     def _go() -> None:
         try:
+            raise_if_stopped(task_id)
             # v0.10.0: pass the task_id so the runner can bind a should_stop
             # closure to THIS task (terminal stop marks the correct task). All
             # runners (built by _build_send_runner / _build_compact_runner)
             # accept it.
             result = runner(task_id)
+            # Preserve a result even when completion races a stop request.
+            state.result = result
             # If the task was stopped just before the result came back (the
             # interrupt acknowledged via error_during_execution result event),
             # report "stopped" rather than "done."
@@ -280,11 +327,10 @@ def start_task(pair_name: str, message: str,
                 state.error = "stopped by pair_stop"
             else:
                 state.status = "done"
-                state.result = result
         except Exception as e:
             # Distinguish deliberate stop (interrupt-induced CLIError, or
             # tree-kill while the worker was waiting) from a real failure.
-            if _was_stopped(task_id):
+            if isinstance(e, TaskStopped) or _was_stopped(task_id):
                 state.status = "stopped"
                 state.error = "stopped by pair_stop"
             else:
@@ -296,6 +342,10 @@ def start_task(pair_name: str, message: str,
                 # conventional ``"<TypeName>: <message>"`` wrapping for clarity.
                 state.error = _format_task_error(e)
         finally:
+            progress = load_task(task_id)
+            if progress is not None:
+                state.execution_started_at = progress.execution_started_at
+                state.queued = progress.queued
             state.finished_at = datetime.utcnow()
             _save(state)
             event.set()
@@ -315,16 +365,18 @@ def wait_for_task(task_id: str, timeout_s: float) -> AsyncTaskState | None:
     state-file load on Event timeout. Cross-process waiters should call
     ``load_task`` directly in a poll loop or use ``python -m claude_squared wait``.
     """
-    event = _get_or_create_event(task_id)
-    fired = event.wait(timeout_s)
     state = load_task(task_id)
-    if state is None:
-        return None
-    if state.status in ("done", "failed", "stopped"):
-        # Free the event now that the task is observed terminal — don't leak
-        # entries indefinitely. Subsequent waiters that arrive AFTER completion
-        # will find load_task already returns the terminal state synchronously.
-        # (v0.12.0: "stopped" added — it leaked an entry per pair_stop before.)
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    event = _get_or_create_event(task_id)
+    while state is not None and state.status == "running":
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        # Local completion signals instantly; bounded disk checks also see a
+        # task completed by a different MCP process, whose Event is private.
+        event.wait(min(remaining, 0.5))
+        state = load_task(task_id)
+    if state is None or state.status != "running":
         _drop_event(task_id)
     return state
 

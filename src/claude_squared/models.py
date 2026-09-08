@@ -531,6 +531,9 @@ def premium_model_note(model: str) -> str | None:
 class PairSpec(BaseModel):
     """Persistent pair configuration stored in the registry."""
 
+    # Preserve additive fields written by a newer compatible process.
+    model_config = {"extra": "allow"}
+
     name: str = Field(..., description="Unique addressable name")
     # Which CLI runs this pair. Fixed at create (a Claude session can't become a
     # Codex thread); inferred from the model when not given.
@@ -608,10 +611,7 @@ class PairSpec(BaseModel):
         if not values.get("backend"):
             values["backend"] = infer_backend(values.get("model"))
         if "permission_mode" in values and values["permission_mode"] is not None:
-            try:
-                values["permission_mode"] = normalize_permission(values["permission_mode"])
-            except ValueError:
-                values["permission_mode"] = "auto"
+            values["permission_mode"] = normalize_permission(values["permission_mode"])
         if "context_window" in values and values["context_window"] is not None:
             try:
                 values["context_window"] = normalize_context_window(values["context_window"])
@@ -628,6 +628,7 @@ class PairSpec(BaseModel):
 
 
 class Registry(BaseModel):
+    model_config = {"extra": "allow"}
     version: int = 3
     pairs: dict[str, PairSpec] = Field(default_factory=dict)
 
@@ -748,6 +749,9 @@ class AsyncTaskState(BaseModel):
     error: str | None = None
     # PID of the MCP server process that owns this task (orphan supervision).
     owner_pid: int | None = None
+    # Additive metadata: old task files are treated as already executing.
+    queued: bool = False
+    execution_started_at: datetime | None = None
 
 
 class ActionInfo(BaseModel):

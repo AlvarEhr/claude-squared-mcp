@@ -2,13 +2,12 @@
 
 Two halves:
 
-  UNIT (default) — pure functions, no CLI, no network, no registry writes:
+  UNIT (default) — no CLI or network; all state uses temporary fixtures:
     permission aliases/translation, per-backend effort coercion, model-id
     helpers, ``[1m]``/legacy-spelling normalization on PairSpec, the Codex
-    models-cache reader (against the REAL ~/.codex/models_cache.json when
-    present, else skipped), exec argument construction, event → log/SendResult
-    parsing on recorded probe events, and the v3 registry migration on a COPY
-    of the real registry.
+    models-cache/config readers, exec argument construction with a mock binary,
+    event → log/SendResult parsing on recorded probe events, and v3 migration
+    of a synthetic legacy registry. No user cache or registry is read.
 
   LIVE (``--live``) — drives the server tool functions end-to-end against the
     real codex CLI (``gpt-5.6-luna`` at low effort, scratch cwd) in a TEMP
@@ -26,29 +25,76 @@ Run:  PYTHONIOENCODING=utf-8 python -u tests/smoke_codex.py [--live]
 from __future__ import annotations
 
 import asyncio
+from contextlib import ExitStack, contextmanager
 import json
 import os
 import re
-import shutil
+import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 LIVE = "--live" in sys.argv
+_SESSION_TEMP = tempfile.TemporaryDirectory(prefix="cs-codex-smoke-", ignore_cleanup_errors=True)
+_TMP_HOME = Path(_SESSION_TEMP.name)
+# Set before package imports, including when this script is run directly.
+os.environ["CLAUDE_HOME"] = str(_TMP_HOME)
 if LIVE:
-    # Must be set BEFORE importing the package: registry/logs/async paths derive
-    # from CLAUDE_HOME. Codex keeps using the real CODEX_HOME (auth + cache).
-    _TMP_HOME = Path(tempfile.mkdtemp(prefix="cs-codex-live-"))
-    os.environ["CLAUDE_HOME"] = str(_TMP_HOME)
+    # Codex keeps using its actual home (auth + cache) in the explicit live half.
     os.environ["CLAUDE_PAIR_SYNC_CAP_SECONDS"] = "300"
 
 from claude_squared import codex_models as CM  # noqa: E402
 from claude_squared import models as M  # noqa: E402
+from claude_squared.adapters import claude as CA  # noqa: E402
+from claude_squared.adapters import codex as CX  # noqa: E402
 from claude_squared.adapters.claude import ClaudeAdapter  # noqa: E402
-from claude_squared.adapters.codex import CodexAdapter, config_readd_args, codex_executable  # noqa: E402
+from claude_squared.adapters.codex import CodexAdapter, config_readd_args  # noqa: E402
+
+
+@contextmanager
+def offline_fixtures():
+    """Patch filesystem roots and CLI discovery for the unit half only."""
+    with ExitStack() as stack:
+        root = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="cs-codex-unit-")))
+        home = root / "codex"
+        home.mkdir()
+        levels = ["low", "medium", "high", "xhigh", "max"]
+        models = []
+        for tier in ("sol", "terra", "luna", "astra"):
+            models.append({
+                "slug": f"gpt-{'6' if tier == 'astra' else '5.6'}-{tier}",
+                "visibility": "list", "priority": len(models) + 1,
+                "supported_reasoning_levels": [
+                    {"effort": level} for level in levels + ([] if tier == "luna" else ["ultra"])
+                ],
+                "context_window": 272_000, "max_context_window": 872_000,
+                "effective_context_window_percent": 95,
+            })
+        models.append({"slug": "gpt-7-sol", "visibility": "hide"})
+        models.append({"slug": "gpt-7-mini", "visibility": "list", "upgrade": {"model": "gpt-5.6-luna"}})
+        (home / "models_cache.json").write_text(json.dumps({"models": models}), encoding="utf-8")
+        (home / "config.toml").write_text(
+            'web_search = "cached"\nnotify = ["should-not-run"]\n'
+            '[windows]\nsandbox = "elevated"\n'
+            '[mcp_servers.should_not_inherit]\ncommand = "should-not-run"\n',
+            encoding="utf-8",
+        )
+        stack.enter_context(patch.dict(os.environ, {"CLAUDE_HOME": str(root / "claude")}))
+        # codex.py imports codex_home by value, so patch both lookup sites.
+        # Never change CODEX_HOME: --live must keep the user's actual auth/store.
+        stack.enter_context(patch.object(CM, "codex_home", return_value=home))
+        stack.enter_context(patch.object(CX, "codex_home", return_value=home))
+        stack.enter_context(patch.object(CX, "codex_executable", return_value=str(root / "codex-fixture")))
+        stack.enter_context(patch.object(CA, "_cli_permission_choices", return_value=("manual",)))
+        spawn = stack.enter_context(patch.object(
+            subprocess, "Popen", side_effect=AssertionError("Offline Codex checks must not launch processes")
+        ))
+        yield root
+        spawn.assert_not_called()
 
 passed = 0
 failed = 0
@@ -68,195 +114,207 @@ def check(label: str, cond: bool, detail: str = "") -> None:
 # UNIT
 # ===========================================================================
 
-print("=== permission vocabulary ===")
-for alias, level in [("bypassPermissions", "unrestricted"), ("acceptEdits", "workspace"),
-                     ("default", "read-only"), ("dontAsk", "read-only"), ("plan", "plan"),
-                     ("auto", "auto"), ("READ-ONLY", "read-only"), ("workspace-write", "workspace"),
-                     ("approve-for-me", "auto"), ("danger-full-access", "unrestricted")]:
-    check(f"{alias!r} -> {level}", M.normalize_permission(alias) == level)
-check("None -> default 'auto'", M.normalize_permission(None) == "auto")
-try:
-    M.normalize_permission("bogus")
-    check("bogus raises", False)
-except ValueError:
-    check("bogus raises", True)
-check("claude native map", ClaudeAdapter.native_permission("workspace") == "acceptEdits"
-      and ClaudeAdapter.native_permission("bypassPermissions") == "bypassPermissions")
-check("codex auto -> --approve-for-me", CodexAdapter.permission_args("auto") == ["--approve-for-me"])
-check("codex plan -> read-only sandbox", CodexAdapter.permission_args("plan") == ["-s", "read-only"])
-check("codex unrestricted -> bypass flag",
-      CodexAdapter.permission_args("unrestricted") == ["--dangerously-bypass-approvals-and-sandbox"])
-check("codex native override", CodexAdapter.permission_args("auto", {"sandbox": "danger-full-access", "approval": "none"})
-      == ["-s", "danger-full-access"])
-check("no -a flag ever emitted", all("-a" not in CodexAdapter.permission_args(l) for l in M.PERMISSION_LEVELS))
+def run_unit_checks(fixture_root: Path) -> None:
+    print("=== permission vocabulary ===")
+    for alias, level in [("bypassPermissions", "unrestricted"), ("acceptEdits", "workspace"),
+                         ("default", "read-only"), ("dontAsk", "read-only"), ("plan", "plan"),
+                         ("auto", "auto"), ("READ-ONLY", "read-only"), ("workspace-write", "workspace"),
+                         ("approve-for-me", "auto"), ("danger-full-access", "unrestricted")]:
+        check(f"{alias!r} -> {level}", M.normalize_permission(alias) == level)
+    check("None -> default 'auto'", M.normalize_permission(None) == "auto")
+    try:
+        M.normalize_permission("bogus")
+        check("bogus raises", False)
+    except ValueError:
+        check("bogus raises", True)
+    check("claude native map", ClaudeAdapter.native_permission("workspace") == "acceptEdits"
+          and ClaudeAdapter.native_permission("bypassPermissions") == "bypassPermissions")
+    check("codex auto -> --approve-for-me", CodexAdapter.permission_args("auto") == ["--approve-for-me"])
+    check("codex plan -> read-only sandbox", CodexAdapter.permission_args("plan") == ["-s", "read-only"])
+    check("codex unrestricted -> bypass flag",
+          CodexAdapter.permission_args("unrestricted") == ["--dangerously-bypass-approvals-and-sandbox"])
+    check("codex native override", CodexAdapter.permission_args("auto", {"sandbox": "danger-full-access", "approval": "none"})
+          == ["-s", "danger-full-access"])
+    check("no -a flag ever emitted", all("-a" not in CodexAdapter.permission_args(l) for l in M.PERMISSION_LEVELS))
 
-print("\n=== effort ===")
-check("default effort is high", M.DEFAULT_EFFORT == "high" and M.default_effort_for_model("opus") == "high")
-check("haiku -> None", M.default_effort_for_model("haiku") is None)
-check("sonnet xhigh -> high", M.coerce_effort_for_model("claude-sonnet-5", "xhigh")[0] == "high")
-check("opus max ok", M.coerce_effort_for_model("claude-opus-5", "max") == ("max", None))
-check("unknown effort coerces (no registry poisoning)", M.coerce_effort_for_model("opus", "bogus")[0] == "high")
-check("codex fallback set includes ultra when cache absent",
-      "ultra" in M.EFFORT_LEVELS_CODEX_FALLBACK)
+    print("\n=== effort ===")
+    check("default effort is high", M.DEFAULT_EFFORT == "high" and M.default_effort_for_model("opus") == "high")
+    check("haiku -> None", M.default_effort_for_model("haiku") is None)
+    check("sonnet xhigh -> high", M.coerce_effort_for_model("claude-sonnet-5", "xhigh")[0] == "high")
+    check("opus max ok", M.coerce_effort_for_model("claude-opus-5", "max") == ("max", None))
+    check("unknown effort coerces (no registry poisoning)", M.coerce_effort_for_model("opus", "bogus")[0] == "high")
+    check("codex fallback set includes ultra when cache absent",
+          "ultra" in M.EFFORT_LEVELS_CODEX_FALLBACK)
 
-print("\n=== model-id helpers ===")
-check("infer_backend gpt", M.infer_backend("gpt-5.6-sol") == "codex")
-check("infer_backend alias", M.infer_backend("sol") == "codex" and M.infer_backend("astra") == "codex")
-check("infer_backend claude", M.infer_backend("opus") == "claude" and M.infer_backend("claude-fable-5[1m]") == "claude")
-check("parse_codex_model", M.parse_codex_model("gpt-5.6-luna") == ((5, 6), "luna")
-      and M.parse_codex_model("gpt-6-astra") == ((6,), "astra") and M.parse_codex_model("gpt-5.5") == ((5, 5), None)
-      and M.parse_codex_model("codex-auto-review") is None)
-check("pinned vs floating", M.is_pinned_model("gpt-5.6-sol") and not M.is_pinned_model("sol")
-      and M.is_pinned_model("claude-opus-5") and not M.is_pinned_model("opus"))
-check("short labels", M.short_model_label("gpt-5.6-luna") == "luna" and M.short_model_label("claude-opus-5") == "opus"
-      and M.short_model_label("gpt-5.5") == "gpt-5.5")
-check("split_model_tier", M.split_model_tier("claude-opus-5[1m]") == ("claude-opus-5", "1m")
-      and M.split_model_tier("opus") == ("opus", "default"))
-check("premium astra", M.premium_model_note("astra") is not None and M.premium_model_note("gpt-6-astra") is not None)
-check("premium fable still", M.premium_model_note("claude-fable-5") is not None)
-check("not premium sol/opus", M.premium_model_note("gpt-5.6-sol") is None and M.premium_model_note("opus") is None)
-check("parse_model_id silent on codex", M.parse_model_id("gpt-5.6-sol") == (None, ()))
-check("context_window aliases", M.normalize_context_window("1M") == "1m" and M.normalize_context_window("[1m]") == "1m"
-      and M.normalize_context_window(None) == "default" and M.normalize_context_window("standard") == "default")
+    print("\n=== model-id helpers ===")
+    check("infer_backend gpt", M.infer_backend("gpt-5.6-sol") == "codex")
+    check("infer_backend alias", M.infer_backend("sol") == "codex" and M.infer_backend("astra") == "codex")
+    check("infer_backend claude", M.infer_backend("opus") == "claude" and M.infer_backend("claude-fable-5[1m]") == "claude")
+    check("parse_codex_model", M.parse_codex_model("gpt-5.6-luna") == ((5, 6), "luna")
+          and M.parse_codex_model("gpt-6-astra") == ((6,), "astra") and M.parse_codex_model("gpt-5.5") == ((5, 5), None)
+          and M.parse_codex_model("codex-auto-review") is None)
+    check("pinned vs floating", M.is_pinned_model("gpt-5.6-sol") and not M.is_pinned_model("sol")
+          and M.is_pinned_model("claude-opus-5") and not M.is_pinned_model("opus"))
+    check("short labels", M.short_model_label("gpt-5.6-luna") == "luna" and M.short_model_label("claude-opus-5") == "opus"
+          and M.short_model_label("gpt-5.5") == "gpt-5.5")
+    check("split_model_tier", M.split_model_tier("claude-opus-5[1m]") == ("claude-opus-5", "1m")
+          and M.split_model_tier("opus") == ("opus", "default"))
+    check("premium astra", M.premium_model_note("astra") is not None and M.premium_model_note("gpt-6-astra") is not None)
+    check("premium fable still", M.premium_model_note("claude-fable-5") is not None)
+    check("not premium sol/opus", M.premium_model_note("gpt-5.6-sol") is None and M.premium_model_note("opus") is None)
+    check("parse_model_id silent on codex", M.parse_model_id("gpt-5.6-sol") == (None, ()))
+    check("context_window aliases", M.normalize_context_window("1M") == "1m" and M.normalize_context_window("[1m]") == "1m"
+          and M.normalize_context_window(None) == "default" and M.normalize_context_window("standard") == "default")
 
-print("\n=== PairSpec normalization (registry safety net) ===")
-s = M.PairSpec(name="a", session_id="s", model="claude-opus-5[1m]", permission_mode="bypassPermissions", effort="xhigh")
-check("[1m] moves into context_window", s.model == "claude-opus-5" and s.context_window == "1m")
-check("legacy permission normalized", s.permission_mode == "unrestricted" and s.backend == "claude")
-check("cli_model re-appends [1m]", ClaudeAdapter.cli_model(s) == "claude-opus-5[1m]")
-s2 = M.PairSpec(name="b", session_id="s", model="gpt-5.6-luna", permission_mode="acceptEdits", effort="high")
-check("codex backend inferred", s2.backend == "codex" and s2.permission_mode == "workspace")
-s3 = M.PairSpec(name="c", session_id="s", model="haiku", effort="xhigh")
-check("haiku effort -> None", s3.effort is None)
-check("default effort on spec", M.PairSpec(name="d", session_id="s").effort == "high")
-check("SendResult cost nullable", M.SendResult(name="x", response="", session_id="s", model_used="m",
-                                                cost_usd=None, duration_ms=1).cost_usd is None)
+    print("\n=== PairSpec normalization (registry safety net) ===")
+    s = M.PairSpec(name="a", session_id="s", model="claude-opus-5[1m]", permission_mode="bypassPermissions", effort="xhigh")
+    check("[1m] moves into context_window", s.model == "claude-opus-5" and s.context_window == "1m")
+    check("legacy permission normalized", s.permission_mode == "unrestricted" and s.backend == "claude")
+    check("cli_model re-appends [1m]", ClaudeAdapter.cli_model(s) == "claude-opus-5[1m]")
+    s2 = M.PairSpec(name="b", session_id="s", model="gpt-5.6-luna", permission_mode="acceptEdits", effort="high")
+    check("codex backend inferred", s2.backend == "codex" and s2.permission_mode == "workspace")
+    s3 = M.PairSpec(name="c", session_id="s", model="haiku", effort="xhigh")
+    check("haiku effort -> None", s3.effort is None)
+    check("default effort on spec", M.PairSpec(name="d", session_id="s").effort == "high")
+    check("SendResult cost nullable", M.SendResult(name="x", response="", session_id="s", model_used="m",
+                                                    cost_usd=None, duration_ms=1).cost_usd is None)
 
-print("\n=== codex models cache (real file if present) ===")
-cache = CM.load_models_cache()
-if cache is None:
-    print("  (no ~/.codex/models_cache.json — skipping cache-backed checks)")
-else:
+    print("\n=== synthetic codex models cache ===")
+    check("fixture cache is readable", CM.load_models_cache() is not None)
     slug, why = CM.codex_default_model()
-    check("default model chosen", slug is not None, why)
-    if slug:
-        p = M.parse_codex_model(slug)
-        check("default is a tiered current-gen model, never astra", p is not None and p[1] not in M.NEVER_DEFAULT_CODEX_TIERS)
+    check("default excludes premium, hidden and retiring newer models", slug == "gpt-5.6-sol", why)
     for alias in ("sol", "terra", "luna"):
-        try:
-            r, note = CM.resolve_codex_model(alias)
-            check(f"alias {alias} resolves", M.parse_codex_model(r) is not None and M.parse_codex_model(r)[1] == alias)
-        except ValueError as e:
-            print(f"  (alias {alias} not on this plan: {e})")
+        r, note = CM.resolve_codex_model(alias)
+        check(f"alias {alias} resolves", r == f"gpt-5.6-{alias}")
     r, note = CM.resolve_codex_model("gpt-9-nope")
     check("unlisted slug gets a note, not an error", r == "gpt-9-nope" and note and "NOT listed" in note)
-    cw = CM.context_windows(slug or "gpt-5.6-luna")
-    check("context windows computed with effective %", cw is not None and cw[0] < cw[1])
-    eff = CM.supported_efforts(slug or "gpt-5.6-luna")
-    check("supported efforts read", bool(eff) and "high" in eff)
+    check("context windows apply effective %", CM.context_windows(slug) == (258_400, 828_400))
+    check("supported efforts read", "ultra" in CM.supported_efforts(slug))
+    check("luna unsupported effort is coerced", M.coerce_effort_for_model("luna", "ultra")[0] == "max")
+    with patch.object(CM, "models_cache_path", return_value=fixture_root / "missing.json"):
+        check("missing cache returns None", CM.load_models_cache() is None)
+        check("missing cache cannot choose a default", CM.codex_default_model()[0] is None)
+        check("explicit slug works without cache", CM.resolve_codex_model("gpt-5.6-luna") == ("gpt-5.6-luna", None))
+        check("missing cache retains effort fallback", "ultra" in M._allowed_efforts("gpt-5.6-sol", "codex"))
 
-print("\n=== exec args ===")
-spec = M.PairSpec(name="t", backend="codex", session_id="x", model="luna", effort="high",
-                  permission_mode="auto", context_window="1m", cwd="C:/tmp",
-                  extra_dirs=["C:/tmp/extra"], backend_options={"config": {"foo.bar": 1}, "args": ["--color", "never"]})
-args = CodexAdapter()._exec_args(spec, model=None, effort=None, permission_mode=None)  # noqa: SLF001
-joined = " ".join(args)
-check("exec + --json + skip-git + -C", "exec --json --skip-git-repo-check -C C:/tmp" in joined)
-check("--ignore-user-config + thread-source", "--ignore-user-config --thread-source claude-squared" in joined)
-check("model + effort re-passed every call", "-m gpt-5.6-luna" in joined and 'model_reasoning_effort="high"' in joined)
-_m = re.search(r"model_auto_compact_token_limit=(\d+)", joined)
-check("1m config pair (compact threshold below the clamped window)",
-      "model_context_window=1000000" in joined and _m is not None and 0 < int(_m.group(1)) <= 900_000)
-try:
-    CodexAdapter.permission_args("auto", {"sandbox": "read-only"})
-    check("sandbox override refused at auto (CLI rejects -s with --approve-for-me)", False)
-except ValueError as e:
-    check("sandbox override refused at auto (CLI rejects -s with --approve-for-me)", "approve-for-me" in str(e))
-check("auto -> --approve-for-me", "--approve-for-me" in args)
-check("extra_dirs -> --add-dir", "--add-dir" in args and "C:/tmp/extra" in args)
-check("backend_options.config + args", "foo.bar=1" in joined and args[-2:] == ["--color", "never"])
-if os.name == "nt" and any("windows.sandbox" in a for a in config_readd_args()):
-    check("windows.sandbox re-added under --ignore-user-config", any("windows.sandbox" in a for a in args))
-check("codex executable resolves", "codex" in codex_executable().lower())
+    print("\n=== synthetic config isolation ===")
+    readded = config_readd_args()
+    check("windows sandbox re-added", 'windows.sandbox="elevated"' in readded)
+    check("web search re-added", 'web_search="cached"' in readded)
+    check("MCP servers and hooks excluded", not any("should-not-run" in arg or "should_not_inherit" in arg for arg in readded))
 
-print("\n=== event parsing on recorded probe shapes ===")
-_ad = CodexAdapter()
-from claude_squared.runtime import ToolCounter  # noqa: E402
-_ctr = ToolCounter(index_path=None)
-_tags: dict = {}
-ev_started = {"type": "item.started", "item": {"id": "item_1", "type": "command_execution",
-              "command": '"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "Set-Content x"',
-              "status": "in_progress"}}
-ev_done = {"type": "item.completed", "item": {"id": "item_1", "type": "command_execution",
-           "command": "…", "aggregated_output": "ok\nline2", "exit_code": 0, "status": "completed"}}
-ev_fc = {"type": "item.started", "item": {"id": "item_2", "type": "file_change",
-         "changes": [{"path": "C:\\ws\\inside.txt", "kind": "add"}], "status": "in_progress"}}
-ev_msg = {"type": "item.completed", "item": {"id": "item_3", "type": "agent_message", "text": "Done."}}
-ev_turn = {"type": "turn.completed", "usage": {"input_tokens": 100, "cached_input_tokens": 50, "output_tokens": 5, "reasoning_output_tokens": 1}}
-l1 = _ad._format_event(ev_started, _ctr, _tags)  # noqa: SLF001
-l2 = _ad._format_event(ev_done, _ctr, _tags)  # noqa: SLF001
-l3 = _ad._format_event(ev_fc, _ctr, _tags)  # noqa: SLF001
-l4 = _ad._format_event(ev_msg, _ctr, _tags)  # noqa: SLF001
-l5 = _ad._format_event(ev_turn, _ctr, _tags)  # noqa: SLF001
-check("tool_use line tagged T-1 with wrapper stripped", l1 and "[T-1] [tool_use] command_execution(Set-Content x)" in l1[0], str(l1))
-check("tool_result reuses T-1 + exit code", l2 and "[T-1] [tool_result] exit 0 ok / line2" in l2[0], str(l2))
-check("file_change gets T-2", l3 and "[T-2] [tool_use] file_change(add inside.txt)" in l3[0], str(l3))
-check("agent_message -> [text]", l4 and "[text] Done." in l4[0])
-check("turn marker matches pair_poll's regex shape", l5 and "=== TURN COMPLETED (" in l5[0] and l5[0].endswith("tokens) ==="))
-
-_spec = M.PairSpec(name="u", backend="codex", session_id="01a07d5a-032f-7212-a219-f93df4ab9e8b", model="gpt-5.6-luna")
-_events = [{"type": "thread.started", "thread_id": _spec.session_id}, ev_msg, ev_turn,
-           {"type": "_log_scope", "log_path": "x/main.log", "start_line": 1, "end_line": 3}]
-_res = _ad._build_send_result(_spec, _events, "", 0, 1234, time.time(), model_used="gpt-5.6-luna",  # noqa: SLF001
-                              permission_level="workspace")
-check("SendResult basics", _res.response == "Done." and _res.cost_usd is None and _res.backend == "codex"
-      and _res.log_line_start == 1 and _res.log_line_end == 3 and _res.duration_ms == 1234)
-check("context window fallback from cache", _res.context is not None and _res.context.tokens_max >= 200_000)
-_den = _ad._build_send_result(  # noqa: SLF001
-    _spec, [ev_msg, ev_turn], "2026-09-07T19:23:36Z ERROR codex_core::tools::router: error=patch rejected: "
-    "writing outside of the project; rejected by user approval settings\n", 0, 1, time.time(),
-    model_used="gpt-5.6-luna", permission_level="workspace")
-check("stderr denial -> PermissionDenial", len(_den.permission_denials) == 1 and _den.permission_denials[0].tool_name == "apply_patch")
-_deg = _ad._build_send_result(  # noqa: SLF001
-    _spec, [ev_msg, ev_turn], "ERROR patch rejected: writing is blocked by read-only sandbox; rejected by user approval settings\n",
-    0, 1, time.time(), model_used="gpt-5.6-luna", permission_level="workspace")
-check("read-only degrade note", any("READ-ONLY" in n for n in _deg.notes))
-_fail = _ad._build_send_result(  # noqa: SLF001
-    _spec, [{"type": "item.completed", "item": {"id": "e", "type": "error", "message": "The 'gpt-9' model is not supported when using Codex with a ChatGPT account."}},
-            {"type": "turn.failed", "error": {"message": "invalid_request_error"}}], "", 1, 1, time.time(),
-    model_used="gpt-9", permission_level="workspace")
-check("model-unavailable classified", _fail.safety_kind == "model_unavailable" and "(no reply" in _fail.response)
-
-print("\n=== registry v3 migration on a COPY ===")
-_real = Path(os.environ.get("CLAUDE_HOME_REAL", str(Path.home() / ".claude"))) / "pairs" / "registry.json"
-if _real.exists():
-    _tmp = Path(tempfile.mkdtemp(prefix="cs-mig-"))
-    (_tmp / "pairs").mkdir()
-    shutil.copy(_real, _tmp / "pairs" / "registry.json")
-    _raw = json.loads((_tmp / "pairs" / "registry.json").read_text(encoding="utf-8"))
-    _raw["version"] = 2
-    for _p in _raw["pairs"].values():
-        _p.pop("backend", None)
-        _p.pop("context_window", None)
-    (_tmp / "pairs" / "registry.json").write_text(json.dumps(_raw), encoding="utf-8")
-    _prev = os.environ.get("CLAUDE_HOME")
-    os.environ["CLAUDE_HOME"] = str(_tmp)
+    print("\n=== exec args ===")
+    workspace = str(fixture_root / "workspace with spaces")
+    extra_dir = str(fixture_root / "extra")
+    spec = M.PairSpec(name="t", backend="codex", session_id="x", model="luna", effort="high",
+                      permission_mode="auto", context_window="1m", cwd=workspace,
+                      extra_dirs=[extra_dir], backend_options={"config": {"foo.bar": 1}, "args": ["--color", "never"]})
+    args = CodexAdapter()._exec_args(spec, model=None, effort=None, permission_mode=None)  # noqa: SLF001
+    joined = " ".join(args)
+    check("exec + --json + skip-git + -C", args[1:6] == ["exec", "--json", "--skip-git-repo-check", "-C", workspace])
+    check("--ignore-user-config + thread-source", "--ignore-user-config --thread-source claude-squared" in joined)
+    check("model + effort re-passed every call", "-m gpt-5.6-luna" in joined and 'model_reasoning_effort="high"' in joined)
+    _m = re.search(r"model_auto_compact_token_limit=(\d+)", joined)
+    check("1m config pair (compact threshold below the clamped window)",
+          "model_context_window=1000000" in joined and _m is not None and 0 < int(_m.group(1)) <= 900_000)
     try:
-        from claude_squared import registry as R
-        _reg = R.load()
-        _disk = json.loads((_tmp / "pairs" / "registry.json").read_text(encoding="utf-8"))
-        check("version bumped to 3 in memory + on disk", _reg.version == 3 and _disk.get("version") == 3)
-        check("every pair still loads", len(_reg.pairs) == len(_raw["pairs"]))
-        check("no [1m] left in any model", all("[" not in p.model for p in _reg.pairs.values()))
-        check("all permission levels neutral", all(p.permission_mode in M.PERMISSION_LEVELS for p in _reg.pairs.values()))
-        check("all backends set", all(p.backend in M.BACKENDS for p in _reg.pairs.values()))
-    finally:
-        if _prev is None:
-            os.environ.pop("CLAUDE_HOME", None)
-        else:
-            os.environ["CLAUDE_HOME"] = _prev
-else:
-    print("  (no real registry to copy — skipped)")
+        CodexAdapter.permission_args("auto", {"sandbox": "read-only"})
+        check("sandbox override refused at auto (CLI rejects -s with --approve-for-me)", False)
+    except ValueError as e:
+        check("sandbox override refused at auto (CLI rejects -s with --approve-for-me)", "approve-for-me" in str(e))
+    check("auto -> --approve-for-me", "--approve-for-me" in args)
+    check("extra_dirs -> --add-dir", args[args.index("--add-dir") + 1] == extra_dir)
+    check("backend_options.config + args", "foo.bar=1" in joined and args[-2:] == ["--color", "never"])
+    if os.name == "nt" and any("windows.sandbox" in a for a in config_readd_args()):
+        check("windows.sandbox re-added under --ignore-user-config", any("windows.sandbox" in a for a in args))
+    check("mock executable used", args[0] == str(fixture_root / "codex-fixture"))
+
+    print("\n=== event parsing on recorded probe shapes ===")
+    _ad = CodexAdapter()
+    from claude_squared.runtime import ToolCounter  # noqa: E402
+    _ctr = ToolCounter(index_path=None)
+    _tags: dict = {}
+    ev_started = {"type": "item.started", "item": {"id": "item_1", "type": "command_execution",
+                  "command": '"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "Set-Content x"',
+                  "status": "in_progress"}}
+    ev_done = {"type": "item.completed", "item": {"id": "item_1", "type": "command_execution",
+               "command": "…", "aggregated_output": "ok\nline2", "exit_code": 0, "status": "completed"}}
+    ev_fc = {"type": "item.started", "item": {"id": "item_2", "type": "file_change",
+             "changes": [{"path": str(fixture_root / "inside.txt"), "kind": "add"}], "status": "in_progress"}}
+    ev_msg = {"type": "item.completed", "item": {"id": "item_3", "type": "agent_message", "text": "Done."}}
+    ev_turn = {"type": "turn.completed", "usage": {"input_tokens": 100, "cached_input_tokens": 50, "output_tokens": 5, "reasoning_output_tokens": 1}}
+    l1 = _ad._format_event(ev_started, _ctr, _tags)  # noqa: SLF001
+    l2 = _ad._format_event(ev_done, _ctr, _tags)  # noqa: SLF001
+    l3 = _ad._format_event(ev_fc, _ctr, _tags)  # noqa: SLF001
+    l4 = _ad._format_event(ev_msg, _ctr, _tags)  # noqa: SLF001
+    l5 = _ad._format_event(ev_turn, _ctr, _tags)  # noqa: SLF001
+    check("tool_use line tagged T-1 with wrapper stripped", l1 and "[T-1] [tool_use] command_execution(Set-Content x)" in l1[0], str(l1))
+    check("tool_result reuses T-1 + exit code", l2 and "[T-1] [tool_result] exit 0 ok / line2" in l2[0], str(l2))
+    check("file_change gets T-2", l3 and "[T-2] [tool_use] file_change(add inside.txt)" in l3[0], str(l3))
+    check("agent_message -> [text]", l4 and "[text] Done." in l4[0])
+    check("completed turn is logged", l5 and "=== TURN COMPLETED (" in l5[0] and l5[0].endswith("tokens) ==="))
+
+    _spec = M.PairSpec(name="u", backend="codex", session_id="01a07d5a-032f-7212-a219-f93df4ab9e8b", model="gpt-5.6-luna")
+    _events = [{"type": "thread.started", "thread_id": _spec.session_id}, ev_msg, ev_turn,
+               {"type": "_log_scope", "log_path": "x/main.log", "start_line": 1, "end_line": 3}]
+    _res = _ad._build_send_result(_spec, _events, "", 0, 1234, time.time(), model_used="gpt-5.6-luna",  # noqa: SLF001
+                                  permission_level="workspace")
+    check("SendResult basics", _res.response == "Done." and _res.cost_usd is None and _res.backend == "codex"
+          and _res.log_line_start == 1 and _res.log_line_end == 3 and _res.duration_ms == 1234)
+    check("context window fallback from cache", _res.context is not None and _res.context.tokens_max >= 200_000)
+    _den = _ad._build_send_result(  # noqa: SLF001
+        _spec, [ev_msg, ev_turn], "2026-09-07T19:23:36Z ERROR codex_core::tools::router: error=patch rejected: "
+        "writing outside of the project; rejected by user approval settings\n", 0, 1, time.time(),
+        model_used="gpt-5.6-luna", permission_level="workspace")
+    check("stderr denial -> PermissionDenial", len(_den.permission_denials) == 1 and _den.permission_denials[0].tool_name == "apply_patch")
+    _deg = _ad._build_send_result(  # noqa: SLF001
+        _spec, [ev_msg, ev_turn], "ERROR patch rejected: writing is blocked by read-only sandbox; rejected by user approval settings\n",
+        0, 1, time.time(), model_used="gpt-5.6-luna", permission_level="workspace")
+    check("read-only degrade note", any("READ-ONLY" in n for n in _deg.notes))
+    _fail = _ad._build_send_result(  # noqa: SLF001
+        _spec, [{"type": "item.completed", "item": {"id": "e", "type": "error", "message": "The 'gpt-9' model is not supported when using Codex with a ChatGPT account."}},
+                {"type": "turn.failed", "error": {"message": "invalid_request_error"}}], "", 1, 1, time.time(),
+        model_used="gpt-9", permission_level="workspace")
+    check("model-unavailable classified", _fail.safety_kind == "model_unavailable" and "(no reply" in _fail.response)
+
+    print("\n=== synthetic registry v3 migration ===")
+    from claude_squared import registry as R
+    raw_registry = {
+        "version": 2,
+        "pairs": {
+            "legacy-claude": {
+                "session_id": "00000000-0000-4000-8000-000000000001",
+                "model": "claude-opus-5[1m]", "permission_mode": "bypassPermissions",
+                "effort": "xhigh", "purpose": "synthetic migration fixture",
+            },
+            "legacy-codex": {
+                "session_id": "00000000-0000-4000-8000-000000000002",
+                "model": "gpt-5.6-luna", "permission_mode": "acceptEdits", "effort": "high",
+            },
+        },
+    }
+    registry_path = R.registry_path()
+    registry_path.write_text(json.dumps(raw_registry), encoding="utf-8")
+    original_bytes = registry_path.read_bytes()
+    reg = R.load()
+    disk = json.loads(registry_path.read_text(encoding="utf-8"))
+    check("version bumped to 3 in memory + on disk", reg.version == 3 and disk.get("version") == 3)
+    check("every fixture pair still loads", set(reg.pairs) == set(raw_registry["pairs"]))
+    check("legacy name inferred from key", reg.pairs["legacy-claude"].name == "legacy-claude")
+    check("model tier migrated", reg.pairs["legacy-claude"].model == "claude-opus-5"
+          and reg.pairs["legacy-claude"].context_window == "1m")
+    check("permissions normalized", reg.pairs["legacy-claude"].permission_mode == "unrestricted"
+          and reg.pairs["legacy-codex"].permission_mode == "workspace")
+    check("backends inferred", reg.pairs["legacy-claude"].backend == "claude"
+          and reg.pairs["legacy-codex"].backend == "codex")
+    check("migration preserves original backup", registry_path.with_name("registry.v2.backup.json").read_bytes() == original_bytes)
+    R.load()
+    check("repeated load preserves backup", registry_path.with_name("registry.v2.backup.json").read_bytes() == original_bytes)
+
+
+with offline_fixtures() as fixture_root:
+    run_unit_checks(fixture_root)
+
 
 # ===========================================================================
 # LIVE

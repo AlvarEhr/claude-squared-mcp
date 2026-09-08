@@ -23,6 +23,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -48,6 +49,7 @@ from claude_squared.models import (
 )
 from claude_squared.registry import logs_dir
 from claude_squared.runtime import ToolCounter
+from claude_squared.tool_details import save_codex_item
 
 
 WARNING_THRESHOLD = 0.60
@@ -600,11 +602,13 @@ def resync_history_after_truncate(thread_id: str, cut_ordinal: int, path: Path) 
         try:
             with con:
                 for table in ("thread_items", "thread_turns", "thread_realtime_items"):
-                    try:
-                        con.execute(f"delete from {table} where thread_id=? and rollout_ordinal>=?",
-                                    (thread_id, cut_ordinal))
-                    except sqlite3.Error:
-                        pass  # table shape may differ across versions
+                    exists = con.execute("select 1 from sqlite_master where type='table' and name=?", (table,)).fetchone()
+                    if not exists and table == "thread_realtime_items":
+                        continue  # optional on older Codex builds
+                    # Any incompatible required table/column must roll back
+                    # all deletes, without advancing the projection cursor.
+                    con.execute(f"delete from {table} where thread_id=? and rollout_ordinal>=?",
+                                (thread_id, cut_ordinal))
                 n = con.execute(
                     "update thread_history_projection_state set next_rollout_ordinal=?, "
                     "next_rollout_byte_offset=? where thread_id=?",
@@ -1145,6 +1149,7 @@ class CodexAdapter(PairAdapter):
         start_line = line_count + 1
         # Item ids seen so we can tag completions with the same T-N.
         tags: dict[str, str] = {}
+        run_id = task_id or uuid.uuid4().hex
 
         log_lock = threading.Lock()
 
@@ -1225,7 +1230,7 @@ class CodexAdapter(PairAdapter):
                         events.append(ev)
                     _touch()
                     if log:
-                        for out_line in self._format_event(ev, counter, tags):
+                        for out_line in self._format_event(ev, counter, tags, detail_dir=log_dir, run_id=run_id):
                             _log(out_line)
                     if on_event is not None:
                         try:
@@ -1307,7 +1312,8 @@ class CodexAdapter(PairAdapter):
             return 0
 
     @staticmethod
-    def _format_event(ev: dict, counter: ToolCounter | None, tags: dict[str, str]) -> list[str]:
+    def _format_event(ev: dict, counter: ToolCounter | None, tags: dict[str, str], *,
+                      detail_dir: Path | None = None, run_id: str | None = None) -> list[str]:
         """Codex ``--json`` event → main.log lines (T-N tagged like Claude's)."""
         ts = datetime.now().strftime("%H:%M:%S")
         t = ev.get("type")
@@ -1339,7 +1345,9 @@ class CodexAdapter(PairAdapter):
                     tags[iid] = tag
                     out.append(f"[{ts}] [{tag}] [tool_use] {ity}({CodexAdapter._item_preview(it)})")
                 else:
-                    tag = tags.get(iid) or (counter.id_for(iid) if counter else "T-?")
+                    # Codex item IDs can repeat in the next exec invocation.
+                    # Only this run's map may correlate a completion.
+                    tag = tags.get(iid, "T-?")
                     if tag == "T-?" and counter:
                         tag = counter.next_id_for(iid, tool_name=str(ity))
                         tags[iid] = tag
@@ -1352,6 +1360,11 @@ class CodexAdapter(PairAdapter):
                     preview = str(res).replace("\n", " / ")[:160]
                     exit_s = f"exit {it.get('exit_code')} " if it.get("exit_code") is not None else ""
                     out.append(f"[{ts}] [{tag}] [tool_result{err}] {exit_s}{preview}")
+                if detail_dir is not None and tag != "T-?":
+                    try:
+                        save_codex_item(detail_dir, tag, it, completed=t == "item.completed", run_id=run_id)
+                    except OSError as exc:
+                        out.append(f"[{ts}] [tool detail unavailable] {type(exc).__name__}")
         elif t == "turn.completed":
             u = ev.get("usage") or {}
             out.append(f"[{ts}] === TURN COMPLETED (in {u.get('input_tokens', 0):,} / cached "

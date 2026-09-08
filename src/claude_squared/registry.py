@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 # valid JSON. Writes through ``locked_registry`` are refused while a path is
 # in here — see ``_load_unlocked``.
 _CORRUPT: set[str] = set()
+_READ_ONLY_REASONS: dict[str, str] = {}
 
 
 def claude_home() -> Path:
@@ -78,6 +79,19 @@ def agents_dir() -> Path:
 REGISTRY_VERSION = 3
 
 
+def _unsafe_registry(path: Path, reason: str) -> None:
+    """Keep the original bytes and prevent a partial view from being saved."""
+    if str(path) not in _CORRUPT:
+        try:
+            stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+            path.with_name(f"registry.corrupt-{stamp}.json").write_bytes(path.read_bytes())
+        except OSError:
+            pass
+    _CORRUPT.add(str(path))
+    _READ_ONLY_REASONS[str(path)] = reason
+    logger.warning("Registry %s: %s; refusing writes until repaired", path, reason)
+
+
 def _load_unlocked() -> Registry:
     """Read + validate the registry. Always called under the file lock.
 
@@ -92,47 +106,52 @@ def _load_unlocked() -> Registry:
     path = registry_path()
     if not path.exists():
         _CORRUPT.discard(str(path))
+        _READ_ONLY_REASONS.pop(str(path), None)
         return Registry()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
-        # v0.13.0 (caught by the first Codex pair's review): a corrupt file used
-        # to read as an EMPTY registry, and the next mutation would then
-        # atomically replace it with that empty view — every pair gone. Now:
-        # keep a copy of the bad file once, remember that this load was a
-        # fallback, and let ``locked_registry`` refuse to write over it.
-        try:
-            bad = path.with_name(f"registry.corrupt-{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.json")
-            if not any(path.parent.glob("registry.corrupt-*.json")):
-                bad.write_text(path.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
-        except Exception:
-            pass
-        _CORRUPT.add(str(path))
-        logger.warning("registry.json is not valid JSON (%s); treating as empty for reads and "
-                       "REFUSING writes until it is fixed or restored", e)
+    except (json.JSONDecodeError, UnicodeError) as e:
+        _unsafe_registry(path, f"not valid UTF-8 JSON ({e})")
         return Registry()
-    _CORRUPT.discard(str(path))
+    if not isinstance(data, dict):
+        _unsafe_registry(path, "the registry root must be an object")
+        return Registry()
     # Migration: inject dict-key as `name` for legacy entries that omit it.
-    pairs_obj = data.get("pairs") or {}
-    if isinstance(pairs_obj, dict):
-        for key, val in list(pairs_obj.items()):
-            if isinstance(val, dict) and "name" not in val:
-                val["name"] = key
+    pairs_obj = data.get("pairs", {})
+    if not isinstance(pairs_obj, dict):
+        _unsafe_registry(path, "pairs must be an object")
+        return Registry()
+    for key, val in pairs_obj.items():
+        if isinstance(val, dict) and "name" not in val:
+            val["name"] = key
+    reasons: list[str] = []
     try:
-        on_disk_version = int(data.get("version", 2) or 2)
+        raw_version = data.get("version", 2)
+        if isinstance(raw_version, bool) or str(raw_version) != str(int(raw_version)):
+            raise ValueError("version must be an integer")
+        on_disk_version = int(raw_version)
+        if on_disk_version < 1:
+            raise ValueError("version must be positive")
     except (TypeError, ValueError):
         on_disk_version = 2
-    try:
-        reg = Registry.model_validate(data)
-    except Exception:
-        # Last-resort: skip malformed entries
-        cleaned: dict = {}
-        for key, val in pairs_obj.items():
-            try:
-                cleaned[key] = PairSpec.model_validate({**val, "name": val.get("name", key)})
-            except Exception:
-                continue
-        reg = Registry(version=on_disk_version, pairs=cleaned)
+        reasons.append("invalid registry version")
+    if on_disk_version > REGISTRY_VERSION:
+        reasons.append(f"version {on_disk_version} is newer than supported version {REGISTRY_VERSION}")
+    cleaned: dict[str, PairSpec] = {}
+    for key, val in pairs_obj.items():
+        try:
+            spec = PairSpec.model_validate(val)
+            if spec.name != key:
+                raise ValueError("pair name does not match its registry key")
+            cleaned[key] = spec
+        except (TypeError, ValueError):
+            reasons.append(f"invalid pair entry {key!r}")
+    reg = Registry.model_validate({**data, "version": on_disk_version, "pairs": cleaned})
+    if reasons:
+        _unsafe_registry(path, "; ".join(reasons))
+        return reg
+    _CORRUPT.discard(str(path))
+    _READ_ONLY_REASONS.pop(str(path), None)
     if on_disk_version < REGISTRY_VERSION:
         reg.version = REGISTRY_VERSION
         try:
@@ -145,15 +164,25 @@ def _load_unlocked() -> Registry:
             if not backup.exists():
                 backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
             _save_unlocked(reg)
-        except Exception:
+        except OSError:
             pass  # read-only media etc. — in-memory migration still applies
     return reg
 
 
 def _save_unlocked(reg: Registry) -> None:
     path = registry_path()
+    if str(path) in _CORRUPT:
+        raise PairError(f"refusing to write {path}: {_READ_ONLY_REASONS.get(str(path), 'unsafe registry')}. "
+                        "Repair or restore the original registry before retrying.")
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(reg.model_dump_json(indent=2, exclude_none=True), encoding="utf-8")
+    data = reg.model_dump(mode="json", exclude_none=True)
+    full = reg.model_dump(mode="json")
+    for key in reg.model_extra or {}:
+        data[key] = full[key]
+    for name, spec in reg.pairs.items():
+        for key in spec.model_extra or {}:
+            data["pairs"][name][key] = full["pairs"][name][key]
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
     os.replace(tmp, path)
 
 
@@ -163,17 +192,16 @@ def locked_registry() -> Iterator[Registry]:
     lock = FileLock(str(lock_path()), timeout=30)
     with lock:
         reg = _load_unlocked()
+        if str(registry_path()) in _CORRUPT:
+            raise PairError(
+                f"refusing to write {registry_path()}: "
+                f"{_READ_ONLY_REASONS.get(str(registry_path()), 'unsafe registry')}. "
+                "Repair or restore the original file; a backup is kept as registry.corrupt-*.json."
+            )
         before = reg.model_dump_json()
         yield reg
         after = reg.model_dump_json()
         if before != after:
-            if str(registry_path()) in _CORRUPT:
-                raise PairError(
-                    f"refusing to write {registry_path()}: the file on disk is not valid JSON "
-                    f"and writing would replace every registered pair with this empty view. "
-                    f"Fix it by hand or restore it (a copy was kept as registry.corrupt-*.json; "
-                    f"the pre-0.13 backup is registry.v2.backup.json), then retry."
-                )
             _save_unlocked(reg)
 
 
