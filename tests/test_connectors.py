@@ -232,6 +232,18 @@ class ConnectorTests(unittest.TestCase):
             self.assertEqual(R.get_pair("source").mcp_whitelist, ["probe"])
             R.remove_pair("source")
 
+    def test_stored_pair_selection_keeps_the_pairs_allowed_tools(self):
+        # Astra review catch: a stored ['pair'] must count as "no connectors",
+        # so the pair's own allow-list still reaches the CLI on spawn.
+        spec = PairSpec(name="legacy", session_id="s", cwd=str(self.directory),
+                        mcp_whitelist=["pair"], allowed_tools=["Bash(git status)", "Read"])
+        args = CL.ClaudeAdapter()._common_create_args(spec)
+        self.assertIn("--allowed-tools", args)
+        self.assertIn("Bash(git status) Read", args)
+        self.assertIn("--strict-mcp-config", args)
+        self.assertNotIn("--allowedTools", args)
+        self.assertEqual(N.claude_init_notes(["pair"], []), [])
+
     def test_stored_pair_selection_is_skipped_at_spawn_not_fatal(self):
         # A whitelist saved before 0.15.0 may contain 'pair' (it was silently
         # ignored then). Spawning must not fail over it: skip it with a note,

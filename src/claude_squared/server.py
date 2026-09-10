@@ -3662,7 +3662,10 @@ _HANDOFF_PROBE = (
 
 
 def _handoff_message(source: PairSpec, level: str, briefing: str | None,
-                     probe: str | None) -> str:
+                     probe: str | None, instructions: str | None = None) -> str:
+    """``instructions`` is the source's resolved system prompt, read ONCE
+    before the import by the caller — nothing after the import may fail on a
+    profile file that became unreadable (that would leak the thread)."""
     parts = [
         f"This conversation began in Claude Code (source model: {source.model}); "
         "the history above was imported into this new Codex thread.",
@@ -3671,7 +3674,6 @@ def _handoff_message(source: PairSpec, level: str, briefing: str | None,
         "internals were not carried; attachments and exact native tool calls may be missing.",
         f"The permission level now in force is '{level}' ({permission_native(level, 'codex')}).",
     ]
-    instructions = ClaudeAdapter()._resolve_system_prompt(source)
     if instructions:
         parts.append("The source's pinned instructions follow. They now arrive as a user "
                      "message, not a system instruction:\n" + instructions)
@@ -3784,7 +3786,10 @@ def pair_handoff(
             tier = short_model_label(slug)
             stored_model = (tier if tier in codex_models.CODEX_TIER_ALIASES else slug) \
                 if not typed or typed == "codex" else typed
-            message = _handoff_message(source, level, briefing, probe)
+            # Everything that can fail on the SOURCE side happens before the
+            # import, so a failure here leaves nothing to clean up.
+            instructions = ClaudeAdapter()._resolve_system_prompt(source)  # noqa: SLF001
+            message = _handoff_message(source, level, briefing, probe, instructions)
             path = ClaudeAdapter().transcript_path(source)
             if path is None or not path.is_file():
                 raise PairError(f"Pair '{name}' has no Claude transcript to import")
@@ -3817,8 +3822,17 @@ def pair_handoff(
     thread_id = imported["thread_id"]
     # Belt to the snapshot copy above: if Codex ever hands back a thread that
     # already belongs to a pair, refuse WITHOUT deleting it — it's that pair's.
-    owner = next((s.name for s in reg_mod.load().pairs.values()
-                  if s.backend == "codex" and s.session_id == thread_id), None)
+    # If ownership can't even be established (registry unreadable / lock
+    # timeout), don't delete either — report the id so it's never a silent leak.
+    try:
+        owner = next((s.name for s in reg_mod.load().pairs.values()
+                      if s.backend == "codex" and s.session_id == thread_id), None)
+    except Exception as exc:
+        raise PairError(
+            f"Imported Codex thread {thread_id}, but could not check whether it already belongs to a pair "
+            f"({type(exc).__name__}: {exc}). It was NOT deleted and no pair was registered; if no pair uses it, "
+            f"remove it with: codex delete --force {thread_id}"
+        ) from exc
     if owner is not None:
         raise PairError(f"Codex returned thread {thread_id}, which already belongs to pair '{owner}'; "
                         "refusing to register a second pair on it (nothing was deleted).")
@@ -3866,7 +3880,7 @@ def pair_handoff(
                           "(maximum reasoning plus automatic task delegation).")
     if source.allowed_invocations is not None:
         omitted.append("allowed_invocations")  # pair_invoke doesn't exist on Codex at all — nothing to warn about
-    if ClaudeAdapter()._resolve_system_prompt(source):  # noqa: SLF001
+    if instructions:
         capability.append("The source's pinned instructions are delivered as the first user message, not as a "
                           "system instruction — the model weighs them less firmly than before.")
     if level == "plan":

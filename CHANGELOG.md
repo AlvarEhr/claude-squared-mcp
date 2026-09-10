@@ -45,7 +45,11 @@ rule: a running MCP process keeps the code it loaded).
   (`handoff_from`: source name, backend, session, model, import id, time,
   omissions).
 - **Per-pair MCP connectors on both backends** (`mcp_whitelist` on
-  `pair_create` / `pair_update`): nothing is loaded unless a pair names it.
+  `pair_create` / `pair_update`): a pair gets no MCP tools unless it names
+  the servers. On Claude, selecting only local servers keeps strict mode (only
+  they start); selecting a claude.ai connector or plugin drops strict mode, so
+  every configured server starts in the background with only the selected
+  ones' tools exposed. Codex pairs start only the selected servers.
   Claude pairs get local servers from your Claude config (user, local and
   project `.mcp.json` scope) and claude.ai cloud connectors; Codex pairs get
   servers from `~/.codex/config.toml`. This MCP's own `pair` server is never

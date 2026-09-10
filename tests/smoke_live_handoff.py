@@ -250,6 +250,7 @@ finally:
     for tid in sorted(THREADS):
         r = subprocess.run([exe, "delete", "--force", tid], capture_output=True, text=True, timeout=60)
         print(f"    codex delete {tid[:8]}: {(r.stdout or r.stderr).strip()[:80]}")
+        check(f"deleted test thread {tid[:8]}", r.returncode == 0, r.stderr or r.stdout)
     proj = _REAL_HOME / "projects" / encode_cwd_for_project(str(WS))
     if proj.exists() and all(p.suffix == ".jsonl" or p.is_dir() for p in proj.iterdir()):
         import shutil

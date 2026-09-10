@@ -209,7 +209,7 @@ class ClaudeAdapter(PairAdapter):
                  "-p", prompt]
 
         result_json = self._run_print(args, timeout_seconds=300, pair_name=spec.name, cwd=spec.cwd,
-                                      **({"connector_spec": spec} if spec.mcp_whitelist else {}))
+                                      **({"connector_spec": spec} if connectors.effective(spec.mcp_whitelist) else {}))
         return CreateResult(
             name=spec.name,
             session_id=result_json.get("session_id", spec.session_id),
@@ -277,7 +277,7 @@ class ClaudeAdapter(PairAdapter):
         mark_task_executing(task_id)
         result_json = self._run_print(args, timeout_seconds=timeout_seconds,
                                       pair_name=spec.name, cwd=spec.cwd,
-                                      **({"connector_spec": spec} if spec.mcp_whitelist else {}))
+                                      **({"connector_spec": spec} if connectors.effective(spec.mcp_whitelist) else {}))
         return self._build_send_result(spec, result_json)
 
     def compact(self, spec: PairSpec, steering_prompt: str | None = None,
@@ -324,7 +324,7 @@ class ClaudeAdapter(PairAdapter):
         args += self._mcp_args(spec)
         result_json = self._run_print(
             args, timeout_seconds=timeout_seconds, pair_name=spec.name, cwd=spec.cwd,
-            **({"connector_spec": spec} if spec.mcp_whitelist else {})
+            **({"connector_spec": spec} if connectors.effective(spec.mcp_whitelist) else {})
         )
         new_sid = result_json.get("session_id")
         if not new_sid or new_sid == spec.session_id:
@@ -430,7 +430,7 @@ class ClaudeAdapter(PairAdapter):
         if sp_text:
             args += ["--append-system-prompt", sp_text]
 
-        if spec.allowed_tools and not spec.mcp_whitelist:
+        if spec.allowed_tools and not connectors.effective(spec.mcp_whitelist):
             args += ["--allowed-tools", " ".join(spec.allowed_tools)]
 
         return args
@@ -457,7 +457,7 @@ class ClaudeAdapter(PairAdapter):
     def _run_print(self, args: list[str], *, timeout_seconds: int, pair_name: str,
                    cwd: str | None = None, connector_spec: PairSpec | None = None) -> dict:
         cli = _claude_executable()
-        if connector_spec is not None and connector_spec.mcp_whitelist:
+        if connector_spec is not None and connectors.effective(connector_spec.mcp_whitelist):
             args = list(args)
             args[args.index("--output-format") + 1] = "stream-json"
             args.append("--verbose")
@@ -496,7 +496,7 @@ class ClaudeAdapter(PairAdapter):
                 exit_code=proc.returncode,
             )
         try:
-            if connector_spec is not None and connector_spec.mcp_whitelist:
+            if connector_spec is not None and connectors.effective(connector_spec.mcp_whitelist):
                 events = []
                 for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
                     try:
@@ -565,7 +565,7 @@ class ClaudeAdapter(PairAdapter):
                 events.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-        if spec.mcp_whitelist:
+        if connectors.effective(spec.mcp_whitelist):
             self._attach_mcp_init(events)
         return events
 

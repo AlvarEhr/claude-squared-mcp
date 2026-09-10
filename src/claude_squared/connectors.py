@@ -191,10 +191,21 @@ def select(names: list[str] | None, backend: str, cwd: str | None = None,
     return selected, notes
 
 
+def effective(names: list[str] | None) -> list[str]:
+    """The selection that can actually load: stored recursion names removed.
+
+    Every "does this pair have connectors?" decision must use this, not the
+    raw list — otherwise a stored ['pair'] (possible from before 0.15.0) would
+    route the pair's allowed_tools into the connector path, where they are
+    only emitted when a real connector is selected, and the pair would lose
+    its approved tools (Astra review catch)."""
+    return [name for name in names or [] if not _is_recursion(name)]
+
+
 def claude_args(names: list[str] | None, level: str, cwd: str | None = None,
                 allowed_tools: list[str] | None = None) -> list[str]:
-    # Spawn path: a stored recursion name is skipped by select(), never fatal.
-    names = [name for name in names or [] if not _is_recursion(name)] or None
+    # Spawn path: a stored recursion name is skipped, never fatal.
+    names = effective(names) or None
     available = inventory("claude", cwd) if names else []
     selected, _notes = select(names, "claude", cwd, available=available)
     inherited = any(entry.kind != "local" for entry in selected)
@@ -240,6 +251,7 @@ def codex_args(names: list[str] | None, level: str, cwd: str | None = None) -> l
 
 
 def claude_init_notes(names: list[str] | None, servers: list[dict] | None) -> list[str]:
+    names = effective(names)
     statuses = {_key(row["name"]): row.get("status") for row in servers or []
                 if isinstance(row, dict) and isinstance(row.get("name"), str)}
     return [f"connector {name} is not connected ({statuses.get(_key(name)) or 'missing from system/init'})"

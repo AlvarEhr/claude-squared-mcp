@@ -25,11 +25,18 @@ def probe_read() -> str:
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True})
 def probe_write(name: str, text: str) -> str:
-    """Write text to a file in the probe output directory."""
+    """Write text to a file in the probe output directory (a bare file name only)."""
+    # Plain file names only: an absolute path would replace OUT in the join and
+    # '..' would escape it — this process is not sandboxed by either backend.
+    if not name or Path(name).name != name or name in (".", ".."):
+        return f"PROBE-WRITE-FAILED invalid name {name!r}: pass a bare file name"
     try:
         OUT.mkdir(parents=True, exist_ok=True)
-        (OUT / name).write_text(text, encoding="utf-8")
-        return f"PROBE-WRITE-OK {OUT / name}"
+        target = (OUT / name).resolve()
+        if target.parent != OUT.resolve():
+            return f"PROBE-WRITE-FAILED {name!r} resolves outside the probe output directory"
+        target.write_text(text, encoding="utf-8")
+        return f"PROBE-WRITE-OK {target}"
     except OSError as exc:
         return f"PROBE-WRITE-FAILED {type(exc).__name__}: {exc}"
 

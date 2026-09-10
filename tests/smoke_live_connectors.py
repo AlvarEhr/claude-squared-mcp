@@ -1,11 +1,13 @@
 """Live checks for per-pair MCP connectors on BOTH backends (costs a little usage).
 
-Uses the throwaway server tests/fixtures/mcp_probe_server.py ("cs-probe":
+Uses the throwaway server tests/fixtures/mcp_probe_server.py (registered as
+"cs-probe-<random>", a fresh name per run:
 probe_read is annotated read-only, probe_write writes a file OUTSIDE the pair
 workspace). Claude sees it through a project-scope ``.mcp.json`` in the scratch
 workspace — no change to your Claude config. Codex only sees servers in its
-own config, so the run registers ``cs-probe`` with ``codex mcp add`` and ALWAYS
-removes it at the end (the user approved this, 2026-09-10).
+own config, so the run registers that unique name with ``codex mcp add`` —
+refusing if it somehow exists, since ``add`` overwrites — and ALWAYS removes
+exactly that entry at the end (the user approved this, 2026-09-10).
 
 Policy under test (confirmed by the user): read-only / plan / workspace —
 Codex runs only read-only-annotated tools, Claude runs none (each blocked call
@@ -21,6 +23,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,13 +49,14 @@ from claude_squared.errors import PairError  # noqa: E402
 PASSED = FAILED = 0
 THREADS: set[str] = set()
 FIXTURE = ROOT / "tests" / "fixtures" / "mcp_probe_server.py"
+SRV = f"cs-probe-{uuid.uuid4().hex[:8]}"  # unique per run: `codex mcp add` overwrites same-named entries
 WS = _TMP_HOME / "ws"
 OUT = _TMP_HOME / "probe-out"       # outside WS on purpose
 WS.mkdir()
 OUT.mkdir()
 PY = sys.executable
 CODEX = C.codex_executable()
-ASK = ("Use the MCP tools from the 'cs-probe' server: call probe_read, then call probe_write with "
+ASK = (f"Use the MCP tools from the '{SRV}' server: call probe_read, then call probe_write with "
        "name='{n}.txt' and text='hello'. Use no other tools. Report each tool's exact result, or say "
        "exactly why a call was not made.")
 
@@ -99,15 +103,19 @@ def remember_threads() -> None:
 
 
 # Claude: project-scope definition in the scratch workspace.
-(WS / ".mcp.json").write_text(json.dumps({"mcpServers": {"cs-probe": {
+(WS / ".mcp.json").write_text(json.dumps({"mcpServers": {SRV: {
     "command": PY, "args": [str(FIXTURE)], "env": {"PROBE_OUT_DIR": str(OUT)}}}}), encoding="utf-8")
 print(f"(temp CLAUDE_HOME {_TMP_HOME})")
 codex_registered = False
 try:
-    r = subprocess.run([CODEX, "mcp", "add", "cs-probe", "--env", f"PROBE_OUT_DIR={OUT}", "--", PY, str(FIXTURE)],
+    existing = json.loads(subprocess.run([CODEX, "mcp", "list", "--json"], capture_output=True, text=True,
+                                         timeout=60, check=True).stdout)
+    if any(row.get("name") == SRV for row in existing):
+        raise RuntimeError(f"{SRV} already exists in the Codex config; refusing to overwrite it")
+    r = subprocess.run([CODEX, "mcp", "add", SRV, "--env", f"PROBE_OUT_DIR={OUT}", "--", PY, str(FIXTURE)],
                        capture_output=True, text=True, timeout=60)
     codex_registered = r.returncode == 0
-    check("registered cs-probe with codex (temporary)", codex_registered, r.stderr or r.stdout)
+    check(f"registered {SRV} with codex (temporary)", codex_registered, r.stderr or r.stdout)
 
     print("\n=== 1. default: a pair with no connectors gets none ===")
     out = call(S.pair_create, name="cn-none", purpose="no connectors", model="haiku", permission_mode="auto", cwd=str(WS))
@@ -121,7 +129,7 @@ try:
 
     print("\n=== 3. Claude read-only: connector loaded, every call denied and reported ===")
     out = call(S.pair_create, name="cn-claude", purpose="claude connector", model="haiku", permission_mode="read-only",
-               cwd=str(WS), mcp_whitelist=["cs-probe", "does-not-exist"])
+               cwd=str(WS), mcp_whitelist=[SRV, "does-not-exist"])
     check("create with one real and one unknown connector", "Created 'cn-claude'" in out, out)
     check("unknown connector warned, not activated", "does-not-exist" in out and "not activated" in out, out)
     reply, res, shown = send("cn-claude", ASK.format(n="claude-ro"))
@@ -136,7 +144,7 @@ try:
     check("write ran at auto", written("claude-auto"), shown)
 
     print("\n=== 5. Claude: adding a connector later via pair_update (no pair_clear) ===")
-    out = call(S.pair_update, "cn-none", mcp_whitelist=["cs-probe"])
+    out = call(S.pair_update, "cn-none", mcp_whitelist=[SRV])
     check("update whitelist", "ERROR" not in out, out)
     reply, res, shown = send("cn-none", ASK.format(n="late"))
     check("connector usable after update", "PROBE-READ-OK" in reply and written("late"), shown)
@@ -144,7 +152,7 @@ try:
     if codex_registered:
         print("\n=== 6. Codex read-only: read-only-annotated tool runs, write refused ===")
         out = call(S.pair_create, name="cn-codex", purpose="codex connector", model="luna", effort="low",
-                   permission_mode="read-only", cwd=str(WS), mcp_whitelist=["cs-probe"])
+                   permission_mode="read-only", cwd=str(WS), mcp_whitelist=[SRV])
         remember_threads()
         check("create codex pair with connector", "Created 'cn-codex'" in out, out)
         reply, res, shown = send("cn-codex", ASK.format(n="codex-ro"))
@@ -160,19 +168,19 @@ try:
         # Read-only FIRST: at read-only Claude pre-approves no connector tools,
         # so the real Gmail connector can be loaded without any call running.
         out = call(S.pair_update, "cn-claude", permission_mode="read-only",
-                   mcp_whitelist=["cs-probe", "claude_ai_Gmail"])
+                   mcp_whitelist=[SRV, "claude_ai_Gmail"])
         check("update to read-only with a cloud connector", "ERROR" not in out, out)
         reply, res, shown = send("cn-claude", "Do not call any tools. List the MCP server names whose tools you "
                                               "can see (tool names look like mcp__<server>__<tool>), one per line.")
         check("cloud connector visible alongside the local one",
-              "cs-probe" in reply.replace("cs_probe", "cs-probe") and "gmail" in reply.lower(), shown)
+              (SRV in reply or SRV.replace("-", "_") in reply) and "gmail" in reply.lower(), shown)
         check("pair's own tools never visible", "mcp__pair__" not in reply, shown)
         out = call(S.pair_handoff, "cn-claude", model="luna", effort="low", permission_mode="read-only",
                    probe="Reply with exactly: HANDOFF-OK")
         remember_threads()
         new = R.load().pairs.get("cn-claude-codex")
         check("handoff created the pair", new is not None, out)
-        check("cs-probe carried over", bool(new) and "cs-probe" in (new.mcp_whitelist or []),
+        check("test server carried over", bool(new) and SRV in (new.mcp_whitelist or []),
               str(new and new.mcp_whitelist))
         check("Gmail warned as not available", "claude_ai_Gmail" in out and "not activated" in out, out)
         reply, res, shown = send("cn-claude-codex", ASK.format(n="handoff-ro"))
@@ -188,13 +196,19 @@ finally:
         print("   ", call(S.pair_forget, name, archive=False))
     runtime_mod.registry().stop_all()
     if codex_registered:
-        r = subprocess.run([CODEX, "mcp", "remove", "cs-probe"], capture_output=True, text=True, timeout=60)
-        print("    codex mcp remove cs-probe:", (r.stdout or r.stderr).strip()[:120])
-    left = subprocess.run([CODEX, "mcp", "list", "--json"], capture_output=True, text=True, timeout=60).stdout
-    check("cs-probe no longer in the Codex config", "cs-probe" not in left)
+        r = subprocess.run([CODEX, "mcp", "remove", SRV], capture_output=True, text=True, timeout=60)
+        print(f"    codex mcp remove {SRV}:", (r.stdout or r.stderr).strip()[:120])
+        check(f"removed {SRV} from the Codex config", r.returncode == 0, r.stderr or r.stdout)
+    try:
+        left = json.loads(subprocess.run([CODEX, "mcp", "list", "--json"], capture_output=True, text=True,
+                                         timeout=60, check=True).stdout)
+        check(f"{SRV} no longer in the Codex config", all(row.get("name") != SRV for row in left))
+    except (subprocess.CalledProcessError, ValueError) as exc:
+        check("Codex server list readable after cleanup", False, str(exc))
     for tid in sorted(THREADS):
         r = subprocess.run([CODEX, "delete", "--force", tid], capture_output=True, text=True, timeout=60)
         print(f"    codex delete {tid[:8]}: {(r.stdout or r.stderr).strip()[:80]}")
+        check(f"deleted test thread {tid[:8]}", r.returncode == 0, r.stderr or r.stdout)
     proj = _REAL_HOME / "projects" / encode_cwd_for_project(str(WS))
     if proj.exists():
         import shutil

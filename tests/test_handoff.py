@@ -246,6 +246,22 @@ class HandoffTests(unittest.TestCase):
         release.set()
         worker.join(5)
 
+    def test_ownership_check_failure_reports_thread_without_deleting(self):
+        # Astra review catch: a registry failure AFTER a successful import must
+        # neither leak the thread silently nor delete one that might be owned.
+        real_load = R.load
+
+        def load_after_import():
+            if self.imports:
+                raise OSError("registry unreadable")
+            return real_load()
+
+        with patch.object(R, "load", side_effect=load_after_import):
+            with self.assertRaisesRegex(PairError, "codex-target.*NOT deleted"):
+                self.handoff()
+        self.deleter.assert_not_called()
+        self.assertNotIn("source-codex", real_load().pairs)
+
     def test_stored_pair_connector_does_not_block_handoff(self):
         R.update_pair("source", mcp_whitelist=["pair"])
         result = self.handoff()

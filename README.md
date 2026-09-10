@@ -336,7 +336,9 @@ turn opens. Codex pairs run one process per turn and have no self-woken machiner
 
 ## Connectors (MCP servers) per pair
 
-A pair loads **no** MCP servers unless you name them — `mcp_whitelist=[...]` on `pair_create` or `pair_update`, on either backend. It's a deliberate per-pair choice: there is no global default for it, and this MCP's own `pair` server can never be selected (recursion). Claude pairs can use local servers from your Claude config (user, local, or the project's `.mcp.json`) and your claude.ai connectors (names as `claude mcp list` shows them, e.g. `"claude.ai Gmail"`, or `claude_ai_Gmail`); Codex pairs can use servers from `~/.codex/config.toml` (`codex mcp list`).
+A pair gets **no** MCP tools unless you name the servers — `mcp_whitelist=[...]` on `pair_create` or `pair_update`, on either backend. It's a deliberate per-pair choice: there is no global default for it, and this MCP's own `pair` server can never be selected (recursion). Claude pairs can use local servers from your Claude config (user, local, or the project's `.mcp.json`) and your claude.ai connectors (names as `claude mcp list` shows them, e.g. `"claude.ai Gmail"`, or `claude_ai_Gmail`); Codex pairs can use servers from `~/.codex/config.toml` (`codex mcp list`).
+
+How a selection is applied differs, and it matters for what runs in the background. With no selection, or only local servers selected, a Claude pair starts in strict mode with exactly those servers' definitions — nothing else starts. Selecting a claude.ai connector or a plugin server requires dropping strict mode: then **every server in your Claude config starts** for that pair (this MCP's `pair` server included), and only the selected servers' tools are exposed to the model — the rest are hidden, not stopped. Codex pairs only ever start the selected servers.
 
 Neither backend sandboxes a connector's own process — once a call is allowed, the connector acts with its own privileges, even from a read-only pair. So **the pair's permission level decides which connector tools run**:
 
