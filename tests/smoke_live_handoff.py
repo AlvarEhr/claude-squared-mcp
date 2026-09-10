@@ -242,13 +242,23 @@ except Exception:
     check("harness ran to completion", False, "crashed; see traceback above")
 finally:
     print("\n=== cleanup ===")
-    remember_threads()
-    for name in list(R.load().pairs):
-        print("   ", call(S.pair_forget, name, archive=False))
-    runtime_mod.registry().stop_all()
+    try:
+        remember_threads()
+        for name in list(R.load().pairs):
+            try:
+                print("   ", call(S.pair_forget, name, archive=False))
+            except Exception as exc:  # keep cleaning the rest
+                check(f"forgot {name}", False, f"{type(exc).__name__}: {exc}")
+        runtime_mod.registry().stop_all()
+    except Exception as exc:
+        check("pair cleanup", False, f"{type(exc).__name__}: {exc}")
     exe = C.codex_executable()
     for tid in sorted(THREADS):
-        r = subprocess.run([exe, "delete", "--force", tid], capture_output=True, text=True, timeout=60)
+        try:  # a timeout/OS error on one thread must not skip the others
+            r = subprocess.run([exe, "delete", "--force", tid], capture_output=True, text=True, timeout=60)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            check(f"deleted test thread {tid[:8]}", False, f"{type(exc).__name__}: {exc}")
+            continue
         print(f"    codex delete {tid[:8]}: {(r.stdout or r.stderr).strip()[:80]}")
         check(f"deleted test thread {tid[:8]}", r.returncode == 0, r.stderr or r.stdout)
     proj = _REAL_HOME / "projects" / encode_cwd_for_project(str(WS))

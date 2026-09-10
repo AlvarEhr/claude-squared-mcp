@@ -191,24 +191,39 @@ except Exception:
     check("harness ran to completion", False, "crashed; see traceback above")
 finally:
     print("\n=== cleanup ===")
-    remember_threads()
-    for name in list(R.load().pairs):
-        print("   ", call(S.pair_forget, name, archive=False))
-    runtime_mod.registry().stop_all()
-    if codex_registered:
-        r = subprocess.run([CODEX, "mcp", "remove", SRV], capture_output=True, text=True, timeout=60)
-        print(f"    codex mcp remove {SRV}:", (r.stdout or r.stderr).strip()[:120])
-        check(f"removed {SRV} from the Codex config", r.returncode == 0, r.stderr or r.stdout)
+
+    def cleanup_run(label: str, argv: list[str]) -> "subprocess.CompletedProcess | None":
+        """One cleanup step; a timeout/OS error is counted and the rest continue."""
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            check(label, False, f"{type(exc).__name__}: {exc}")
+            return None
+        print(f"    {label}: {(r.stdout or r.stderr).strip()[:120]}")
+        check(label, r.returncode == 0, r.stderr or r.stdout)
+        return r
+
     try:
-        left = json.loads(subprocess.run([CODEX, "mcp", "list", "--json"], capture_output=True, text=True,
-                                         timeout=60, check=True).stdout)
-        check(f"{SRV} no longer in the Codex config", all(row.get("name") != SRV for row in left))
-    except (subprocess.CalledProcessError, ValueError) as exc:
-        check("Codex server list readable after cleanup", False, str(exc))
+        remember_threads()
+        for name in list(R.load().pairs):
+            try:
+                print("   ", call(S.pair_forget, name, archive=False))
+            except Exception as exc:  # keep cleaning the rest
+                check(f"forgot {name}", False, f"{type(exc).__name__}: {exc}")
+        runtime_mod.registry().stop_all()
+    except Exception as exc:
+        check("pair cleanup", False, f"{type(exc).__name__}: {exc}")
+    if codex_registered:
+        cleanup_run(f"removed {SRV} from the Codex config", [CODEX, "mcp", "remove", SRV])
+    listing = cleanup_run("Codex server list readable after cleanup", [CODEX, "mcp", "list", "--json"])
+    if listing is not None and listing.returncode == 0:
+        try:
+            left = json.loads(listing.stdout)
+            check(f"{SRV} no longer in the Codex config", all(row.get("name") != SRV for row in left))
+        except ValueError as exc:
+            check("Codex server list parses after cleanup", False, str(exc))
     for tid in sorted(THREADS):
-        r = subprocess.run([CODEX, "delete", "--force", tid], capture_output=True, text=True, timeout=60)
-        print(f"    codex delete {tid[:8]}: {(r.stdout or r.stderr).strip()[:80]}")
-        check(f"deleted test thread {tid[:8]}", r.returncode == 0, r.stderr or r.stdout)
+        cleanup_run(f"deleted test thread {tid[:8]}", [CODEX, "delete", "--force", tid])
     proj = _REAL_HOME / "projects" / encode_cwd_for_project(str(WS))
     if proj.exists():
         import shutil

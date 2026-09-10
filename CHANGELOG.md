@@ -53,7 +53,8 @@ rule: a running MCP process keeps the code it loaded).
   Claude pairs get local servers from your Claude config (user, local and
   project `.mcp.json` scope) and claude.ai cloud connectors; Codex pairs get
   servers from `~/.codex/config.toml`. This MCP's own `pair` server is never
-  loadable (recursion).
+  selectable and its tools are always excluded (recursion); a whitelist saved
+  before 0.15.0 that names it is skipped with a note instead of failing.
 - **Connector permissions follow the pair's level** (neither backend
   sandboxes a connector's own process, so the level is the guard):
   read-only / plan / workspace — Codex runs only tools the server marks
