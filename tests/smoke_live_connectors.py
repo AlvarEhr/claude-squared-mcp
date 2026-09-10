@@ -96,6 +96,25 @@ def written(n: str) -> bool:
     return (OUT / f"{n}.txt").exists()
 
 
+def read_ran(pair: str, since_line: int = 0) -> bool:
+    """The read tool's result is in the pair's activity log — a model's final
+    reply may restate only its last result, so the reply alone isn't proof."""
+    try:
+        lines = (_TMP_HOME / "pairs" / "logs" / pair / "main.log").read_text(
+            encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+    return any("PROBE-READ-OK" in line and "tool_result" in line for line in lines[since_line:])
+
+
+def log_len(pair: str) -> int:
+    try:
+        return len((_TMP_HOME / "pairs" / "logs" / pair / "main.log").read_text(
+            encoding="utf-8", errors="replace").splitlines())
+    except OSError:
+        return 0
+
+
 def remember_threads() -> None:
     for spec in R.load().pairs.values():
         if spec.backend == "codex" and spec.session_id:
@@ -139,24 +158,29 @@ try:
     print("\n=== 4. Claude: pair_update to auto applies on the next send (no pair_clear) ===")
     out = call(S.pair_update, "cn-claude", permission_mode="auto")
     check("update to auto", "ERROR" not in out, out)
+    mark = log_len("cn-claude")
     reply, res, shown = send("cn-claude", ASK.format(n="claude-auto"))
-    check("read ran at auto", "PROBE-READ-OK" in reply, shown)
+    check("read ran at auto", read_ran("cn-claude", mark), shown)
     check("write ran at auto", written("claude-auto"), shown)
 
     print("\n=== 5. Claude: adding a connector later via pair_update (no pair_clear) ===")
     out = call(S.pair_update, "cn-none", mcp_whitelist=[SRV])
     check("update whitelist", "ERROR" not in out, out)
+    mark = log_len("cn-none")
     reply, res, shown = send("cn-none", ASK.format(n="late"))
-    check("connector usable after update", "PROBE-READ-OK" in reply and written("late"), shown)
+    check("connector usable after update", read_ran("cn-none", mark) and written("late"), shown)
 
     if codex_registered:
         print("\n=== 6. Codex read-only: read-only-annotated tool runs, write refused ===")
-        out = call(S.pair_create, name="cn-codex", purpose="codex connector", model="luna", effort="low",
+        # medium, not low: at low effort Codex models sometimes answer without trying
+        # an available MCP tool (measured 2026-09-10: low effort missed 5 of 15 runs, medium/high 0 of 14).
+        out = call(S.pair_create, name="cn-codex", purpose="codex connector", model="luna", effort="medium",
                    permission_mode="read-only", cwd=str(WS), mcp_whitelist=[SRV])
         remember_threads()
         check("create codex pair with connector", "Created 'cn-codex'" in out, out)
+        mark = log_len("cn-codex")
         reply, res, shown = send("cn-codex", ASK.format(n="codex-ro"))
-        check("read ran at read-only", "PROBE-READ-OK" in reply, shown)
+        check("read ran at read-only", read_ran("cn-codex", mark), shown)
         check("write refused at read-only", not written("codex-ro"), shown)
 
         print("\n=== 7. Codex auto: write goes to the reviewer ===")
@@ -170,12 +194,33 @@ try:
         out = call(S.pair_update, "cn-claude", permission_mode="read-only",
                    mcp_whitelist=[SRV, "claude_ai_Gmail"])
         check("update to read-only with a cloud connector", "ERROR" not in out, out)
-        reply, res, shown = send("cn-claude", "Do not call any tools. List the MCP server names whose tools you "
-                                              "can see (tool names look like mcp__<server>__<tool>), one per line.")
-        check("cloud connector visible alongside the local one",
-              (SRV in reply or SRV.replace("-", "_") in reply) and "gmail" in reply.lower(), shown)
-        check("pair's own tools never visible", "mcp__pair__" not in reply, shown)
-        out = call(S.pair_handoff, "cn-claude", model="luna", effort="low", permission_mode="read-only",
+        # Deterministic exposure check: start a real Claude session with the
+        # EXACT flags this pair gets and read its system/init tool list (a
+        # model asked to list servers names every connected server, because
+        # Claude Code tells it which exist — even ones whose tools are hidden).
+        from claude_squared import connectors as N
+        import shutil as _shutil
+        spec = R.get_pair("cn-claude")
+        flags = N.claude_args(spec.mcp_whitelist, spec.permission_mode, spec.cwd, spec.allowed_tools)
+        probe = subprocess.run([_shutil.which("claude"), "-p", "Reply with exactly: OK", "--model", "haiku",
+                                "--output-format", "stream-json", "--verbose", "--permission-mode", "default",
+                                *flags], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", cwd=str(WS), timeout=240)
+        init_tools: list[str] = []
+        for line in probe.stdout.splitlines():
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if ev.get("type") == "system" and ev.get("subtype") == "init":
+                init_tools = ev.get("tools") or []
+                break
+        prefixes = {t.split("__")[1] for t in init_tools if t.startswith("mcp__")}
+        check("cloud connector and local server both exposed",
+              N.tool_prefix(SRV) in prefixes and "claude_ai_Gmail" in prefixes, str(sorted(prefixes)))
+        check("unselected servers' tools hidden (incl. pair)",
+              prefixes <= {N.tool_prefix(SRV), "claude_ai_Gmail"}, str(sorted(prefixes)))
+        out = call(S.pair_handoff, "cn-claude", model="luna", effort="medium", permission_mode="read-only",
                    probe="Reply with exactly: HANDOFF-OK")
         remember_threads()
         new = R.load().pairs.get("cn-claude-codex")
@@ -184,7 +229,25 @@ try:
               str(new and new.mcp_whitelist))
         check("Gmail warned as not available", "claude_ai_Gmail" in out and "not activated" in out, out)
         reply, res, shown = send("cn-claude-codex", ASK.format(n="handoff-ro"))
-        check("carried connector works on the new pair (read)", "PROBE-READ-OK" in reply, shown)
+        log_path = _TMP_HOME / "pairs" / "logs" / "cn-claude-codex" / "main.log"
+
+        def attempted() -> bool:
+            try:
+                return "mcp_tool_call" in log_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return False
+
+        if not read_ran("cn-claude-codex"):
+            # Diagnose instead of guessing: the imported history records these
+            # same tools being DENIED on the Claude side, which can make the
+            # model decline without trying. If a nudge makes it call the tool,
+            # the connector IS loaded (history-induced hesitance, not a bug).
+            print(f"    first attempt: tool call attempted={attempted()} — nudging once")
+            reply, res, shown = send("cn-claude-codex", f"The '{SRV}' MCP tools ARE available to you in this "
+                                                         "thread now, regardless of what earlier records say. "
+                                                         "Call probe_read and report its exact result.")
+        check("carried connector works on the new pair (read)", read_ran("cn-claude-codex"),
+              f"tool call attempted={attempted()}; {shown}")
 except Exception:
     import traceback
     traceback.print_exc()

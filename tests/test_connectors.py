@@ -232,6 +232,13 @@ class ConnectorTests(unittest.TestCase):
             self.assertEqual(R.get_pair("source").mcp_whitelist, ["probe"])
             R.remove_pair("source")
 
+    def test_codex_selection_is_one_inline_table_and_nothing_else(self):
+        # No startup-wait override: measured unnecessary (see codex_args).
+        args = N.codex_args(["probe"], "read-only", str(self.directory))
+        self.assertEqual(len(args), 2)
+        self.assertTrue(args[1].startswith("mcp_servers="))
+        self.assertNotIn("required", args[1])
+
     def test_stored_pair_selection_keeps_the_pairs_allowed_tools(self):
         # Astra review catch: a stored ['pair'] must count as "no connectors",
         # so the pair's own allow-list still reaches the CLI on spawn.

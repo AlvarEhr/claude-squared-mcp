@@ -247,6 +247,11 @@ def codex_args(names: list[str] | None, level: str, cwd: str | None = None) -> l
         return []
     # A root inline table preserves literal server names containing dots/spaces;
     # the CLI's dotted -c path parser would split such names into nested keys.
+    # (Measured 2026-09-10: a ~1.5 s-to-start Python server was in the tool
+    # catalog 8/8 times at medium effort with or without raising
+    # `mcp_optional_startup_grace_ms`, so no startup-wait override is added —
+    # intermittent "tool not available" replies came from LOW-effort turns
+    # answering without trying the tool, not from loading.)
     return ["-c", "mcp_servers=" + _toml(definitions)]
 
 
