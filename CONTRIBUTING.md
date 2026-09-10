@@ -55,9 +55,14 @@ of the run.
 
 Live tests exist for the Codex backend — `python tests/smoke_codex.py --live`
 (a temporary `CLAUDE_HOME`, real `codex` auth, ~15 calls on the cheapest
-model) — and for Claude lifecycle races, `python tests/smoke_live_0140.py`
-(a handful of short Opus turns). Both cost real usage; run them before a
-release, not in CI.
+model) — for Claude lifecycle races, `python tests/smoke_live_0140.py`
+(a handful of short Opus turns), for `pair_handoff`,
+`python tests/smoke_live_handoff.py` (Haiku + Luna turns; the size gate uses
+a synthetic oversized session and spends nothing), and for connectors,
+`python tests/smoke_live_connectors.py` (uses the throwaway server in
+`tests/fixtures/mcp_probe_server.py`; it temporarily registers that server
+with `codex mcp add` and always removes it). They cost real usage; run them
+before a release, not in CI.
 
 ## Code organization
 

@@ -126,11 +126,20 @@ A denied action produces a `⛔ PAIR HANDOFF` block in the reply with the pair's
 - **`pair_tool_detail` works** for turns run since 0.14.0: each item's full started/completed events are kept under `logs/<pair>/codex-tool-items/T-N.json`. Older turns only have the log previews and say so.
 - **Unavailable models** (not on your ChatGPT plan) are refused by the API with HTTP 400 — `pair_create` warns when a slug isn't listed in the cache, and a failed turn is labeled `⛔ MODEL UNAVAILABLE`.
 
+### Handing a Claude pair to Codex (`pair_handoff`, 0.15.0)
+
+A pair's backend is fixed, so "switching" a Claude pair to Codex means creating a **new** Codex pair from it — a cross-backend fork; the source is untouched. `pair_handoff(name)` imports a snapshot of the source conversation through Codex's own importer (the same feature as the Codex CLI's `/import`; no model turn), registers it as `<name>-codex`, and runs a first turn made of a handoff notice, your optional `briefing`, and a `probe` question about the prior work, returning the answer so you can check the new pair understood.
+
+What carries over: every user message and reply, and each tool call with its result as a marked record (`[external_agent_tool_call]` / `[external_agent_tool_result]`) of the previous agent's work. What doesn't: the model's reasoning (signed on Claude, encrypted on Codex — it never crosses providers), the content of written or edited files (recorded by path only; the files are on disk), sub-agent internals (description + final report only), and the pairing of parallel tool calls. The pair's pinned instructions arrive as a user message rather than a system instruction. The result lists all of this and asks the calling agent to tell you unless you already know.
+
+Gates: a busy source is refused; a source with a Claude tool allow-list needs an explicit `permission_mode` (Codex can't enforce the allow-list); and the imported history is measured after import and refused at ≥70% of the chosen window, with the numbers for both windows and three remedies — compact the source first, start a fresh Codex pair, or pass `context_window="1m"`. Codex → Claude is not supported yet.
+
 ## Tools
 
 ### Lifecycle
 - `pair_create(name, purpose, model?, effort?, permission_mode?, backend?, context_window?, system_prompt_append?, profile_name?, allowed_tools?, mcp_whitelist?, cwd?, extra_dirs?, persistent?, ultracode?, fallback_model?, allowed_invocations?, backend_options?, initial_message?, session_id?, parent_model?)`
 - `pair_adopt(name, session_id, model?, effort?, permission_mode?, cwd?, backend?, context_window?)` — register an existing claude session / codex thread
+- `pair_handoff(name, new_name?, model?, effort?, permission_mode?, context_window?, briefing?, probe?)` — hand a Claude pair's conversation to a NEW Codex pair (source untouched; see "Handing a Claude pair to Codex")
 - `pair_forget(name, archive=True)` — remove from registry; optionally archives transcript
 
 ### Communication
@@ -325,15 +334,29 @@ silent for a full idle period (10 min) is finalized as `ABANDONED:` by a reaper 
 it can't sit in flight forever; if the work later resumes, a fresh self-woken
 turn opens. Codex pairs run one process per turn and have no self-woken machinery.
 
+## Connectors (MCP servers) per pair
+
+A pair loads **no** MCP servers unless you name them — `mcp_whitelist=[...]` on `pair_create` or `pair_update`, on either backend. It's a deliberate per-pair choice: there is no global default for it, and this MCP's own `pair` server can never be selected (recursion). Claude pairs can use local servers from your Claude config (user, local, or the project's `.mcp.json`) and your claude.ai connectors (names as `claude mcp list` shows them, e.g. `"claude.ai Gmail"`, or `claude_ai_Gmail`); Codex pairs can use servers from `~/.codex/config.toml` (`codex mcp list`).
+
+Neither backend sandboxes a connector's own process — once a call is allowed, the connector acts with its own privileges, even from a read-only pair. So **the pair's permission level decides which connector tools run**:
+
+| Pair's level | Codex | Claude |
+|---|---|---|
+| `read-only`, `plan`, `workspace` | only tools the server marks read-only | none run; each blocked call is reported back (pre-approve individual tools with `allowed_tools`) |
+| `auto` | all tools; Codex's reviewer judges each write | all tools of the selected connectors, pre-approved |
+| `unrestricted` | all tools | all tools |
+
+A selected connector the backend can't see is stored and reported as "not available and not activated" — never an error — and each turn notes a selected connector that failed to start or needs authentication. `pair_fork` keeps the selection; `pair_handoff` carries over the connectors Codex can see and warns about the rest. Connectors are heavy (one can add dozens of tool definitions to a pair's context), so select only what the pair needs.
+
 ## Mid-flight config changes
 
 `pair_update` propagation depends on the field category — three buckets:
 
 | Category | Fields | When change takes effect |
 |---|---|---|
-| Per-send | `model`, `effort`, `permission_mode`, `context_window`, `backend_options`, `ultracode`, `fallback_model` | Next `pair_send` (registry write + runtime eviction → respawn with new values; Codex: every send is a fresh process) |
+| Per-send | `model`, `effort`, `permission_mode`, `context_window`, `backend_options`, `ultracode`, `fallback_model`, `mcp_whitelist` | Next `pair_send` (registry write + runtime eviction → respawn with new values; Codex: every send is a fresh process) |
 | Server-side | `allowed_invocations` | Next `pair_invoke` — no eviction needed (MCP-layer enforcement, not pinned to CLI subprocess). Mutable freely. |
-| Pinned-at-create | `allowed_tools`, `mcp_whitelist`, `system_prompt_append` | **Only after `pair_clear`** — the existing session was started with the OLD values; rotation creates a fresh session with the new pinned config |
+| Pinned-at-create | `allowed_tools`, `system_prompt_append` | **Only after `pair_clear`** — the existing session was started with the OLD values; rotation creates a fresh session with the new pinned config |
 | Pinned-at-spawn | `cwd`, `extra_dirs` | Next spawn after eviction. A Claude `cwd` change ALSO moves the session JSONL across project dirs (rejected with recovery hint if the move fails); Codex threads aren't cwd-keyed |
 
 ## Per-pair invocation allow-list (v0.8.1+)
@@ -354,7 +377,7 @@ Mutable via `pair_update(allowed_invocations=...)` **without runtime eviction** 
 
 - **One vocabulary, translated per backend.** Permission levels, effort names, `context_window` and model aliases are backend-neutral on the tool surface; each adapter maps them to native flags. The old Claude spellings stay accepted as input aliases so nothing an agent learned before 0.13.0 breaks.
 - **`--model` and `--effort` re-passed every call** because they don't persist on resume in either CLI.
-- **`--append-system-prompt`, `--allowed-tools`, `--strict-mcp-config` pinned at create** because they DO persist (Claude).
+- **`--append-system-prompt`, `--allowed-tools` pinned at create** because they DO persist (Claude). MCP flags are re-applied on every spawn instead (verified: a resumed session uses the new ones), which is what lets `pair_update(mcp_whitelist=…)` take effect without a `pair_clear`.
 - **Per-pair FIFO lock** in the server: concurrent `pair_send` to the same pair queue automatically (cross-process too; Codex's own thread-store lock is the belt).
 - **Two execution paths in the Claude adapter**: a warm `--print --input-format stream-json` runtime for normal sends; a one-shot stream-json subprocess for slash commands (compact/context/invoke). **Codex is one `exec` process per turn** (phase 1; the `codex app-server` daemon is the warm-runtime candidate).
 - **Auto is the default permission level** — `unrestricted` is refused as a global default.

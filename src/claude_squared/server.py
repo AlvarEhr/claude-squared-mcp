@@ -25,6 +25,7 @@ from filelock import FileLock, Timeout as FileLockTimeout
 from claude_squared import agents as agents_mod
 from claude_squared import async_tasks
 from claude_squared import codex_models
+from claude_squared import connectors
 from claude_squared import registry as reg_mod
 from claude_squared import transcript as transcript_mod
 from claude_squared import runtime as runtime_mod
@@ -660,8 +661,23 @@ def _require_claude(spec: PairSpec, tool: str, why: str) -> None:
         raise PairError(f"{tool} is not available for {spec.backend} pair '{spec.name}': {why}")
 
 
+def _check_model_backend(spec: PairSpec, model: str | None) -> None:
+    """Reject cross-backend model changes before creating tasks or CLI residue."""
+    if model is None or infer_backend(model) == spec.backend:
+        return
+    target = infer_backend(model)
+    remedy = (f"use pair_handoff('{spec.name}', model={model!r}) for a Claude-to-Codex snapshot"
+              if spec.backend == "claude" and target == "codex"
+              else f"create a new pair (pair_create backend='{target}') instead")
+    raise PairError(
+        f"pair '{spec.name}' runs on the {spec.backend} backend; model {model!r} "
+        f"belongs to {target}. A pair's backend is fixed — {remedy}."
+    )
+
+
 # Curated MCP-level commands surfaced via pair_actions
 _PAIR_ACTIONS = {
+    "handoff": "pair_handoff — import a settled Claude conversation into a new Codex pair",
     "send": "pair_send / pair_send_async — message the pair (sync FIFO-queued or async with task_id)",
     "compact": "pair_compact — native /compact via stream-json, optional steering prompt",
     "context": "pair_context — invoke /context for accurate token usage breakdown",
@@ -768,7 +784,9 @@ def pair_create(
         profile_name: ``~/.claude/pairs/profiles/<name>.md`` used as system_prompt_append.
         allowed_tools: Claude permission patterns like ``["Bash(git *)", "Read"]``.
             Pinned at create. Ignored by Codex.
-        mcp_whitelist: Claude MCP server names to enable. None or [] = all MCPs disabled.
+        mcp_whitelist: Deliberate per-pair connector opt-in on either backend.
+            None or [] selects none. Unknown names are stored with a warning.
+            MCP calls act with the server's own privileges, outside the pair sandbox.
         cwd: Absolute workspace root (gates file ops OUTSIDE this path on both
             backends). Default: MCP server's cwd. Use ``extra_dirs`` to widen access.
         extra_dirs: Additional writable roots (``--add-dir`` on both backends).
@@ -818,6 +836,7 @@ def pair_create(
     # Defensive coercion: hosts may JSON-encode list params into strings; widen accepted shapes.
     allowed_tools_norm = _coerce_to_str_list(allowed_tools)
     mcp_whitelist_norm = _coerce_to_str_list(mcp_whitelist)
+    connectors.validate_selection(mcp_whitelist_norm)
     # allowed_invocations: distinguish "not passed" (None → allow all) from "explicit
     # empty list" (deny all). preserve_empty=True keeps `[]` as `[]` instead of
     # collapsing to `None` — without it, the lockdown intent is silently lost
@@ -845,6 +864,7 @@ def pair_create(
         backend=be,
         context_window=context_window,
     )
+    transparency_msgs.extend(connectors.select(mcp_whitelist_norm, be, resolved_cwd)[1])
     backend_options_norm = _coerce_backend_options(backend_options)
     if be == "codex" and backend_options_norm:
         try:
@@ -966,6 +986,7 @@ def pair_create(
             pass
         raise
 
+    transparency_msgs.extend(result.notes)
     # Echo the RESOLVED values (not what the caller passed) so the agent always
     # sees what got applied — defaults filled in, match-parent expanded, effort
     # coerced. Followed by any transparency messages (one per line of context).
@@ -1341,6 +1362,7 @@ def _build_send_runner(
             async_tasks.raise_if_stopped(task_id)
             should_stop = _make_stop_checker(name, task_id) if task_id else None
             current = reg_mod.get_pair(name)
+            _check_model_backend(current, override_model)
             # v0.12.0 cross-process FIFO for self-woken turns: a self-woken turn
             # in ANOTHER MCP process doesn't hold this pair's lock (no send
             # behind it), so without this we'd spawn our own claude on a JSONL
@@ -2010,7 +2032,7 @@ async def pair_send(
         )
 
     # Sanity: pair must exist before we spawn a worker
-    reg_mod.get_pair(name)
+    _check_model_backend(reg_mod.get_pair(name), override_model)
 
     # Build the same runner the async path uses, but with the MCP progress callback
     # wired in so live events surface to the host UI during the sync wait window.
@@ -2107,7 +2129,7 @@ def pair_send_async(
     per-pair lock.
     """
     # Sanity: pair must exist before we spawn a worker
-    reg_mod.get_pair(name)
+    _check_model_backend(reg_mod.get_pair(name), override_model)
 
     runner = _build_send_runner(
         name, message,
@@ -2726,9 +2748,14 @@ def pair_update(
     context_window: str | None = None,
     backend_options: dict | str | None = None,
     verbose: bool = False,
+    mcp_whitelist: str | list[str] | None = None,
 ) -> str:
     """Update mutable settings of an existing pair (per-pair, not defaults —
     use ``pair_settings_set`` for user-wide defaults).
+
+    mcp_whitelist is a deliberate per-pair connector opt-in, default none;
+    pass [] to disable connectors. Changes apply on the next spawn, with no
+    pair_clear. Missing connectors remain selected and produce a warning.
 
     The pair's ``backend`` is fixed: ``model`` must stay on the same backend
     (a Claude session can't become a Codex thread — create a new pair).
@@ -2739,13 +2766,13 @@ def pair_update(
 
     Three field categories with different propagation semantics — see README
     "Mid-flight config changes":
-      - **Per-send** (``model``/``effort``/``permission_mode``/``context_window``/
+      - **Per-send** (``model``/``effort``/``permission_mode``/``context_window``/``mcp_whitelist``/
         ``ultracode``/``backend_options``): registry write + runtime eviction →
         next ``pair_send`` respawns with new values (Codex: every send is a
         fresh process, so they apply immediately).
       - **Server-side** (``allowed_invocations``): MCP-layer only, no eviction;
         takes effect on next ``pair_invoke``. Pass ``[]`` for lockdown.
-      - **Pinned-at-create** (``allowed_tools``/``mcp_whitelist``/
+      - **Pinned-at-create** (``allowed_tools``/
         ``system_prompt_append``): registry updated but only takes effect after
         ``pair_clear`` (rotates session). ``cwd``/``extra_dirs`` take effect on
         next spawn after eviction; a Claude ``cwd`` change also moves the session
@@ -2759,13 +2786,7 @@ def pair_update(
             fields: dict[str, Any] = {}
             cur_spec = reg_mod.get_pair(name)
             if model is not None:
-                if infer_backend(model) != cur_spec.backend and (
-                        cur_spec.backend == "codex" or infer_backend(model) == "codex"):
-                    raise PairError(
-                        f"pair '{name}' runs on the {cur_spec.backend} backend; model {model!r} "
-                        f"belongs to {infer_backend(model)}. A pair's backend is fixed — create a "
-                        f"new pair (pair_create backend='{infer_backend(model)}') instead."
-                    )
+                _check_model_backend(cur_spec, model)
                 if cur_spec.backend == "codex":
                     try:
                         _slug, _note = codex_models.resolve_codex_model(model)
@@ -2828,6 +2849,15 @@ def pair_update(
                 fields["purpose"] = purpose
             if allowed_tools is not None:
                 fields["allowed_tools"] = _coerce_to_str_list(allowed_tools)
+            if mcp_whitelist is not None:
+                fields["mcp_whitelist"] = _coerce_to_str_list(mcp_whitelist)
+                # A NEW selection naming the pair MCP is refused outright; a
+                # stored one (pre-0.15) is only skipped at spawn, never fatal.
+                connectors.validate_selection(fields["mcp_whitelist"])
+            connector_cwd =(_normalize_path(cwd) or cur_spec.cwd) if cwd is not None else cur_spec.cwd
+            transparency_msgs.extend(connectors.select(
+                fields.get("mcp_whitelist", cur_spec.mcp_whitelist), cur_spec.backend, connector_cwd,
+            )[1])
             if allowed_invocations is not None:
                 # Server-side allow-list. preserve_empty=True keeps `[]` as `[]`
                 # so passing an explicit empty list locks down the pair (deny all)
@@ -2933,7 +2963,7 @@ def pair_update(
             spec = reg_mod.update_pair(name, **fields)
             # Material config changes invalidate any live runtime — next send will re-spawn
             if any(k in fields for k in ("model", "effort", "permission_mode", "context_window", "backend_options",
-                                         "cwd", "extra_dirs", "allowed_tools", "ultracode", "fallback_model")):
+                                         "cwd", "extra_dirs", "allowed_tools", "mcp_whitelist", "ultracode", "fallback_model")):
                 try:
                     runtime_mod.registry().evict(name)
                 except Exception:
@@ -2944,7 +2974,7 @@ def pair_update(
             # keeps using its startup config until pair_clear rotates it. This
             # is the one place agents reliably make the wrong assumption — flag
             # it inline so they don't have to dig into the README.
-            pinned_at_create = {"allowed_tools", "system_prompt_append", "mcp_whitelist"}
+            pinned_at_create = {"allowed_tools", "system_prompt_append"}
             pinned_changed = sorted(pinned_at_create & fields.keys())
             if pinned_changed:
                 pinned_warning = (
@@ -3623,6 +3653,311 @@ def pair_clear(name: str, archive_old: bool = True, verbose: bool = False) -> st
 # the forked JSONL's tip immediately after. Must be distinctive enough not to
 # collide with real conversation content.
 _FORK_SENTINEL = "__claude_squared_fork_init__ (auto-removed by pair_fork)"
+
+
+_HANDOFF_PROBE = (
+    "Before continuing: in a few lines, summarize what this conversation was working on, "
+    "the key decisions, and what was left unfinished."
+)
+
+
+def _handoff_message(source: PairSpec, level: str, briefing: str | None,
+                     probe: str | None) -> str:
+    parts = [
+        f"This conversation began in Claude Code (source model: {source.model}); "
+        "the history above was imported into this new Codex thread.",
+        "Lines marked [external_agent_tool_call]/[external_agent_tool_result] are records "
+        "of work done by the previous agent, not actions you took. Reasoning and sub-agent "
+        "internals were not carried; attachments and exact native tool calls may be missing.",
+        f"The permission level now in force is '{level}' ({permission_native(level, 'codex')}).",
+    ]
+    instructions = ClaudeAdapter()._resolve_system_prompt(source)
+    if instructions:
+        parts.append("The source's pinned instructions follow. They now arrive as a user "
+                     "message, not a system instruction:\n" + instructions)
+    if briefing:
+        parts.append("Additional briefing:\n" + briefing)
+    parts.append(_HANDOFF_PROBE if probe is None else probe)
+    return "\n\n".join(parts)
+
+
+def _discard_handoff_thread(thread_id: str) -> str:
+    try:
+        codex_adapter_mod.delete_thread(thread_id)
+    except Exception as exc:
+        return f"Cleanup failed; orphaned Codex thread {thread_id}: {exc}. No new pair was registered."
+    return f"Deleted imported Codex thread {thread_id}; no new pair was registered."
+
+
+@mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False})
+def pair_handoff(
+    name: str,
+    new_name: str | None = None,
+    model: str | None = None,
+    effort: str | None = None,
+    permission_mode: str | None = None,
+    context_window: str | None = None,
+    briefing: str | None = None,
+    probe: str | None = None,
+    timeout_seconds: int = 45,
+    verbose: bool = False,
+) -> str:
+    """Hand off a settled Claude conversation to a new Codex pair.
+
+    Source untouched: imports one session snapshot without inference, then runs
+    a normal cancellable briefing/probe turn in the new pair. Codex sources are
+    not supported yet. Default name: <name>-codex, with collision suffixes;
+    explicit existing names fail. Claude-only configuration is not carried.
+
+    model defaults to the dynamic Codex tier; effort inherits the source and
+    is coerced for that model. permission_mode inherits the neutral source
+    level, but must be explicit when allowed_tools is nonempty. context_window
+    defaults to 'default'. Imports at >=70% of the chosen usable window are
+    deleted and refused; >=50% warns. The estimate includes the first message.
+
+    briefing adds instructions after the handoff notice. probe overrides the
+    default request to summarize the conversation's work and unfinished tasks.
+    timeout_seconds caps only the briefing wait (also bounded by the sync cap);
+    import has a separate 60s ceiling. A briefing failure leaves the registered
+    pair available for correction. verbose returns JSON including the report.
+    """
+    if timeout_seconds < 0:
+        raise PairError("timeout_seconds must be non-negative")
+    if new_name is not None and not new_name.strip():
+        raise PairError("new_name must not be empty")
+
+    def _busy() -> bool:
+        runtime = runtime_mod.registry().get_or_none(name)
+        return bool(async_tasks.list_running_task_ids_for_pair(name)
+                    or (runtime is not None and (runtime.has_untracked_turn() or runtime.active_task_ids())))
+
+    busy_msg = (f"Pair '{name}' is busy (running/queued task or open self-woken turn); "
+                "wait for it to settle before pair_handoff.")
+    # Refuse a busy source up front. A running turn HOLDS the source's pair
+    # lock, so waiting on the lock would sit out the whole turn (and outlast
+    # the host's RPC timeout) and then hand off a snapshot the caller never
+    # asked for — found by the live harness, 2026-09-10. The lock is then
+    # taken with a short timeout and the check repeated under it (race).
+    if _busy():
+        raise PairError(busy_msg)
+    try:
+        with _with_pair_lock(name, timeout_s=5.0):
+            source = reg_mod.get_pair(name)
+            if source.backend != "claude":
+                raise PairError("pair_handoff from a Codex source is not supported yet (Claude -> Codex only)")
+            # No global Claude defaults may leak into the target configuration.
+            if model is not None and infer_backend(model) != "codex":
+                raise PairError("pair_handoff target model must be a Codex model or tier alias")
+            if source.allowed_tools and permission_mode is None:
+                raise PairError(
+                    "Codex cannot enforce this pair's allowed_tools. Pass permission_mode explicitly "
+                    "to acknowledge the capability widening before handing it off."
+                )
+            if _busy():  # re-check under the lock
+                raise PairError(busy_msg)
+            existing = set(reg_mod.load().pairs) | set(reg_mod.quarantined())
+            if new_name is not None and new_name in existing:
+                raise PairAlreadyExists(new_name)
+            target = new_name if new_name is not None else f"{name}-codex"
+            base = target
+            suffix = 2
+            while target in existing:
+                target = f"{base}-{suffix}"
+                suffix += 1
+            try:
+                slug, model_note = codex_models.resolve_codex_model(model)
+                level = normalize_permission(permission_mode if permission_mode is not None else source.permission_mode)
+                window = normalize_context_window(context_window)
+                # A source without an effort level (e.g. Haiku) must not leave
+                # the Codex pair on the CLI's cache default (Sol: low) — fall
+                # back to the policy default like pair_create does.
+                target_effort, effort_note = coerce_effort_for_model(
+                    slug, effort if effort is not None else (source.effort or DEFAULT_EFFORT), "codex",
+                )
+            except ValueError as exc:
+                raise PairError(str(exc)) from exc
+            windows = codex_models.context_windows(slug)
+            if not windows or min(windows) <= 0:
+                raise PairError(f"Cannot determine usable context windows for '{slug}'; refresh the "
+                                "Codex models cache or select a listed model before pair_handoff.")
+            typed = (model or "").strip().lower()
+            tier = short_model_label(slug)
+            stored_model = (tier if tier in codex_models.CODEX_TIER_ALIASES else slug) \
+                if not typed or typed == "codex" else typed
+            message = _handoff_message(source, level, briefing, probe)
+            path = ClaudeAdapter().transcript_path(source)
+            if path is None or not path.is_file():
+                raise PairError(f"Pair '{name}' has no Claude transcript to import")
+            # Import a uniquely named SNAPSHOT copy, never the live session file.
+            # (A stored 'pair' connector is simply not carried — see the
+            # connector warnings below; it must not block the handoff.)
+            # Verified 2026-09-10 (codex-cli 0.153.4): the importer keys on the
+            # file path — re-importing a path it has seen either skips it (no
+            # target, no failure) or, if the file grew, APPENDS to the thread it
+            # created the first time. That would silently write into an earlier
+            # handoff's pair. A fresh path always yields a new thread. The copy
+            # must sit in the source's own project dir (the importer only
+            # accepts sessions it can detect there) and is deleted right away.
+            staged = path.with_name(f"{uuid.uuid4()}.jsonl")
+            try:
+                shutil.copyfile(path, staged)
+                imported = codex_adapter_mod.import_claude_session(
+                    staged, cwd=source.cwd or os.getcwd(), title=target,
+                )
+            finally:
+                try:
+                    staged.unlink(missing_ok=True)
+                except OSError:
+                    pass
+    except FileLockTimeout as exc:
+        raise PairError(f"Pair '{name}' is busy; could not acquire its lock for pair_handoff") from exc
+
+    # The source lock ends here. Measurement, registration and target inference
+    # must not keep it locked; the imported thread is now an independent snapshot.
+    thread_id = imported["thread_id"]
+    # Belt to the snapshot copy above: if Codex ever hands back a thread that
+    # already belongs to a pair, refuse WITHOUT deleting it — it's that pair's.
+    owner = next((s.name for s in reg_mod.load().pairs.values()
+                  if s.backend == "codex" and s.session_id == thread_id), None)
+    if owner is not None:
+        raise PairError(f"Codex returned thread {thread_id}, which already belongs to pair '{owner}'; "
+                        "refusing to register a second pair on it (nothing was deleted).")
+    try:
+        size = codex_adapter_mod.HandoffSize(
+            codex_adapter_mod.measure_imported_history(thread_id, message), windows[0], windows[1], window,
+        )
+    except Exception as exc:
+        raise PairError(f"Cannot measure imported history: {exc}\n{_discard_handoff_thread(thread_id)}") from exc
+    size_line = size.render()
+    if size.refused:
+        fit = "would fit below 70%" if size.fits_1m else "would still NOT fit below 70%"
+        raise PairError(
+            f"Handoff refused: imported history is >=70% of the chosen window.\n{size_line}\n"
+            f"Compact the source first with pair_compact('{name}'), or start a fresh Codex pair instead, "
+            f"or retry with context_window='1m' ({fit}).\n{_discard_handoff_thread(thread_id)}"
+        )
+
+    capability: list[str] = []
+    omitted = ["reasoning", "sub-agent internals", "exact tool calls", "attachments"]
+    if source.allowed_tools:
+        omitted.append("allowed_tools")
+        capability.append(f"The source's tool allow-list {source.allowed_tools!r} is NOT enforced on Codex; "
+                          f"the new pair is limited only by its permission level ('{level}').")
+    # Match against the TARGET inventory; import does not migrate MCP config.
+    carried, _connector_notes = connectors.select(source.mcp_whitelist, "codex", source.cwd)
+    carried_names = [entry.name for entry in carried]
+    for server_name in source.mcp_whitelist or []:
+        entry = connectors.match(server_name, carried)
+        if entry is not None:
+            capability.append(f"MCP connector '{server_name}' is carried as '{entry.name}' and selected for "
+                              "activation on Codex; its server acts with its own privileges.")
+        else:
+            capability.append(f"MCP connector '{server_name}' is not available to this Codex pair and was not activated.")
+            if carried:
+                omitted.append(f"mcp_whitelist:{server_name}")
+    if source.mcp_whitelist and not carried:
+        omitted.append("mcp_whitelist")
+    if source.fallback_model:
+        omitted.append("fallback_model")
+        capability.append(f"Claude fallback model {source.fallback_model!r} has no Codex equivalent and was dropped.")
+    if source.ultracode:
+        omitted.append("ultracode")
+        capability.append("Claude Ultracode mode was dropped; on Codex, effort='ultra' is the closest equivalent "
+                          "(maximum reasoning plus automatic task delegation).")
+    if source.allowed_invocations is not None:
+        omitted.append("allowed_invocations")  # pair_invoke doesn't exist on Codex at all — nothing to warn about
+    if ClaudeAdapter()._resolve_system_prompt(source):  # noqa: SLF001
+        capability.append("The source's pinned instructions are delivered as the first user message, not as a "
+                          "system instruction — the model weighs them less firmly than before.")
+    if level == "plan":
+        capability.append("Claude plan mode becomes Codex read-only sandboxing, without Claude's planning workflow.")
+    elif level == "auto":
+        capability.append("Auto now uses Codex's guardian reviewer for escalations.")
+    capability.append(f"Target permissions: {level} ({permission_native(level, 'codex')}).")
+    for note in (model_note, effort_note):
+        if note:
+            capability.append(note)
+    # Observed on a real import (2026-09-10): everything arrives as marked
+    # text, but these details don't survive the flattening.
+    lost = [
+        "Reasoning is not carried; tool calls and results arrive as [external_agent_tool_call] / "
+        "[external_agent_tool_result] records of the previous agent's work, not actions this pair took.",
+        "Files written or edited are recorded by path only — the content and the edit itself are not in the "
+        "history (the files are still on disk in the shared cwd).",
+        "A sub-agent appears only as its short description and final report; its prompt and internal steps "
+        "are not imported.",
+        "Parallel tool calls lose their pairing: calls and results arrive as separate unlabeled lists, so "
+        "which result belongs to which call has to be inferred. Attachments are not carried.",
+    ]
+    if size.warning:
+        lost.append("Size warning: the handoff already occupies >=50% of the chosen window.")
+    housekeeping = [
+        "The new pair's main.log and pair_tool_detail start empty; source T-N tags do not resolve here. "
+        "Native rewind points start empty until the first Codex turn; imported Claude turns are not native rewind points.",
+        "Counters and pending self-woken state reset; the briefing/probe is the first counted turn.",
+        f"Source '{name}' is untouched. Both pairs share cwd {source.cwd or os.getcwd()!r}; "
+        "don't let both edit the same files.",
+        f"This import is a snapshot as of {imported['imported_at']}; later source work is not transferred.",
+    ]
+    try:
+        spec = PairSpec(
+            name=target, backend="codex", session_id=thread_id,
+            purpose=f"Handed off from Claude pair '{name}'" + (f": {source.purpose}" if source.purpose else ""),
+            model=stored_model, effort=target_effort, permission_mode=level, context_window=window,
+            cwd=source.cwd, extra_dirs=source.extra_dirs, persistent=source.persistent,
+            system_prompt_append=source.system_prompt_append, profile_name=source.profile_name,
+            mcp_whitelist=carried_names or None,
+            handoff_from={"name": name, "backend": source.backend, "session_id": source.session_id,
+                          "model": source.model, "imported_at": imported["imported_at"],
+                          "import_id": imported["import_id"], "omitted": omitted},
+        )
+        reg_mod.add_pair(spec)
+    except Exception as exc:
+        cleanup = _discard_handoff_thread(thread_id)
+        if isinstance(exc, PairAlreadyExists):
+            exc.args = (f"{exc}\n{cleanup}",)
+            raise
+        raise PairError(f"Could not register handoff pair '{target}': {exc}\n{cleanup}") from exc
+
+    lines = [f"Handed off '{name}' (Claude/{source.model}) -> '{target}' (Codex/{stored_model}, "
+             f"thread {thread_id}).", size_line]
+    for label, entries in (("Capability changes", capability), ("Lost context", lost), ("Housekeeping", housekeeping)):
+        lines.append(label + ":\n" + "\n".join(f"  - {entry}" for entry in entries))
+    lines.append("If the user hasn't already acknowledged these limitations in this conversation, "
+                 "tell them before relying on the new pair — then continue.")
+    state = None
+    final = None
+    try:
+        runner = _build_send_runner(target, message, hard_timeout_seconds=None,
+                                    override_model=None, override_effort=None,
+                                    override_permission_mode=None, on_event=None)
+        state = async_tasks.start_task(target, message, runner, queued=True)
+        rpc_hold = min(int(timeout_seconds), _sync_cap_seconds())
+        final = async_tasks.wait_for_task(state.task_id, timeout_s=float(rpc_hold))
+        if final is None:
+            raise PairError(f"task {state.task_id} disappeared after creation")
+        if final.result is not None:
+            lines.append("Probe reply:\n" + _fmt_send_result(final.result))
+        if final.status in ("failed", "stopped"):
+            lines.append(f"Briefing task {state.task_id} {final.status}: {final.error or '(no error message)'}. "
+                         "The imported pair remains registered.")
+        elif final.status == "running":
+            lines.append(_format_async_handle(
+                state.task_id,
+                f"Sync wait held for {rpc_hold}s (stated patience {timeout_seconds}s); "
+                f"handoff briefing for '{target}' continues with no auto-kill.", pair_name=target,
+            ))
+    except Exception as exc:
+        lines.append(f"Pair '{target}' remains registered, but its briefing could not be completed: {exc}. "
+                     + (f"Inspect pair_poll('{state.task_id}')." if state else "Send the briefing with pair_send."))
+    lines.append("Check the answer; if it is wrong or thin, send a corrective briefing before real work.")
+    text = "\n\n".join(lines)
+    if verbose:
+        return json.dumps({"pair": spec.model_dump(mode="json"), "size_tokens": size.tokens,
+                           "size_line": size_line, "task_id": state.task_id if state else None,
+                           "task": final.model_dump(mode="json") if final else None,
+                           "text": text}, ensure_ascii=False, indent=2)
+    return text
 
 
 @mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False})

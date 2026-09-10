@@ -588,6 +588,7 @@ class PairRuntime:
     # ---- lifecycle ----
 
     def start(self) -> None:
+        self._init_event = None
         cli = _claude_executable()
         args = [cli] + self.adapter._common_create_args(self.spec)  # noqa: SLF001
         args += [
@@ -863,6 +864,8 @@ class PairRuntime:
         # continuation doesn't necessarily start with one (par6 log: the parent
         # kept working for 10 min after a result with no init in between).
         ev_type = ev.get("type")
+        if ev_type == "system" and ev.get("subtype") == "init" and not ev.get("parent_tool_use_id"):
+            self._init_event = ev
         if ev_type in ("assistant", "user") and not ev.get("parent_tool_use_id"):
             with self._scope_lock:
                 needs_open = self._current_scope is None and self._implicit_scope is None
@@ -1193,6 +1196,8 @@ class PairRuntime:
         """Reader thread, on EVERY result event. Solicited → snapshot the exact
         log range for send(). Otherwise → close the self-woken turn (or record
         an unattributed completion). Never CREATES state on the result path."""
+        if self.spec.mcp_whitelist:
+            ev["_mcp_servers"] = (self._init_event or {}).get("mcp_servers")
         self._result_seq += 1
         with self._scope_lock:
             solicited = self._current_scope
@@ -1566,6 +1571,8 @@ class PairRuntime:
                         except Exception:
                             pass
                     if ev.get("type") == "result":
+                        if self.spec.mcp_whitelist:
+                            ev["_mcp_servers"] = (self._init_event or {}).get("mcp_servers")
                         self.last_activity = datetime.utcnow()
                         # Record the JSONL mtime AFTER our own write completed —
                         # any future mtime greater than this means SOMEONE ELSE wrote.
@@ -1623,6 +1630,7 @@ class RuntimeRegistry:
                         or rt.spec.context_window != spec.context_window
                         or rt.spec.effort != spec.effort
                         or rt.spec.cwd != spec.cwd
+                        or rt.spec.mcp_whitelist != spec.mcp_whitelist
                         or rt.spec.permission_mode != spec.permission_mode):
                     self._stop_unlocked(spec.name)
                     rt = None

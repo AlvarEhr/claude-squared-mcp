@@ -539,6 +539,7 @@ class PairSpec(BaseModel):
     # Codex thread); inferred from the model when not given.
     backend: Backend = "claude"
     session_id: str = Field(..., description="Claude session UUID / Codex thread id")
+    handoff_from: dict[str, Any] | None = None
     purpose: str = ""
     # v0.12.0: self-woken turns that completed since the last pair_send, parked
     # here by the runtime's reader thread (see runtime._record_self_woken) and
@@ -569,7 +570,7 @@ class PairSpec(BaseModel):
     system_prompt_append: str | None = None
     profile_name: str | None = None  # references ~/.claude/pairs/profiles/<name>.md
     allowed_tools: list[str] | None = None
-    mcp_whitelist: list[str] | None = None  # None = strict empty MCP config
+    mcp_whitelist: list[str] | None = None  # explicit connector opt-in on either backend; default none
     # MCP-level safety rail on ``pair_invoke``: which slash commands the calling
     # agent may invoke through the structured channel. ``None`` = allow all;
     # ``[]`` = explicit lockdown (deny all). Patterns use ``fnmatch`` glob syntax.
@@ -654,6 +655,7 @@ class CreateResult(BaseModel):
     status: Literal["ready"] = "ready"
     transcript_path: str | None = None
     initial_response: str | None = None
+    notes: list[str] = Field(default_factory=list)
 
 
 class SendResult(BaseModel):

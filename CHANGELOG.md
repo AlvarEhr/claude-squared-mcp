@@ -4,6 +4,85 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] — 2026-09-10
+
+Hand a Claude pair's conversation to a new Codex pair, and per-pair MCP
+connectors that actually work — on both backends, off by default.
+
+**Restart every open Claude and Codex session after installing** (the fleet
+rule: a running MCP process keeps the code it loaded).
+
+### Added
+
+- **`pair_handoff(name, …)` — Claude → Codex.** Imports the source pair's
+  conversation into a NEW Codex pair through Codex's own importer (the
+  app-server's `externalAgentConfig/import`, the same feature as the Codex
+  CLI's `/import`) and leaves the source untouched — a cross-backend fork.
+  Default name `<name>-codex` (`-2`, `-3` on collision). The new pair's first
+  turn is a generated handoff notice plus the caller's `briefing` and a
+  `probe` question about the prior work; the probe's answer comes back in the
+  result, and the turn runs through the normal task machinery (pollable,
+  stoppable). Model defaults to the Codex default tier; effort, permission
+  level, cwd, extra_dirs, pinned instructions and persistence carry over.
+  Codex → Claude is not supported yet.
+- **Handoff warnings, tiered:** capability changes (a Claude tool allow-list
+  Codex can't enforce, connectors not available on Codex, plan → read-only,
+  auto → Codex's guardian, pinned instructions arriving as a user message),
+  lost context (reasoning; tool calls and results arrive as marked records of
+  the previous agent's work; written/edited files by path only; sub-agents as
+  description + final report; parallel calls lose their pairing) and
+  housekeeping (fresh logs/rewind points/counters, shared cwd, snapshot time).
+  The result tells the calling agent to inform the user unless they have
+  already acknowledged these limitations — then continue.
+- **Handoff gates:** refuses a busy source; refuses a source with a tool
+  allow-list unless `permission_mode` is passed explicitly (a capability
+  widening must be a conscious choice); measures the imported history after
+  import (free, no model turn) and refuses at ≥70% of the chosen Codex window
+  — reporting both the default and `1m` windows and the three remedies:
+  compact the source first, start a fresh Codex pair, or `context_window='1m'`
+  (warns at ≥50%). Refused imports are deleted; a thread that can't be
+  deleted is reported as orphaned. Lineage is recorded on the new pair
+  (`handoff_from`: source name, backend, session, model, import id, time,
+  omissions).
+- **Per-pair MCP connectors on both backends** (`mcp_whitelist` on
+  `pair_create` / `pair_update`): nothing is loaded unless a pair names it.
+  Claude pairs get local servers from your Claude config (user, local and
+  project `.mcp.json` scope) and claude.ai cloud connectors; Codex pairs get
+  servers from `~/.codex/config.toml`. This MCP's own `pair` server is never
+  loadable (recursion).
+- **Connector permissions follow the pair's level** (neither backend
+  sandboxes a connector's own process, so the level is the guard):
+  read-only / plan / workspace — Codex runs only tools the server marks
+  read-only, Claude runs none (each blocked call is reported; pre-approve
+  individual tools with `allowed_tools`); auto — all tools, Codex's reviewer
+  judging each write, Claude pre-approving the pair's connectors;
+  unrestricted — all tools.
+- **Availability is checked, never fatal:** a selected connector the backend
+  can't see is stored and reported ("not available and not activated") at
+  create/update, and each turn notes a selected connector that didn't start
+  or needs authentication. `pair_fork` keeps the selection; `pair_handoff`
+  carries the connectors Codex can see and warns about the rest.
+
+### Fixed
+
+- **`mcp_whitelist` was silently ignored.** Pairs always started with an
+  empty MCP config in strict mode: local servers never loaded (their
+  definitions were never passed), and cloud connectors stopped loading when
+  the Claude CLI began dropping them in strict mode.
+- `pair_update(mcp_whitelist=…)` now applies on the next spawn — no
+  `pair_clear` (verified: a resumed session uses the new MCP settings).
+- A per-send `override_model` from the other backend is refused up front
+  (it used to reach the CLI and leave residue in the transcript); the
+  `pair_update` refusal points to `pair_handoff` for Claude → Codex.
+- `effort=None` (models without effort levels, e.g. Haiku) is persisted
+  instead of reloading as `high`.
+
+### Changed
+
+- The Codex app-server JSON-RPC plumbing is a shared client
+  (`adapters/appserver.py`) used by compaction and the importer — no
+  behavior change for `pair_compact`.
+
 ## [0.14.0] — 2026-09-08
 
 Maintenance release. Merges the Codex-app agent's `codex/maintenance-2026-09-08`

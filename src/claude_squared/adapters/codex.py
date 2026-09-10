@@ -24,11 +24,14 @@ import subprocess
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 from claude_squared.adapters.base import PairAdapter
+from claude_squared import connectors
+from claude_squared.adapters.appserver import AppServerClient
 from claude_squared.codex_models import (
     CODEX_1M_CONFIG,
     codex_home,
@@ -655,6 +658,145 @@ def _fmt_tokens(n: int) -> str:
     return str(n)
 
 
+HANDOFF_CODEX_OVERHEAD_TOKENS = 13_000
+
+
+def delete_thread(thread_id: str) -> None:
+    """Delete an imported thread; callers must report failures as orphaned IDs."""
+    args = [codex_executable(), "delete", "--force", thread_id]
+    try:
+        result = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True,
+                                text=True, encoding="utf-8", errors="replace", timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CLIError(f"could not delete Codex thread {thread_id}: {exc}") from exc
+    if result.returncode:
+        raise CLIError(f"could not delete Codex thread {thread_id}",
+                       stderr=result.stderr or result.stdout, exit_code=result.returncode)
+
+
+def import_claude_session(path: Path, *, cwd: str, title: str,
+                         timeout_seconds: int = 60) -> dict[str, str]:
+    """Import exactly one Claude session without inference or config migration."""
+    with AppServerClient([codex_executable(), "app-server"] + config_readd_args(),
+                         cwd=cwd, timeout_seconds=timeout_seconds, kill=_tree_kill) as client:
+        client.initialize()
+        result = client.request("externalAgentConfig/import", {
+            "migrationItems": [{
+                "itemType": "SESSIONS", "description": f"Import Claude pair as {title}",
+                "cwd": cwd, "details": {"sessions": [{
+                    "cwd": cwd, "path": str(path), "title": title,
+                }]},
+            }],
+        })
+        import_id = result.get("importId") if isinstance(result, dict) else None
+        if not isinstance(import_id, str) or not import_id:
+            client.fail("Codex session import returned no importId")
+        while time.monotonic() < client.deadline:
+            for message in client.messages():
+                if message.get("method") != "externalAgentConfig/import/completed":
+                    continue
+                params = message.get("params") or {}
+                if params.get("importId") != import_id:
+                    continue
+                targets: list[str] = []
+                failures: list = []
+                for item in params.get("itemTypeResults") or []:
+                    if item.get("itemType") != "SESSIONS":
+                        continue
+                    failures.extend(item.get("failures") or [])
+                    targets.extend(success["target"] for success in item.get("successes") or []
+                                   if isinstance(success.get("target"), str) and success["target"])
+                if len(targets) != 1 or failures:
+                    cleanup: list[str] = []
+                    for thread_id in set(targets):
+                        try:
+                            delete_thread(thread_id)
+                        except Exception as exc:
+                            cleanup.append(f"orphaned thread {thread_id}: {exc}")
+                    client.fail(f"Codex import {import_id} failed: expected one session target; "
+                                f"got {len(targets)}, failures={json.dumps(failures)[:500]}. "
+                                + "; ".join(cleanup))
+                return {"thread_id": targets[0], "import_id": import_id,
+                        "imported_at": datetime.utcnow().isoformat() + "Z"}
+            if client.proc.poll() is not None:
+                break
+            time.sleep(0.2)
+        client.fail(f"Codex import {import_id} ended without a completion notification; "
+                    "no pair registered. An imported thread may need cleanup if the import completed late.")
+
+
+def measure_imported_history(thread_id: str, briefing: str) -> int:
+    """Estimate imported visible history plus Codex overhead and the first turn."""
+    path = rollout_path_for(thread_id)
+    if path is None:
+        raise CLIError(f"cannot measure imported Codex thread {thread_id}: rollout missing")
+    chars = 0
+    seeded = 0
+    with path.open(encoding="utf-8") as rollout:
+        for raw in rollout:
+            if not raw.strip():
+                continue
+            # Fail closed on a partial/corrupt rollout instead of undercounting it.
+            event = json.loads(raw)
+            payload = event.get("payload") or {}
+            if event.get("type") == "event_msg" and payload.get("type") == "token_count":
+                # Ignore empty quota-only ticks; retain the last nonzero seed.
+                info = payload.get("info") or {}
+                for key in ("last_token_usage", "total_token_usage"):
+                    usage = info.get(key) or {}
+                    count = int(usage.get("total_tokens") or 0)
+                    if not count:
+                        count = int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)
+                    if count > 0:
+                        seeded = count
+                        break
+            if event.get("type") != "response_item":
+                continue
+            kind = payload.get("type")
+            if kind == "message":
+                chars += len(_content_text(payload.get("content")))
+            elif kind in ("function_call", "function_call_output", "custom_tool_call",
+                          "custom_tool_call_output", "local_shell_call", "tool_call", "tool_result"):
+                chars += len(json.dumps(payload, ensure_ascii=False))
+    history = seeded if seeded > 0 else (chars + 3) // 4
+    return history + HANDOFF_CODEX_OVERHEAD_TOKENS + (len(briefing) + 3) // 4
+
+
+@dataclass(frozen=True)
+class HandoffSize:
+    tokens: int
+    default_window: int
+    max_window: int
+    context_window: str
+
+    @property
+    def chosen_window(self) -> int:
+        return self.max_window if self.context_window == "1m" else self.default_window
+
+    @property
+    def refused(self) -> bool:
+        return self.tokens * 10 >= self.chosen_window * 7
+
+    @property
+    def warning(self) -> bool:
+        return self.tokens * 2 >= self.chosen_window
+
+    @property
+    def fits_1m(self) -> bool:
+        return self.tokens * 10 < self.max_window * 7
+
+    def render(self) -> str:
+        used_pct = 100 * self.tokens / self.chosen_window
+        return (
+            f"≈{self.tokens:,} tokens: {100 * self.tokens / self.default_window:.0f}% of the default "
+            f"window (≈{self.default_window / 1000:.0f}k), "
+            f"{100 * self.tokens / self.max_window:.0f}% with context_window='1m' "
+            f"(≈{self.max_window / 1000:.0f}k). Chosen: {self.context_window}; "
+            f"~{max(0.0, 90 - used_pct):.0f}% remains before Codex auto-compacts "
+            "(~90% of the window). Includes estimated Codex overhead and the full first message."
+        )
+
+
 class CodexAdapter(PairAdapter):
     backend_name = "codex"
 
@@ -708,7 +850,8 @@ class CodexAdapter(PairAdapter):
         tp = self.transcript_path(new_spec)
         return CreateResult(name=spec.name, session_id=tid,
                             transcript_path=str(tp) if tp else None,
-                            initial_response=reply or None)
+                            initial_response=reply or None,
+                            notes=connectors.codex_startup_notes(spec.mcp_whitelist, spec.cwd, stderr, events))
 
     def send(self, spec: PairSpec, message: str, *, model: str | None = None,
              effort: str | None = None, permission_mode: str | None = None,
@@ -805,168 +948,69 @@ class CodexAdapter(PairAdapter):
 
     def _appserver_compact(self, spec: PairSpec, *, timeout_seconds: int,
                            should_stop: Callable[[], bool] | None = None) -> str | None:
-        """Drive one compaction over the app-server's stdio JSON-RPC. Returns a
-        short note (or None) and raises CLIError / CommandTimeout on failure;
-        ``should_stop`` (polled ~1/s) tree-kills the daemon and raises."""
-        exe = codex_executable()
-        args = [exe, "app-server"] + config_readd_args()
-        popen_kwargs: dict[str, Any] = {
-            "stdin": subprocess.PIPE, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE,
-            "cwd": spec.cwd or None,
-        }
-        if os.name == "nt":
-            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-        else:
-            popen_kwargs["start_new_session"] = True
+        """Drive compaction through the shared stdio JSON-RPC client."""
+        client = AppServerClient(
+            [codex_executable(), "app-server"] + config_readd_args(),
+            cwd=spec.cwd or None, timeout_seconds=timeout_seconds, kill=_tree_kill,
+            should_stop=should_stop,
+            stop_message="compaction stopped by pair_stop (codex app-server tree-killed; "
+                         "the thread is unchanged unless the compaction record was already written)",
+        )
         try:
-            proc = subprocess.Popen(args, **popen_kwargs)
-        except OSError as e:
-            raise CLIError(f"could not start codex app-server ({exe}): {e}")
-        with _INFLIGHT_LOCK:
-            _INFLIGHT[spec.name] = {"proc": proc, "task_id": None, "started_at": datetime.utcnow(),
-                                    "last_activity": datetime.utcnow(), "label": "compact"}
-        msgs: list[dict] = []
-        lock = threading.Lock()
-        stderr_chunks: list[str] = []
-
-        def _rd() -> None:
-            assert proc.stdout is not None
-            for raw in iter(proc.stdout.readline, b""):
-                try:
-                    m = json.loads(raw.decode("utf-8", "replace"))
-                except Exception:
-                    continue
-                with lock:
-                    msgs.append(m)
-
-        def _erd() -> None:
-            assert proc.stderr is not None
-            for raw in iter(proc.stderr.readline, b""):
-                stderr_chunks.append(raw.decode("utf-8", "replace"))
-
-        threading.Thread(target=_rd, daemon=True).start()
-        threading.Thread(target=_erd, daemon=True).start()
-        deadline = time.monotonic() + max(30, int(timeout_seconds))
-
-        def _send(i: int, method: str, params: dict) -> None:
-            assert proc.stdin is not None
-            proc.stdin.write((json.dumps({"jsonrpc": "2.0", "id": i, "method": method,
-                                          "params": params}) + "\n").encode("utf-8"))
-            proc.stdin.flush()
-
-        last_stop_check = [0.0]
-
-        def _check_stop() -> None:
-            if should_stop is None:
-                return
-            now = time.monotonic()
-            if now - last_stop_check[0] < 1.0:
-                return
-            last_stop_check[0] = now
-            try:
-                if should_stop():
-                    _tree_kill(proc)
-                    raise CLIError("compaction stopped by pair_stop (codex app-server tree-killed; "
-                                   "the thread is unchanged unless the compaction record was already written)")
-            except CLIError:
-                raise
-            except Exception:
-                pass
-
-        def _wait_result(i: int) -> dict:
-            while time.monotonic() < deadline and proc.poll() is None:
-                _check_stop()
-                with lock:
-                    for m in msgs:
-                        if m.get("id") == i and ("result" in m or "error" in m):
-                            return m
-                time.sleep(0.2)
-            return {}
-
-        def _fail(msg: str) -> None:
-            _tree_kill(proc)
-            raise CLIError(msg, stderr="".join(stderr_chunks)[-1500:])
-
-        try:
-            from claude_squared import __version__ as _ver
-            _send(1, "initialize", {"clientInfo": {"name": "claude-squared", "version": _ver}})
-            r = _wait_result(1)
-            if not r or "error" in r:
-                if not r and proc.poll() is not None:
-                    _fail(f"codex app-server exited (code {proc.poll()}) before initialize completed")
-                _fail(f"codex app-server initialize failed: {json.dumps(r.get('error'))[:300] if r else 'timeout'}")
-            # JSON-RPC handshake completion notification (documented; the
-            # server tolerated its absence on 0.153.4 but don't rely on that).
-            try:
-                assert proc.stdin is not None
-                proc.stdin.write((json.dumps({"jsonrpc": "2.0", "method": "initialized"}) + "\n").encode("utf-8"))
-                proc.stdin.flush()
-            except Exception:
-                pass
-            cfg: dict[str, Any] = {"mcp_servers": {}}
-            if spec.effort:
-                cfg["model_reasoning_effort"] = spec.effort
-            for k, v in (spec.backend_options or {}).get("config", {}).items():
-                cfg[k] = v
-            _send(2, "thread/resume", {
-                "threadId": spec.session_id, "cwd": spec.cwd or os.getcwd(),
-                "model": self._model_for(spec), "sandbox": "read-only",
-                "config": cfg, "excludeTurns": True,
-            })
-            r = _wait_result(2)
-            if not r or "error" in r:
-                _fail(f"codex app-server thread/resume failed: {json.dumps(r.get('error'))[:300] if r else 'timeout'}")
-            _send(3, "thread/compact/start", {"threadId": spec.session_id})
-            r = _wait_result(3)
-            if not r or "error" in r:
-                _fail(f"codex app-server thread/compact/start failed: {json.dumps(r.get('error'))[:300] if r else 'timeout'}")
-            # Completion = a contextCompaction item completed for this thread
-            # followed by turn/completed (thread/compacted was NOT observed on
-            # 0.153.4 — the item + turn notifications are the reliable signal).
-            saw_item = False
-            turn_status: str | None = None
-            turn_error: str | None = None
-            while time.monotonic() < deadline and proc.poll() is None:
-                _check_stop()
-                with lock:
-                    for m in msgs:
-                        meth = m.get("method")
-                        p = m.get("params") or {}
-                        if p.get("threadId") not in (None, spec.session_id):
+            with client:
+                with _INFLIGHT_LOCK:
+                    _INFLIGHT[spec.name] = {
+                        "proc": client.proc, "task_id": None, "started_at": datetime.utcnow(),
+                        "last_activity": datetime.utcnow(), "label": "compact",
+                    }
+                client.initialize()
+                cfg: dict[str, Any] = {"mcp_servers": {}}
+                if spec.effort:
+                    cfg["model_reasoning_effort"] = spec.effort
+                for k, v in (spec.backend_options or {}).get("config", {}).items():
+                    cfg[k] = v
+                client.request("thread/resume", {
+                    "threadId": spec.session_id, "cwd": spec.cwd or os.getcwd(),
+                    "model": self._model_for(spec), "sandbox": "read-only",
+                    "config": cfg, "excludeTurns": True,
+                })
+                client.request("thread/compact/start", {"threadId": spec.session_id})
+                # Keep the existing compaction notification/status interpretation.
+                saw_item = False
+                turn_status: str | None = None
+                turn_error: str | None = None
+                while time.monotonic() < client.deadline and client.proc.poll() is None:
+                    client.check_stop()
+                    for message in client.messages():
+                        method = message.get("method")
+                        params = message.get("params") or {}
+                        if params.get("threadId") not in (None, spec.session_id):
                             continue
-                        if meth == "item/completed" and (p.get("item") or {}).get("type") == "contextCompaction":
+                        if method == "item/completed" and (params.get("item") or {}).get("type") == "contextCompaction":
                             saw_item = True
-                        elif meth == "thread/compacted":
+                        elif method == "thread/compacted":
                             saw_item = True
-                        elif meth == "turn/completed":
-                            turn = p.get("turn") or {}
+                        elif method == "turn/completed":
+                            turn = params.get("turn") or {}
                             turn_status = str(turn.get("status") or "completed")
                             if turn.get("error"):
-                                turn_error = json.dumps(turn.get("error"))[:300]
-                        elif meth == "error":
-                            turn_error = json.dumps(p)[:300]
+                                turn_error = json.dumps(turn["error"])[:300]
+                        elif method == "error":
+                            turn_error = json.dumps(params)[:300]
                             turn_status = "failed"
-                if turn_status is not None:
-                    break
-                time.sleep(0.3)
-            if turn_status is None:
-                _tree_kill(proc)
-                raise CommandTimeout(spec.name, int(timeout_seconds))
-            if turn_error or (turn_status not in ("completed",) and not saw_item):
-                _fail(f"codex compaction did not complete (status {turn_status}): {turn_error or 'no contextCompaction item observed'}")
-            return None if saw_item else f"turn completed with status {turn_status} but no contextCompaction item was observed"
+                    if turn_status is not None:
+                        break
+                    time.sleep(0.3)
+                if turn_status is None:
+                    _tree_kill(client.proc)
+                    raise CommandTimeout(spec.name, int(timeout_seconds))
+                if turn_error or (turn_status not in ("completed",) and not saw_item):
+                    client.fail(f"codex compaction did not complete (status {turn_status}): "
+                                f"{turn_error or 'no contextCompaction item observed'}")
+                return None if saw_item else f"turn completed with status {turn_status} but no contextCompaction item was observed"
         finally:
-            try:
-                if proc.stdin and not proc.stdin.closed:
-                    proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                _tree_kill(proc)
             with _INFLIGHT_LOCK:
-                if _INFLIGHT.get(spec.name, {}).get("proc") is proc:
+                if _INFLIGHT.get(spec.name, {}).get("proc") is client.proc:
                     _INFLIGHT.pop(spec.name, None)
 
     def context(self, spec: PairSpec, timeout_seconds: int = 60) -> ContextReport:
@@ -1099,6 +1143,7 @@ class CodexAdapter(PairAdapter):
         args = [exe, "exec", "--json", "--skip-git-repo-check", "-C", cwd,
                 "--ignore-user-config", "--thread-source", THREAD_SOURCE]
         args += config_readd_args()
+        args += connectors.codex_args(spec.mcp_whitelist, permission_mode or spec.permission_mode, cwd)
         slug = self._model_for(spec, model)
         args += ["-m", slug]
         eff = effort if effort is not None else spec.effort
@@ -1430,7 +1475,7 @@ class CodexAdapter(PairAdapter):
                        f"pair_compact('{spec.name}') to free context (Codex compaction takes "
                        f"no steering text).")
 
-        notes: list[str] = []
+        notes = connectors.codex_startup_notes(spec.mcp_whitelist, spec.cwd, stderr, events)
         denials: list[PermissionDenial] = []
         for line in (stderr or "").splitlines():
             if _DENIAL_RE.search(line):

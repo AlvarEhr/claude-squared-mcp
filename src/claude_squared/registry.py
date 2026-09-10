@@ -201,6 +201,8 @@ def _save_unlocked(reg: Registry) -> None:
     for key in reg.model_extra or {}:
         data[key] = full[key]
     for name, spec in reg.pairs.items():
+        # None deliberately omits the CLI effort flag; preserve it on reload.
+        data["pairs"][name]["effort"] = spec.effort
         for key in spec.model_extra or {}:
             data["pairs"][name][key] = full["pairs"][name][key]
     # Quarantined entries ride along untouched. A live pair under the same

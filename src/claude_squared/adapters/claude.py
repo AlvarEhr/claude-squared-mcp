@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from claude_squared.adapters.base import PairAdapter
+from claude_squared import connectors
 from claude_squared.cli_paths import encode_cwd_for_project as _encode_cwd_for_project
 from claude_squared.errors import CLIError, CommandTimeout, SessionMissing
 from claude_squared.models import (
@@ -192,8 +193,8 @@ class ClaudeAdapter(PairAdapter):
     def create(self, spec: PairSpec, initial_message: str | None = None) -> CreateResult:
         """Create a new session with pinned config; optionally send the first message.
 
-        Pinned at create (verified to persist): --strict-mcp-config / --mcp-config,
-        --append-system-prompt, --allowed-tools, --add-dir (cwd).
+        Connector selection is a deliberate per-pair opt-in, default none;
+        its flags are re-applied on resume. System instructions remain pinned.
         """
         if not spec.session_id:
             spec.session_id = str(uuid.uuid4())
@@ -207,12 +208,14 @@ class ClaudeAdapter(PairAdapter):
                  "--permission-mode", self.native_permission(spec.permission_mode),
                  "-p", prompt]
 
-        result_json = self._run_print(args, timeout_seconds=300, pair_name=spec.name, cwd=spec.cwd)
+        result_json = self._run_print(args, timeout_seconds=300, pair_name=spec.name, cwd=spec.cwd,
+                                      **({"connector_spec": spec} if spec.mcp_whitelist else {}))
         return CreateResult(
             name=spec.name,
             session_id=result_json.get("session_id", spec.session_id),
             transcript_path=str(self.transcript_path(spec)) if self.transcript_path(spec) else None,
             initial_response=result_json.get("result"),
+            notes=connectors.claude_init_notes(spec.mcp_whitelist, result_json.get("_mcp_servers")),
         )
 
     def send(self, spec: PairSpec, message: str, *, model: str | None = None,
@@ -263,6 +266,7 @@ class ClaudeAdapter(PairAdapter):
             "--model", self.cli_model(spec, model),
         ]
         args += self._fallback_args(spec)
+        args += self._mcp_args(spec, permission_mode)
         if eff is not None:
             args += ["--effort", eff]
         args += [
@@ -272,7 +276,8 @@ class ClaudeAdapter(PairAdapter):
         from claude_squared.async_tasks import mark_task_executing
         mark_task_executing(task_id)
         result_json = self._run_print(args, timeout_seconds=timeout_seconds,
-                                      pair_name=spec.name, cwd=spec.cwd)
+                                      pair_name=spec.name, cwd=spec.cwd,
+                                      **({"connector_spec": spec} if spec.mcp_whitelist else {}))
         return self._build_send_result(spec, result_json)
 
     def compact(self, spec: PairSpec, steering_prompt: str | None = None,
@@ -316,8 +321,10 @@ class ClaudeAdapter(PairAdapter):
             "--permission-mode", self.native_permission(spec.permission_mode),
             "-p", sentinel,
         ]
+        args += self._mcp_args(spec)
         result_json = self._run_print(
-            args, timeout_seconds=timeout_seconds, pair_name=spec.name, cwd=spec.cwd
+            args, timeout_seconds=timeout_seconds, pair_name=spec.name, cwd=spec.cwd,
+            **({"connector_spec": spec} if spec.mcp_whitelist else {})
         )
         new_sid = result_json.get("session_id")
         if not new_sid or new_sid == spec.session_id:
@@ -389,27 +396,7 @@ class ClaudeAdapter(PairAdapter):
         """Args that pin specialization at create time (verified to persist on resume)."""
         args: list[str] = []
 
-        # MCP scope: --strict-mcp-config drops local MCPs; cloud MCPs (mcp__claude_ai_*)
-        # and our own pair MCP tools are loaded server-side or via user config and need
-        # explicit --disallowed-tools globs to keep their definitions out of the pair's prompt.
-        mcp_config = self._mcp_config_json(spec)
-        args += ["--strict-mcp-config", "--mcp-config", mcp_config]
-        for d in self._cloud_mcp_disallow(spec):
-            args += ["--disallowed-tools", d]
-        # Pairs don't need to be able to spawn pairs themselves — strip our own tools
-        # (~12k tokens of definitions) from the pair's prompt by disallowing both
-        # CLI-side and Desktop-side namespaces.
-        args += ["--disallowed-tools", "mcp__pair__*",
-                 "--disallowed-tools", "mcp__Claude_Squared__*"]
-        # Strip tools that can't work in headless --print mode (no interactive UI).
-        # AskUserQuestion is the key one: a headless pair has no way to render it,
-        # so the CLI denies the call regardless of permission_mode AND the content
-        # the model composed inside it is lost. Removing it from the toolset makes
-        # the model put clarifying questions in its plain-text reply, which routes
-        # back to the orchestrator intact. (See models.HEADLESS_INCOMPATIBLE_TOOLS.)
-        for t in HEADLESS_INCOMPATIBLE_TOOLS:
-            args += ["--disallowed-tools", t]
-
+        args += self._mcp_args(spec)
         # v0.9.10: Ultracode mode. Anthropic's mechanism is a session settings
         # key (--settings), NOT a --effort value. The CLI rejects --effort
         # ultracode with a warning ("Unknown --effort value 'ultracode'") but
@@ -443,43 +430,19 @@ class ClaudeAdapter(PairAdapter):
         if sp_text:
             args += ["--append-system-prompt", sp_text]
 
-        if spec.allowed_tools:
+        if spec.allowed_tools and not spec.mcp_whitelist:
             args += ["--allowed-tools", " ".join(spec.allowed_tools)]
 
         return args
 
-    def _cloud_mcp_disallow(self, spec: PairSpec) -> list[str]:
-        """Build --disallowed-tools globs for cloud MCPs (claude.ai-managed integrations).
-
-        Default: suppress everything under `mcp__claude_ai_*` to keep pair context lean.
-        If `mcp_whitelist` includes a cloud server name like 'claude_ai_Gmail', that one
-        is left enabled.
-        """
-        # Always suppress everything under claude_ai_* unless explicitly whitelisted
-        if not spec.mcp_whitelist:
-            return ["mcp__claude_ai_*"]
-        # Collect server names that should stay; suppress all others under claude_ai_*
-        # (Note: we can't enumerate all cloud servers ahead of time, so this is a heuristic:
-        # we only suppress the well-known ones that aren't in the whitelist.)
-        known_cloud_servers = [
-            "claude_ai_Canva", "claude_ai_Figma", "claude_ai_Gmail",
-            "claude_ai_Google_Calendar", "claude_ai_Google_Drive",
-            "claude_ai_Hugging_Face", "claude_ai_Notion", "claude_ai_PitchBook_Premium",
-        ]
-        whitelisted = set(spec.mcp_whitelist)
-        return [f"mcp__{srv}__*" for srv in known_cloud_servers if srv not in whitelisted]
-
-    def _mcp_config_json(self, spec: PairSpec) -> str:
-        """Build the --mcp-config JSON string. Empty by default; opt-in via mcp_whitelist."""
-        if not spec.mcp_whitelist:
-            return json.dumps({"mcpServers": {}})
-        # If whitelist given, the caller is asking us to read the user's normal MCP config
-        # and pass through only the named ones. Without --strict-mcp-config we'd inherit all;
-        # with it we'd see only what we list. Since we can't easily read the user's MCP defs from
-        # here, we register just the named ones as a reference; user must have them in their global
-        # MCP config for the names to resolve.
-        # Simpler: drop --strict-mcp-config when whitelist given so the user's MCPs are inherited.
-        return json.dumps({"mcpServers": {}})
+    def _mcp_args(self, spec: PairSpec, permission_mode: str | None = None) -> list[str]:
+        args = connectors.claude_args(
+            spec.mcp_whitelist, permission_mode or spec.permission_mode, spec.cwd, spec.allowed_tools,
+        )
+        # Reapplying disallow flags on resume must retain headless exclusions.
+        for tool in HEADLESS_INCOMPATIBLE_TOOLS:
+            args += ["--disallowed-tools", tool]
+        return args
 
     def _resolve_system_prompt(self, spec: PairSpec) -> str | None:
         parts = []
@@ -492,8 +455,12 @@ class ClaudeAdapter(PairAdapter):
         return "\n\n".join(parts) if parts else None
 
     def _run_print(self, args: list[str], *, timeout_seconds: int, pair_name: str,
-                   cwd: str | None = None) -> dict:
+                   cwd: str | None = None, connector_spec: PairSpec | None = None) -> dict:
         cli = _claude_executable()
+        if connector_spec is not None and connector_spec.mcp_whitelist:
+            args = list(args)
+            args[args.index("--output-format") + 1] = "stream-json"
+            args.append("--verbose")
         full = [cli] + args
         try:
             proc = subprocess.run(
@@ -529,6 +496,20 @@ class ClaudeAdapter(PairAdapter):
                 exit_code=proc.returncode,
             )
         try:
+            if connector_spec is not None and connector_spec.mcp_whitelist:
+                events = []
+                for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(event, dict):
+                        events.append(event)
+                self._attach_mcp_init(events)
+                for event in reversed(events):
+                    if event.get("type") == "result":
+                        return event
+                raise CLIError("claude CLI stream contained no result event")
             return json.loads(proc.stdout.decode("utf-8", errors="replace"))
         except json.JSONDecodeError as e:
             raise CLIError(
@@ -548,6 +529,7 @@ class ClaudeAdapter(PairAdapter):
                 "--permission-mode", self.native_permission(spec.permission_mode),
                 "--input-format", "stream-json",
                 "--output-format", "stream-json"]
+        args += self._mcp_args(spec)
 
         stdin_payload = "\n".join(
             json.dumps({"type": "user", "message": {"role": "user", "content": m}})
@@ -583,7 +565,18 @@ class ClaudeAdapter(PairAdapter):
                 events.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
+        if spec.mcp_whitelist:
+            self._attach_mcp_init(events)
         return events
+
+    @staticmethod
+    def _attach_mcp_init(events: list[dict]) -> None:
+        init = next((event for event in reversed(events)
+                     if event.get("type") == "system" and event.get("subtype") == "init"
+                     and not event.get("parent_tool_use_id")), {})
+        for event in events:
+            if event.get("type") == "result":
+                event["_mcp_servers"] = init.get("mcp_servers")
 
     def _read_last_turn_context_fill(self, spec: PairSpec) -> int | None:
         """Compute true 'context fill' by reading the LAST assistant message's
@@ -777,6 +770,7 @@ class ClaudeAdapter(PairAdapter):
             self_woken_waited_s=waited_s,
             terminal_reason=result_json.get("terminal_reason"),
             backend="claude",
+            notes=connectors.claude_init_notes(spec.mcp_whitelist, result_json.get("_mcp_servers")),
         )
 
 
