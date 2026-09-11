@@ -4,6 +4,22 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- `pair_compact`: the tool description states up front that Codex compaction
+  takes no steering input — the app-server's `thread/compact/start` accepts
+  only a thread id (verified against codex-cli 0.153.4's protocol schema) —
+  and suggests briefing the pair right after compacting instead.
+  `steering_prompt` was already ignored there with a note in the result; the
+  description just never said so. The v0.9.x history is gone from the
+  description (it lives in the changelog).
+- `pair_handoff`: the result's static "Lost context" and "Housekeeping"
+  sections are two short paragraphs instead of eight bullets, and the two
+  closing instructions are one line — same facts, roughly half the tokens.
+  The tool description is tightened as well.
+
 ## [0.15.0] — 2026-09-10
 
 Hand a Claude pair's conversation to a new Codex pair, and per-pair MCP

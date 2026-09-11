@@ -679,7 +679,7 @@ def _check_model_backend(spec: PairSpec, model: str | None) -> None:
 _PAIR_ACTIONS = {
     "handoff": "pair_handoff — import a settled Claude conversation into a new Codex pair",
     "send": "pair_send / pair_send_async — message the pair (sync FIFO-queued or async with task_id)",
-    "compact": "pair_compact — native /compact via stream-json, optional steering prompt",
+    "compact": "pair_compact — compact the history in place (Claude: native /compact + optional steering prompt; Codex: app-server compaction, no steering input)",
     "context": "pair_context — invoke /context for accurate token usage breakdown",
     "clear": "pair_clear — rotate to a new session_id (preserves pair config; old transcript archived)",
     "fork": "pair_fork — branch the pair into a new independent pair, keeping both (like /fork)",
@@ -3704,24 +3704,22 @@ def pair_handoff(
     timeout_seconds: int = 45,
     verbose: bool = False,
 ) -> str:
-    """Hand off a settled Claude conversation to a new Codex pair.
+    """Hand off a settled Claude conversation to a NEW Codex pair (Claude -> Codex only).
 
-    Source untouched: imports one session snapshot without inference, then runs
-    a normal cancellable briefing/probe turn in the new pair. Codex sources are
-    not supported yet. Default name: <name>-codex, with collision suffixes;
-    explicit existing names fail. Claude-only configuration is not carried.
+    Imports a snapshot of the source through Codex's own importer (no model
+    turn; source untouched), registers it as <name>-codex (collision suffixes;
+    an explicit existing new_name fails), then runs one briefing/probe turn in
+    the new pair and returns its answer plus warnings about what did not carry.
 
-    model defaults to the dynamic Codex tier; effort inherits the source and
-    is coerced for that model. permission_mode inherits the neutral source
-    level, but must be explicit when allowed_tools is nonempty. context_window
-    defaults to 'default'. Imports at >=70% of the chosen usable window are
-    deleted and refused; >=50% warns. The estimate includes the first message.
-
-    briefing adds instructions after the handoff notice. probe overrides the
-    default request to summarize the conversation's work and unfinished tasks.
-    timeout_seconds caps only the briefing wait (also bounded by the sync cap);
-    import has a separate 60s ceiling. A briefing failure leaves the registered
-    pair available for correction. verbose returns JSON including the report.
+    model defaults to the Codex default tier; effort inherits the source
+    (coerced for the model); permission_mode inherits the source level but must
+    be explicit when the source has allowed_tools (Codex can't enforce them);
+    context_window defaults to 'default'. Imports at >=70% of the chosen window
+    are deleted and refused (>=50% warns). briefing is appended to the handoff
+    notice; probe replaces the default "summarize the work and what's
+    unfinished" question. timeout_seconds caps only the briefing wait (the
+    import has its own 60s ceiling); a failed briefing leaves the registered
+    pair for a manual send.
     """
     if timeout_seconds < 0:
         raise PairError("timeout_seconds must be non-negative")
@@ -3892,27 +3890,20 @@ def pair_handoff(
         if note:
             capability.append(note)
     # Observed on a real import (2026-09-10): everything arrives as marked
-    # text, but these details don't survive the flattening.
-    lost = [
-        "Reasoning is not carried; tool calls and results arrive as [external_agent_tool_call] / "
-        "[external_agent_tool_result] records of the previous agent's work, not actions this pair took.",
-        "Files written or edited are recorded by path only — the content and the edit itself are not in the "
-        "history (the files are still on disk in the shared cwd).",
-        "A sub-agent appears only as its short description and final report; its prompt and internal steps "
-        "are not imported.",
-        "Parallel tool calls lose their pairing: calls and results arrive as separate unlabeled lists, so "
-        "which result belongs to which call has to be inferred. Attachments are not carried.",
-    ]
+    # text, but these details don't survive the flattening. Two short
+    # paragraphs, not bullets — this lands in the caller's context every time.
+    lost = ("Not carried: reasoning, attachments, the content of written or edited files (recorded by "
+            "path only; the files are on disk in the shared cwd), and sub-agent internals (description + "
+            "final report only). Parallel tool calls lose their pairing: calls and results arrive as "
+            "separate unlabeled lists. Tool calls and results are [external_agent_tool_call] / "
+            "[external_agent_tool_result] records of the previous agent's work, not actions this pair took.")
     if size.warning:
-        lost.append("Size warning: the handoff already occupies >=50% of the chosen window.")
-    housekeeping = [
-        "The new pair's main.log and pair_tool_detail start empty; source T-N tags do not resolve here. "
-        "Native rewind points start empty until the first Codex turn; imported Claude turns are not native rewind points.",
-        "Counters and pending self-woken state reset; the briefing/probe is the first counted turn.",
-        f"Source '{name}' is untouched. Both pairs share cwd {source.cwd or os.getcwd()!r}; "
-        "don't let both edit the same files.",
-        f"This import is a snapshot as of {imported['imported_at']}; later source work is not transferred.",
-    ]
+        lost += " Size warning: the handoff already occupies >=50% of the chosen window."
+    housekeeping = (f"The new pair's main.log, pair_tool_detail, counters, pending self-woken state and native "
+                    f"rewind points start empty (source T-N tags and imported turns don't resolve here); the "
+                    f"briefing/probe is its first counted turn. Source '{name}' is untouched — this is a snapshot as of "
+                    f"{imported['imported_at']}; later source work is not transferred — and both pairs share "
+                    f"cwd {source.cwd or os.getcwd()!r}, so don't let both edit the same files.")
     try:
         spec = PairSpec(
             name=target, backend="codex", session_id=thread_id,
@@ -3934,11 +3925,10 @@ def pair_handoff(
         raise PairError(f"Could not register handoff pair '{target}': {exc}\n{cleanup}") from exc
 
     lines = [f"Handed off '{name}' (Claude/{source.model}) -> '{target}' (Codex/{stored_model}, "
-             f"thread {thread_id}).", size_line]
-    for label, entries in (("Capability changes", capability), ("Lost context", lost), ("Housekeeping", housekeeping)):
-        lines.append(label + ":\n" + "\n".join(f"  - {entry}" for entry in entries))
-    lines.append("If the user hasn't already acknowledged these limitations in this conversation, "
-                 "tell them before relying on the new pair — then continue.")
+             f"thread {thread_id}).", size_line,
+             "Capability changes:\n" + "\n".join(f"  - {entry}" for entry in capability),
+             "Lost context: " + lost,
+             "Housekeeping: " + housekeeping]
     state = None
     final = None
     try:
@@ -3964,7 +3954,9 @@ def pair_handoff(
     except Exception as exc:
         lines.append(f"Pair '{target}' remains registered, but its briefing could not be completed: {exc}. "
                      + (f"Inspect pair_poll('{state.task_id}')." if state else "Send the briefing with pair_send."))
-    lines.append("Check the answer; if it is wrong or thin, send a corrective briefing before real work.")
+    lines.append("Check the probe answer (send a corrective briefing if it is wrong or thin) and, unless the user "
+                 "has already acknowledged these limitations in this conversation, tell them before relying on "
+                 "the new pair — then continue.")
     text = "\n\n".join(lines)
     if verbose:
         return json.dumps({"pair": spec.model_dump(mode="json"), "size_tokens": size.tokens,
@@ -4184,39 +4176,36 @@ def pair_compact(
     compact_timeout_seconds: int = 600,
     verbose: bool = False,
 ) -> str:
-    """Compact a pair's conversation history via native /compact (stream-json).
+    """Compact a pair's conversation in place (a summary replaces the history).
 
-    v0.9.8: pair_compact now uses the same async-task machinery as pair_send
-    (graceful sync-cap degradation). The sync wait blocks for up to
-    ``timeout_seconds``; if compaction hasn't finished by then, returns an
-    async handle — compaction continues in the background, caller polls via
-    ``pair_poll(name)`` or the Bash watcher. **This fixes the pre-v0.9.8
-    bug** where pair_compact held the JSON-RPC call open up to 600s, well
-    past the host's ~60s RPC budget, producing MCP -32001 errors even though
-    the underlying compact often DID complete server-side (verified via
-    JSONL ``compact_boundary`` event counts).
+    Claude pairs: native ``/compact`` via stream-json; ``steering_prompt``
+    becomes the ``/compact <text>`` argument. **Codex pairs: compaction runs
+    through the app-server's ``thread/compact/start``, which takes ONLY a
+    thread id — the protocol has no steering input (verified against
+    codex-cli 0.153.4's schema), so ``steering_prompt`` is ignored and the
+    result says so.** To shape a Codex pair's post-compaction state, send it a
+    short briefing right after compacting (or a "state of play" message just
+    before, so the summarizer has it in view).
+
+    Runs as an async task like pair_send: the sync wait blocks up to
+    ``timeout_seconds`` (capped at the sync cap); past that you get an async
+    handle and compaction continues — poll with ``pair_poll(name)`` or the
+    background wait script.
 
     Args:
         name: Pair to compact.
-        steering_prompt: Optional custom steering text. If omitted, uses Claude's default
-            summarization. For high-quality compactions, focus the steering on:
-            (1) the conversational arc and decisions made,
-            (2) binding user preferences and rules,
-            (3) in-flight work state.
-            Defer technical detail to ``.md`` files in the project rather than restating
-            it in the summary — the post-compaction agent can re-read those.
-        timeout_seconds: Your stated patience for the sync wait (default 45s,
-            matching ``pair_send``). Compaction continues regardless — this only
-            affects whether you see the result inline or via a poll. Values >
-            sync cap (``CLAUDE_PAIR_SYNC_CAP_SECONDS``, default 45s) degrade
-            gracefully to an async handle. **Renamed semantic**: pre-v0.9.8 this
-            was the hard ceiling; now it's patience. The old hard-ceiling
-            behavior lives in ``compact_timeout_seconds``.
-        compact_timeout_seconds: Hard ceiling on the underlying /compact
-            subprocess (default 600s = 10 min, inherited from the pre-v0.9.8
-            default). Past this, the subprocess is killed and the task is
-            marked failed. Long sessions can legitimately take minutes to
-            compact.
+        steering_prompt: Claude only — custom steering for the summary. Focus it on
+            (1) the conversational arc and decisions made, (2) binding user
+            preferences and rules, (3) in-flight work state; defer technical
+            detail to ``.md`` files the post-compaction pair can re-read.
+            Ignored on Codex (noted in the result).
+        timeout_seconds: Stated patience for the sync wait (default 45s).
+            Compaction continues regardless; values above the sync cap
+            (``CLAUDE_PAIR_SYNC_CAP_SECONDS``, default 45s) degrade to an async
+            handle.
+        compact_timeout_seconds: Hard ceiling on the underlying compaction
+            (default 600s); past it the subprocess is killed and the task marked
+            failed. Long sessions can legitimately take minutes.
     """
     # Sanity: pair must exist (raises PairNotFound if not). Codex pairs compact
     # through the app-server (CodexAdapter.compact); steering text is ignored
