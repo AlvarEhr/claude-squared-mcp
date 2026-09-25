@@ -163,16 +163,20 @@ def stop_detached(state) -> str | None:
             or current.child_pid != state.child_pid or not current.child_pid
             or not async_tasks._is_pid_alive(current.child_pid)):
         return None
+    from claude_squared import process_identity
     pid = current.child_pid
     try:
-        if os.name == "nt":
-            result = subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                                    capture_output=True, timeout=10, check=False,
-                                    creationflags=subprocess.CREATE_NO_WINDOW)
-            return "tree-killed" if result.returncode == 0 else "kill-failed"
-        import signal
-        os.killpg(pid, signal.SIGKILL)  # exec starts its own session/process group
-        return "tree-killed"
+        with process_identity.matching_process(pid, current.child_started_at) as matches:
+            if not matches:
+                return "identity-unverified (child exited or PID was reused; no process killed)"
+            if os.name == "nt":
+                result = subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                                        capture_output=True, timeout=10, check=False,
+                                        creationflags=subprocess.CREATE_NO_WINDOW)
+                return "tree-killed" if result.returncode == 0 else "kill-failed"
+            import signal
+            os.killpg(pid, signal.SIGKILL)  # exec starts its own session/process group
+            return "tree-killed"
     except ProcessLookupError:
         return "already-exited"
     except (OSError, subprocess.TimeoutExpired):
@@ -185,20 +189,10 @@ def recover_turn(state) -> SendResult | None:
 
     events_path = Path(state.events_path)
     try:
-        with open(events_path, "rb") as stream:
-            lines = list(codex_turns.complete_lines(stream))
+        rows = codex_turns.read_events(events_path)
     except FileNotFoundError:
         return None
-    events = []
-    offsets = []
-    for offset, line in lines:
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(event, dict):
-            events.append(event)
-            offsets.append(offset)
+    events = [event for _, event in rows]
     completed = any(e.get("type") == "turn.completed" for e in events)
     failed = any(e.get("type") == "turn.failed" for e in events)
     # A store conflict can fail before turn.started/turn.failed. Preserve it
@@ -225,17 +219,7 @@ def recover_turn(state) -> SendResult | None:
         if "replay_start" not in receipt:
             receipt["replay_start"] = adapter._count_lines(main_log) + 1
             codex_turns.save_receipt(events_path, receipt)
-            codex_turns.append_log(events_path, receipt,
-                                  [f"[{datetime.now().strftime('%H:%M:%S')}] === recovered after owner death ==="],
-                                  receipt["logged_offset"])
-        counter = ToolCounter(index_path=log_dir / "main.idx.json")
-        tags: dict[str, str] = {}
-        for offset, event in zip(offsets, events):
-            if offset <= receipt["logged_offset"]:
-                continue
-            output = adapter._format_event(event, counter, tags, detail_dir=log_dir,
-                                            run_id=receipt["run_id"])
-            codex_turns.append_log(events_path, receipt, output, offset)
+        adapter._replay_events(events_path, receipt, rows, recovered=True)
         events.append({"type": "_log_scope", "log_path": str(main_log),
                        "start_line": receipt["replay_start"],
                        "end_line": adapter._count_lines(main_log)})
@@ -1321,7 +1305,7 @@ class CodexAdapter(PairAdapter):
         codex_turns.save_receipt(events_path, receipt)
 
         log_available = log
-        log_lock = threading.Lock()
+        log_lock = threading.RLock()
         reader_closed = threading.Event()
 
         def _log(lines: list[str], offset: int | None = None) -> None:
@@ -1329,11 +1313,11 @@ class CodexAdapter(PairAdapter):
             with log_lock:
                 if reader_closed.is_set() and threading.current_thread() is reader:
                     return
-                if log_available:
+                if log_available and lines:
                     try:
                         codex_turns.append_log(events_path, receipt, lines,
                                                receipt["logged_offset"] if offset is None else offset)
-                    except OSError:
+                    except Exception:
                         # Logging was best-effort before file-backed exec too.
                         # Don't kill useful work on a main.log/receipt disk error,
                         # or overwrite a pending append with the next event. The
@@ -1352,9 +1336,11 @@ class CodexAdapter(PairAdapter):
         except OSError as e:
             raise CLIError(f"could not start codex ({args[0]}): {e}")
         try:
+            from claude_squared import process_identity
             receipt["child_pid"] = proc.pid
+            receipt["child_started_at"] = process_identity.started_at(proc.pid, handle=getattr(proc, "_handle", None))
             codex_turns.save_receipt(events_path, receipt)
-            async_tasks.mark_codex_child(task_id, proc.pid, str(events_path))
+            async_tasks.mark_codex_child(task_id, proc.pid, str(events_path), receipt["child_started_at"])
         except BaseException:
             # Never leave an unobservable child if publishing its identity fails.
             _tree_kill(proc)
@@ -1376,34 +1362,41 @@ class CodexAdapter(PairAdapter):
                         # Poll BEFORE draining: once exit is known, this drain
                         # includes the final writes (no read-EOF/exit race).
                         exited = proc.poll() is not None
+                        batch: list[tuple[int, dict]] = []
                         for offset, line in codex_turns.complete_lines(stdout, max_lines=None if exited else 64):
-                            if reader_closed.is_set():
-                                return
                             try:
                                 ev = json.loads(line)
                             except (ValueError, TypeError):
                                 continue
-                            if not isinstance(ev, dict):
-                                continue
-                            events.append(ev)
-                            with _INFLIGHT_LOCK:
-                                info = _INFLIGHT.get(spec.name)
-                                if info is not None and info.get("proc") is proc:
-                                    info["last_activity"] = datetime.utcnow()
-                            _log(self._format_event(ev, counter, tags, detail_dir=log_dir,
-                                                    run_id=run_id) if log else [], offset)
+                            if isinstance(ev, dict):
+                                batch.append((offset, ev))
+                        with log_lock:
+                            if reader_closed.is_set():
+                                return
+                            output: list[str] = []
+                            for _, ev in batch:
+                                with _INFLIGHT_LOCK:
+                                    info = _INFLIGHT.get(spec.name)
+                                    if info is not None and info.get("proc") is proc:
+                                        info["last_activity"] = datetime.utcnow()
+                                if log:
+                                    output.extend(self._safe_format_event(ev, counter, tags,
+                                                  detail_dir=log_dir, run_id=run_id))
+                            for _, line in codex_turns.complete_lines(stderr_file, max_lines=None if exited else 64):
+                                if "Reading additional input from stdin" in line:
+                                    continue
+                                if _DENIAL_RE.search(line):
+                                    ts = datetime.now().strftime("%H:%M:%S")
+                                    output.append(f"[{ts}] [sandbox/approval DENIED] {line.strip()[:300]}")
+                            _log(output, batch[-1][0] if batch else None)
+                        for _, ev in batch:
+                            if reader_closed.is_set():
+                                return
                             if on_event is not None:
                                 try:
                                     on_event(ev)
                                 except Exception:
                                     pass
-                        for _, line in codex_turns.complete_lines(stderr_file, max_lines=None if exited else 64):
-                            if "Reading additional input from stdin" in line:
-                                continue
-                            stderr_chunks.append(line)
-                            if _DENIAL_RE.search(line):
-                                ts = datetime.now().strftime("%H:%M:%S")
-                                _log([f"[{ts}] [sandbox/approval DENIED] {line.strip()[:300]}"])
                         if exited:
                             # Stderr can end without a newline; JSONL cannot.
                             stderr_chunks.append(stderr_file.read().decode("utf-8", errors="replace"))
@@ -1458,7 +1451,17 @@ class CodexAdapter(PairAdapter):
                     _INFLIGHT.pop(spec.name, None)
         code = proc.poll()
         dur_ms = int((time.monotonic() - t0) * 1000)
-        stderr = "".join(stderr_chunks)
+        # A slow callback can outlast join(5). Files, not the observer's
+        # in-memory prefix, are authoritative after process exit.
+        rows = codex_turns.read_events(events_path)
+        events = [event for _, event in rows]
+        stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
+        try:
+            receipt = codex_turns.read_receipt(events_path)
+            self._replay_events(events_path, receipt, rows)
+            log_available = log
+        except Exception as exc:
+            events.append({"type": "_log_warning", "message": f"event log replay failed: {exc}; events at {events_path}"})
         if killed_reason:
             _log([f"[{datetime.now().strftime('%H:%M:%S')}] === TURN {killed_reason.upper()} ({dur_ms}ms) ==="])
         elif not any(e.get("type") in ("turn.completed", "turn.failed") for e in events):
@@ -1471,6 +1474,40 @@ class CodexAdapter(PairAdapter):
         events.append({"type": "_log_scope", "log_path": str(main_log),
                        "start_line": start_line, "end_line": self._count_lines(main_log)})
         return events, stderr, code, dur_ms
+
+    @staticmethod
+    def _safe_format_event(ev: dict, counter: ToolCounter | None, tags: dict[str, str], **kwargs) -> list[str]:
+        try:
+            return CodexAdapter._format_event(ev, counter, tags, **kwargs)
+        except Exception as exc:
+            # Formatting is observability, never grounds to kill useful work.
+            return [f"[{datetime.now().strftime('%H:%M:%S')}] [event formatting skipped] {type(exc).__name__}: {exc}"]
+
+    def _replay_events(self, events_path: Path, receipt: dict, rows: list[tuple[int, dict]], *,
+                       recovered: bool = False) -> None:
+        from claude_squared import codex_turns
+
+        codex_turns.finish_pending_log(events_path, receipt)
+        if not receipt.get("log", True):
+            return
+        log_dir = Path(receipt["log_path"]).parent
+        counter = ToolCounter(index_path=log_dir / "main.idx.json")
+        tags: dict[str, str] = {}
+        output = ([f"[{datetime.now().strftime('%H:%M:%S')}] === recovered after owner death ==="]
+                  if recovered and not receipt.get("replay_logged") else [])
+        offset = receipt["logged_offset"]
+        for next_offset, event in rows:
+            if next_offset <= offset:
+                continue
+            output.extend(self._safe_format_event(event, counter, tags, detail_dir=log_dir,
+                                                  run_id=receipt["run_id"]))
+            offset = next_offset
+        if output:
+            # The marker flag travels with the pending append, so a crash
+            # retries its bytes instead of adding another replay marker.
+            if recovered:
+                receipt["replay_logged"] = True
+            codex_turns.append_log(events_path, receipt, output, offset)
 
     @staticmethod
     def _count_lines(p: Path) -> int:
@@ -1565,6 +1602,9 @@ class CodexAdapter(PairAdapter):
     def _build_send_result(self, spec: PairSpec, events: list[dict], stderr: str,
                            code: int | None, dur_ms: int, started_epoch: float, *,
                            model_used: str, permission_level: str) -> SendResult:
+        # A malformed optional item must not hide the terminal reply/usage.
+        events = [e for e in events if e.get("type") not in ("item.started", "item.completed")
+                  or isinstance(e.get("item"), dict)]
         scope = next((e for e in events if e.get("type") == "_log_scope"), {})
         reply = ""
         errors: list[str] = []
@@ -1604,6 +1644,7 @@ class CodexAdapter(PairAdapter):
                        f"no steering text).")
 
         notes = connectors.codex_startup_notes(spec.mcp_whitelist, spec.cwd, stderr, events)
+        notes.extend(e["message"] for e in events if e.get("type") == "_log_warning")
         denials: list[PermissionDenial] = []
         for line in (stderr or "").splitlines():
             if _DENIAL_RE.search(line):
@@ -1651,7 +1692,11 @@ class CodexAdapter(PairAdapter):
 
         safety_signal: str | None = None
         safety_kind: str | None = None
-        err_text = " ".join(errors + ([str((failed or {}).get("error", {}).get("message") or "")] if failed else []))
+        terminal_error = (failed or {}).get("error") or {}
+        terminal_message = str(terminal_error.get("message") or "") if isinstance(terminal_error, dict) else str(terminal_error)
+        # Reconnect notices can mention rate limits unrelated to the eventual
+        # failure. The terminal message is authoritative for classification.
+        err_text = terminal_message or " ".join(errors)
         rl = (tc or {}).get("rate_limits") or {}
         if failed or (code not in (0, None) and not completed):
             if _MODEL_UNSUPPORTED_RE.search(err_text):
@@ -1660,7 +1705,7 @@ class CodexAdapter(PairAdapter):
                     f"{err_text.strip()[:200]}. Switch with pair_update(name, model='sol'|'terra'|'luna')."
                 )
                 safety_kind = "model_unavailable"
-            elif _RATE_LIMIT_RE.search(err_text) or rl.get("rate_limit_reached_type"):
+            elif _RATE_LIMIT_RE.search(err_text) or (not terminal_message and rl.get("rate_limit_reached_type")):
                 safety_signal = f"usage limit reached on the ChatGPT plan: {err_text.strip()[:200]}"
                 safety_kind = "usage_limit"
             else:

@@ -757,9 +757,11 @@ class AsyncTaskState(BaseModel):
     # Keep the child identity until terminal task persistence, including the
     # interval after child exit but before the owner's bookkeeping finishes.
     child_pid: int | None = None
+    child_started_at: float | None = None  # process creation time, UTC epoch seconds
     events_path: str | None = None
     recovered_at: datetime | None = None
     recovered_by_pid: int | None = None
+    recovery_attempts: int = 0  # fallback if the receipt itself cannot be read/written
     # Additive metadata: old task files are treated as already executing.
     queued: bool = False
     execution_started_at: datetime | None = None

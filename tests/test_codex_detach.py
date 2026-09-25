@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from datetime import datetime, timedelta
 import io
 import json
@@ -26,7 +26,8 @@ os.environ["CODEX_HOME"] = str(Path(TEST_HOME.name) / "codex")
 
 from claude_squared import async_tasks as A, codex_turns as T, registry as R, server as S
 from claude_squared.adapters import codex as C
-from claude_squared.errors import CLIError, CommandTimeout, TaskStopped
+from claude_squared import process_identity as P
+from claude_squared.errors import CLIError, CommandTimeout, TaskStopped, PairError
 from claude_squared.models import AsyncTaskState, PairSpec
 
 
@@ -70,11 +71,12 @@ class DetachTests(unittest.TestCase):
         path.write_text("".join(json.dumps(e) + "\n" for e in (EVENTS if events is None else events)), encoding="utf-8")
         os.utime(path, (time.time() - 10, time.time() - 10))
         state = AsyncTaskState(task_id=tid, pair_name=self.spec.name, message="test", status="running",
-                               started_at=datetime.utcnow() - timedelta(seconds=30), owner_pid=999999999,
-                               child_pid=child_pid, events_path=str(path))
+                               started_at=datetime.utcnow(), owner_pid=999999999,
+                               child_pid=child_pid, child_started_at=P.started_at(child_pid) or 100,
+                               events_path=str(path))
         A._save(state)
         T.save_receipt(path, {
-            "run_id": tid, "task_id": tid, "child_pid": child_pid,
+            "run_id": tid, "task_id": tid, "child_pid": child_pid, "child_started_at": state.child_started_at,
             "spec": self.spec.model_dump(mode="json"), "model_used": "gpt-6-astra",
             "permission_level": "read-only", "started_epoch": time.time() - 30,
             "log_path": str(directory.parent / "main.log"), "logged_offset": 0, "log": True,
@@ -93,9 +95,8 @@ class DetachTests(unittest.TestCase):
         self.assertIn("\ufffd", lines[1][1])
         self.assertEqual(stream.read(), b"partial")
 
-    def test_recovery_replays_once_and_clears_cancel(self):
+    def test_recovery_replays_once(self):
         state, path = self.task()
-        A.request_task_stop(state.task_id)
         threads = [threading.Thread(target=A.reap_orphan, args=(state.task_id,)) for _ in range(5)]
         for thread in threads:
             thread.start()
@@ -153,7 +154,7 @@ class DetachTests(unittest.TestCase):
         os.utime(path, (time.time() - 10, time.time() - 10))
         result = A.reap_orphan(state.task_id)
         self.assertEqual(result.status, "failed")
-        self.assertIn("No completed Codex turn", result.error)
+        self.assertIn("No completed Codex result", result.error)
         self.assertNotIn("often runs to completion", tool(S.pair_poll)(state.task_id))
 
     def test_replay_skips_logged_prefix_and_allocates_fresh_tags(self):
@@ -192,6 +193,215 @@ class DetachTests(unittest.TestCase):
         T.finish_pending_log(path, receipt)
         self.assertEqual(Path(receipt["log_path"]).read_bytes(), b"one line\n")
 
+    def test_recovery_failures_are_bounded_and_do_not_wedge_successor(self):
+        state, path = self.task()
+        receipt = T.read_receipt(path)
+        receipt["pending_log"] = {"offset": 100, "text": "lost log\n", "events_offset": 0}
+        T.save_receipt(path, receipt)  # deterministic deleted/truncated log failure
+        for attempt in (1, 2, 3):
+            current = A.reap_orphan(state.task_id)
+            self.assertEqual(current.recovery_attempts, attempt)
+            self.assertEqual(T.read_receipt(path)["recovery_attempts"], attempt)
+        self.assertEqual(current.status, "failed")
+        self.assertIn("recovery failed:", current.error)
+        self.assertIn(str(path), current.error)
+        self.assertNotIn("ORPHANED:", current.error)
+        with S._PairLock(self.spec.name):
+            A.wait_for_detached(self.spec.name)
+
+    def test_unexpected_recovery_exception_and_unreadable_receipt_are_bounded(self):
+        for error in (AttributeError("bad event"), TypeError("bad replay"), ValueError("old spec")):
+            state, path = self.task()
+            with self.subTest(error=error), patch.object(C, "recover_turn", side_effect=error), \
+                    patch.object(T, "read_receipt", side_effect=OSError("receipt unreadable")):
+                for _ in range(3):
+                    current = A.reap_orphan(state.task_id)
+                self.assertEqual(current.status, "failed")
+                self.assertEqual(current.recovery_attempts, 3)
+
+    def test_cancel_precedes_recovery_even_when_recovery_is_broken(self):
+        state, path = self.task()
+        A.request_task_stop(state.task_id)
+        with patch.object(C, "recover_turn", side_effect=AssertionError("must not recover")) as recover:
+            result = A.reap_orphan(state.task_id)
+            recover.assert_not_called()
+        self.assertEqual(result.status, "stopped")
+        self.assertFalse(A.was_stopped(state.task_id))
+
+    def test_missing_pair_skips_recovery_bookkeeping(self):
+        state, _ = self.task()
+        R.remove_pair(self.spec.name)
+        result = A.reap_orphan(state.task_id)
+        self.assertEqual(result.status, "done")
+        self.assertIn("pair missing or quarantined", " ".join(result.result.notes))
+
+    def test_reused_child_pid_neither_blocks_recovery_nor_gets_killed(self):
+        state, path = self.task(child_pid=os.getpid())
+        state.child_started_at -= 100  # same PID, different process lifetime
+        A._save(state)
+        self.assertFalse(A.codex_child_alive(state))
+        with patch.object(C.subprocess, "run") as kill, patch("os.killpg", create=True) as killpg:
+            self.assertIn("identity-unverified", C.stop_detached(state))
+            kill.assert_not_called()
+            killpg.assert_not_called()
+        self.assertEqual(A.reap_orphan(state.task_id).status, "done")
+
+    def test_reused_owner_pid_is_dead_for_poll_and_startup_sweep(self):
+        state, _ = self.task()
+        state.owner_pid = os.getpid()
+        state.started_at = datetime.utcfromtimestamp(P.started_at(os.getpid()) - 10)
+        A._save(state)
+        self.assertTrue(A.is_detached(state))
+        A._sweep_dead_predecessor_orphans()
+        self.assertEqual(A.load_task(state.task_id).status, "done")
+
+    def test_process_creation_time_matches_and_rejects_a_different_lifetime(self):
+        created = P.started_at(os.getpid())
+        self.assertIsNotNone(created)
+        self.assertTrue(P.matches(os.getpid(), created))
+        self.assertFalse(P.matches(os.getpid(), created - 10))
+        self.assertFalse(P.matches(os.getpid(), None))
+
+    def test_mutating_tools_refuse_live_detached_turn_before_side_effects(self):
+        state, _ = self.task(child_pid=os.getpid())
+        before = R.registry_path().read_bytes()
+        operations = [
+            (S.pair_clear, {"name": self.spec.name}),
+            (S.pair_forget, {"name": self.spec.name}),
+            (S.pair_fork, {"name": self.spec.name, "new_name": "fork"}),
+            (S.pair_rewind, {"name": self.spec.name, "to_point": 1}),
+            (S.pair_update, {"name": self.spec.name, "purpose": "new"}),
+        ]
+        for operation, kwargs in operations:
+            with self.subTest(tool=operation), self.assertRaisesRegex(PairError, "detached Codex turn is in flight"):
+                tool(operation)(**kwargs)
+            self.assertEqual(R.registry_path().read_bytes(), before)
+            self.assertEqual(A.load_task(state.task_id).status, "running")
+
+    def test_replay_formatting_failure_is_best_effort_and_batched(self):
+        state, path = self.task(events=[{"type": "item.completed", "item": "bad shape"}] + EVENTS)
+        with patch.object(T, "append_log", wraps=T.append_log) as append:
+            result = A.reap_orphan(state.task_id)
+        self.assertEqual(result.status, "done")
+        self.assertEqual(result.result.response, "recovered reply")
+        self.assertEqual(append.call_count, 1)
+        self.assertIn("event formatting skipped", Path(result.result.log_path).read_text())
+
+    def run_fake_events(self, events, callback=None, *, gap=0):
+        script = self.directory / "events.py"
+        script.write_text("import json, time\n" + f"events = {events!r}\n"
+                          "for event in events:\n print(json.dumps(event), flush=True)\n"
+                          f" time.sleep({gap!r})\n", encoding="utf-8")
+        return self.adapter._run([sys.executable, "-u", str(script)], self.spec,
+                                  timeout_seconds=20, task_label="send", log=True, on_event=callback)
+
+    def test_live_formatting_failure_does_not_kill_turn(self):
+        events, stderr, code, duration = self.run_fake_events(
+            [{"type": "item.completed", "item": "bad shape"}] + EVENTS)
+        self.assertEqual(code, 0)
+        result = self.adapter._build_send_result(self.spec, events, stderr, code, duration,
+                                                 time.time(), model_used=self.spec.model, permission_level="read-only")
+        self.assertEqual(result.response, "recovered reply")
+        self.assertIsNone(result.safety_signal)
+
+    def test_final_file_reread_includes_events_after_a_blocked_callback(self):
+        release = threading.Event()
+        entered = threading.Event()
+        readers = []
+        def callback(event):
+            readers.append(threading.current_thread())
+            entered.set()
+            release.wait(12)
+        try:
+            events, stderr, code, duration = self.run_fake_events(EVENTS, callback, gap=.2)
+            self.assertTrue(entered.is_set())
+            self.assertEqual(code, 0)
+            self.assertEqual(events[-2]["type"], "turn.completed")
+            result = self.adapter._build_send_result(self.spec, events, stderr, code, duration,
+                                                     time.time(), model_used=self.spec.model, permission_level="read-only")
+            self.assertEqual(result.response, "recovered reply")
+        finally:
+            release.set()
+            for reader in set(readers):
+                reader.join(5)
+                self.assertFalse(reader.is_alive(), "event reader did not close its files")
+
+    def test_transient_logging_failure_replays_tail_at_exit(self):
+        append = T.append_log
+        failed = False
+        def flaky(events, receipt, lines, offset):
+            nonlocal failed
+            if offset and not failed:
+                failed = True
+                raise OSError("temporary log failure")
+            return append(events, receipt, lines, offset)
+        with patch.object(T, "append_log", side_effect=flaky):
+            events, _, code, _ = self.run_fake_events(EVENTS)
+        self.assertTrue(failed)
+        self.assertEqual(code, 0)
+        log = Path(events[-1]["log_path"]).read_text()
+        self.assertEqual(log.count("[text] recovered reply"), 1)
+        self.assertIn("TURN COMPLETED", log)
+
+    def test_terminal_error_takes_priority_over_reconnect_notices(self):
+        events = [{"type": "error", "message": "rate limit reconnect " * 100},
+                  {"type": "turn.failed", "error": {"message": "thread-store conflict"}}]
+        result = self.adapter._build_send_result(self.spec, events, "", 1, 10, time.time(),
+                                                 model_used=self.spec.model, permission_level="read-only")
+        self.assertEqual(result.safety_kind, "error")
+        self.assertIn("thread-store conflict", result.safety_signal)
+
+    def test_wait_loop_recovers_detached_completion_early(self):
+        state, _ = self.task()
+        started = time.monotonic()
+        self.assertEqual(A.wait_for_task(state.task_id, 10).status, "done")
+        self.assertLess(time.monotonic() - started, 3)
+
+    def test_detached_wait_scans_directory_once_and_polls_known_task(self):
+        state, _ = self.task(child_pid=os.getpid())
+        finished = state.model_copy(update={"status": "done"})
+        with patch.object(A, "list_running_task_ids_for_pair", wraps=A.list_running_task_ids_for_pair) as scan, \
+                patch.object(A, "reap_orphan", side_effect=[state, state, finished]) as reap, \
+                patch.object(A.time, "sleep") as sleep, S._PairLock(self.spec.name):
+            A.wait_for_detached(self.spec.name)
+        self.assertEqual(scan.call_count, 1)
+        self.assertEqual(reap.call_count, 3)
+        self.assertEqual([call.args for call in sleep.call_args_list], [(1,), (1,)])
+
+    def test_new_runs_do_not_require_reading_receipts_for_retention(self):
+        _, path = self.task()
+        with patch.object(T, "read_receipt", side_effect=AssertionError("too new to prune")):
+            T.prune_turns(path.parent)
+
+    def test_live_batch_writes_no_receipts_for_no_output_events(self):
+        with patch.object(T, "append_log", wraps=T.append_log) as append:
+            self.run_fake_events([{"type": "turn.started"}] * 20 + [EVENTS[-1]])
+        # Initial turn marker plus the terminal event, regardless of how many
+        # batches the no-output events were read in.
+        self.assertEqual(append.call_count, 2)
+
+    def test_linux_creation_time_handles_spaces_and_parentheses_in_comm(self):
+        # Pure synthetic /proc records; no live Linux process required.
+        fields = ["S"] + ["0"] * 18 + ["12345"]
+        def read(path, *args, **kwargs):
+            return ("100 (worker (test) name) " + " ".join(fields)
+                    if path.as_posix() != "/proc/stat" else "btime 1000\n")
+        with patch.object(P.sys, "platform", "linux"), patch.object(Path, "read_text", read), \
+                patch.object(P.os, "sysconf", return_value=100, create=True):
+            self.assertEqual(P.started_at(100), 1123.45)
+
+    def test_startup_sweeps_unvalidated_legacy_task_and_compact_text_is_specific(self):
+        path = A._task_path("legacy")
+        path.write_text(json.dumps({"task_id": "legacy", "pair_name": self.spec.name,
+                                    "owner_pid": 999999999, "status": "running"}))
+        A._sweep_dead_predecessor_orphans()
+        self.assertEqual(json.loads(path.read_text())["status"], "failed")
+        state, _ = self.task(events=[])
+        state.message = "/compact"
+        state.events_path = None
+        A._save(state)
+        self.assertIn("app-server RPC", A.reap_orphan(state.task_id).error)
+
     def test_wait_behind_detached_can_be_cancelled(self):
         state, _ = self.task(child_pid=os.getpid())
         with S._PairLock(self.spec.name), self.assertRaises(TaskStopped):
@@ -214,6 +424,7 @@ class DetachTests(unittest.TestCase):
                                 response="next", model_used=self.spec.model, backend="codex", duration_ms=1)
 
         with patch.object(A, "_is_pid_alive", side_effect=alive), \
+                patch.object(P, "matches", return_value=True), \
                 patch.object(C.CodexAdapter, "send", side_effect=send):
             runner = S._build_send_runner(self.spec.name, "next", hard_timeout_seconds=5,
                                           override_model=None, override_effort=None, override_permission_mode=None)
@@ -262,6 +473,7 @@ class DetachTests(unittest.TestCase):
     def test_stop_targets_selected_detached_pid_only(self):
         state, _ = self.task(child_pid=54321)
         with patch.object(A, "_is_pid_alive", side_effect=lambda pid: pid == 54321), \
+                patch.object(P, "matching_process", return_value=nullcontext(True)), \
                 patch.object(C.subprocess, "run") as run, patch("os.killpg", create=True) as killpg:
             run.return_value.returncode = 0
             output = tool(S.pair_stop)(self.spec.name)

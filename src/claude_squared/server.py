@@ -655,6 +655,21 @@ def _adapter_for(spec: PairSpec) -> PairAdapter:
     raise PairError(f"Unsupported backend '{spec.backend}' (known: {list(BACKENDS)})")
 
 
+def _refuse_detached_codex(name: str) -> None:
+    """Under the pair lock, settle dead execs before a user mutation; never wait."""
+    if reg_mod.get_pair(name).backend != "codex":
+        return
+    for tid in async_tasks.list_running_task_ids_for_pair(name):
+        state = async_tasks.load_task(tid)
+        if state is None or not async_tasks.is_detached(state):
+            continue
+        if not async_tasks.codex_child_alive(state):
+            state = async_tasks.reap_orphan(tid, pair_locked=True)
+        if state and state.status == "running":
+            raise PairError(f"a detached Codex turn is in flight (child PID {state.child_pid}) "
+                            "— wait for it (pair_poll) or pair_stop it")
+
+
 def _require_claude(spec: PairSpec, tool: str, why: str) -> None:
     """Hard-error for tools that only exist on the Claude backend."""
     if spec.backend != "claude":
@@ -970,6 +985,7 @@ def pair_create(
         # layer (Claude Desktop's RPC timeout is typically ~60s; an Opus briefing
         # reading 5 docs can take minutes).
         with _with_pair_lock(name):
+            _refuse_detached_codex(name)
             adapter = _adapter_for(spec)
             result = adapter.create(spec, initial_message=None)
             reg_mod.update_pair(name, session_id=result.session_id, turn_count=0)
@@ -1116,6 +1132,17 @@ def pair_forget(name: str, archive: bool = True) -> str:
         archive: If True, copy the pair's JSONL transcript to ~/.claude/pairs/archive/
             before removal. Default True.
     """
+    if reg_mod.get_pair(name).backend == "codex":
+        try:
+            with _with_pair_lock(name):
+                _refuse_detached_codex(name)
+                return _forget_pair(name, archive)
+        except FileLockTimeout:
+            raise PairError(f"Pair '{name}' is busy; pair_stop it before forgetting.")
+    return _forget_pair(name, archive)
+
+
+def _forget_pair(name: str, archive: bool) -> str:
     reg_mod.assert_writable()
     # Stop any live runtime / in-flight turn for this pair before removing it
     # (a Codex turn is a one-shot process with no runtime — tree-kill it here,
@@ -2804,6 +2831,7 @@ def pair_update(
     transparency_msgs: list[str] = []
     try:
         with _with_pair_lock(name):
+            _refuse_detached_codex(name)
             fields: dict[str, Any] = {}
             cur_spec = reg_mod.get_pair(name)
             if model is not None:
@@ -3632,6 +3660,7 @@ def pair_clear(name: str, archive_old: bool = True, verbose: bool = False) -> st
     """
     try:
         with _with_pair_lock(name):
+            _refuse_detached_codex(name)
             spec = reg_mod.get_pair(name)
             adapter = _adapter_for(spec)
             old_sid = spec.session_id
@@ -4009,6 +4038,7 @@ def pair_fork(name: str, new_name: str | None = None, verbose: bool = False) -> 
     from claude_squared.transcript import find_sentinel_line, truncate_jsonl_before_line
     try:
         with _with_pair_lock(name, timeout_s=360.0):
+            _refuse_detached_codex(name)
             spec = reg_mod.get_pair(name)
             # Pick a non-colliding new name.
             existing = set(reg_mod.load().pairs.keys())
@@ -4120,6 +4150,7 @@ def pair_rewind(name: str, to_point: int, archive: bool = True, verbose: bool = 
     )
     try:
         with _with_pair_lock(name):
+            _refuse_detached_codex(name)
             spec = reg_mod.get_pair(name)
             adapter = _adapter_for(spec)
             path = adapter.transcript_path(spec)
@@ -4445,6 +4476,7 @@ def pair_stop(
         # we just torn down the in-flight work.
         try:
             with _with_pair_lock(name, timeout_s=10.0):
+                _refuse_detached_codex(name)
                 # Tear down any live runtime — soft interrupt left it alive
                 try:
                     runtime_mod.registry().evict(name)

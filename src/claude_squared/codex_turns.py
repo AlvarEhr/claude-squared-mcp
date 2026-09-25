@@ -51,6 +51,19 @@ def complete_lines(stream, *, max_lines: int | None = None):
         yield stream.tell(), raw.decode("utf-8", errors="replace")
 
 
+def read_events(path: Path) -> list[tuple[int, dict]]:
+    out = []
+    with open(path, "rb") as stream:
+        for offset, line in complete_lines(stream):
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event, dict):
+                out.append((offset, event))
+    return out
+
+
 def finish_pending_log(events: Path, receipt: dict) -> None:
     pending = receipt.get("pending_log")
     if pending is None:
@@ -93,19 +106,21 @@ def prune_turns(directory: Path, *, keep_days: int = 30) -> None:
     files, even after a server restart or a week-long detached turn.
     """
     from claude_squared import async_tasks
+    from claude_squared import process_identity
 
     cutoff = time.time() - keep_days * 86400
     for events in directory.glob("*.events.jsonl"):
         try:
-            receipt = read_receipt(events)
             if events.stat().st_mtime >= cutoff:
                 continue
+            receipt = read_receipt(events)
             task_id = receipt.get("task_id")
             state = async_tasks.load_task(task_id) if task_id else None
             if state and state.status == "running":
                 continue
             pid = receipt.get("child_pid")
-            if pid and async_tasks._is_pid_alive(pid):
+            if (pid and async_tasks._is_pid_alive(pid)
+                    and process_identity.matches(pid, receipt.get("child_started_at"))):
                 continue
             for suffix in ("events.jsonl", "events.receipt.json", "stderr.log", "stdin.txt"):
                 (directory / f"{receipt['run_id']}.{suffix}").unlink(missing_ok=True)
@@ -124,7 +139,10 @@ def bookkeep_send(events: Path, result, **extra) -> None:
 
     receipt = read_receipt(events)
     with registry.locked_registry() as reg:
-        spec = reg.pairs[result.name]
+        spec = reg.pairs.get(result.name)
+        if spec is None:
+            result.notes.append("pair missing or quarantined; registry bookkeeping skipped")
+            return
         if spec.session_id != result.session_id:
             result.notes.append("recovered turn belongs to an earlier session; registry totals left unchanged")
             return
