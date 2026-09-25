@@ -199,12 +199,12 @@ class Alert:
     def __init__(self, mode, pct):
         self.mode, self.pct, self.prev = mode, pct, None
 
-    def level(self, window):
+    def level(self, window, backend="claude", auto_compact_token_limit=None):
         if self.mode == "off" or not window:
             return None
         if self.mode == "pct":
             return int(window * self.pct / 100.0)
-        return context_alert_threshold(window, _headroom())
+        return context_alert_threshold(window, _headroom(), backend, auto_compact_token_limit)
 
     def check(self, ctx, reported):
         """(used, window, level) when this observation crosses the level."""
@@ -212,7 +212,9 @@ class Alert:
             return None
         used = int(ctx["used"])
         window = ctx.get("window") or (reported or {}).get("tokens")
-        level = self.level(window)
+        self.backend = ctx.get("backend") or (reported or {}).get("backend") or "claude"
+        self.auto_compact_token_limit = ctx.get("auto_compact_token_limit") or (reported or {}).get("auto_compact_token_limit")
+        level = self.level(window, self.backend, self.auto_compact_token_limit)
         prev, self.prev = self.prev, used
         if level is None or prev is None:
             return None
@@ -233,9 +235,9 @@ def _without_alert_flags(args):
     return out
 
 
-def _alert_message(pair, used, window, level, rearm_base):
+def _alert_message(pair, used, window, level, rearm_base, backend="claude", auto_compact_token_limit=None):
     rearm_base = _without_alert_flags(rearm_base)
-    point = compaction_point(window)
+    point = compaction_point(window, backend, auto_compact_token_limit)
     nxt = min(99, int(max(used, (used + point) / 2 if point else used) * 100 / window) + 1)
     lines = [
         f"CONTEXT ALERT: pair '{pair}' is at {used:,} / {window:,} tokens ({used * 100 / window:.0f}%), "
@@ -244,8 +246,9 @@ def _alert_message(pair, used, window, level, rearm_base):
     if point:
         lines.append(f"  Auto-compaction fires near {point:,} ({max(0, point - used):,} tokens away) — "
                      f"mid-turn, with a generic summary.")
-    lines.append(f"  To compact cleanly: pair_stop('{pair}') → pair_compact('{pair}', steering_prompt=...) "
-                 f"→ pair_send('{pair}', 'continue').")
+    compact = (f"pair_compact('{pair}')" if backend == "codex" else
+               f"pair_compact('{pair}', steering_prompt=...)")
+    lines.append(f"  To compact cleanly: pair_stop('{pair}') → {compact} → pair_send('{pair}', 'continue').")
     lines.append(f"  Keep watching:  {_cmd(*rearm_base, '--context-alert', str(nxt))}")
     lines.append(f"  or without the alert:  {_cmd(*rearm_base, '--no-context-alert')}")
     return "\n".join(lines)
@@ -327,7 +330,7 @@ def wait_task(task_id: str, arg: str, timeout_s: float, poll_s: float, alert: Al
             view = pair_activity_view(_pairs_dir(), pair, now=now, grace_seconds=0)
             hit = alert.check(view.get("context"), view.get("reported_window"))
             if hit:
-                print(_alert_message(pair, *hit, [arg] + extra))
+                print(_alert_message(pair, *hit, [arg] + extra, alert.backend, alert.auto_compact_token_limit))
                 return 8
         if time.monotonic() >= deadline:
             print(f"watcher gave up after {_dur(timeout_s)}; task {task_id[:8]} is still "
@@ -453,7 +456,7 @@ def wait_pair(pair: str, each_turn: bool, timeout_s: float, poll_s: float, alert
                 new_turns.append(t)
         hit = alert.check(view.get("context"), view.get("reported_window"))
         if hit:
-            print(_alert_message(pair, *hit, base))
+            print(_alert_message(pair, *hit, base, alert.backend, alert.auto_compact_token_limit))
             return 8
         for row in view.get("running_tasks") or []:
             if row.get("state") in ("orphaned", "finished_detached"):

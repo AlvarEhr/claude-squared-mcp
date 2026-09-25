@@ -17,6 +17,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import queue
 import re
 import shutil
 import sqlite3
@@ -38,7 +39,7 @@ from claude_squared.codex_models import (
     context_windows,
     resolve_codex_model,
 )
-from claude_squared.errors import CLIError, CommandTimeout, SessionMissing
+from claude_squared.errors import CLIError, CommandTimeout, SessionMissing, TaskStopped
 from claude_squared.models import (
     CODEX_PERMISSION_MAP,
     CompactResult,
@@ -59,6 +60,156 @@ WARNING_THRESHOLD = 0.60
 STRONG_WARNING_THRESHOLD = 0.85
 THREAD_SOURCE = "claude-squared"   # tags our threads in ~/.codex sqlite + the Desktop UI
 PROBE_PROMPT = "Reply with exactly: pair-ready"
+CONTEXT_POLL_SECONDS = 10.0
+
+
+def _configured_compact_limit(args: list[str]) -> int | None:
+    """Last CLI config assignment wins, including backend_options.args overrides."""
+    value = None
+    for index, arg in enumerate(args):
+        assignment = (args[index + 1] if arg in ("-c", "--config") and index + 1 < len(args)
+                      else arg[len("--config="):] if arg.startswith("--config=")
+                      else arg[2:].lstrip("=") if arg.startswith("-c") else "")
+        key, sep, raw = assignment.partition("=")
+        if sep and key.strip() == "model_auto_compact_token_limit":
+            try:
+                value = int(raw.strip())
+            except ValueError:
+                value = None
+    return value if value is not None and value > 0 else None
+
+
+class _CodexActivity:
+    """One send's activity; rollout I/O stays on the exec supervisor thread.
+
+    The event reader only enqueues compaction notices. Sampling and activity
+    mutations are best-effort and must never turn a useful reply into an error.
+    """
+
+    def __init__(self, spec: PairSpec, task_id: str | None):
+        from claude_squared import activity
+
+        self.spec, self.task_id = spec, task_id
+        self.writer = activity.writer(spec.name, "codex")
+        self.writer.turn_opened(task_id, "send")
+        self.status, self.preview = "failed", ""
+        self.limit: int | None = None
+        self.used: int | None = None
+        self._rollout: Path | None = None
+        self._next_sample = 0.0
+        self._events: queue.SimpleQueue = queue.SimpleQueue()
+        self._pre: dict[str, int | None] = {}
+        self._completed: set[str] = set()
+
+    def observe(self, event: dict) -> None:
+        """Reader hot path: memory only; capture the most recent known fill."""
+        item = event.get("item")
+        if (isinstance(item, dict) and item.get("type") in ("contextCompaction", "context_compaction")
+                and event.get("type") in ("item.started", "item.completed")):
+            self._events.put((event, self.used))
+
+    def _sample(self, force: bool) -> None:
+        from claude_squared import activity
+
+        now = time.monotonic()
+        if not force and now < self._next_sample:
+            return
+        self._next_sample = now + CONTEXT_POLL_SECONDS
+        if self._rollout is None:
+            self._rollout = rollout_path_for(self.spec.session_id)
+        payload = read_last_token_count(self._rollout) or {}
+        info = payload.get("info") or {}
+        window = int(info.get("model_context_window") or 0)
+        if window <= 0:
+            return
+        limit = activity.compaction_point(window, "codex", self.limit)
+        self.writer.note_reported_window(window, model_key=f"{self.spec.model}|{self.spec.context_window}",
+                                          model=self.spec.model, source="rollout",
+                                          auto_compact_token_limit=limit)
+        last = info.get("last_token_usage") or {}
+        # Match the SendResult footer: current model-call input, never the
+        # rollout's cumulative total_token_usage (design revision E).
+        if last.get("input_tokens") is None:
+            return
+        self.used = max(0, int(last["input_tokens"]))
+        self.writer.note_context(self.used, window, window_source="rollout", source="rollout",
+                                  auto_compact_token_limit=limit)
+
+    def poll(self, *, force: bool = False) -> None:
+        try:
+            completed = []
+            while True:
+                try:
+                    event, sampled_pre = self._events.get_nowait()
+                except queue.Empty:
+                    break
+                item = event["item"]
+                key = str(item.get("id") or "context-compaction")
+                if key in self._completed:
+                    continue
+                pre = item.get("pre_tokens", item.get("preTokens", sampled_pre))
+                if event["type"] == "item.started":
+                    self._pre[key] = pre
+                else:
+                    self._completed.add(key)
+                    completed.append((self._pre.pop(key, pre), item.get("post_tokens", item.get("postTokens"))))
+            try:
+                self._sample(force or bool(completed))
+            except Exception:
+                pass  # a missing/half-written rollout must not hide compaction events
+            for pre, post in completed:
+                # A newer, smaller sample is evidence of the post-compaction
+                # fill; an unchanged old token_count isn't a measured post.
+                if post is None and pre is not None and self.used is not None and self.used < pre:
+                    post = self.used
+                self.writer.note_compaction("auto", pre, post)
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        try:
+            self.writer.turn_closed(self.task_id, status=self.status, preview=self.preview)
+        except Exception:
+            pass
+
+
+def record_recovered_activity(state) -> None:
+    """After terminal task persistence, publish under the recovering owner's PID.
+
+    The dead owner's file is left untouched. A fresh window excludes its
+    synthesized owner_died turn; the terminal task file remains authoritative.
+    """
+    from claude_squared import codex_turns, registry
+
+    try:
+        current = registry.get_pair(state.pair_name)
+    except Exception:
+        return  # forgotten/quarantined pair: its task result is still recoverable
+    if current.backend != "codex":
+        return
+    try:
+        path = Path(state.events_path)
+        receipt = codex_turns.read_receipt(path)
+        spec = PairSpec.model_validate(receipt["spec"])
+    except Exception:
+        spec = current
+        receipt = {}
+    if spec.session_id != current.session_id:
+        return  # do not replace a newer session's activity with an old task
+    turn = _CodexActivity(spec, state.task_id)
+    try:
+        turn.limit = receipt.get("auto_compact_token_limit")
+        if state.recovered_at:
+            try:
+                for _, event in codex_turns.read_events(Path(state.events_path)):
+                    turn.observe(event)
+            except OSError:
+                pass
+        turn.poll(force=True)
+        turn.status = state.status
+        turn.preview = getattr(state.result, "response", None) or state.error or ""
+    finally:
+        turn.close()
 
 # User-config keys re-added under ``--ignore-user-config``. The flag is
 # required (the user's config mounts claude-squared itself as an MCP server →
@@ -944,27 +1095,50 @@ class CodexAdapter(PairAdapter):
              on_event: Callable[[dict], None] | None = None,
              should_stop: Callable[[], bool] | None = None,
              task_id: str | None = None) -> SendResult:
-        if not self.session_exists(spec):
-            raise SessionMissing(spec.name, spec.session_id)
-        args = self._exec_args(spec, model=model, effort=effort, permission_mode=permission_mode)
-        args += ["resume", spec.session_id, "-"]   # message over stdin (see create)
-        run_spec = spec.model_copy(update={
-            "model": self._model_for(spec, model),
-            "effort": effort if effort is not None else spec.effort,
-            "permission_mode": normalize_permission(permission_mode or spec.permission_mode),
-        })
-        started = time.time()
-        events, stderr, code, dur_ms = self._run(
-            args, run_spec, timeout_seconds=timeout_seconds, task_label="send", log=True,
-            on_event=on_event, should_stop=should_stop, task_id=task_id,
-            stdin_text=message,
-        )
-        return self._build_send_result(
-            spec, events, stderr, code, dur_ms, started,
-            model_used=run_spec.model,
-            permission_level=run_spec.permission_mode,
-        )
-
+        turn = _CodexActivity(spec, task_id)
+        try:
+            if not self.session_exists(spec):
+                raise SessionMissing(spec.name, spec.session_id)
+            args = self._exec_args(spec, model=model, effort=effort, permission_mode=permission_mode)
+            args += ["resume", spec.session_id, "-"]
+            run_spec = spec.model_copy(update={
+                "model": self._model_for(spec, model),
+                "effort": effort if effort is not None else spec.effort,
+                "permission_mode": normalize_permission(permission_mode or spec.permission_mode),
+            })
+            turn.spec = run_spec
+            turn.limit = _configured_compact_limit(args)
+            started = time.time()
+            events, stderr, code, dur_ms = self._run(
+                args, run_spec, timeout_seconds=timeout_seconds, task_label="send", log=True,
+                on_event=on_event, should_stop=should_stop, task_id=task_id,
+                stdin_text=message, activity_turn=turn,
+            )
+            result = self._build_send_result(
+                spec, events, stderr, code, dur_ms, started,
+                model_used=run_spec.model, permission_level=run_spec.permission_mode,
+            )
+            completed = any(e.get("type") == "turn.completed" for e in events)
+            failed = any(e.get("type") == "turn.failed" for e in events)
+            turn.status = "failed" if failed or (code not in (0, None) and not completed) else "done"
+            from claude_squared import async_tasks
+            if task_id and async_tasks.was_stopped(task_id):
+                turn.status = "stopped"
+            turn.preview = result.response
+            return result
+        except CommandTimeout:
+            turn.status = "timeout"
+            raise
+        except TaskStopped:
+            turn.status = "stopped"
+            raise
+        except BaseException:
+            from claude_squared import async_tasks
+            if task_id and async_tasks.was_stopped(task_id):
+                turn.status = "stopped"
+            raise
+        finally:
+            turn.close()
     def fork(self, spec: PairSpec, sentinel: str | None = None, timeout_seconds: int = 300) -> str:
         """Native ``exec fork <thread-id>`` — no prompt needed (verified: a
         promptless fork with stdin closed creates the new thread, 0 tokens,
@@ -1269,6 +1443,7 @@ class CodexAdapter(PairAdapter):
              should_stop: Callable[[], bool] | None = None,
              task_id: str | None = None,
              stdin_text: str | None = None,
+             activity_turn: _CodexActivity | None = None,
              ) -> tuple[list[dict], str, int | None, int]:
         """File-backed exec: parent death must not break the child's next write.
 
@@ -1301,6 +1476,7 @@ class CodexAdapter(PairAdapter):
             "model_used": model_used, "permission_level": permission,
             "started_epoch": time.time(), "log_path": str(main_log),
             "logged_offset": 0, "start_line": start_line, "log": log,
+            "auto_compact_token_limit": _configured_compact_limit(args),
         }
         codex_turns.save_receipt(events_path, receipt)
 
@@ -1330,6 +1506,8 @@ class CodexAdapter(PairAdapter):
         else:
             popen_kwargs["start_new_session"] = True
         t0 = time.monotonic()
+        if activity_turn is not None:
+            activity_turn.poll(force=True)
         try:
             with open(stdin_path, "rb") as inp, open(events_path, "wb") as out, open(stderr_path, "wb") as err:
                 proc = subprocess.Popen(args, stdin=inp, stdout=out, stderr=err, **popen_kwargs)
@@ -1375,6 +1553,8 @@ class CodexAdapter(PairAdapter):
                                 return
                             output: list[str] = []
                             for _, ev in batch:
+                                if activity_turn is not None:
+                                    activity_turn.observe(ev)
                                 with _INFLIGHT_LOCK:
                                     info = _INFLIGHT.get(spec.name)
                                     if info is not None and info.get("proc") is proc:
@@ -1428,12 +1608,18 @@ class CodexAdapter(PairAdapter):
                         stop = False
                     if stop:
                         killed_reason = "stopped"
+                        if activity_turn is not None:
+                            activity_turn.status = "stopped"
                         _tree_kill(proc)
                         break
                 if deadline is not None and now >= deadline:
                     killed_reason = "timeout"
+                    if activity_turn is not None:
+                        activity_turn.status = "timeout"
                     _tree_kill(proc)
                     break
+                if activity_turn is not None:
+                    activity_turn.poll()
                 time.sleep(0.2)
             reader.join(timeout=5)
             if reader_errors:
@@ -1455,6 +1641,12 @@ class CodexAdapter(PairAdapter):
         # in-memory prefix, are authoritative after process exit.
         rows = codex_turns.read_events(events_path)
         events = [event for _, event in rows]
+        if activity_turn is not None:
+            for event in events:
+                activity_turn.observe(event)
+            activity_turn.poll(force=True)
+            if killed_reason:
+                activity_turn.status = killed_reason
         stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
         try:
             receipt = codex_turns.read_receipt(events_path)

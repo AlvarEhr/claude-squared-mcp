@@ -38,6 +38,7 @@ class ConnectorTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         self.directory = Path(self.stack.enter_context(tempfile.TemporaryDirectory(dir=TEST_HOME.name)))
         self.stack.enter_context(patch.dict(os.environ, {"CLAUDE_HOME": str(self.directory / "claude")}))
+        self.addCleanup(self.retire_activity)
         self.config_path = self.directory / ".claude.json"
         self.stack.enter_context(patch.object(N, "claude_config_path", return_value=self.config_path))
         self.user_config = {"mcpServers": {
@@ -99,6 +100,17 @@ class ConnectorTests(unittest.TestCase):
     def result_event(self):
         return {"type": "result", "subtype": "success", "result": "Done", "session_id": "source-id",
                 "duration_ms": 1, "usage": {"input_tokens": 1}}
+
+    def retire_activity(self):
+        # The activity flusher must stop using this fixture before its temp
+        # tree is removed (Windows otherwise sees newly recreated files).
+        from claude_squared import activity
+        home = str(self.directory / "claude" / "pairs")
+        with activity._WRITERS_LOCK:
+            writers = [activity._WRITERS.pop(key) for key in list(activity._WRITERS) if key[0] == home]
+        for writer in writers:
+            with writer._io_lock, writer._lock:
+                writer._forgotten = True
 
     def stream_output(self, servers):
         return b"\n".join(json.dumps(event).encode() for event in [

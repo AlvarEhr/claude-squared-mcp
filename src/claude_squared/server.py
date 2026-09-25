@@ -1486,18 +1486,22 @@ def _activity_status_lines(name: str) -> list[str]:
         line = f"  context: {used:,}"
         if window:
             line += f" / {window:,} ({used / window * 100:.0f}%)"
-        line += " live" if ctx.get("source") == "stream" else ""
+        line += " live" if ctx.get("source") in ("stream", "rollout") else ""
         if ctx.get("window_source") == "inferred":
             line += " (window estimated until the first reply reports it)"
         try:
             headroom = settings_mod.load_defaults().context_alert_headroom
         except Exception:
             headroom = None
-        threshold = activity_mod.context_alert_threshold(window, headroom)
+        reported = view.get("reported_window") or {}
+        backend = ctx.get("backend") or reported.get("backend") or "claude"
+        limit = ctx.get("auto_compact_token_limit") or reported.get("auto_compact_token_limit")
+        threshold = activity_mod.context_alert_threshold(window, headroom, backend, limit)
         if threshold and used >= threshold:
             line += (f" — ⚠ past the context alert ({threshold:,}); auto-compaction fires near "
-                     f"{activity_mod.compaction_point(window):,}. Clean compaction: pair_stop → "
-                     f"pair_compact with a steering prompt → pair_send('continue')")
+                     f"{activity_mod.compaction_point(window, backend, limit):,}. Clean compaction: pair_stop → "
+                     + ("pair_compact" if backend == "codex" else "pair_compact with a steering prompt")
+                     + " → pair_send('continue')")
         elif threshold:
             line += f" — alert at {threshold:,}"
         out.append(line)
@@ -5139,6 +5143,7 @@ def _codex_status(spec: PairSpec, *, last_n_log: int, verbose: bool) -> str:
         return json.dumps({
             "name": name, "backend": "codex",
             "runtime_alive": bool(info) or any(async_tasks.codex_child_alive(state) for state in detached),
+            "activity": activity_mod.view(name),
             "started_at": info["started_at"].isoformat() if info and info.get("started_at") else None,
             "last_log_activity_at": last_activity.isoformat() if last_activity else None,
             "idle_seconds": idle_seconds,
@@ -5150,6 +5155,7 @@ def _codex_status(spec: PairSpec, *, last_n_log: int, verbose: bool) -> str:
     lines = [f"Pair '{name}' status (codex):"]
     lines.append(f"  turn process: {'running' if info else 'none'}")
     lines.append(f"  liveness: {heuristic}")
+    lines.extend(_activity_status_lines(name))
     if inflight_tasks:
         ids_str = ", ".join(inflight_tasks) if len(inflight_tasks) <= 2 else ", ".join(t[:8] for t in inflight_tasks[:3]) + "..."
         lines.append(f"  in-flight async tasks: {len(inflight_tasks)} ({ids_str})")
