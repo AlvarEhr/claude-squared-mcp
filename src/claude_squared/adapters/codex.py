@@ -14,6 +14,7 @@ with ChatGPT-plan auth on 2026-09-07 — see HANDOFF.md "Codex backend".
 
 from __future__ import annotations
 
+import atexit
 import glob
 import json
 import os
@@ -61,6 +62,42 @@ STRONG_WARNING_THRESHOLD = 0.85
 THREAD_SOURCE = "claude-squared"   # tags our threads in ~/.codex sqlite + the Desktop UI
 PROBE_PROMPT = "Reply with exactly: pair-ready"
 CONTEXT_POLL_SECONDS = 10.0
+_ACTIVITY_EXIT_LOCK = threading.Lock()
+_ACTIVITY_EXIT_REGISTERED = False
+
+
+class _NoCodexActivity:
+    """Activity publication is optional; an unavailable writer cannot block exec."""
+
+    def __init__(self, spec: PairSpec):
+        self.spec = spec
+        self.limit = None
+        self.status, self.preview = "failed", ""
+
+    def observe(self, event: dict, *, position: int | None = None) -> None:
+        pass
+
+    def poll(self, *, force: bool = False) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def _new_codex_activity(spec: PairSpec, task_id: str | None):
+    try:
+        from claude_squared import activity
+
+        # Short-lived CLI observers can publish recovery activity without ever
+        # entering server.run(). Register before creating their owner file.
+        global _ACTIVITY_EXIT_REGISTERED
+        with _ACTIVITY_EXIT_LOCK:
+            if not _ACTIVITY_EXIT_REGISTERED:
+                atexit.register(activity.shutdown)
+                _ACTIVITY_EXIT_REGISTERED = True
+        return _CodexActivity(spec, task_id)
+    except Exception:
+        return _NoCodexActivity(spec)
 
 
 def _configured_compact_limit(args: list[str]) -> int | None:
@@ -99,14 +136,16 @@ class _CodexActivity:
         self._next_sample = 0.0
         self._events: queue.SimpleQueue = queue.SimpleQueue()
         self._pre: dict[str, int | None] = {}
-        self._completed: set[str] = set()
+        self._completed: set[object] = set()
+        self._seen_positions: set[int] = set()
+        self._anonymous_pre: list[int | None] = []
 
-    def observe(self, event: dict) -> None:
+    def observe(self, event: dict, *, position: int | None = None) -> None:
         """Reader hot path: memory only; capture the most recent known fill."""
         item = event.get("item")
         if (isinstance(item, dict) and item.get("type") in ("contextCompaction", "context_compaction")
                 and event.get("type") in ("item.started", "item.completed")):
-            self._events.put((event, self.used))
+            self._events.put((event, self.used, position))
 
     def _sample(self, force: bool) -> None:
         from claude_squared import activity
@@ -117,6 +156,9 @@ class _CodexActivity:
         self._next_sample = now + CONTEXT_POLL_SECONDS
         if self._rollout is None:
             self._rollout = rollout_path_for(self.spec.session_id)
+        # Codex 0.155, 2026-09-25 live probe: token_count may be flushed only
+        # after the tool call it launched finishes. This is the latest REPORTED
+        # fill; an alert can arrive one tool call late, including just after exit.
         payload = read_last_token_count(self._rollout) or {}
         info = payload.get("info") or {}
         window = int(info.get("model_context_window") or 0)
@@ -128,7 +170,9 @@ class _CodexActivity:
                                           auto_compact_token_limit=limit)
         last = info.get("last_token_usage") or {}
         # Match the SendResult footer: current model-call input, never the
-        # rollout's cumulative total_token_usage (design revision E).
+        # rollout's cumulative total_token_usage (design revision E). Whether
+        # native auto-compaction counts output too is unmeasured; this proxy
+        # and the default 90% compaction point are alerting estimates.
         if last.get("input_tokens") is None:
             return
         self.used = max(0, int(last["input_tokens"]))
@@ -140,19 +184,30 @@ class _CodexActivity:
             completed = []
             while True:
                 try:
-                    event, sampled_pre = self._events.get_nowait()
+                    event, sampled_pre, position = self._events.get_nowait()
                 except queue.Empty:
                     break
+                if position is not None:
+                    if position in self._seen_positions:
+                        continue
+                    self._seen_positions.add(position)
                 item = event["item"]
-                key = str(item.get("id") or "context-compaction")
+                item_id = item.get("id")
+                key = ("id", str(item_id)) if item_id else (
+                    "offset", position if position is not None else len(self._completed))
                 if key in self._completed:
                     continue
                 pre = item.get("pre_tokens", item.get("preTokens", sampled_pre))
                 if event["type"] == "item.started":
-                    self._pre[key] = pre
+                    if item_id:
+                        self._pre[key] = pre
+                    else:
+                        self._anonymous_pre.append(pre)
                 else:
                     self._completed.add(key)
-                    completed.append((self._pre.pop(key, pre), item.get("post_tokens", item.get("postTokens"))))
+                    pre = (self._pre.pop(key, pre) if item_id else
+                           self._anonymous_pre.pop(0) if self._anonymous_pre else pre)
+                    completed.append((pre, item.get("post_tokens", item.get("postTokens"))))
             try:
                 self._sample(force or bool(completed))
             except Exception:
@@ -196,17 +251,23 @@ def record_recovered_activity(state) -> None:
         receipt = {}
     if spec.session_id != current.session_id:
         return  # do not replace a newer session's activity with an old task
-    turn = _CodexActivity(spec, state.task_id)
+    turn = _new_codex_activity(spec, state.task_id)
     try:
         turn.limit = receipt.get("auto_compact_token_limit")
         if state.recovered_at:
             try:
-                for _, event in codex_turns.read_events(Path(state.events_path)):
-                    turn.observe(event)
+                for position, event in codex_turns.read_events(Path(state.events_path)):
+                    turn.observe(event, position=position)
             except OSError:
                 pass
         turn.poll(force=True)
         turn.status = state.status
+        if state.status == "failed":
+            from claude_squared.async_tasks import ORPHAN_ERROR_PREFIX, CRASHED_ERROR_PREFIX
+            if (state.error or "").startswith(ORPHAN_ERROR_PREFIX):
+                turn.status = "owner_died"
+            elif (state.error or "").startswith(CRASHED_ERROR_PREFIX):
+                turn.status = "crashed"
         turn.preview = getattr(state.result, "response", None) or state.error or ""
     finally:
         turn.close()
@@ -605,29 +666,58 @@ def guardian_verdicts_since(since_epoch: float, parent_thread_id: str | None = N
     return out
 
 
+def _reverse_complete_lines(stream, chunk_size: int = 64 * 1024):
+    """Read complete JSONL records newest first, without loading the history.
+
+    Keep fragments as a list so a large tool-output line does not cause
+    quadratic concatenation. The unterminated EOF fragment is never parsed.
+    A fresh EOF snapshot per call also handles rewind/truncate/replacement.
+    """
+    stream.seek(0, os.SEEK_END)
+    position = stream.tell()
+    fragments: list[bytes] = []
+    trailing = True
+    while position:
+        start = max(0, position - chunk_size)
+        stream.seek(start)
+        parts = stream.read(position - start).split(b"\n")
+        position = start
+        if len(parts) == 1:
+            fragments.append(parts[0])
+            continue
+        if not trailing:
+            yield parts[-1] + b"".join(reversed(fragments))
+        trailing = False
+        fragments = [parts[0]]
+        yield from reversed(parts[1:-1])
+    if not trailing:
+        yield b"".join(reversed(fragments))
+
+
 def read_last_token_count(rollout: Path | None) -> dict[str, Any] | None:
     """The LAST ``token_count`` event_msg payload in a rollout: carries
     ``info.total_token_usage``, ``info.last_token_usage``,
     ``info.model_context_window`` (the EFFECTIVE window — 258,400 default,
-    828,400 with the 1M config) and ``rate_limits`` (plan quota)."""
-    if rollout is None or not rollout.exists():
+    828,400 with the 1M config) and ``rate_limits`` (plan quota). Scans backward
+    in chunks and returns at the first valid token_count; a long old thread
+    must not stall exec supervision on every ten-second sample."""
+    if rollout is None:
         return None
-    last: dict[str, Any] | None = None
     try:
-        with open(rollout, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if '"token_count"' not in line:
+        with open(rollout, "rb") as f:
+            for line in _reverse_complete_lines(f):
+                if b'"token_count"' not in line:
                     continue
                 try:
-                    d = json.loads(line)
-                except Exception:
+                    d = json.loads(line.decode("utf-8", errors="replace"))
+                except ValueError:
                     continue
-                pl = d.get("payload") or {}
-                if d.get("type") == "event_msg" and pl.get("type") == "token_count":
-                    last = pl
-    except Exception:
-        return None
-    return last
+                pl = d.get("payload") if isinstance(d, dict) else None
+                if isinstance(pl, dict) and d.get("type") == "event_msg" and pl.get("type") == "token_count":
+                    return pl
+    except OSError:
+        pass
+    return None
 
 
 def _estimate_compacted_tokens(rollout: Path | None) -> int:
@@ -1095,7 +1185,7 @@ class CodexAdapter(PairAdapter):
              on_event: Callable[[dict], None] | None = None,
              should_stop: Callable[[], bool] | None = None,
              task_id: str | None = None) -> SendResult:
-        turn = _CodexActivity(spec, task_id)
+        turn = _new_codex_activity(spec, task_id)
         try:
             if not self.session_exists(spec):
                 raise SessionMissing(spec.name, spec.session_id)
@@ -1139,6 +1229,7 @@ class CodexAdapter(PairAdapter):
             raise
         finally:
             turn.close()
+
     def fork(self, spec: PairSpec, sentinel: str | None = None, timeout_seconds: int = 300) -> str:
         """Native ``exec fork <thread-id>`` — no prompt needed (verified: a
         promptless fork with stdin closed creates the new thread, 0 tokens,
@@ -1443,7 +1534,7 @@ class CodexAdapter(PairAdapter):
              should_stop: Callable[[], bool] | None = None,
              task_id: str | None = None,
              stdin_text: str | None = None,
-             activity_turn: _CodexActivity | None = None,
+             activity_turn: _CodexActivity | _NoCodexActivity | None = None,
              ) -> tuple[list[dict], str, int | None, int]:
         """File-backed exec: parent death must not break the child's next write.
 
@@ -1552,9 +1643,9 @@ class CodexAdapter(PairAdapter):
                             if reader_closed.is_set():
                                 return
                             output: list[str] = []
-                            for _, ev in batch:
+                            for offset, ev in batch:
                                 if activity_turn is not None:
-                                    activity_turn.observe(ev)
+                                    activity_turn.observe(ev, position=offset)
                                 with _INFLIGHT_LOCK:
                                     info = _INFLIGHT.get(spec.name)
                                     if info is not None and info.get("proc") is proc:
@@ -1642,8 +1733,8 @@ class CodexAdapter(PairAdapter):
         rows = codex_turns.read_events(events_path)
         events = [event for _, event in rows]
         if activity_turn is not None:
-            for event in events:
-                activity_turn.observe(event)
+            for position, event in rows:
+                activity_turn.observe(event, position=position)
             activity_turn.poll(force=True)
             if killed_reason:
                 activity_turn.status = killed_reason

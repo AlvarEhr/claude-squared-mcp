@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import io
 from contextlib import ExitStack
 from datetime import datetime, timedelta
 import json
@@ -123,6 +124,121 @@ class CodexActivityTests(unittest.TestCase):
             turn.poll(force=True)
         self.assertIsNone(self.snapshot()["context"])
         turn.close()
+
+    def test_token_lookup_reads_only_tail_of_large_history(self):
+        payload = {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 123}}}
+        latest = (json.dumps({"type": "event_msg", "payload": payload}) + "\n").encode()
+        class CountingFile(io.BytesIO):
+            bytes_read = 0
+            def read(self, size=-1):
+                data = super().read(size)
+                self.bytes_read += len(data)
+                return data
+        stream = CountingFile((b'{"type":"old"}\n' * 200_000) + latest)
+        with patch("builtins.open", return_value=stream):
+            self.assertEqual(C.read_last_token_count(self.rollout), payload)
+        self.assertLessEqual(stream.bytes_read, 64 * 1024)
+
+    def test_reverse_reader_handles_boundaries_partial_utf8_and_rewind(self):
+        records = [b'first', 'split euro: €'.encode(), b'third' * 20]
+        for chunk in (1, 3, 17, 64):
+            for tail in (b'', b'partial' * 30):
+                with self.subTest(chunk=chunk, tail=bool(tail)):
+                    stream = io.BytesIO(b'\n'.join(records) + b'\n' + tail)
+                    self.assertEqual(list(C._reverse_complete_lines(stream, chunk)), list(reversed(records)))
+        self.tokens(90_000)
+        self.assertEqual(C.read_last_token_count(self.rollout)["info"]["last_token_usage"]["input_tokens"], 90_000)
+        self.rollout.write_bytes(b'')  # rewind truncates; no stale payload/cursor may survive
+        self.tokens(100)
+        with self.rollout.open("ab") as stream:
+            stream.write(b'{"type":"event_msg","payload":{"type":"token_count"}}')
+        self.assertEqual(C.read_last_token_count(self.rollout)["info"]["last_token_usage"]["input_tokens"], 100)
+
+    def test_compactions_without_ids_use_file_positions_for_replay_dedup(self):
+        turn = C._CodexActivity(self.spec, "anonymous")
+        rows = [(10, {"type": "item.started", "item": {"type": "contextCompaction", "pre_tokens": 100}}),
+                (20, {"type": "item.completed", "item": {"type": "contextCompaction", "post_tokens": 50}}),
+                (30, {"type": "item.started", "item": {"type": "contextCompaction", "pre_tokens": 200}}),
+                (40, {"type": "item.completed", "item": {"type": "contextCompaction", "post_tokens": 75}})]
+        for _ in range(2):  # live reader followed by the final file reread
+            for position, event in rows:
+                turn.observe(event, position=position)
+            turn.poll()
+        self.assertEqual([(c["pre"], c["post"]) for c in self.snapshot()["compactions"]], [(100, 50), (200, 75)])
+        turn.close()
+
+    def test_broken_activity_writer_does_not_prevent_send(self):
+        with patch.object(V, "writer", side_effect=OSError("activity unavailable")), \
+                patch.object(self.adapter, "_exec_args", return_value=["fake"]), \
+                patch.object(self.adapter, "_run", return_value=(EVENTS, "", 0, 1)) as run:
+            result = self.adapter.send(self.spec, "go")
+        self.assertEqual(result.response, "finished")
+        self.assertIsInstance(run.call_args.kwargs["activity_turn"], C._NoCodexActivity)
+
+    def test_recovery_supervision_status_matches_watcher_exit_codes(self):
+        g = {"__name__": "offline_wait"}
+        exec(W.WAIT_SCRIPT_SOURCE, g)
+        for prefix, status, code in [(A.ORPHAN_ERROR_PREFIX, "owner_died", 4),
+                                     (A.CRASHED_ERROR_PREFIX, "crashed", 6)]:
+            with self.subTest(status=status):
+                state = AsyncTaskState(task_id="lost", pair_name=self.spec.name, message="lost", status="failed",
+                                       started_at=datetime.utcnow(), events_path=str(self.root / "missing.events.jsonl"),
+                                       error=prefix + "owner/process exited")
+                C.record_recovered_activity(state)
+                self.assertEqual(self.snapshot()["window_turns"][-1]["status"], status)
+                self.assertEqual(g["_turn_exit"](status), code)
+
+    def test_identity_query_failure_cannot_skip_finalization_cleanup(self):
+        state = AsyncTaskState(task_id="finalize", pair_name=self.spec.name, message="done", status="running",
+                               owner_pid=os.getpid(), started_at=datetime.utcnow(), events_path="unused")
+        A._save(state)
+        A.request_task_stop(state.task_id)
+        with A._states_guard:
+            A._local_states[state.task_id] = state
+        state.status = "done"
+        event = threading.Event()
+        with patch.object(A, "owner_alive", side_effect=RuntimeError("process query failed")):
+            A._finish_task(state, event)
+        self.assertTrue(event.is_set())
+        self.assertNotIn(state.task_id, A.local_running_tasks(self.spec.name))
+        with A._states_guard:
+            self.assertNotIn(state.task_id, A._local_states)
+        self.assertFalse(A.was_stopped(state.task_id))
+        self.assertEqual(A.load_task(state.task_id).status, "done")
+
+    def test_short_lived_recovery_publisher_marks_owner_file_exited(self):
+        tid = str(uuid.uuid4())
+        directory = R.logs_dir() / self.spec.name / "turns"
+        directory.mkdir(parents=True)
+        events_path = directory / f"{tid}.events.jsonl"
+        events_path.write_text("".join(json.dumps(e) + "\n" for e in EVENTS))
+        os.utime(events_path, (time.time() - 10,) * 2)
+        A._save(AsyncTaskState(task_id=tid, pair_name=self.spec.name, message="recover", status="running",
+                               started_at=datetime.utcnow(), owner_pid=999999999, child_pid=999999998,
+                               events_path=str(events_path)))
+        T.save_receipt(events_path, {"run_id": tid, "spec": self.spec.model_dump(mode="json"),
+                                     "model_used": self.spec.model, "permission_level": "read-only",
+                                     "started_epoch": time.time()-30, "log_path": str(directory.parent / "main.log"),
+                                     "logged_offset": 0})
+        code = ("import threading\nfrom claude_squared import async_tasks as A\n"
+                "for thread in threading.enumerate():\n"
+                " if thread.name == 'codex-orphan-recovery': thread.join(10)\n"
+                f"assert A.load_task({tid!r}).status == 'done'\n")
+        env = {**os.environ, "PYTHONPATH": str(ROOT / "src"), "PYTHONDONTWRITEBYTECODE": "1"}
+        flags = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+        proc = subprocess.Popen([sys.executable, "-B", "-c", code], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, encoding="utf-8", **flags)
+        try:
+            out, err = proc.communicate(timeout=20)
+            self.assertEqual(proc.returncode, 0, out + err)
+            owner_file = R.pairs_dir() / "activity" / self.spec.name / f"{proc.pid}.json"
+            self.assertEqual(json.loads(owner_file.read_text())["state"], "exited")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+            proc.stdout.close()
+            proc.stderr.close()
 
     def test_compaction_is_queued_off_reader_and_deduplicated(self):
         turn = C._CodexActivity(self.spec, "compaction")

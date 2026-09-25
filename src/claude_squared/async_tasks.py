@@ -489,16 +489,17 @@ def _finish_task(state: AsyncTaskState, event: threading.Event) -> None:
         logger.warning("Task %s completed but state persistence failed: %s", state.task_id, exc)
         _retry_persist_in_background(state.task_id)
     finally:
-        if state.events_path and (state.recovered_at or not owner_alive(state)):
-            try:
+        try:
+            if state.events_path and (state.recovered_at or not owner_alive(state)):
                 from claude_squared.adapters.codex import record_recovered_activity
                 record_recovered_activity(state)
-            except Exception as exc:
-                logger.warning("Could not publish recovered activity for %s: %s", state.task_id, exc)
-        with _states_guard:
-            _local_states.pop(state.task_id, None)
-        event.set()
-        _clear_stopped(state.task_id)
+        except Exception as exc:
+            logger.warning("Could not publish recovered activity for %s: %s", state.task_id, exc)
+        finally:
+            with _states_guard:
+                _local_states.pop(state.task_id, None)
+            event.set()
+            _clear_stopped(state.task_id)
 
 
 _PERSIST_RETRY_DELAYS = (1, 2, 4, 8, 16, 32, 60, 60, 60, 60)

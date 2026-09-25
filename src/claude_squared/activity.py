@@ -1184,7 +1184,8 @@ class ActivityWriter:
         now = _av_now()
         with self._lock:
             st = self._state
-            # A file-backed Codex send outlives this owner; its collector closes it.
+            # A Codex send can outlive this owner. Keep its historical scope;
+            # recovery publishes a separate closed turn in the collector's file.
             if st["turn"] is not None and not (self.backend == "codex" and st["turn"].get("kind") == "send"):
                 self._close_turn_locked(None, "aborted", "", False, now)["note"] = reason
         self.lose_background(reason)
