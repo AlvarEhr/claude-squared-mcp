@@ -63,8 +63,12 @@ a synthetic oversized session and spends nothing), and for connectors,
 `tests/fixtures/mcp_probe_server.py`; it temporarily registers that server
 with `codex mcp add` and always removes it), and for the v0.16 pair watcher,
 background protection, interim triage and context alert,
-`python tests/smoke_live_v016.py` (four Haiku pairs, ~6–8 min). They cost real
-usage; run them before a release, not in CI.
+`python tests/smoke_live_v016.py` (four Haiku pairs, ~6–8 min), and for Codex
+turns surviving their MCP server and the Codex context alert,
+`python tests/smoke_live_codex_detach.py` and
+`python tests/smoke_live_codex_context.py` (a few short Luna turns each; both
+delete the threads they create). They cost real usage; run them before a
+release — and after a Codex CLI update — not in CI.
 
 ## Code organization
 
