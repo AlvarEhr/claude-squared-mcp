@@ -61,8 +61,10 @@ model) — for Claude lifecycle races, `python tests/smoke_live_0140.py`
 a synthetic oversized session and spends nothing), and for connectors,
 `python tests/smoke_live_connectors.py` (uses the throwaway server in
 `tests/fixtures/mcp_probe_server.py`; it temporarily registers that server
-with `codex mcp add` and always removes it). They cost real usage; run them
-before a release, not in CI.
+with `codex mcp add` and always removes it), and for the v0.16 pair watcher,
+background protection, interim triage and context alert,
+`python tests/smoke_live_v016.py` (four Haiku pairs, ~6–8 min). They cost real
+usage; run them before a release, not in CI.
 
 ## Code organization
 
