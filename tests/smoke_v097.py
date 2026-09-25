@@ -63,8 +63,10 @@ def test_wait_by_pair_name_done():
     _write_task("wt-new", "wpair", "done", datetime(2026, 1, 1, 12, 0, 0))
     r = _run_wait("wpair")
     assert_eq(r.returncode, 0, "exit 0 (latest task is done)")
-    assert_true("resolved pair 'wpair'" in (r.stderr or ""), "stderr shows name resolution")
-    assert_true("wt-new" in (r.stderr or ""), "resolved to the LATEST task (wt-new)")
+    # v0.16.0: a pair name FOLLOWS the pair until idle (was: its latest task).
+    assert_true("pair 'wpair' idle" in (r.stdout or ""), "stdout shows the idle summary")
+    # (Pair mode no longer resolves to a single task — the task-id path is
+    # covered by the exact-id / prefix tests.)
 
 
 def test_wait_by_pair_name_failed():

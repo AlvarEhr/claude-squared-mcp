@@ -22,6 +22,7 @@ from typing import Any, Callable
 from fastmcp import Context, FastMCP
 from filelock import FileLock, Timeout as FileLockTimeout
 
+from claude_squared import activity as activity_mod
 from claude_squared import agents as agents_mod
 from claude_squared import async_tasks
 from claude_squared import codex_models
@@ -289,16 +290,21 @@ def _fmt_send_result(r: SendResult) -> str:
             f"The pair will wake itself when the work completes; that continuation is "
             f"tracked as its OWN task: pair_poll('{r.name}', wait_seconds=30) waits "
             f"for the wake-up and shows its reply; pair_status('{r.name}') shows what's "
-            f"still out. Do NOT re-send the same request."
+            f"still out; Bash(run_in_background=True, command=\"{_watcher_cmd(r.name)}\") "
+            f"follows the pair until it is idle. Do NOT re-send the same request."
         )
-    if r.self_woken_completed:
-        _n = len(r.self_woken_completed)
+    _lost = [c for c in (r.self_woken_completed or []) if c.get("status") == "background_lost"]
+    for _c in _lost:
+        lines.append(f"⚠ BACKGROUND WORK LOST since your last send: {_c.get('note')}")
+    _woken = [c for c in (r.self_woken_completed or []) if c.get("status") != "background_lost"]
+    if _woken:
+        _n = len(_woken)
         lines.append(
             f"⏮ {_n} SELF-WOKEN TURN{'S' if _n != 1 else ''} completed since your last "
             f"send (the pair resumed on its own after background work finished — NOT "
             f"included in the reply above):"
         )
-        for _c in r.self_woken_completed:
+        for _c in _woken:
             _tid = _c.get("task_id")
             _tid_s = _tid[:8] if _tid else "(unattributed)"
             _rng = f"main.log:{_c.get('log_line_start')}-{_c.get('log_line_end')}"
@@ -388,6 +394,16 @@ def _fmt_send_result(r: SendResult) -> str:
                     f"out-of-sandbox file access, unrestricted OR pair_clear+pair_create with a wider "
                     f"cwd/--add-dir; for a persistent narrow allowlist, recreate with `allowed_tools=[...]`."
                 )
+            if (backend != "codex" and getattr(_spec, "allowed_tools", None)
+                    and any(t in ("Bash", "PowerShell") for t in permissionish)):
+                # v0.16.0 (item 5): the pair HAS rules, so the likely cause is
+                # a rule that doesn't match the literal command (verified
+                # 2026-09-25 on a read-only pair).
+                remedy += (
+                    "\n       Rules match the literal command with `*` wildcards — `Bash(git log*)` "
+                    "doesn't cover `git -C <dir> log`; add e.g. `Bash(git -C * log*)` (a mid-rule `*` "
+                    "matches any text). extra_dirs doesn't help, and the CLI refuses `cd <dir> && git …`."
+                )
             lines.append(
                 f"\n   • {denied_p}: blocked at permission level '{mode}'. "
                 f"The pair worked around it in its reply above (or didn't, if the task needed those tools).\n"
@@ -417,6 +433,8 @@ def _fmt_compact_result(r: CompactResult) -> str:
     )
     if r.summary_preview:
         body += f"\n  {r.summary_preview}"
+    for n in r.notes or []:
+        body += f"\nℹ {n}"
     return f"{header}\n{body}"
 
 
@@ -783,7 +801,8 @@ def pair_create(
             system-prompt flag); it persists in the thread history.
         profile_name: ``~/.claude/pairs/profiles/<name>.md`` used as system_prompt_append.
         allowed_tools: Claude permission patterns like ``["Bash(git *)", "Read"]``.
-            Pinned at create. Ignored by Codex.
+            Pinned at create. Ignored by Codex. Rules match the literal command
+            (``*`` = any text, also mid-rule: ``Bash(git -C * log*)``).
         mcp_whitelist: Deliberate per-pair connector opt-in on either backend.
             None or [] selects none. Unknown names are stored with a warning.
             MCP calls act with the server's own privileges, outside the pair sandbox.
@@ -1122,10 +1141,12 @@ def pair_forget(name: str, archive: bool = True) -> str:
     # or leave the cross-process stop marker; once the pair is forgotten,
     # pair_stop can no longer reach it. Astra catch.)
     spec = reg_mod.get_pair(name)
+    lost: list[dict] = []
     try:
-        runtime_mod.registry().evict(name)
+        lost = runtime_mod.registry().evict(name, "the pair was forgotten (pair_forget)")
     except Exception:
         pass
+    _local, foreign_bg = _pending_background_split(name)
     if spec.backend == "codex":
         try:
             if not codex_adapter_mod.stop_inflight(name) and async_tasks.list_running_task_ids_for_pair(name):
@@ -1142,9 +1163,19 @@ def pair_forget(name: str, archive: bool = True) -> str:
             dst = reg_mod.archive_dir() / f"{name}-{ts}.jsonl"
             shutil.copy2(src, dst)
             archived = str(dst)
+    try:
+        activity_mod.forget(name)
+    except Exception:
+        pass
     msg = f"Forgot '{name}' (session {_short(spec.session_id)})"
     if archived:
         msg += f"; archived to {archived}"
+    note = _lost_note(lost)
+    if note:
+        msg += f"\n⚠ {note}"
+    if foreign_bg:
+        msg += (f"\n⚠ {len(foreign_bg)} background task(s) still run in another MCP process "
+                f"({_describe_background(foreign_bg)}); they end when that process drops its runtime.")
     return msg
 
 
@@ -1241,6 +1272,31 @@ def _foreign_self_woken_task_ids(name: str) -> list[str]:
     return out
 
 
+# v0.16.0: how long a send waits for ANOTHER MCP process's pending background
+# work (and the self-wake it leads to) before failing with a clear message.
+_FOREIGN_BACKGROUND_WAIT_S = 1800.0
+
+
+def _foreign_activity_blocker(name: str) -> str | None:
+    """Background work (or a pending wake) in ANOTHER live MCP process that
+    owns a runtime for this pair, from the activity files. Sending now would
+    resume a copy of the session that process will write to again when its
+    pair wakes — divergent history (v0.16 design rev. D)."""
+    try:
+        view = activity_mod.view(name, grace_seconds=0)
+    except Exception:
+        return None
+    me = os.getpid()
+    bg = [b for b in view.get("background") or [] if b.get("pid") != me]
+    if bg:
+        kinds = ", ".join(sorted({str(b.get("kind")) for b in bg}))
+        return f"{len(bg)} background task(s) ({kinds}) pending in MCP process {bg[0]['pid']}"
+    wake = [w for w in view.get("wake_pending") or [] if w.get("pid") != me]
+    if wake:
+        return f"a self-wake pending in MCP process {wake[0]['pid']}"
+    return None
+
+
 def _wait_for_foreign_self_woken(
     name: str, timeout_s: float | None, should_stop: "Callable[[], bool] | None",
 ) -> float:
@@ -1256,15 +1312,29 @@ def _wait_for_foreign_self_woken(
     """
     t0 = time.monotonic()
     end = (t0 + timeout_s) if timeout_s is not None else None
+    bg_end = t0 + (_FOREIGN_BACKGROUND_WAIT_S if timeout_s is None
+                   else min(float(timeout_s), _FOREIGN_BACKGROUND_WAIT_S))
     while True:
         foreign = _foreign_self_woken_task_ids(name)
-        if not foreign:
+        # v0.16.0: ALSO wait while another process's runtime has background
+        # work pending. It holds no task and no lock while idle, so the check
+        # above missed it: that process's later self-wake ran on its stale
+        # memory and wrote a divergent turn (design rev. D).
+        blocker = None if foreign else _foreign_activity_blocker(name)
+        if not foreign and blocker is None:
             return time.monotonic() - t0
-        if end is not None and time.monotonic() >= end:
+        if foreign and end is not None and time.monotonic() >= end:
             raise PairError(
                 f"Pair '{name}' is mid self-woken turn in another MCP process "
                 f"(task {_short(foreign[0])}; waited {timeout_s}s). Retry later, or "
                 f"pair_stop it from that process."
+            )
+        if blocker is not None and time.monotonic() >= bg_end:
+            raise PairError(
+                f"Pair '{name}' has {blocker}; a send now would fork the pair's history when "
+                f"that process's pair wakes (waited {time.monotonic() - t0:.0f}s). Retry after it "
+                f"settles — {_watcher_cmd(name)} follows it — or pair_stop(force=True) it from "
+                f"that process."
             )
         if should_stop is not None:
             try:
@@ -1284,17 +1354,27 @@ def _background_pending(name: str) -> tuple[list[str], str]:
 
     Returns ``(kinds, source)``. ``source == "runtime"`` when this process owns
     the pair's live runtime (authoritative: it saw task_started and hasn't seen
-    the matching completion). Otherwise a disk heuristic: the pair's latest
-    task is a finished pair_send whose reply launched background work and no
-    newer task (the wake-up) exists yet — which from another process or a
-    cold runtime is the best available signal. ``("", [])`` when nothing is
-    pending.
+    the matching completion); ``"activity"`` (v0.16.0) when another process's
+    activity file says so. Only when a live pre-0.16 process owns the pair's
+    tasks (activity unknown) the old disk heuristic: the pair's latest task is
+    a finished pair_send whose reply launched background work and no newer
+    task (the wake-up) exists yet. ``("", [])`` when nothing is pending.
     """
     try:
         rt = runtime_mod.registry().get_or_none(name)
         if rt is not None and rt.is_alive():
             kinds = [str(p.get("kind") or "task") for p in rt.pending_background_tasks()]
-            return kinds, ("runtime" if kinds else "")
+            if kinds:
+                return kinds, "runtime"
+    except Exception:
+        pass
+    try:
+        view = activity_mod.view(name, grace_seconds=0)
+        kinds = [str(b.get("kind") or "task") for b in view.get("background") or []]
+        if kinds:
+            return kinds, "activity"
+        if view.get("verdict") != "unknown":
+            return [], ""
     except Exception:
         pass
     try:
@@ -1306,6 +1386,104 @@ def _background_pending(name: str) -> tuple[list[str], str]:
     except Exception:
         pass
     return [], ""
+
+
+def _pending_background_split(name: str) -> tuple[list[dict], list[dict]]:
+    """(this process's runtime, other live MCP processes) pending background."""
+    local: list[dict] = []
+    try:
+        rt = runtime_mod.registry().get_or_none(name)
+        if rt is not None and rt.is_alive():
+            local = rt.pending_background_tasks()
+    except Exception:
+        pass
+    foreign: list[dict] = []
+    try:
+        view = activity_mod.view(name, grace_seconds=0)
+        foreign = [b for b in view.get("background") or [] if b.get("pid") != os.getpid()]
+    except Exception:
+        pass
+    return local, foreign
+
+
+def _describe_background(items: list[dict]) -> str:
+    parts = []
+    for b in items[:5]:
+        desc = str(b.get("description") or "")[:60]
+        parts.append(f"{b.get('kind') or 'task'} {str(b.get('task_id') or '?')[:10]}"
+                     + (f" ({desc})" if desc else ""))
+    more = f" +{len(items) - 5} more" if len(items) > 5 else ""
+    return "; ".join(parts) + more
+
+
+def _refuse_if_background(name: str, action: str, force: bool) -> None:
+    """v0.16.0 (design rev. D): an operation that kills or rewrites under the
+    pair's runtime refuses while background work is pending, unless force.
+    Killed work never wakes the pair; a rewritten JSONL would be written to
+    later by a self-wake from pre-mutation memory."""
+    if force:
+        return
+    local, foreign = _pending_background_split(name)
+    if not (local or foreign):
+        return
+    where = _describe_background(local + foreign)
+    extra = (" Work pending in another MCP process can only be stopped from there."
+             if foreign else "")
+    raise PairError(
+        f"Pair '{name}' has background work pending ({where}); {action} would kill it and the "
+        f"pair would never wake for it. Wait for it ({_watcher_cmd(name)}), or pass force=True "
+        f"to {action} anyway (the work is killed and recorded as lost).{extra}"
+    )
+
+
+def _lost_note(lost: list[dict]) -> str | None:
+    if not isinstance(lost, list) or not lost:
+        return None
+    return (f"{len(lost)} background task(s) killed and recorded as lost: "
+            f"{_describe_background(lost)}")
+
+
+def _activity_status_lines(name: str) -> list[str]:
+    """v0.16.0: what the activity files add to pair_status / a running
+    pair_poll — live context and its alert state, background lost this
+    window, a pending wake-up, owners whose activity can't be seen."""
+    try:
+        view = activity_mod.view(name, grace_seconds=0)
+    except Exception:
+        return []
+    out: list[str] = []
+    ctx = view.get("context") or {}
+    used = ctx.get("used")
+    if used:
+        window = ctx.get("window") or (view.get("reported_window") or {}).get("tokens")
+        line = f"  context: {used:,}"
+        if window:
+            line += f" / {window:,} ({used / window * 100:.0f}%)"
+        line += " live" if ctx.get("source") == "stream" else ""
+        if ctx.get("window_source") == "inferred":
+            line += " (window estimated until the first reply reports it)"
+        try:
+            headroom = settings_mod.load_defaults().context_alert_headroom
+        except Exception:
+            headroom = None
+        threshold = activity_mod.context_alert_threshold(window, headroom)
+        if threshold and used >= threshold:
+            line += (f" — ⚠ past the context alert ({threshold:,}); auto-compaction fires near "
+                     f"{activity_mod.compaction_point(window):,}. Clean compaction: pair_stop → "
+                     f"pair_compact with a steering prompt → pair_send('continue')")
+        elif threshold:
+            line += f" — alert at {threshold:,}"
+        out.append(line)
+    if view.get("wake_pending"):
+        out.append("  wake-up pending: background work finished; the pair should resume shortly")
+    lost = view.get("background_lost") or []
+    if lost:
+        out.append(f"  ⚠ background lost since the last send: {_describe_background(lost)} — "
+                   f"{lost[-1].get('reason')}")
+    unknown = [r for r in view.get("reasons") or [] if r.startswith("activity unknown")]
+    if unknown:
+        out.append(f"  ⚠ {unknown[0]}")
+    return out
 
 
 def _take_self_woken_pending(name: str) -> list[dict]:
@@ -1383,16 +1561,34 @@ def _build_send_runner(
                     eff_perm = normalize_permission(override_permission_mode)
                 except ValueError as e:
                     raise PairError(str(e))
-            result = adapter.send(
-                current, message,
-                model=override_model,
-                effort=override_effort,
-                permission_mode=eff_perm,
-                timeout_seconds=hard_timeout_seconds,
-                on_event=on_event,
-                should_stop=should_stop,
-                task_id=task_id,
-            )
+            # v0.16.0: a Claude per-call override runs a one-shot process, not
+            # the runtime (whose reader records turns itself) — record it here.
+            one_shot = (isinstance(adapter, ClaudeAdapter) and not (
+                override_model is None and override_effort is None and eff_perm is None))
+            writer = activity_mod.writer(name, current.backend) if one_shot else None
+            if writer is not None:
+                writer.turn_opened(task_id, "send")
+            try:
+                result = adapter.send(
+                    current, message,
+                    model=override_model,
+                    effort=override_effort,
+                    permission_mode=eff_perm,
+                    timeout_seconds=hard_timeout_seconds,
+                    on_event=on_event,
+                    should_stop=should_stop,
+                    task_id=task_id,
+                )
+            except BaseException:
+                if writer is not None:
+                    writer.turn_closed(task_id, status="failed")
+                raise
+            if writer is not None:
+                if result.context is not None:
+                    writer.note_context(result.context.tokens_used, result.context.tokens_max,
+                                        window_source=getattr(result.context, "window_source", None),
+                                        source="result")
+                writer.turn_closed(task_id, preview=result.response or "")
 
             # v0.12.0 premium-model notice — per-call override only. A one-off
             # `override_model='fable'` IS a switch, so it gets the same warning
@@ -1492,6 +1688,7 @@ def _build_compact_runner(
     *,
     compact_timeout_seconds: int,
     lock_acquire_timeout_s: float | None = None,
+    force: bool = False,
 ) -> "Callable[[], CompactResult]":
     """Construct the closure that performs one pair_compact under the
     cross-process lock. Parallel of ``_build_send_runner`` shape.
@@ -1529,23 +1726,51 @@ def _build_compact_runner(
             should_stop = _make_stop_checker(name, task_id) if task_id else None
             async_tasks.mark_task_executing(task_id)
             current = reg_mod.get_pair(name)
+            # v0.16.0: re-checked under the lock — background may have started
+            # since pair_compact's entry check.
+            _refuse_if_background(name, "compacting", force)
             # Compaction rewrites the session JSONL — any warm runtime has
             # stale in-memory state and would write a turn against a JSONL
             # that no longer matches its view. Evict NOW, under the lock,
             # so the next pair_send respawns fresh.
+            lost: list[dict] = []
             try:
-                runtime_mod.registry().evict(name)
+                lost = runtime_mod.registry().evict(
+                    name, "pair_compact(force=True) replaced the runtime")
             except Exception:
                 pass
             adapter = _adapter_for(current)
-            return adapter.compact(
-                current,
-                steering_prompt=steering_prompt,
-                timeout_seconds=compact_timeout_seconds,
-                should_stop=should_stop,
-            )
+            writer = activity_mod.writer(name, current.backend)
+            writer.turn_opened(task_id, "compact")
+            try:
+                result = adapter.compact(
+                    current,
+                    steering_prompt=steering_prompt,
+                    timeout_seconds=compact_timeout_seconds,
+                    should_stop=should_stop,
+                )
+            except BaseException:
+                writer.turn_closed(task_id, status="failed")
+                raise
+            writer.note_compaction(result.trigger or "manual", result.pre_tokens, result.post_tokens)
+            writer.turn_closed(task_id, preview=f"compacted {result.pre_tokens} -> {result.post_tokens}")
+            note = _lost_note(lost)
+            if note:
+                result.notes.append(note)
+            return result
 
     return _run
+
+
+def _watcher_cmd(ref: str) -> str:
+    """The Bash command that runs the standalone wait.py on ``ref`` (a pair
+    name follows the pair until idle; a task id waits for that task)."""
+    py = shlex.quote(sys.executable)
+    if _WAIT_SCRIPT_PATH is not None:
+        # POSIX-style path is friendlier to bash on both Windows (Git Bash) and
+        # POSIX shells than the native Windows backslashed form.
+        return f"{py} {shlex.quote(_WAIT_SCRIPT_PATH.as_posix())} {shlex.quote(ref)}"
+    return f"{py} -m claude_squared wait {shlex.quote(ref)}"
 
 
 def _format_async_handle(task_id: str, why: str, pair_name: str | None = None) -> str:
@@ -1579,18 +1804,15 @@ def _format_async_handle(task_id: str, why: str, pair_name: str | None = None) -
     # task. The exact task id is still printed on the "Async task:" line for the
     # rare case an agent needs to target an older task explicitly.
     poll_ref = pair_name if pair_name else task_id
-    py = shlex.quote(sys.executable)
-    watch_ref = shlex.quote(poll_ref)
-    if _WAIT_SCRIPT_PATH is not None:
-        # POSIX-style path is friendlier to bash on both Windows (Git Bash) and
-        # POSIX shells than the native Windows backslashed form.
-        wait_path = shlex.quote(_WAIT_SCRIPT_PATH.as_posix())
-        wait_cmd = f"{py} {wait_path} {watch_ref}"
-    else:
-        wait_cmd = f"{py} -m claude_squared wait {watch_ref}"
+    wait_cmd = _watcher_cmd(poll_ref)
     name_hint = (
         f"  (name '{pair_name}' resolves to its LATEST task everywhere here; "
         f"use the task id above to target an older one)\n"
+        if pair_name else ""
+    )
+    follow_hint = (
+        "  (by name it follows the pair until idle — background work and self-woken turns "
+        "included; add --each-turn to return after the next turn instead)\n"
         if pair_name else ""
     )
     return (
@@ -1601,6 +1823,7 @@ def _format_async_handle(task_id: str, why: str, pair_name: str | None = None) -
         f"  pair_poll('{poll_ref}', with_turn_log=True)      # status + current/last-turn content\n"
         f"{name_hint}"
         f"  Bash(run_in_background=True, command=\"{wait_cmd}\")  # auto-notify on done\n"
+        f"{follow_hint}"
         f"Tip: Bash watcher = hands-off notification. No background Bash (e.g. Cowork)? "
         f"Use pair_poll(wait_seconds=N) to avoid spam-polling."
     )
@@ -1987,6 +2210,10 @@ async def pair_send(
     patience for ``pair_poll``/``pair_wait``. See README "Async handles" for
     the recommended notification-driven pattern (run a backgrounded
     ``python -m claude_squared wait <id>`` to get fired a completion notification).
+    ``wait.py <pair>`` follows the pair until idle (``--each-turn``: until the next turn
+    ends); exits 0 done/idle, 1 failed, 2 not found, 3 timeout (re-arm), 4 orphaned,
+    5 stopped, 6 crashed, 7 finished detached, 8 context alert, 9 background lost —
+    exit 1 with empty output means the watcher itself was killed (README "wait.py").
 
     Args:
         timeout_seconds: Your stated patience (default 45s). Work continues
@@ -2107,6 +2334,10 @@ def pair_send_async(
     Use ``pair_poll(task_id)`` for status. For notification-on-completion (no
     manual polling), background-run the wait script via the Bash tool — see
     README "Async handles" for the full pattern.
+    ``wait.py <pair>`` follows the pair until idle (``--each-turn``: until the next turn
+    ends); exits 0 done/idle, 1 failed, 2 not found, 3 timeout (re-arm), 4 orphaned,
+    5 stopped, 6 crashed, 7 finished detached, 8 context alert, 9 background lost —
+    exit 1 with empty output means the watcher itself was killed (README "wait.py").
 
     Args:
         hard_timeout_seconds: Auto-kill ceiling for the underlying claude
@@ -2215,6 +2446,8 @@ def pair_poll(
     """Inspect a specific async task — works for ALL statuses (running, done,
     failed, stopped). **This is the right tool whenever you have a task_id**,
     regardless of whether the task is still in flight or has already finished.
+
+    For hands-off waiting use ``wait.py`` (exit codes in ``pair_send``'s description).
 
     Default returns a brief status line:
       - running   → "running for Xs on pair 'name' (started ...)" + hang warning if idle >120s
@@ -2447,6 +2680,8 @@ def pair_poll(
         lines.append(f"  {resolved_note}")
     if wake_note:
         lines.append(f"  {wake_note}")
+    if state.status == "running":
+        lines.extend(_activity_status_lines(state.pair_name))
 
     # Auto hang-warning for running tasks — always shown, even without with_turn_log
     if state.status == "running" and not state.queued:
@@ -2749,9 +2984,13 @@ def pair_update(
     backend_options: dict | str | None = None,
     verbose: bool = False,
     mcp_whitelist: str | list[str] | None = None,
+    force: bool = False,
 ) -> str:
     """Update mutable settings of an existing pair (per-pair, not defaults —
     use ``pair_settings_set`` for user-wide defaults).
+
+    A change that respawns the runtime is refused while background work is
+    pending, unless ``force=True`` (the work is killed and recorded as lost).
 
     mcp_whitelist is a deliberate per-pair connector opt-in, default none;
     pass [] to disable connectors. Changes apply on the next spawn, with no
@@ -2928,6 +3167,16 @@ def pair_update(
                 if coerced != old_spec.effort or "effort" in fields:
                     fields["effort"] = coerced
 
+            # v0.16.0: every field below is pinned at spawn — changing one
+            # respawns the runtime, killing pending background work. Refuse
+            # BEFORE any mutation (the cwd move below evicts too).
+            _cur = reg_mod.get_pair(name)
+            _respawn = [k for k in _SPAWN_PINNED_FIELDS
+                        if k in fields and fields[k] != getattr(_cur, k, None)]
+            if cwd is not None and _normalize_path(cwd) != _cur.cwd:
+                _respawn.append("cwd")
+            if _respawn:
+                _refuse_if_background(name, f"changing {', '.join(_respawn)}", force)
             # cwd is special: changing it requires moving the session JSONL between project dirs
             # because --resume looks up the JSONL under the new cwd's encoded project path.
             cwd_move_msg: str | None = None
@@ -2962,12 +3211,16 @@ def pair_update(
                 return f"No fields to update for '{name}'."
             spec = reg_mod.update_pair(name, **fields)
             # Material config changes invalidate any live runtime — next send will re-spawn
-            if any(k in fields for k in ("model", "effort", "permission_mode", "context_window", "backend_options",
-                                         "cwd", "extra_dirs", "allowed_tools", "mcp_whitelist", "ultracode", "fallback_model")):
+            lost: list[dict] = []
+            if any(k in fields for k in _SPAWN_PINNED_FIELDS):
                 try:
-                    runtime_mod.registry().evict(name)
+                    lost = runtime_mod.registry().evict(
+                        name, "pair_update changed a spawn-pinned setting (runtime respawned)")
                 except Exception:
                     pass
+            lost_note = _lost_note(lost)
+            if lost_note:
+                transparency_msgs.append(lost_note)
             # Operational warning when pinned-at-create fields change: the
             # underlying claude --resume subprocess was started with the OLD
             # values. The registry is now correct but the existing session
@@ -3003,6 +3256,12 @@ def pair_update(
         raise PairError(f"Pair '{name}' is busy in another process; could not acquire lock to update.")
 
 
+# Fields pinned at runtime spawn: changing one evicts the warm runtime.
+_SPAWN_PINNED_FIELDS = ("model", "effort", "permission_mode", "context_window", "backend_options",
+                        "cwd", "extra_dirs", "allowed_tools", "mcp_whitelist", "ultracode",
+                        "fallback_model")
+
+
 def _move_session_jsonl_for_cwd_change(old_spec: PairSpec, new_cwd: str) -> str:
     """Move the pair's session JSONL from the old cwd's project dir to the new one.
 
@@ -3023,9 +3282,11 @@ def _move_session_jsonl_for_cwd_change(old_spec: PairSpec, new_cwd: str) -> str:
     if old_encoded == new_encoded:
         return f"cwd encoded to same project path; no JSONL move needed"
 
-    # First evict any live runtime so it's not holding the file open
+    # First evict any live runtime so it's not holding the file open.
+    # (pair_update refused first if background was pending, unless forced.)
+    lost: list[dict] = []
     try:
-        runtime_mod.registry().evict(old_spec.name)
+        lost = runtime_mod.registry().evict(old_spec.name, "pair_update(force=True) moved the pair's cwd")
     except Exception:
         pass
 
@@ -3065,7 +3326,8 @@ def _move_session_jsonl_for_cwd_change(old_spec: PairSpec, new_cwd: str) -> str:
                     f"sub-agent transcripts remain at the old location)")
 
     extra = " + session dir (with sub-agent transcripts)" if moved_session_dir else ""
-    return f"moved JSONL{extra}: {src.parent} -> {dst.parent}"
+    note = _lost_note(lost)
+    return f"moved JSONL{extra}: {src.parent} -> {dst.parent}" + (f"; {note}" if note else "")
 
 
 @mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True})
@@ -3450,6 +3712,8 @@ def pair_settings_get(verbose: bool = False) -> str:
     lines.append(f"    fallback_model  = {_show('fallback_model', defaults.fallback_model, _HARDCODED_DEFAULTS['fallback_model'])}")
     lines.append(f"    extra_dirs      = {_show('extra_dirs', defaults.extra_dirs, _HARDCODED_DEFAULTS['extra_dirs'])}")
     lines.append(f"    allowed_invocations = {_show('allowed_invocations', defaults.allowed_invocations, 'None (allow all)')}")
+    lines.append(f"    interim_triage  = {_show('interim_triage', defaults.interim_triage, 'auto')}")
+    lines.append(f"    context_alert_headroom = {_show('context_alert_headroom', defaults.context_alert_headroom, 'max(15% of window, 40k)')}")
     lines.append("")
     lines.append("  File paths:")
     for k, v in paths.items():
@@ -3488,6 +3752,8 @@ def pair_settings_set(
     backend: str | None = None,
     context_window: str | None = None,
     verbose: bool = False,
+    interim_triage: str | None = None,
+    context_alert_headroom: int | None = None,
 ) -> str:
     """Set per-user defaults for new pairs (writable subset of pair_settings_get).
 
@@ -3526,6 +3792,10 @@ def pair_settings_set(
         allowed_invocations: Default ``pair_invoke`` allow-list (see ``pair_create``
             for syntax). ``[]`` REFUSED as a default (same foot-gun principle as
             bypassPermissions: silent deny-all on every fresh pair).
+        interim_triage: ``auto`` (default: the CLI's own turn summary, Haiku when
+            missing) | ``haiku`` | ``off`` — triage of self-woken interim turns.
+        context_alert_headroom: tokens before the estimated auto-compaction point
+            at which wait.py's context alert fires (default max(15% of window, 40k)).
         verbose: If True, return full JSON + change messages.
     """
     # Build the kwargs dict with only the fields actually passed (None means
@@ -3550,6 +3820,10 @@ def pair_settings_set(
         fields["fallback_model"] = fallback_model.strip() or None
     if extra_dirs is not None:
         fields["extra_dirs"] = _normalize_path_list(_coerce_to_str_list(extra_dirs))
+    if interim_triage is not None:
+        fields["interim_triage"] = interim_triage
+    if context_alert_headroom is not None:
+        fields["context_alert_headroom"] = int(context_alert_headroom)
     if allowed_invocations is not None:
         # Don't path-normalize — these are fnmatch glob patterns over slash-command
         # names like "mcp__claude_ai_*", not filesystem paths. preserve_empty=True
@@ -3586,6 +3860,9 @@ def pair_settings_set(
         lines.append(f"  {msg}")
     lines.append("")
     lines.append("Affects only NEW pairs. Existing pairs untouched (use pair_update for those).")
+    if interim_triage is not None or context_alert_headroom is not None:
+        lines.append("(interim_triage / context_alert_headroom apply to ALL pairs: read at each "
+                     "send and by every wait.py.)")
     return "\n".join(lines)
 
 
@@ -3599,8 +3876,9 @@ def pair_settings_reset() -> str:
 
 
 @mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False})
-def pair_clear(name: str, archive_old: bool = True, verbose: bool = False) -> str:
+def pair_clear(name: str, archive_old: bool = True, verbose: bool = False, force: bool = False) -> str:
     """Reset a pair's conversation history while preserving its config.
+    Refused while background work is pending unless ``force=True``.
 
     Implementation: rotates to a new session_id and starts a fresh session with the same
     pinned config (system prompt, allowed_tools, MCP scope). Optionally archives the old
@@ -3615,10 +3893,12 @@ def pair_clear(name: str, archive_old: bool = True, verbose: bool = False) -> st
             adapter = _adapter_for(spec)
             old_sid = spec.session_id
             old_path = adapter.transcript_path(spec)
+            _refuse_if_background(name, "clearing", force)
 
             # Tear down any live runtime — it's pinned to the old session_id
+            lost: list[dict] = []
             try:
-                runtime_mod.registry().evict(name)
+                lost = runtime_mod.registry().evict(name, "pair_clear(force=True) rotated the session")
             except Exception:
                 pass
 
@@ -3644,6 +3924,8 @@ def pair_clear(name: str, archive_old: bool = True, verbose: bool = False) -> st
             msg = f"Cleared '{name}': {_short(old_sid)} → {_short(new_sid)}"
             if archived:
                 msg += f" (archived to {archived})"
+            if _lost_note(lost):
+                msg += f"\n⚠ {_lost_note(lost)}"
             return msg
     except FileLockTimeout:
         raise PairError(f"Pair '{name}' is busy in another process; could not acquire lock to clear.")
@@ -4074,8 +4356,10 @@ def pair_rewind_points(name: str, last_n: int = 20, verbose: bool = False) -> st
 
 
 @mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False})
-def pair_rewind(name: str, to_point: int, archive: bool = True, verbose: bool = False) -> str:
+def pair_rewind(name: str, to_point: int, archive: bool = True, verbose: bool = False,
+                force: bool = False) -> str:
     """Rewind a pair's conversation to BEFORE a chosen user message (like /rewind).
+    Refused while background work is pending unless ``force=True``.
 
     **Conversation only.** This truncates the pair's session history so the next
     send continues from the chosen point — it does NOT revert files the pair
@@ -4122,8 +4406,11 @@ def pair_rewind(name: str, to_point: int, archive: bool = True, verbose: bool = 
             # The session JSONL is about to be truncated — a warm runtime pinned
             # to it holds stale in-memory state, so evict it (next send respawns
             # from the rewound file).
+            _refuse_if_background(name, "rewinding", force)
+            rewind_lost: list[dict] = []
             try:
-                runtime_mod.registry().evict(name)
+                rewind_lost = runtime_mod.registry().evict(
+                    name, "pair_rewind(force=True) truncated the session")
             except Exception:
                 pass
             archived: str | None = None
@@ -4165,6 +4452,8 @@ def pair_rewind(name: str, to_point: int, archive: bool = True, verbose: bool = 
         shown = ", ".join(dropped_files[:8]) + (f" (+{len(dropped_files) - 8} more)" if len(dropped_files) > 8 else "")
         lines.append(f"  ⚠ Files written in the discarded range are NOT reverted "
                      f"(use git if you want them back): {shown}")
+    if _lost_note(rewind_lost):
+        lines.append(f"  ⚠ {_lost_note(rewind_lost)}")
     return "\n".join(lines)
 
 
@@ -4175,8 +4464,10 @@ def pair_compact(
     timeout_seconds: int = 45,
     compact_timeout_seconds: int = 600,
     verbose: bool = False,
+    force: bool = False,
 ) -> str:
     """Compact a pair's conversation in place (a summary replaces the history).
+    Refused while background work is pending unless ``force=True``.
 
     Claude pairs: native ``/compact`` via stream-json; ``steering_prompt``
     becomes the ``/compact <text>`` argument. **Codex pairs: compaction runs
@@ -4211,6 +4502,7 @@ def pair_compact(
     # through the app-server (CodexAdapter.compact); steering text is ignored
     # there with a note in the result.
     reg_mod.get_pair(name)
+    _refuse_if_background(name, "compacting", force)
 
     # Decouple stated patience (agent's "how long I'll wait inline") from the
     # actual RPC-hold (server-cap-bounded to stay below host's RPC timeout).
@@ -4221,6 +4513,7 @@ def pair_compact(
     runner = _build_compact_runner(
         name, steering_prompt,
         compact_timeout_seconds=compact_timeout_seconds,
+        force=force,
     )
     # Async-task message description — surfaces in pair_status / async dir
     # listings so the agent can tell at a glance "this task is a compact",
@@ -4394,6 +4687,15 @@ def pair_stop(
                 else:
                     actions.append("in-band interrupt did not ack within 3s")
                     force = True
+            if not force:
+                # A soft interrupt stops only the in-flight turn: background
+                # Bash / agents survive it and still wake the pair (verified
+                # 2026-09-25, CLI 2.1.280).
+                surviving = runtime_obj.pending_background_tasks()
+                if surviving:
+                    actions.append(
+                        f"{len(surviving)} background task(s) still running and will wake the pair "
+                        f"({_describe_background(surviving)}); pair_stop(force=True) kills them")
             if force:
                 # Identity-checked eviction: only the runtime captured above,
                 # never a replacement (evict_if_current). Allowed when nothing
@@ -4406,6 +4708,9 @@ def pair_stop(
                         or runtime_obj.has_untracked_turn()):
                     if runtime_mod.registry().evict_if_current(name, runtime_obj):
                         actions.append("tree-killed runtime subprocess (and descendants)")
+                        _killed = getattr(runtime_obj, "last_lost_background", None)
+                        if _lost_note(_killed):
+                            actions.append(_lost_note(_killed))
                 else:
                     actions.append("selected turn already ended; runtime left alive for its successor")
 
@@ -4421,7 +4726,10 @@ def pair_stop(
             with _with_pair_lock(name, timeout_s=10.0):
                 # Tear down any live runtime — soft interrupt left it alive
                 try:
-                    runtime_mod.registry().evict(name)
+                    hard_lost = runtime_mod.registry().evict(
+                        name, "pair_stop(hard=True) rotated the session")
+                    if _lost_note(hard_lost):
+                        actions.append(_lost_note(hard_lost))
                 except Exception:
                     pass
                 cur_spec = reg_mod.get_pair(name)
@@ -4440,6 +4748,8 @@ def pair_stop(
 
     if not actions:
         return f"Pair '{name}': nothing to stop (no live runtime or in-flight tasks)"
+    if len(actions) == 1 and "will wake the pair" in actions[0]:
+        return f"Pair '{name}': no turn in flight to stop; {actions[0]}"
     return f"Stopped '{name}': " + "; ".join(actions)
 
 
@@ -4682,6 +4992,7 @@ def pair_status(name: str, last_n_log: int = 5, verbose: bool = False) -> str:
         age_s = (now - started_at).total_seconds()
         lines.append(f"  runtime age: {age_s:.0f}s")
     lines.append(f"  liveness: {heuristic}")
+    lines.extend(_activity_status_lines(name))
     if inflight_tasks:
         # Show FULL task IDs when there are 1-2 (agent can paste straight into
         # pair_poll); truncate to 8-char prefix for 3+ to keep the line readable
@@ -4846,7 +5157,14 @@ def pair_invoke(
                     f"Discover available commands via pair_actions('{name}')."
                 )
             adapter = _adapter_for(spec)
-            result = adapter.invoke_skill(spec, skill_name, args=args, timeout_seconds=timeout_seconds)
+            writer = activity_mod.writer(name, spec.backend)
+            writer.turn_opened(None, "invoke")
+            try:
+                result = adapter.invoke_skill(spec, skill_name, args=args, timeout_seconds=timeout_seconds)
+            except BaseException:
+                writer.turn_closed(None, status="failed")
+                raise
+            writer.turn_closed(None, preview=result.response or "")
             if verbose:
                 return _verbose_dump(result)
             return _fmt_send_result(result)
@@ -4921,4 +5239,14 @@ def pair_agent_list(verbose: bool = False) -> str:
 
 # Re-export entry point
 def run() -> None:
+    # v0.16.0 activity files: declare this process a v1 writer (readers
+    # otherwise report its pairs as "activity unknown"), persist what dead
+    # predecessors left behind, and close our files on exit.
+    try:
+        activity_mod.announce()
+        activity_mod.sweep()
+    except Exception:
+        pass
+    import atexit
+    atexit.register(activity_mod.shutdown)
     mcp.run()

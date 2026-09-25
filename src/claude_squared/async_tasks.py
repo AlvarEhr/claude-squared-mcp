@@ -84,14 +84,24 @@ def _is_pid_alive(pid: int) -> bool:
     if sys.platform == "win32":
         try:
             import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.windll.kernel32
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            handle = ctypes.windll.kernel32.OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
-            )
-            if handle:
-                ctypes.windll.kernel32.CloseHandle(handle)
+            STILL_ACTIVE = 259
+            handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return False
+            try:
+                # v0.16.0: OpenProcess alone succeeds on an EXITED process
+                # while anyone still holds a handle to it (verified 2026-09-25:
+                # a finished child whose Popen object was alive read as
+                # alive). The exit code says whether it is still running.
+                code = wintypes.DWORD()
+                if k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return code.value == STILL_ACTIVE
                 return True
-            return False
+            finally:
+                k32.CloseHandle(handle)
         except Exception:
             return False
     # POSIX: os.kill with signal 0 raises ProcessLookupError if dead,

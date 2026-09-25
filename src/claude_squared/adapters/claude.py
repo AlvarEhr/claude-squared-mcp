@@ -243,11 +243,14 @@ class ClaudeAdapter(PairAdapter):
             # v0.12.0: wait out any self-woken turn BEFORE the stale check —
             # the turn is writing the JSONL, which would otherwise read as
             # stale and evict (tree-kill) the pair's in-flight background work.
-            # After the turn the JSONL IS newer than the watermark, so the
-            # respawn below happens on purpose (see runtime.is_stale).
+            # The self-woken turn's close refreshes the watermark (our own
+            # write), so the warm runtime is kept; only a genuine foreign write
+            # respawns it here. Background work never moves the JSONL on its
+            # own (verified 2026-09-25), so no refresh is needed between turns.
             pre_wait_s = rt.wait_for_implicit_idle(timeout_seconds, should_stop)
             if rt.is_stale():
-                reg.evict(spec.name)
+                reg.evict(spec.name, "another process wrote the pair's session; the stale "
+                                     "runtime was respawned")
                 rt = reg.get_or_start(spec, self)
             result_json = rt.send(message, timeout_seconds=timeout_seconds,
                                   on_event=on_event, should_stop=should_stop, task_id=task_id)

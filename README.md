@@ -235,6 +235,9 @@ on Codex).
 | `~/.claude/pairs/async/<task_id>.json` | Async task state (poll-able across process restarts); `<task_id>.cancel` next to it = a stop request any process can honor (0.14.0) |
 | `~/.claude/pairs/async/control/<name>.lock` | Short per-pair control lock: stop selection vs. queued-task promotion (0.14.0) |
 | `~/.claude/pairs/registry.corrupt-<sha>.json` | Verbatim copy of a registry whose root could not be read (writes refused until repaired) |
+| `~/.claude/pairs/activity/<name>/<pid>.json` | What the pair is doing right now, one file per MCP process that owns work for it: open turn, pending background, expected wake-up, live context, this window's turns / compactions / lost background (0.16.0; read by `wait.py`, `pair_status`, `pair_poll`) |
+| `~/.claude/pairs/activity/<name>/pair.json` | The context window the CLI last reported for the pair (0.16.0) |
+| `~/.claude/pairs/activity_owners/<pid>.json` | "This MCP process writes activity files" — a live task owner without one is an older process whose activity can't be seen (0.16.0) |
 | `~/.claude/pairs/logs/<name>/main.log` | The pair's activity log (both backends) + `main.idx.json` T-N index |
 | `~/.claude/pairs/logs/<name>/codex-tool-items/T-N.json` | Full Codex item events behind each T-N (`pair_tool_detail`, 0.14.0) |
 | `~/.claude/agents/<name>.md` | Custom agent definitions (visible to all Claude sessions globally) |
@@ -253,22 +256,54 @@ here's the task_id" handle — work continues, no second turn is queued.
 Three ways to consume the handle:
 
 1. **Notification-driven (recommended for long tasks)**: background-run the
-   waiter; the harness fires you a completion notification when the task ends.
+   watcher; the harness fires you a notification when it exits.
 
    ```python
-   task_id = pair_send_async(name="scout", message="long task...")
-   Bash(run_in_background=True,
-        command=f"python ~/.claude/pairs/wait.py {task_id}")
-   # Exit codes (v0.9.8): 0=done, 1=failed (work error), 2=not-found,
-   #   3=timeout (default 1800s), 4=orphaned (MCP server died — supervision
-   #   event, not a work failure), 5=stopped (pair_stop), 6=crashed
-   #   (claude.exe died mid-turn). On notification, call pair_poll(task_id).
+   pair_send_async(name="scout", message="long task...")
+   Bash(run_in_background=True, command="python ~/.claude/pairs/wait.py scout")
    ```
 
    The MCP server installs `~/.claude/pairs/wait.py` on startup — a
-   stdlib-only script that polls the on-disk task state. Works regardless of
-   whether `claude_squared` is importable from the agent's PATH-resolved
-   `python`.
+   stdlib-only script (Python ≥ 3.7) that reads the on-disk task and activity
+   files, so it works whether or not `claude_squared` is importable from the
+   agent's `python`. Three modes (0.16.0):
+
+   | Command | Returns when |
+   |---|---|
+   | `wait.py <pair>` | the pair is **idle**: no turn open, no task running or queued, no background work pending, no wake-up expected — quiet for 5 s. Background work and the self-woken turns it causes are followed through. Prints a summary of the window (since the last send): duration; turns (sends / self-woken / interims); interims flagged by triage with `pair_poll('<id>')`; background started / finished / lost; auto-compactions; context now; where to read the final reply |
+   | `wait.py <pair> --each-turn` | the next turn ends — including an interim self-woken turn — with that turn's summary |
+   | `wait.py <task_id or prefix>` | that one task ends (as before 0.16) |
+
+   Options: `--timeout SECS` (default 6 h), `--poll SECS`, `--context-alert PCT`,
+   `--no-context-alert`. Exit codes:
+
+   | Code | Meaning |
+   |---|---|
+   | 0 | done / idle |
+   | 1 | failed (work error, on stderr). **Exit 1 with empty output = the watcher itself was killed** |
+   | 2 | not found / ambiguous prefix |
+   | 3 | the watcher gave up (timeout) — the pair is still working; the message has the exact re-arm command |
+   | 4 | orphaned: the owning MCP server died mid-turn (supervision event, not a work failure) |
+   | 5 | stopped by `pair_stop` |
+   | 6 | crashed: the pair's claude process died mid-turn |
+   | 7 | finished detached (Codex): the owner died, the turn finished on its own — `pair_poll` collects it |
+   | 8 | context alert (below) |
+   | 9 | background work was killed while the watcher ran — the pair will not wake for it |
+   | 64 | usage error |
+
+   **Context alert (exit 8).** Auto-compaction fires mid-turn at about the
+   window minus 30k tokens (measured at 967–971k of a 1M window on Opus 5 /
+   5.5, in both `1m` and `default` pairs) and summarizes with no steering. The
+   watcher exits 8 when the context **crosses** an alert level while it runs —
+   never at start, so re-arming is safe — with the numbers, the clean recipe
+   (`pair_stop` → `pair_compact` with a steering prompt → `pair_send("continue")`)
+   and the exact re-arm line (`--context-alert <next %>` or `--no-context-alert`).
+   The default level is the compaction point minus a headroom of max(15% of the
+   window, 40k) tokens — 820k on a 1M window, 130k on 200k (where the
+   compaction point is an estimate). `pair_settings_set(context_alert_headroom=N)`
+   changes the headroom; the window is the one the CLI last reported for the
+   pair. `pair_status` and a running `pair_poll` show the live context and
+   whether it is past the alert.
 
 2. **Manual quick status**: `pair_poll(task_id)` returns one-line status; if
    `status="done"` includes the full response text. **You can poll by pair
@@ -288,6 +323,11 @@ error — the pair's `claude` subprocess runs in its own process group and usual
 completes the work anyway. Verify via `pair_transcript` + your git/file state,
 then `pair_send` to resume from the persisted session JSONL. `wait.py` reports
 this with exit code 4.
+
+**Mixed versions.** A pair whose tasks belong to a still-running pre-0.16 MCP
+process has no activity file there: `wait.py <pair>` falls back to the task
+files and says "activity unknown for PID X" instead of calling the pair idle
+with confidence. Restart every session after installing.
 
 **Universal fallback** (when `python` isn't on the agent's shell PATH):
 
@@ -318,8 +358,8 @@ its own async task, so nothing about it is hidden:
 - `pair_poll(name, wait_seconds=30)` waits for the wake-up — even before the
   self-woken task exists — and shows its reply; `pair_poll(name)` resolves to
   the *latest* task, which may be the self-woken one: it's labeled, and the
-  latest `pair_send` task is named next to it (the `wait.py` watcher by name
-  works once the task exists);
+  latest `pair_send` task is named next to it; `wait.py <name>` follows the
+  whole thing until the pair is idle;
 - your **next** `pair_send` queues behind an in-progress continuation (FIFO — its
   result is never mistaken for your answer; a send from *another* MCP process
   queues behind it too) and its footer lists
@@ -327,6 +367,36 @@ its own async task, so nothing about it is hidden:
   ranges and cost;
 - `main.log` shows `=== SELF-WOKEN TURN (task …) ===`, `[background launch: …]`
   and the CLI's `task_notification` so the wake-up has a visible cause.
+
+**Background protection (0.16.0).** Killing a runtime kills its background work,
+and the pair never wakes for it. So:
+
+- the idle evictor never evicts a runtime with background work pending (after
+  24 h with no log activity at all it does, and records the work as lost — "may
+  already have finished, no completion event seen");
+- `pair_clear`, `pair_rewind`, `pair_compact` and a `pair_update` that changes a
+  spawn-pinned setting (model, effort, permission level, window, cwd,
+  extra_dirs, allowed_tools, connectors, ultracode, fallback model) **refuse**
+  while background work is pending, unless `force=True`, which kills it and
+  records the loss; other `pair_update` fields apply at once;
+- `pair_forget` and `pair_stop(force=True)` / `hard=True` kill and report what
+  was lost; a soft `pair_stop` interrupts only the in-flight turn — background
+  Bash and agents survive it (verified) and still wake the pair, and the result
+  says so;
+- a send from another MCP process waits (up to 30 min) while the process that
+  owns the runtime has background work pending — otherwise that process's later
+  wake-up would write a divergent history;
+- every loss is recorded (activity file, the next send's footer, `pair_status`,
+  and `wait.py` exit 9).
+
+**Interim triage (0.16.0).** A self-woken turn that ends while background work
+is still pending is an *interim*: progress, or a problem. Each one is triaged so
+`wait.py <pair>` can flag the ones that need you. The source is the CLI's own
+per-turn summary (`post_turn_summary`: status category, detail, needed action —
+free), falling back to an isolated Haiku call (~$0.002, no tools, no MCP, no
+settings, replaced system prompt) when that is missing, then a heuristic.
+`pair_settings_set(interim_triage="auto" | "haiku" | "off")`. Replies to your
+own sends are never triaged — you read those.
 
 Sub-agent use is **not** gated — blocking fan-out stays the recommended shape,
 and background launches are simply tracked. One caveat: a continuation that goes

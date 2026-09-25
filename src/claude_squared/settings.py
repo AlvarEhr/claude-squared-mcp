@@ -92,6 +92,32 @@ class PairDefaults(BaseModel):
     # would silently break every fresh pair). Pass ``[]`` per-pair on pair_create
     # where the lockdown intent is explicit. To disable the field, omit it.
     allowed_invocations: list[str] | None = None
+    # v0.16.0: triage of self-woken INTERIM turns (a turn that ends while
+    # background work is still pending). "auto" (None) = the CLI's own
+    # post_turn_summary, Haiku only when that is missing/unusable; "haiku" =
+    # always the isolated Haiku classifier; "off" = none.
+    interim_triage: str | None = None
+    # v0.16.0: wait.py's context alert fires this many tokens before the
+    # estimated auto-compaction point (window - 30k, measured on 1M Opus
+    # windows). None = max(15% of the window, 40k).
+    context_alert_headroom: int | None = None
+
+    @field_validator("interim_triage")
+    @classmethod
+    def _check_interim_triage(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        mode = str(v).strip().lower()
+        if mode not in ("auto", "haiku", "off"):
+            raise ValueError(f"interim_triage must be auto, haiku or off (got {v!r})")
+        return mode
+
+    @field_validator("context_alert_headroom")
+    @classmethod
+    def _check_headroom(cls, v: int | None) -> int | None:
+        if v is not None and int(v) < 0:
+            raise ValueError("context_alert_headroom must be >= 0 tokens")
+        return v
 
     @field_validator("permission_mode")
     @classmethod

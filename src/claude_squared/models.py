@@ -710,6 +710,8 @@ class CompactResult(BaseModel):
     duration_ms: int
     trigger: str
     summary_preview: str | None = None
+    # v0.16.0: e.g. background work killed by pair_compact(force=True).
+    notes: list[str] = Field(default_factory=list)
 
 
 class ContextReport(BaseModel):

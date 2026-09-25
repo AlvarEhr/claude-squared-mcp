@@ -42,6 +42,14 @@ def main() -> int:
         "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
         "-p", "test_connectors.py", "-v",
     ]))
+    commands.append(("activity", [
+        "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
+        "-p", "test_activity.py", "-v",
+    ]))
+    commands.append(("v016", [
+        "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
+        "-p", "test_v016.py", "-v",
+    ]))
     failures = []
     for name, arguments in commands:
         print(f"\n=== {name} ===", flush=True)

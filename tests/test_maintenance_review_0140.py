@@ -134,7 +134,7 @@ class StopSelectionTests(ReviewCase):
         rt = self.claude_runtime()
         rt.is_alive = lambda: True
         stopped = threading.Event()
-        rt.stop = lambda: (stopped.set(), "killed")[1]
+        rt.stop = lambda *a: (stopped.set(), "killed")[1]  # v0.16.0: stop(reason)
         rt._implicit_scope = TurnLogScope(rt.main_log_path, 1)
         rt._implicit_task = None
         RT.registry()._runtimes["pair"] = rt

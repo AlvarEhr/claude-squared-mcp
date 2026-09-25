@@ -109,8 +109,9 @@ def test_waitpy_pair_name_still_works():
     print("\n=== 1.4: wait.py pair name still works (no regression) ===")
     _write_task("byname-task-id-99", "by_name_pair", "done")
     r = _run_waitpy("by_name_pair")
-    assert_eq(r.returncode, 0, "pair name resolves to latest task")
-    assert_true("resolved pair" in (r.stderr or ""), "stderr says 'resolved pair'")
+    # v0.16.0: a pair name FOLLOWS the pair until idle (was: its latest task).
+    assert_eq(r.returncode, 0, "pair name resolves (pair mode, idle)")
+    assert_true("idle" in (r.stdout or ""), "stdout carries the idle summary")
 
 
 def test_waitpy_unknown_arg_clear_message():

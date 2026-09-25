@@ -6,6 +6,53 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Activity files** (`~/.claude/pairs/activity/<pair>/<pid>.json`): what each
+  pair is doing right now — open turn, pending background work, an expected
+  wake-up, live context, and this window's turns / compactions / lost
+  background — one file per MCP process, merged by every reader.
+- **`wait.py <pair>` follows the pair until it is idle**, background work and
+  self-woken turns included, and prints a summary of the window;
+  `--each-turn` returns at the next turn's end; a task id still waits for that
+  task. Default timeout 6 h (the timeout message says the pair is still
+  working and gives the re-arm command). New exit codes: 7 finished detached
+  (Codex), 8 context alert, 9 background work lost.
+- **Context alert**: `wait.py` exits 8 when the context crosses a level set a
+  headroom before the estimated auto-compaction point (window − 30k; headroom
+  max(15% of the window, 40k), `pair_settings_set(context_alert_headroom=…)`),
+  with the clean-compaction recipe and a re-arm line. `pair_status` and a
+  running `pair_poll` show the live context.
+- **Interim triage**: a self-woken turn that ends with background work still
+  pending is triaged from the CLI's own `post_turn_summary`, falling back to
+  an isolated Haiku call; `wait.py` lists the ones that need attention.
+  `pair_settings_set(interim_triage="auto" | "haiku" | "off")`.
+
+### Fixed
+
+- **Background work is no longer killed silently.** The idle evictor never
+  evicts a runtime with background work pending (24 h ceiling, then recorded
+  as lost). `pair_clear`, `pair_rewind`, `pair_compact` and a `pair_update`
+  that changes a spawn-pinned setting refuse while background work is
+  pending unless `force=True`; `pair_forget` and forced stops report what they
+  killed; a soft `pair_stop` says which background work survives it.
+- **Empty reply after a runtime restart.** When a runtime ended with a
+  background shell still running, the next resume emitted a stale
+  notification plus an empty result before reading our message; the send
+  returned that empty result and the real reply was logged as a self-woken
+  turn. The runtime now recognizes and skips it.
+- **Diverging history across MCP processes**: a send from another process now
+  waits while the process that owns the pair's runtime has background work
+  pending.
+- Foreground Bash and blocking sub-agent calls no longer count as "background
+  tasks still running" in `pair_status`.
+- PID liveness checks (orphan detection, `wait.py`) read a dead process whose
+  handle was still held elsewhere as alive; they now check the exit code.
+- The runtime registry stops runtimes outside its lock, so one slow teardown no
+  longer stalls every other pair's send.
+- A denied Bash/PowerShell call on a pair with `allowed_tools` explains that
+  rules match the literal command (`Bash(git -C * log*)` for `git -C <dir> log`).
+
 ### Changed
 
 - `pair_compact`: the tool description states up front that Codex compaction

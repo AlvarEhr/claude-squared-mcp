@@ -291,16 +291,17 @@ plain = server._fmt_send_result(SendResult(name="swt", response="x", session_id=
                                            model_used="claude-opus-5", cost_usd=0.0, duration_ms=1))
 check("plain reply has none of the new lines", "⏳" not in plain and "⏮" not in plain and "waited" not in plain)
 
-print("\n=== 14. wait.py resolves the name to the latest task and labels self-woken ===")
+print("\n=== 14. wait.py follows the pair by name; its summary labels the self-woken turn ===")
 wait_py = Path(_TMP.name) / "pairs" / "wait.py"
 check("wait.py installed under CLAUDE_HOME", wait_py.exists())
 if wait_py.exists():
     # latest task for 'swt' is rt3's ABANDONED (failed) one → exit 1, with the self-woken note on stderr
     pr = subprocess.run([sys.executable, str(wait_py), "swt", "--timeout", "3"],
                         capture_output=True, text=True, env=dict(os.environ, CLAUDE_HOME=_TMP.name))
+    # v0.16.0: by name = pair mode (until idle); the last turn failed → exit 1.
     check("exit 1 (failed task)", pr.returncode == 1)
-    check("stderr labels SELF-WOKEN", "SELF-WOKEN" in pr.stderr)
-    check("stderr carries ABANDONED error", "ABANDONED" in pr.stderr)
+    check("summary labels the self-woken turn", "self-woken" in pr.stdout)
+    check("summary carries the ABANDONED reason", "ABANDONED" in pr.stdout)
 
 print("\n=== 15. wait_for_task drops the event for 'stopped' too ===")
 async_tasks._get_or_create_event(tid2[0])
@@ -323,10 +324,20 @@ check("no implicit turn opened by system events", rt6._implicit_scope is None)
 
 print("\n=== 17. v0.12.1: pair_status says so when idle with background work out (disk heuristic) ===")
 runtime_mod.registry()._runtimes.pop("swt", None)
+# v0.16.0: the disk heuristic only applies to a live PRE-0.16 owner (no
+# activity beacon) — this process's own activity is authoritative. Drop our
+# activity for the pair (#16's completions left a wake pending) and make the
+# task below look owned by the parent process, which never announced itself.
+from claude_squared import activity as _activity  # noqa: E402
+_activity.forget("swt")
 bg_send = async_tasks.start_task("swt", "launch recon", lambda tid: SendResult(
     name="swt", response="BG-LAUNCHED", session_id=SID, model_used="claude-opus-5",
     cost_usd=0.01, duration_ms=5, background_launches=["agent"]))
 async_tasks.wait_for_task(bg_send.task_id, timeout_s=10)
+_p17 = async_tasks._task_path(bg_send.task_id)
+_d17 = json.loads(_p17.read_text(encoding="utf-8"))
+_d17["owner_pid"] = os.getppid()
+_p17.write_text(json.dumps(_d17), encoding="utf-8")
 server._take_self_woken_pending("swt")
 kinds, src = server._background_pending("swt")
 check("disk heuristic sees the pending launch", kinds == ["agent"] and src == "disk")

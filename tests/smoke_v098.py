@@ -116,7 +116,7 @@ def test_evict_idle_kills_idle_non_mid_turn():
 
     # Patch out the actual stop() call to avoid platform-specific taskkill side
     # effects in CI — we only care that the runtime was popped from the registry.
-    rt.stop = lambda: "tree-killed"
+    rt.stop = lambda *a: "tree-killed"  # v0.16.0: stop(reason)
 
     reg._evict_idle()
 
