@@ -352,20 +352,26 @@ def _av_dead_owner_state(data, pid):
 _AV_COMPACT_MARGIN = 30000
 
 
-def compaction_point(window):
+def compaction_point(window, backend="claude", auto_compact_token_limit=None):
     """Estimated context size at which the CLI auto-compacts, or None."""
+    if backend == "codex":
+        if not isinstance(window, int) or window <= 0:
+            return None
+        if isinstance(auto_compact_token_limit, int) and auto_compact_token_limit > 0:
+            return min(window, auto_compact_token_limit)
+        return int(window * 0.9)
     if not isinstance(window, int) or window <= _AV_COMPACT_MARGIN:
         return None
     return window - _AV_COMPACT_MARGIN
 
 
-def context_alert_threshold(window, headroom=None):
+def context_alert_threshold(window, headroom=None, backend="claude", auto_compact_token_limit=None):
     """Context size at which to alert: ``headroom`` tokens before the
     estimated compaction point, so a real turn still fits (default
     max(15% of the window, 40k) — the pair_settings default
     ``context_alert_headroom`` overrides it). None when the window is
     unknown."""
-    point = compaction_point(window)
+    point = compaction_point(window, backend, auto_compact_token_limit)
     if point is None:
         return None
     if not isinstance(headroom, int) or headroom < 0:
@@ -930,12 +936,15 @@ class ActivityWriter:
     # -- context --
 
     def note_context(self, used: int | None, window: int | None = None, *,
-                     window_source: str | None = None, source: str = "stream") -> None:
+                     window_source: str | None = None, source: str = "stream",
+                     auto_compact_token_limit: int | None = None) -> None:
         """Live context fill. Claude: input + cache_read + cache_creation of the
         latest TOP-LEVEL assistant event; Codex: the rollout's
         ``last_token_usage`` (never the cumulative total). ``window`` should be
         the CLI-reported one (see ``reported_window``); ``window_source``
-        "reported" | "inferred". Written lazily (<= 1/s)."""
+        "reported" | "inferred" | "rollout". Codex also persists its effective
+        auto-compact limit so stdlib watchers use the same alert boundary.
+        Written lazily (<= 1/s)."""
         if used is None:
             return
         with self._lock:
@@ -945,11 +954,14 @@ class ActivityWriter:
                 "window_source": window_source, "source": source,
                 "at": _av_iso(_av_now()),
             }
+            if self.backend == "codex":
+                self._state["context"].update(backend="codex", auto_compact_token_limit=auto_compact_token_limit)
             self._mark(_LAZY)
         _poke()
 
     def note_reported_window(self, tokens: int | None, *, model_key: str | None = None,
-                             model: str | None = None, source: str = "result") -> None:
+                             model: str | None = None, source: str = "result",
+                             auto_compact_token_limit: int | None = None) -> None:
         """Persist the window the CLI reported (Claude: result modelUsage
         contextWindow; Codex: the rollout's model_context_window) per pair, so
         a fresh runtime or another process uses it instead of inferring from
@@ -959,10 +971,12 @@ class ActivityWriter:
             return
         rec = {"tokens": int(tokens), "model_key": model_key, "model": model,
                "source": source, "at": _av_iso(_av_now())}
+        if self.backend == "codex":
+            rec.update(backend="codex", auto_compact_token_limit=auto_compact_token_limit)
         with self._lock:
             old = (self._meta or {}).get("reported_window") or {}
-            if (old.get("tokens"), old.get("model_key"), old.get("model")) == (
-                    rec["tokens"], model_key, model):
+            if all(old.get(k) == rec.get(k) for k in
+                   ("tokens", "model_key", "model", "backend", "auto_compact_token_limit")):
                 return
             self._meta = {"version": ACTIVITY_SCHEMA_VERSION, "pair": self.pair,
                           "reported_window": rec}
@@ -1057,7 +1071,8 @@ class ActivityWriter:
         now = _av_now()
         with self._lock:
             st = self._state
-            if st["turn"] is not None:
+            # A file-backed Codex send outlives this owner; its collector closes it.
+            if st["turn"] is not None and not (self.backend == "codex" and st["turn"].get("kind") == "send"):
                 self._close_turn_locked(None, "aborted", "", False, now)["note"] = reason
         self.lose_background(reason)
         with self._lock:

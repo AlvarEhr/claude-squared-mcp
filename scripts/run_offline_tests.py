@@ -42,6 +42,10 @@ def main() -> int:
         "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
         "-p", "test_codex_detach.py", "-v",
     ]))
+    commands.append(("codex_activity", [
+        "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
+        "-p", "test_codex_activity.py", "-v",
+    ]))
     commands.append(("connectors", [
         "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
         "-p", "test_connectors.py", "-v",

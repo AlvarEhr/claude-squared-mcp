@@ -54,6 +54,7 @@ class DetachTests(unittest.TestCase):
         self.stack.enter_context(patch.dict(os.environ, {
             "CLAUDE_HOME": str(self.directory / "claude"), "CODEX_HOME": str(self.directory / "codex"),
         }))
+        self.addCleanup(self.retire_activity)
         self.spec = PairSpec(name="detach", backend="codex", model="gpt-6-astra", effort="high",
                              permission_mode="read-only", session_id="test-thread", cwd=str(self.directory))
         R.add_pair(self.spec)
@@ -62,6 +63,15 @@ class DetachTests(unittest.TestCase):
         self.stack.enter_context(patch.object(C, "resolve_codex_model", return_value=("gpt-6-astra", None)))
         self.stack.enter_context(patch.object(C, "context_windows", return_value=(1000, 2000)))
         self.stack.enter_context(patch.object(C, "guardian_verdicts_since", return_value=[]))
+
+    def retire_activity(self):
+        from claude_squared import activity
+        home = str(self.directory / "claude" / "pairs")
+        with activity._WRITERS_LOCK:
+            writers = [activity._WRITERS.pop(key) for key in list(activity._WRITERS) if key[0] == home]
+        for writer in writers:
+            with writer._io_lock, writer._lock:
+                writer._forgotten = True
 
     def task(self, events=None, *, child_pid=999999998):
         tid = str(uuid.uuid4())
