@@ -1471,7 +1471,11 @@ def _pending_work_split(name: str) -> tuple[list[dict], list[dict]]:
     process's runtime, other live MCP processes): pending background tasks,
     a wake-up about to start a self-woken turn, an open self-woken turn.
     Background alone missed the gap between a completion and the turn it
-    wakes (anvil review, 2026-09-25). Foreign items carry their ``pid``."""
+    wakes (anvil review, 2026-09-25). Foreign items carry their ``pid``;
+    ``unconfirmed`` marks another process's work past its deadline with no
+    evidence either way (a wake-up that never started, 24 h-stale
+    background) — ``force=True`` may override those (critic decision,
+    2026-09-25)."""
     local: list[dict] = []
     try:
         rt = runtime_mod.registry().get_or_none(name)
@@ -1485,13 +1489,14 @@ def _pending_work_split(name: str) -> tuple[list[dict], list[dict]]:
         view = activity_mod.view(name, grace_seconds=0)
     except Exception:
         view = {}
-    foreign += [dict(b, description=f"{b.get('description') or ''} — stale: no completion "
-                                    f"event for 24 h".lstrip(" —")) if b.get("stale") else b
+    foreign += [dict(b, unconfirmed=True,
+                     description=f"{b.get('description') or ''} — stale: no completion "
+                                 f"event for 24 h".lstrip(" —")) if b.get("stale") else b
                 for b in view.get("background") or [] if b.get("pid") != me]
     foreign += [{"kind": "wake-up", "task_id": None, "pid": w.get("pid"),
                  "description": "background finished; the pair is about to resume"}
                 for w in view.get("wake_pending") or [] if w.get("pid") != me]
-    foreign += [{"kind": "wake-up", "task_id": None, "pid": w.get("pid"),
+    foreign += [{"kind": "wake-up", "task_id": None, "pid": w.get("pid"), "unconfirmed": True,
                  "description": f"unconfirmed: announced {w.get('since')}, never started"}
                 for w in view.get("wake_stale") or [] if w.get("pid") != me]
     foreign += [{"kind": "self-woken turn", "task_id": t.get("task_id"), "pid": t.get("pid")}
@@ -1527,20 +1532,31 @@ def _refuse_if_background(name: str, action: str, force: bool) -> None:
     unless force. Killed work never wakes the pair; a rewritten JSONL would
     be written to later by a self-wake from pre-mutation memory.
 
-    Work in ANOTHER MCP process refuses even with force: force kills only
-    THIS process's runtime, so the other one would self-wake onto the
+    Real work in ANOTHER MCP process refuses even with force: force kills
+    only THIS process's runtime, so the other one would self-wake onto the
     rewritten session (anvil review, 2026-09-25). No cross-process kill here
     on purpose — an idle owner polls nothing, so it could not acknowledge a
-    stop request before the mutation; its own session can stop it."""
+    stop request before the mutation; its own session can stop it. Another
+    process's UNCONFIRMED work (past its deadline, no evidence either way)
+    refuses too, but force overrides it (critic decision, 2026-09-25)."""
     local, foreign = _pending_work_split(name)
-    if foreign:
-        pids = ", ".join(sorted({str(f.get("pid")) for f in foreign}))
+    confirmed = [f for f in foreign if not f.get("unconfirmed")]
+    if confirmed:
+        pids = ", ".join(sorted({str(f.get("pid")) for f in confirmed}))
         raise PairError(
             f"Pair '{name}' has work pending in another MCP process (PID {pids}: "
-            f"{_describe_background(foreign)}); {action} now would change the session under that "
+            f"{_describe_background(confirmed)}); {action} now would change the session under that "
             f"process's runtime, which writes to it again when the pair wakes. force=True can't "
             f"help — it only kills this process's runtime. Wait for it ({_watcher_cmd(name)}), or "
             f"pair_stop('{name}', force=True) from the session that owns it."
+        )
+    if foreign and not force:
+        pids = ", ".join(sorted({str(f.get("pid")) for f in foreign}))
+        raise PairError(
+            f"Pair '{name}' has unconfirmed work in another MCP process (PID {pids}: "
+            f"{_describe_background(foreign)}) — past its deadline, and nothing says whether it "
+            f"ended. force=True {action} anyway (that process's pair, if it does resume, writes "
+            f"onto the old history), or wait ({_watcher_cmd(name)})."
         )
     if force or not local:
         return
@@ -4894,7 +4910,8 @@ def pair_stop(
     # v0.16.0: rotating the session under another process's pending work would
     # let that process's pair wake onto a session this pair no longer uses —
     # force/hard only ever kill THIS process's runtime (anvil review, 2026-09-25).
-    hard_foreign = _pending_work_split(name)[1] if hard and not foreign_implicit else []
+    hard_foreign = ([f for f in _pending_work_split(name)[1] if not f.get("unconfirmed")]
+                    if hard and not foreign_implicit else [])
     if hard_foreign:
         actions.append(f"hard reset skipped: work pending in another MCP process "
                        f"({_describe_background(hard_foreign)}) must first be stopped by its owner")
@@ -4909,7 +4926,7 @@ def pair_stop(
                 _refuse_detached_codex(name)
                 # Re-checked under the lock: foreign work can appear between
                 # the check above and taking it (anvil re-review, 2026-09-25).
-                hard_foreign = _pending_work_split(name)[1]
+                hard_foreign = [f for f in _pending_work_split(name)[1] if not f.get("unconfirmed")]
                 if hard_foreign:
                     raise _HardResetSkipped(
                         f"hard reset skipped: work pending in another MCP process "
@@ -5450,6 +5467,7 @@ def run() -> None:
         activity_mod.sweep()
     except Exception:
         pass
-    import atexit
-    atexit.register(activity_mod.shutdown)
+    # One exit handler for the whole process: runtimes first, then the
+    # activity files (runtime.install_exit_handler).
+    runtime_mod.install_exit_handler()
     mcp.run()

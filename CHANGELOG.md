@@ -6,7 +6,27 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+**Restart every open Claude and Codex session after installing** (a running
+MCP process keeps the code it loaded; a pre-0.16 process writes no activity
+file, so `wait.py` reports its pairs as "unknown", exit 10, until it restarts).
+
 ### Added
+
+- **Codex turns survive the death of their MCP server.** `codex exec` now
+  writes its events and stderr to files (prompt from a stdin file) instead of
+  pipes — a pipe-backed child died at its next event write once its parent
+  was gone (verified 2026-09-19, when a blanket `taskkill /IM python.exe` in
+  another session killed every MCP server and three Codex turns with them).
+  The turn keeps running; `pair_poll` shows it as DETACHED; when it ends, the
+  next observer (`pair_poll`, `pair_status`, a later send, or the next MCP
+  start) recovers the result exactly once — marked "recovered after owner
+  death", counted, and replayed into `main.log`. A send waits behind a live
+  detached turn; `pair_stop` kills it by PID (with a creation-time check
+  against PID reuse); rewind / fork / clear / forget refuse while one runs.
+  Claude runtimes already survived an owner death.
+- **Live context for Codex pairs** from the rollout, with the same context
+  alert (the compaction point is the configured `model_auto_compact_token_limit`,
+  else an estimated 90% of the window; the rollout can lag one tool call).
 
 - **Activity files** (`~/.claude/pairs/activity/<pair>/<pid>.json`): what each
   pair is doing right now — open turn, pending background work, an expected
@@ -35,12 +55,16 @@ All notable changes to this project are documented here. Format follows
 ### Fixed
 
 - **Background work is no longer killed silently.** The idle evictor never
-  evicts a runtime with background work pending (24 h ceiling, then recorded
-  as lost); a runtime whose claude process dies records its lost work at once.
+  evicts a runtime with background work pending (after 24 h without a
+  completion event it is marked stale, still protected); a runtime whose
+  claude process dies records its lost work at once, and on exit each
+  runtime records what it kills before the activity files close.
   `pair_clear`, `pair_rewind`, `pair_compact` and a `pair_update` that
   actually changes a spawn-pinned setting refuse while background work, a
   self-woken turn or the wake-up before it is pending unless `force=True` —
-  never when another MCP process owns that work (force can't reach it);
+  never when another MCP process owns that work (force can't reach it),
+  unless that work is unconfirmed (a wake-up that never started, stale
+  background);
   `pair_forget` and forced stops report what they killed; a soft `pair_stop`
   says which background work survives it.
 - **A send no longer takes a self-woken turn's reply** when it arrives between
@@ -64,6 +88,13 @@ All notable changes to this project are documented here. Format follows
 
 ### Changed
 
+- `pair_update` with values equal to the current ones no longer respawns the
+  runtime (only an actual change does). To restart a warm runtime without
+  losing context, use `pair_stop(name, force=True)`.
+- Models: the floating `opus` alias now resolves to Opus 5.5 (Claude CLI
+  2.1.280), so new pairs get it by default; Codex tier aliases already follow
+  GPT-6 (`sol` → gpt-6-sol, `luna` → gpt-6-luna, `astra` → gpt-6-astra; there
+  is no GPT-6 Terra, so `terra` stays on gpt-5.6-terra).
 - `pair_compact`: the tool description states up front that Codex compaction
   takes no steering input — the app-server's `thread/compact/start` accepts
   only a thread id (verified against codex-cli 0.153.4's protocol schema) —

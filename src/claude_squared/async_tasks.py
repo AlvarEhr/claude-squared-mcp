@@ -476,6 +476,25 @@ def mark_task_executing(task_id: str | None) -> None:
             _save(state)
 
 
+def mark_task_queued(task_id: str | None) -> None:
+    """Undo ``mark_task_executing``: a promoted Claude send found a self-wake
+    starting at its commit and waits again (v0.16.0). While it waits it must
+    read queued — a default pair_stop aimed at the self-woken turn would
+    otherwise cancel this send instead. No-op once terminal."""
+    if task_id:
+        with _states_guard:
+            state = _local_states.get(task_id)
+        state = state or load_task(task_id)
+        if state is None:
+            return
+        with control_lock(state.pair_name):
+            if state.status != "running":
+                return
+            state.queued = True
+            state.execution_started_at = None
+            _save(state)
+
+
 def _finish_task(state: AsyncTaskState, event: threading.Event) -> None:
     """Finalize without reading metadata back from disk, and always wake waiters."""
     state.child_pid = None

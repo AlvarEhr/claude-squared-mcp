@@ -22,6 +22,9 @@ server at import) as a subprocess — exactly what an agent runs:
   6. soft pair_stop mid-turn with background pending reports it as surviving,
      and the pair later wakes itself
 
+Throughout: no wake-up is ever left unresolved (``wake_stale``) — sampled
+every second across all six cases.
+
 Isolation: a fresh temp CLAUDE_HOME (set before importing the package) with a
 ``projects`` junction to the real ~/.claude/projects (the CLI needs it). The
 pairs' cwd is a scratch dir in the temp home; the only real-home writes are
@@ -43,6 +46,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -239,6 +243,32 @@ PAIR_STOP = f"lv16-stop-{RUN}"
 t_start = time.monotonic()
 print(f"(temp CLAUDE_HOME {_TMP_HOME}; wait.py {WAIT_PY})", flush=True)
 
+# An unresolved wake-up (announced, never started within its bound) must
+# never occur in these normal scenarios — the wake triggers are meant to fire
+# only for turns the CLI really queues (critic decision, 2026-09-25). Sampled
+# every second across all cases: the activity view's wake_stale, and the
+# runtime's own wake age.
+UNRESOLVED: list[str] = []
+_SAMPLING = threading.Event()
+
+
+def _sample_wakes() -> None:
+    while not _SAMPLING.is_set():
+        for name in (PAIR_IDLE, PAIR_TRIAGE, PAIR_PROTECT, PAIR_STOP):
+            try:
+                if A.view(name, grace_seconds=0).get("wake_stale"):
+                    UNRESOLVED.append(f"{name}: wake_stale in the activity view")
+                rt = runtime_mod.registry().get_or_none(name)
+                at = getattr(rt, "_wake_at", None) if rt is not None else None
+                if at is not None and time.monotonic() - at >= A.WAKE_PENDING_SECONDS:
+                    UNRESOLVED.append(f"{name}: runtime wake unresolved for {time.monotonic() - at:.0f}s")
+            except Exception:
+                pass
+        _SAMPLING.wait(1.0)
+
+
+threading.Thread(target=_sample_wakes, daemon=True, name="wake-sampler").start()
+
 try:
     check("wait.py installed in the temp home", WAIT_PY is not None and Path(WAIT_PY).exists()
           and Path(WAIT_PY).resolve().is_relative_to(_TMP_HOME.resolve()), str(WAIT_PY))
@@ -421,6 +451,10 @@ try:
         case("6 soft stop", FAILED == before, "background survived and woke the pair")
     else:
         case("6 soft stop", False, "pair creation failed")
+
+    _SAMPLING.set()
+    check("no unresolved wake-up (wake_stale) in any scenario (cases 1-6)", not UNRESOLVED,
+          "; ".join(sorted(set(UNRESOLVED))[:5]))
 except Exception:
     import traceback
     traceback.print_exc()

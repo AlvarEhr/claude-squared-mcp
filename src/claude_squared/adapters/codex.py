@@ -14,7 +14,6 @@ with ChatGPT-plan auth on 2026-09-07 — see HANDOFF.md "Codex backend".
 
 from __future__ import annotations
 
-import atexit
 import glob
 import json
 import os
@@ -62,8 +61,6 @@ STRONG_WARNING_THRESHOLD = 0.85
 THREAD_SOURCE = "claude-squared"   # tags our threads in ~/.codex sqlite + the Desktop UI
 PROBE_PROMPT = "Reply with exactly: pair-ready"
 CONTEXT_POLL_SECONDS = 10.0
-_ACTIVITY_EXIT_LOCK = threading.Lock()
-_ACTIVITY_EXIT_REGISTERED = False
 
 
 class _NoCodexActivity:
@@ -89,12 +86,12 @@ def _new_codex_activity(spec: PairSpec, task_id: str | None):
         from claude_squared import activity
 
         # Short-lived CLI observers can publish recovery activity without ever
-        # entering server.run(). Register before creating their owner file.
-        global _ACTIVITY_EXIT_REGISTERED
-        with _ACTIVITY_EXIT_LOCK:
-            if not _ACTIVITY_EXIT_REGISTERED:
-                atexit.register(activity.shutdown)
-                _ACTIVITY_EXIT_REGISTERED = True
+        # entering server.run(). Install before creating their owner file —
+        # the process's single exit handler (runtimes first, then activity),
+        # never a separate activity.shutdown that could run ahead of the
+        # runtimes' own loss records (atexit is LIFO; critic, 2026-09-25).
+        from claude_squared import runtime
+        runtime.install_exit_handler()
         return _CodexActivity(spec, task_id)
     except Exception:
         return _NoCodexActivity(spec)

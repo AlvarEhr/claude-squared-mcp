@@ -687,6 +687,32 @@ class ViewTests(ActivityTestCase):
         self.assertTrue(w.flush())
         self.assertEqual(self.view()["verdict"], "busy")  # published: b1 visible
 
+    def test_forget_writes_its_tombstone_outside_the_lock_and_before_a_successor(self):
+        w = A.writer(self.pair)
+        w.background_started("b1", "local_bash")
+        self.assertTrue(w.flush())
+        real = A._atomic_write
+        seen = {}
+
+        def slow_write(path, text):
+            if '"forgotten"' in text:
+                seen["writers_lock_held"] = A._WRITERS_LOCK.locked()
+                time.sleep(0.5)  # a slow disk (or Windows' PermissionError retries)
+            return real(path, text)
+        with patch.object(A, "_atomic_write", slow_write):
+            th = threading.Thread(target=A.forget, args=(self.pair,), daemon=True)
+            th.start()
+            self.assertTrue(self.wait_for(lambda: "writers_lock_held" in seen))
+            t0 = time.monotonic()
+            w2 = A.writer(self.pair)  # not blocked behind the tombstone write
+            self.assertLess(time.monotonic() - t0, 0.3)
+            self.assertTrue(w2.flush(timeout=5))  # waits for the tombstone, then writes
+            th.join(5)
+        self.assertFalse(seen["writers_lock_held"])
+        data = self.read_own()
+        self.assertEqual(data["state"], "live")  # the successor's file, not the tombstone
+        self.assertEqual([b["task_id"] for b in data["background_lost"]], ["b1"])
+
     def test_recreated_pair_keeps_the_tombstone_history(self):
         w = A.writer(self.pair)
         w.background_started("b1", "local_bash")

@@ -632,6 +632,14 @@ class PairRuntime:
             self._implicit_done.clear()
         return True
 
+    def _turn_opened(self, task_id: str | None, kind: str) -> None:
+        self._activity.turn_opened(task_id, kind, gen=self._gen)
+
+    def _turn_closed(self, task_id: str | None, **kwargs: Any) -> dict | None:
+        """Close THIS runtime's activity turn only — never "whatever is open"
+        in the pair's shared writer (an untracked turn has task_id None)."""
+        return self._activity.turn_closed(task_id, gen=self._gen, **kwargs)
+
     def _clear_wake(self) -> None:
         with self._scope_lock:
             self._wake_at = None
@@ -959,9 +967,10 @@ class PairRuntime:
         with self._scope_lock:
             solicited = self._current_scope
         if solicited is not None and solicited.result_snapshot is None:
-            self._activity.turn_closed(solicited.task_id, status="stopped", preview=f"({why})")
+            self._turn_closed(solicited.task_id, status="stopped", preview=f"({why})")
         self.last_lost_background = self._record_lost_background(why)
         if self.proc is None:
+            self._settle_retired_reader(why)
             return "no runtime"
         pid = self.proc.pid
         # Polite stdin close — gives claude.exe an EOF signal before we tree-kill.
@@ -1005,7 +1014,26 @@ class PairRuntime:
         except Exception:
             pass
         self.proc = None
+        self._settle_retired_reader(why)
         return outcome
+
+    def _settle_retired_reader(self, why: str) -> None:
+        """stop(), after the kill. An event that passed the reader's
+        generation check just before stop() retired it can finish AFTER the
+        cleanup above — opening a self-woken scope (and registering its task)
+        or tracking a background entry with this generation — and the retired
+        reader never runs its EOF cleanup (critic, 2026-09-25). So wait for
+        it (bounded: it can be stuck behind _promote_lock) and sweep again,
+        generation-scoped only."""
+        reader = self._reader_thread
+        if reader is not None and reader is not threading.current_thread() and reader.is_alive():
+            reader.join(timeout=2.0)
+        self._abort_implicit_turn(
+            "runtime stopped/evicted while a self-woken turn was starting — its background "
+            "work was tree-killed with it")
+        late = self._record_lost_background(why)
+        if late:
+            self.last_lost_background = list(self.last_lost_background or []) + late
 
     # ---- log writing ----
 
@@ -1369,9 +1397,14 @@ class PairRuntime:
         with self._scope_lock:
             was_bg = self._bg_tasks.pop(task_id, None) is not None
         if was_bg:
-            # With no turn open the CLI queues a wake-up turn for it (the
-            # activity writer records its own wake_pending).
-            self._note_wake()
+            # With no turn open the CLI queues a wake-up turn for a
+            # completion or a failure (both observed). A kill/stop/cancel —
+            # usually our own — is not measured to wake the pair and needs
+            # no wake; if the CLI does queue a turn, its system:init still
+            # announces it (critic, 2026-09-25). The activity writer applies
+            # the same rule to its own wake_pending.
+            if str(status).lower() in _activity.WAKING_STATUSES:
+                self._note_wake()
             self._activity.background_finished(task_id, status, gen=self._gen)
 
     def _is_stale_resume_result(self, ev: dict) -> bool:
@@ -1484,7 +1517,7 @@ class PairRuntime:
                     pass
             return
         self._last_turn_summary = None
-        self._activity.turn_opened(task.task_id if task is not None else None, "self_woken")
+        self._turn_opened(task.task_id if task is not None else None, "self_woken")
         ts = datetime.now().strftime("%H:%M:%S")
         tid = task.task_id[:8] if task is not None else "untracked"
         # Deliberately does NOT match the ``=== TURN <x> (Nms) ===`` regex that
@@ -1521,7 +1554,7 @@ class PairRuntime:
                 _async_tasks.finalize_external_task(task, status=status, error=reason)
             except Exception:
                 pass
-        self._activity.turn_closed(task.task_id if task is not None else None,
+        self._turn_closed(task.task_id if task is not None else None,
                                    status=status, preview=f"({reason})")
         self._record_self_woken({
             "task_id": task.task_id if task is not None else None,
@@ -1568,7 +1601,7 @@ class PairRuntime:
                 self._implicit_task = None
         if solicited is not None:
             subtype = ev.get("subtype") or ""
-            self._activity.turn_closed(
+            self._turn_closed(
                 solicited.task_id, preview=str(ev.get("result") or ""),
                 status="done" if subtype == "success" else (
                     "stopped" if solicited.interrupt_sent else subtype or "failed"))
@@ -1673,7 +1706,7 @@ class PairRuntime:
             interim = bool(self._bg_tasks)
         from claude_squared import triage as _triage
         pending = interim and status == "done" and self._triage_mode != "off"
-        entry = self._activity.turn_closed(task_id, status=status, preview=reply,
+        entry = self._turn_closed(task_id, status=status, preview=reply,
                                            triage_pending=pending)
         if pending and entry is not None:
             _triage.submit(self._activity, entry.get("task_id"), summary, reply,
@@ -1773,12 +1806,20 @@ class PairRuntime:
                     # land during the promotion above; committing anyway sent
                     # this message behind the queued wake, and the wake's
                     # reply came back as ours (anvil re-review, 2026-09-25).
-                    if self._implicit_scope is not None or self._wake_live_locked():
-                        continue
-                    scope.task_id = task_id
-                    self._current_scope = scope
+                    blocked = self._implicit_scope is not None or self._wake_live_locked()
+                    if not blocked:
+                        scope.task_id = task_id
+                        self._current_scope = scope
+                if blocked:
+                    # Waiting again: the task must read QUEUED meanwhile, or a
+                    # default pair_stop aimed at the self-woken turn cancels
+                    # this send instead (critic, 2026-09-25). Task-file I/O —
+                    # outside _scope_lock; promote -> control as above.
+                    _async_tasks.mark_task_queued(task_id)
+                    promoted = False
+                    continue
                 self._last_turn_summary = None
-                self._activity.turn_opened(task_id, "send")
+                self._turn_opened(task_id, "send")
                 return waited
 
     def active_task_ids(self) -> set[str]:
@@ -2021,7 +2062,7 @@ class PairRuntime:
                     # No result reached the reader (timeout, crash, closed
                     # stdin): the activity turn must not stay open forever.
                     exc = sys.exc_info()[1]
-                    self._activity.turn_closed(scope.task_id, preview=str(exc or "")[:200], status=(
+                    self._turn_closed(scope.task_id, preview=str(exc or "")[:200], status=(
                         "timeout" if isinstance(exc, CommandTimeout) else
                         "crashed" if str(exc or "").startswith(CRASHED_ERROR_PREFIX) else "failed"))
 
@@ -2199,25 +2240,22 @@ class RuntimeRegistry:
             if not rt.is_alive():
                 to_evict.append((rt, "the pair's claude process had already exited"))
                 continue
-            if rt.spec.persistent:
+            if rt.pending_work():
+                # v0.16.0: evicting tree-kills the background work (and the
+                # pair would never wake for it) — never. After a full day
+                # with no log line at all the completion event was probably
+                # missed, but a timeout doesn't establish that the work
+                # ended: the entries are flagged stale ("unknown" to every
+                # reader) and stay protected, persistent or not (critic,
+                # 2026-09-25). A persistent runtime with nothing pending is
+                # never idle-evicted either.
                 if rt.pending_background_tasks() and rt.last_activity < ceiling:
-                    # Kept warm on purpose, and its background stays
-                    # protected: flagged stale ("unknown"), not dropped.
                     rt.mark_background_stale(
                         f"no log activity for {BACKGROUND_EVICT_CEILING_SECONDS // 3600} h with "
                         f"background work still pending — it may already have finished (no "
                         f"completion event seen)")
                 continue
-            if rt.pending_work():
-                # v0.16.0: evicting tree-kills the background work (and the
-                # pair would never wake for it). Never, except after a full
-                # day with no log line at all — then the completion event
-                # was probably missed.
-                if rt.last_activity < ceiling:
-                    to_evict.append((rt, (
-                        f"no log activity for {BACKGROUND_EVICT_CEILING_SECONDS // 3600} h with "
-                        f"background work still pending — it may already have finished (no "
-                        f"completion event seen); the idle runtime was evicted")))
+            if rt.spec.persistent:
                 continue
             if rt.last_activity < cutoff:
                 to_evict.append((rt, None))
@@ -2237,10 +2275,30 @@ def _shutdown_runtimes() -> None:
     _activity.shutdown()
 
 
+_EXIT_HOOK_LOCK = threading.Lock()
+_EXIT_HOOKED = [False]
+
+
+def install_exit_handler() -> None:
+    """Register THE process exit handler once: stop the runtimes (each
+    records the background it kills, with its own reason, on the next send's
+    footer and in main.log), THEN close the activity files. Every path that
+    needs exit cleanup — the server, the first runtime, a CLI process that
+    recovers a Codex turn — installs this same handler. A separately
+    registered activity.shutdown ran first whenever it was registered later
+    (atexit is LIFO): it moved every runtime's background to lost with a
+    generic reason and the runtimes' own records came up empty (critic,
+    2026-09-25)."""
+    with _EXIT_HOOK_LOCK:
+        if not _EXIT_HOOKED[0]:
+            _EXIT_HOOKED[0] = True
+            atexit.register(_shutdown_runtimes)
+
+
 def registry() -> RuntimeRegistry:
     global _REGISTRY
     if _REGISTRY is None:
         _REGISTRY = RuntimeRegistry(idle_timeout_seconds=IDLE_TIMEOUT_SECONDS)
         _REGISTRY.start_evictor()
-        atexit.register(_shutdown_runtimes)
+        install_exit_handler()
     return _REGISTRY

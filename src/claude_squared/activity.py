@@ -63,9 +63,9 @@ changes immediately, context-only changes at most once per
 ``LAZY_WRITE_INTERVAL_S``. File writes are atomic (unique tmp + replace, with
 ``async_tasks._save``'s PermissionError retry for Windows readers). A file's
 writes are serialized by the writer's ``_io_lock`` (flusher vs ``flush()``),
-taken only on I/O threads, always before the leaf lock. ``forget()`` alone
-holds ``_WRITERS_LOCK`` across both (``_WRITERS_LOCK`` -> ``_io_lock`` ->
-leaf); nothing takes ``_WRITERS_LOCK`` while holding a writer lock.
+taken only on I/O threads, always before the leaf lock. ``forget()`` takes
+``_WRITERS_LOCK`` -> leaf to retire a writer, and writes the tombstone after
+releasing both; nothing takes ``_WRITERS_LOCK`` while holding a writer lock.
 
 The reader half between the BEGIN/END markers below is stdlib-only and
 Python 3.7-compatible because wait.py embeds it verbatim;
@@ -631,6 +631,11 @@ def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,
 
 
 WAKE_PENDING_SECONDS = 120
+# Terminal background statuses the CLI is known to wake an idle pair for
+# (both observed, CLI 2.1.280). A kill/stop/cancel — usually our own doing —
+# is not measured to, so it sets no wake; a turn it did queue would still be
+# announced by its system:init (critic decision, 2026-09-25).
+WAKING_STATUSES = ("completed", "failed")
 LAZY_WRITE_INTERVAL_S = 1.0
 WINDOW_TURNS_CAP = 50
 LIST_CAP = 50
@@ -737,6 +742,9 @@ class ActivityWriter:
         self._forgotten = False  # forget() ran: never write this file again
         # The mut_seq the file on disk has reached (see _mark / mutation_seq).
         self._published_seq = -1
+        # Set by writer() when this writer replaces a forgotten one (same
+        # file name): its predecessor's tombstone must land first.
+        self._after: threading.Event | None = None
         now = _av_iso(_av_now())
         self._state: dict = {
             "version": ACTIVITY_SCHEMA_VERSION, "pair": pair, "backend": backend,
@@ -787,7 +795,7 @@ class ActivityWriter:
     # -- turns --
 
     def turn_opened(self, task_id: str | None, kind: str = "send", *,
-                    new_window: bool | None = None) -> None:
+                    new_window: bool | None = None, gen: str | None = None) -> None:
         """A turn started. ``kind`` "self_woken" continues the current window;
         any other kind (a solicited send, compact, invoke) starts a new one,
         clearing this owner's window lists — except ``background_lost``
@@ -810,6 +818,8 @@ class ActivityWriter:
                 for key in ("window_turns", "background_finished", "compactions"):
                     st[key] = []
             st["turn"] = {"task_id": task_id, "kind": kind, "started_at": iso}
+            if gen is not None:
+                st["turn"]["gen"] = gen
             st["wake_pending"] = None
             st["last_transition_at"] = iso
             self._mark(_URGENT)
@@ -835,7 +845,8 @@ class ActivityWriter:
         return entry
 
     def turn_closed(self, task_id: str | None = None, *, status: str = "done",
-                    preview: str = "", triage_pending: bool = False) -> dict | None:
+                    preview: str = "", triage_pending: bool = False,
+                    gen: str | None = None) -> dict | None:
         """The open turn ended. Returns its window_turns entry, or None when no
         turn is open or ``task_id`` names a different one (idempotent). Never
         touches a pending wake-up: a result that belongs to no turn resolves
@@ -848,6 +859,8 @@ class ActivityWriter:
                 return None
             if task_id and turn.get("task_id") and task_id != turn.get("task_id"):
                 return None
+            if gen is not None and turn.get("gen") != gen:
+                return None  # another runtime generation's (or a non-runtime) turn
             out = dict(self._close_turn_locked(task_id, status, preview, triage_pending, now))
             self._mark(_URGENT)
         _poke()
@@ -929,7 +942,7 @@ class ActivityWriter:
                 "outlived_turn": bool(entry and entry.get("outlived_turn")),
             })
             self._cap(st["background_finished"], LIST_CAP)
-            if st["turn"] is None:
+            if st["turn"] is None and str(status).lower() in WAKING_STATUSES:
                 self._set_wake(task_id, now, gen)
             st["last_transition_at"] = iso
             self._mark(_URGENT)
@@ -1132,6 +1145,11 @@ class ActivityWriter:
     def _flush(self, force: bool) -> bool:
         """Write if dirty and due. True when nothing is left unwritten."""
         with self._io_lock:
+            after = self._after
+            if after is not None:
+                if not after.is_set():
+                    return False  # the forgotten predecessor's tombstone first; retry
+                self._after = None
             with self._lock:
                 if self._forgotten or (not self._dirty and not self._meta_dirty):
                     return True
@@ -1225,6 +1243,7 @@ def writer(pair: str, backend: str = "claude") -> ActivityWriter:
             if retired is not None:
                 w._state["background_lost"] = retired["background_lost"]  # noqa: SLF001
                 w._state["mut_seq"] = retired["mut_seq"]  # noqa: SLF001
+                w._after = retired.get("written")  # noqa: SLF001
             _WRITERS[key] = w
             created = True
     if w.backend != backend or created:
@@ -1332,35 +1351,43 @@ def forget(pair: str, reason: str = "the pair was forgotten (pair_forget)") -> N
     A later writer() for the same pair in this process reuses the file name:
     it inherits the tombstone's loss history and mutation count, so a
     recreated pair can't erase what a watcher hasn't seen yet (anvil
-    re-review, 2026-09-25). ``_WRITERS_LOCK`` is held throughout so no new
-    writer can exist before the tombstone is on disk (lock order
-    _WRITERS_LOCK -> _io_lock -> _lock; forget only)."""
+    re-review, 2026-09-25). ``_WRITERS_LOCK`` covers only the retirement
+    and the in-memory tombstone (-> the leaf lock); the file is written
+    outside it, under the old writer's ``_io_lock`` (an in-flight flush of
+    it lands first, later ones see ``_forgotten``), and a successor
+    writer's first flush waits for that write (``_after``), so the
+    tombstone can never overwrite the successor's file (critic,
+    2026-09-25)."""
     home = _home_pairs()
     key = (str(home), pair)
+    written = threading.Event()
     with _WRITERS_LOCK:
         w = _WRITERS.pop(key, None)
         if w is not None:
             now = _av_now()
-            with w._io_lock:  # noqa: SLF001 — no flush may land after the tombstone
-                with w._lock:  # noqa: SLF001
-                    st = w._state  # noqa: SLF001
-                    if st["turn"] is not None:
-                        w._close_turn_locked(None, "aborted", "", False, now)["note"] = reason  # noqa: SLF001
-                    for e in st["background"]:
-                        st["background_lost"].append(dict(e, reason=reason, at=_av_iso(now)))
-                    w._cap(st["background_lost"], LIST_CAP)  # noqa: SLF001
-                    st.update(background=[], wake_pending=None, state="forgotten",
-                              closed_at=_av_iso(now), closed_reason=reason,
-                              updated_at=_av_iso(now), seq=st["seq"] + 1,
-                              mut_seq=st["mut_seq"] + 1)
-                    text = json.dumps(st, indent=1)
-                    _RETIRED[key] = {"background_lost": [dict(e) for e in st["background_lost"]],
-                                     "mut_seq": st["mut_seq"]}
-                    w._forgotten = True  # noqa: SLF001
-                try:
-                    _atomic_write(w._path, text)  # noqa: SLF001
-                except OSError:
-                    pass
+            with w._lock:  # noqa: SLF001
+                st = w._state  # noqa: SLF001
+                if st["turn"] is not None:
+                    w._close_turn_locked(None, "aborted", "", False, now)["note"] = reason  # noqa: SLF001
+                for e in st["background"]:
+                    st["background_lost"].append(dict(e, reason=reason, at=_av_iso(now)))
+                w._cap(st["background_lost"], LIST_CAP)  # noqa: SLF001
+                st.update(background=[], wake_pending=None, state="forgotten",
+                          closed_at=_av_iso(now), closed_reason=reason,
+                          updated_at=_av_iso(now), seq=st["seq"] + 1,
+                          mut_seq=st["mut_seq"] + 1)
+                text = json.dumps(st, indent=1)
+                w._forgotten = True  # noqa: SLF001
+                _RETIRED[key] = {"background_lost": [dict(e) for e in st["background_lost"]],
+                                 "mut_seq": st["mut_seq"], "written": written}
+    if w is not None:
+        try:
+            with w._io_lock:  # noqa: SLF001
+                _atomic_write(w._path, text)  # noqa: SLF001
+        except OSError:
+            pass
+        finally:
+            written.set()
     try:
         (home / "activity" / pair / "pair.json").unlink(missing_ok=True)
         (home / "activity" / pair).rmdir()  # only if empty (no tombstone, no other owner)

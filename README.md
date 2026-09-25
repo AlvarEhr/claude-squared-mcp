@@ -123,6 +123,8 @@ A denied action produces a `⛔ PAIR HANDOFF` block in the reply with the pair's
 - **`pair_rewind` works** (Codex resumes from the rollout JSONL); the adapter re-syncs Codex's sqlite history projection so `pair_fork` keeps working afterwards.
 - **`pair_compact` works** through `codex app-server` (stdio JSON-RPC: `thread/resume` → `thread/compact/start`); `codex exec` itself has no compaction command (a literal `/compact` is just text to the model). The daemon starts the Desktop's plugin MCP servers first (~10 s); this MCP is excluded so nothing recurses. Codex compaction takes no steering text, and its post-compaction size is an estimate until the next reply's footer.
 - **`pair_stop`** tree-kills the in-flight turn (the thread resumes cleanly on the next send). From another MCP process it writes the task's `<task_id>.cancel` file (the owner's turn polls it ~1/s and tree-kills itself) plus the per-pair marker the terminal `stop` command uses, for owners still on pre-0.14 code.
+- **A turn survives its MCP server** (0.16.0). `codex exec` writes its events to files under `logs/<pair>/turns/`, so if the MCP process that launched a turn dies (a crash, a restart, a stray `taskkill`), the turn keeps running: `pair_poll` shows it as DETACHED, and when it finishes the next observer recovers the result exactly once ("recovered after owner death"). Sends wait behind it; `pair_stop` still stops it. `wait.py` exits 7 when a detached turn has finished and its result is waiting to be collected.
+- **Live context and the context alert** (0.16.0) come from the rollout's latest `token_count`. The rollout can lag one tool call (the count for a call that starts a long command lands after the command finishes), and Codex's own compaction point is estimated unless `model_auto_compact_token_limit` is set.
 - **`pair_tool_detail` works** for turns run since 0.14.0: each item's full started/completed events are kept under `logs/<pair>/codex-tool-items/T-N.json`. Older turns only have the log previews and say so.
 - **Unavailable models** (not on your ChatGPT plan) are refused by the API with HTTP 400 — `pair_create` warns when a slug isn't listed in the cache, and a failed turn is labeled `⛔ MODEL UNAVAILABLE`.
 
@@ -372,11 +374,10 @@ its own async task, so nothing about it is hidden:
 **Background protection (0.16.0).** Killing a runtime kills its background work,
 and the pair never wakes for it. So:
 
-- the idle evictor never evicts a runtime with background work pending (after
-  24 h with no log activity at all it does, and records the work as lost — "may
-  already have finished, no completion event seen"; a persistent runtime is
-  kept, its background stays protected and is marked *stale*). A runtime whose
-  claude process dies records its background work as lost at once;
+- the idle evictor never evicts a runtime with background work pending; after
+  24 h with no log activity at all the work is marked *stale* ("may already
+  have finished, no completion event seen") and stays protected. A runtime
+  whose claude process dies records its background work as lost at once;
 - a deadline only limits **waiting**, it never proves work ended: a wake-up
   that doesn't start within 2 min, or background with no completion event for
   24 h, stays protected and reads as *unknown* (`wait.py` exit 10) until
@@ -392,7 +393,9 @@ and the pair never wakes for it. So:
 - `force=True` only reaches **this** MCP process's runtime: while another
   process has work pending for the pair, those operations (and
   `pair_stop(hard=True)`'s session rotation) refuse even with `force` — stop it
-  from the session that owns it, or wait;
+  from the session that owns it, or wait. Only that process's *unconfirmed*
+  work (a wake-up that never started, stale background) can be overridden
+  with `force`;
 - `pair_forget` and `pair_stop(force=True)` / `hard=True` kill and report what
   was lost; a soft `pair_stop` interrupts only the in-flight turn — background
   Bash and agents survive it (verified) and still wake the pair, and the result
@@ -403,7 +406,7 @@ and the pair never wakes for it. So:
   wake-up would write a divergent history; a send in the owning process waits
   for its own wake-up the same way, so it never takes the self-woken reply.
   For unresolved work (a wake-up that never started, stale background) the
-  send waits the same bound, then goes ahead and says so in its result;
+  send waits up to a minute, then goes ahead and says so in its result;
 - every loss is recorded (activity file, the next send's footer, `pair_status`,
   and `wait.py` exit 9).
 

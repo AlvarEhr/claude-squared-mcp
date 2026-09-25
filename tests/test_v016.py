@@ -36,7 +36,7 @@ from claude_squared import triage as TR  # noqa: E402
 from claude_squared import _wait_script as W  # noqa: E402
 from claude_squared.adapters.claude import ClaudeAdapter  # noqa: E402
 from claude_squared.errors import PairError  # noqa: E402
-from claude_squared.models import CreateResult, PairSpec, PermissionDenial, SendResult  # noqa: E402
+from claude_squared.models import AsyncTaskState, CreateResult, PairSpec, PermissionDenial, SendResult  # noqa: E402
 from claude_squared.runtime import PairRuntime  # noqa: E402
 
 # Recorded 2026-09-25 (probes/measure.py run F, CLI 2.1.280): what a fresh
@@ -344,7 +344,9 @@ class WiringTests(V016Case):
 
 
 class RegistryTests(V016Case):
-    def test_evictor_spares_background_until_the_ceiling(self):
+    def test_evictor_never_kills_background_and_marks_it_stale_at_the_ceiling(self):
+        # Persistent or not: past 24 h the work is flagged stale ("unknown"),
+        # never killed (critic, 2026-09-25 — a timeout doesn't end work).
         reg = RT.RuntimeRegistry(idle_timeout_seconds=1)
         rt = self.runtime()
         rt.proc = _AliveProc()
@@ -355,10 +357,15 @@ class RegistryTests(V016Case):
         reg._runtimes[self.pair] = rt
         reg._evict_idle()
         self.assertIn(self.pair, reg._runtimes)
+        self.assertFalse(self.snap()["background"][0].get("stale"))
         rt.last_activity = datetime.utcnow() - timedelta(hours=25)
         reg._evict_idle()
-        self.assertNotIn(self.pair, reg._runtimes)
-        self.assertIn("may already have finished", reasons[0])
+        self.assertIn(self.pair, reg._runtimes)
+        self.assertEqual(reasons, [])
+        entry = self.snap()["background"][0]
+        self.assertEqual((entry["task_id"], entry["stale"]), ("bg", True))
+        self.assertIn("may already have finished", entry["stale_reason"])
+        self.assertEqual(self.snap()["background_lost"], [])
 
     def test_runtimes_are_stopped_outside_the_registry_lock(self):
         reg = RT.RuntimeRegistry()
@@ -1156,8 +1163,9 @@ class ReReviewFixTests(ReviewHelpers):
         view = A.view(self.pair, grace_seconds=0)
         self.assertEqual((view["verdict"], len(view["wake_stale"])), ("unknown", 1))
         with self.assertRaises(PairError) as cm:
-            tool(S.pair_clear)(self.pair, force=True)
+            tool(S.pair_clear)(self.pair)
         self.assertIn("unconfirmed", str(cm.exception))
+        self.assertIn("force=True", str(cm.exception))
         self.assertIsNone(S._foreign_activity_blocker(self.pair))
         notes = []
         with patch.object(S, "_FOREIGN_BACKGROUND_WAIT_S", 1.0):
@@ -1217,7 +1225,8 @@ class ReReviewFixTests(ReviewHelpers):
         th.join(10)
         self.assertFalse(th.is_alive())
         self.assertEqual(rt._current_scope.task_id, "t-send")
-        self.assertEqual(calls, ["t-send"])  # promoted once
+        # promoted, re-queued while the wake ran (round 4), promoted again
+        self.assertEqual(calls, ["t-send", "t-send"])
         self.assertEqual(R.get_pair(self.pair).self_woken_pending[-1]["response_preview"], "bgR finished")
 
     # -- 9: a recreated pair keeps what its forget killed --
@@ -1300,6 +1309,150 @@ class ReReviewFixTests(ReviewHelpers):
         self.assertEqual(box.get("code"), 0, out + box["err"].getvalue())
         self.assertIn("turn ended", out)
         self.assertIn("t2", out)
+
+
+class RoundFourFixTests(ReviewHelpers):
+    """Regression tests for the critic review of round 3 (2026-09-25)."""
+
+    def safe_runtime(self, spec):
+        """Another PairRuntime of an already-registered pair, alive and safe to stop."""
+        rt = PairRuntime(spec, ClaudeAdapter())
+        rt.proc = _AliveProc()
+        real_stop = rt.stop
+
+        def safe_stop(reason=None):
+            rt.proc = None
+            return real_stop(reason)
+        rt.stop = safe_stop
+        return rt
+
+    # -- 1: one exit handler — runtimes record their losses before activity closes --
+
+    def test_one_exit_handler_runs_the_runtimes_first(self):
+        from claude_squared.adapters import codex as C
+        calls = []
+        with patch.object(RT, "_EXIT_HOOKED", [False]), \
+                patch.object(RT.atexit, "register", lambda fn, *a, **kw: calls.append(fn)), \
+                patch.object(S.mcp, "run", lambda *a, **kw: None):
+            RT.install_exit_handler()  # the first runtime / registry()
+            S.run()  # the server
+            spec = PairSpec(name=self.pair + "-cx", session_id="thread-x", cwd=str(self.home))
+            C._new_codex_activity(spec, None).close()  # a Codex turn (or a CLI recovery)
+        self.assertEqual(calls, [RT._shutdown_runtimes])
+        # And that handler: the runtime's own loss record comes first.
+        rt = self.live_runtime()
+        self.feed(rt, task_started("bgX"))
+        reg = RT.RuntimeRegistry()
+        reg._runtimes[self.pair] = rt
+        with patch.object(RT, "_REGISTRY", reg):
+            RT._shutdown_runtimes()
+        rec = R.get_pair(self.pair).self_woken_pending[-1]
+        self.assertEqual(rec["status"], "background_lost")
+        self.assertIn("the owning MCP process exited", rec["note"])
+        self.assertIn("BACKGROUND LOST", self.main_log(rt))
+
+    # -- 2a: only a completion or a failure announces a wake --
+
+    def test_only_completions_and_failures_announce_a_wake(self):
+        rt = self.runtime()
+        for status, wakes in (("killed", False), ("stopped", False), ("cancelled", False),
+                              ("failed", True), ("completed", True)):
+            tid = f"bg-{status}"
+            self.feed(rt, task_started(tid))
+            self.feed(rt, task_done(tid, status))
+            self.assertEqual(rt._wake_at is not None, wakes, status)
+            self.assertEqual(self.snap()["wake_pending"] is not None, wakes, status)
+            rt._clear_wake()
+
+    # -- 2b: force overrides another process's UNCONFIRMED work only --
+
+    def test_force_overrides_only_unconfirmed_foreign_work(self):
+        self.live_runtime()
+        past = A._av_now() - timedelta(hours=1)
+        self.foreign_activity(self.live.pid, self.live_started, wake_pending={
+            "since": A._av_iso(past), "task_id": "b", "until": A._av_iso(past)})
+        with self.assertRaises(PairError) as cm:
+            tool(S.pair_clear)(self.pair)
+        self.assertIn("unconfirmed", str(cm.exception))
+        with patch.object(ClaudeAdapter, "create", lambda self_, spec, initial_message=None:
+                          CreateResult(name=spec.name, session_id=spec.session_id)):
+            out = tool(S.pair_clear)(self.pair, force=True)
+        self.assertNotIn("ERROR", out)
+        self.foreign_activity(self.live.pid, self.live_started, background=[
+            {"task_id": "real", "kind": "local_bash", "description": "",
+             "started_at": A._av_iso(A._av_now())}])
+        with self.assertRaises(PairError) as cm:
+            tool(S.pair_clear)(self.pair, force=True)  # real foreign work: force can't help
+        self.assertIn("force=True can't help", str(cm.exception))
+
+    # -- 3: stop() settles an event that raced the reader's retirement --
+
+    def test_stop_settles_a_reader_event_that_raced_it(self):
+        rt = self.live_runtime()
+        for label, line, slow_name in (
+                ("background", task_started("late"), "_track_background"),
+                ("self-woken turn", assistant("late turn"), "_open_implicit_turn")):
+            if label == "self-woken turn":
+                rt = self.safe_runtime(rt.spec)
+            rt._reader_gen = 1
+            entered, release = threading.Event(), threading.Event()
+            real_slow = getattr(rt, slow_name)
+
+            def slow(*a, _real=real_slow, _entered=entered, _release=release):
+                _entered.set()
+                _release.wait(5)
+                return _real(*a)
+            setattr(rt, slow_name, slow)
+            rt.proc = SimpleNamespace(stdout=io.BytesIO(json.dumps(line).encode() + b"\n"),
+                                      wait=lambda timeout=None: 0)
+            th = threading.Thread(target=rt._stdout_reader, args=(1,), daemon=True)
+            rt._reader_thread = th
+            th.start()
+            self.assertTrue(entered.wait(5), label)  # the event passed the generation check
+            real_record = rt._record_lost_background
+
+            def record_then_release(why, _real=real_record, _release=release):
+                out = _real(why)
+                _release.set()  # the late event completes right after stop()'s first sweep
+                return out
+            rt._record_lost_background = record_then_release
+            rt.stop("replaced")
+            self.assertFalse(th.is_alive(), label)
+            self.assertIsNone(rt._implicit_scope, label)
+            self.assertEqual(rt.pending_background_tasks(), [], label)
+        self.assertNotIn("late", [b["task_id"] for b in self.snap()["background"]])
+        self.assertIn("late", [b["task_id"] for b in self.snap()["background_lost"]])
+        running = [t for t in AT.list_running_task_ids_for_pair(self.pair)]
+        self.assertEqual(running, [])  # the late self-woken task was finalized, not left running
+        self.assertIsNone(self.snap()["turn"])
+
+    # -- 4: a promoted send that has to wait again reads queued --
+
+    def test_a_send_that_waits_again_reads_queued(self):
+        rt = self.live_runtime()
+        tid = str(uuid.uuid4())
+        AT._save(AsyncTaskState(task_id=tid, pair_name=self.pair, message="m", status="running",
+                                started_at=datetime.utcnow(), owner_pid=os.getpid(), queued=True))
+        self.feed(rt, task_started("bgQ"))
+        real_mark = AT.mark_task_executing
+
+        def promote(t):
+            real_mark(t)
+            self.feed(rt, task_done("bgQ"))  # the wake lands mid-promotion
+        th = threading.Thread(target=lambda: rt._prepare_solicited_turn(30, None, tid), daemon=True)
+        with patch.object(AT, "mark_task_executing", promote):
+            th.start()
+            time.sleep(0.8)
+            st = AT.load_task(tid)
+            self.assertIsNone(rt._current_scope)
+            self.assertTrue(st.queued)  # waiting again: queued, not executing
+            self.assertIsNone(st.execution_started_at)
+            self.feed(rt, {"type": "system", "subtype": "init"})
+            self.feed(rt, assistant("bgQ finished"))
+            self.feed(rt, result("bgQ finished"))
+            th.join(10)
+        self.assertEqual(rt._current_scope.task_id, tid)
+        self.assertFalse(AT.load_task(tid).queued)
 
 
 class MiscTests(V016Case):
