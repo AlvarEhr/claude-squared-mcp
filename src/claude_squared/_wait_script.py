@@ -240,7 +240,14 @@ def _alert_message(pair, used, window, level, rearm_base, backend="claude", auto
         f"CONTEXT ALERT: pair '{pair}' is at {used:,} / {window:,} tokens ({used * 100 / window:.0f}%), "
         f"past the alert level {level:,}.",
     ]
-    if point:
+    if point and backend == "codex":
+        # Unmeasured for Codex: the native trigger point/quantity, and the
+        # rollout's token_count can land only after a tool call finishes
+        # (observed 2026-09-25) — say so (anvil, round 3).
+        lines.append(f"  Estimated Codex auto-compaction point: {point:,} ({max(0, point - used):,} tokens "
+                     f"away) — mid-turn, with a generic summary. Based on the last reported input tokens; "
+                     f"native trigger accounting is unmeasured, and rollout updates may lag one tool call.")
+    elif point:
         lines.append(f"  Auto-compaction fires near {point:,} ({max(0, point - used):,} tokens away) — "
                      f"mid-turn, with a generic summary.")
     # Codex compaction takes no steering input (protocol-verified 2026-09-11).

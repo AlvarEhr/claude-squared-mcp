@@ -1586,7 +1586,9 @@ def _activity_status_lines(name: str) -> list[str]:
         limit = ctx.get("auto_compact_token_limit") or reported.get("auto_compact_token_limit")
         threshold = activity_mod.context_alert_threshold(window, headroom, backend, limit)
         if threshold and used >= threshold:
-            line += (f" — ⚠ past the context alert ({threshold:,}); auto-compaction fires near "
+            near = ("estimated Codex auto-compaction point" if backend == "codex"
+                    else "auto-compaction fires near")
+            line += (f" — ⚠ past the context alert ({threshold:,}); {near} "
                      f"{activity_mod.compaction_point(window, backend, limit):,}. Clean compaction: pair_stop → "
                      + ("pair_compact" if backend == "codex" else "pair_compact with a steering prompt")
                      + " → pair_send('continue')")

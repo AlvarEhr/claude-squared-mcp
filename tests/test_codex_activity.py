@@ -338,7 +338,7 @@ class CodexActivityTests(unittest.TestCase):
         turn.poll(force=True)
         text = tool(S.pair_poll)(tid)
         self.assertIn("120,000 / 200,000 (60%) live", text)
-        self.assertIn("auto-compaction fires near 150,000", text)
+        self.assertIn("estimated Codex auto-compaction point 150,000", text)
         self.assertNotIn("steering prompt", text)
         data = json.loads(tool(S.pair_status)(self.spec.name, verbose=True))
         self.assertEqual(data["activity"]["context"]["backend"], "codex")
