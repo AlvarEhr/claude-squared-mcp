@@ -514,7 +514,9 @@ class PairRuntime:
         self._implicit_scope: TurnLogScope | None = None
         self._implicit_task: AsyncTaskState | None = None
         self._implicit_done = threading.Event()
-        self._implicit_done.set()  # set == no self-woken turn in progress
+        # set == no self-woken turn in progress (v0.16.0: nor a wake-up about
+        # to start one — see _wake_at)
+        self._implicit_done.set()
         # Completed self-woken turns are NOT kept here — they're parked on the
         # spec (PairSpec.self_woken_pending) via _record_self_woken, because the
         # next send respawns this runtime (see is_stale) and the records must
@@ -537,6 +539,16 @@ class PairRuntime:
         self._known_tasks: dict[str, tuple[str, str]] = {}  # task_id -> (kind, description)
         self._stale_notice: str | None = None
         self._assistant_since_result = False
+        # v0.16.0: monotonic time of the latest sign that a self-woken turn is
+        # starting with no scope open yet — a background completion, or a
+        # system:init after this runtime's first result (CLI 2.1.280 emits
+        # one ahead of every queued turn; the first assistant event can be
+        # tens of seconds later at xhigh). A send promoted in that gap had
+        # its scope open first, and the continuation's result was taken as
+        # its reply (anvil review, 2026-09-25) — so send() waits for it like
+        # an open self-woken turn. Bounded by activity.WAKE_PENDING_SECONDS
+        # since the latest sign. Guarded by _scope_lock.
+        self._wake_at: float | None = None
         # v0.16.0 activity file (pair_status / pair_poll / wait.py read it from
         # any process). Mutators touch memory only — safe on this reader thread.
         self._activity = _activity.writer(spec.name, "claude")
@@ -555,6 +567,61 @@ class PairRuntime:
         """Background tasks started and not yet reported finished (v0.12.1)."""
         with self._scope_lock:
             return [dict(v, task_id=k) for k, v in self._bg_tasks.items()]
+
+    def pending_work(self) -> list[dict[str, Any]]:
+        """What killing this runtime or rewriting its JSONL would destroy
+        (v0.16.0): pending background tasks, an open self-woken turn, or a
+        wake-up about to start one. A completion removes the last background
+        entry BEFORE the turn opens, so background alone let pair_clear &
+        co. through in that gap (anvil review, 2026-09-25)."""
+        with self._scope_lock:
+            items = [dict(v, task_id=k) for k, v in self._bg_tasks.items()]
+            if self._implicit_scope is not None:
+                task = self._implicit_task
+                items.append({"kind": "self-woken turn",
+                              "task_id": task.task_id if task is not None else None,
+                              "description": "the pair is working on its own"})
+            elif self._wake_live_locked():
+                items.append({"kind": "wake-up", "task_id": None,
+                              "description": "background finished; the pair is about to resume"})
+        return items
+
+    def _wake_live_locked(self) -> bool:
+        """Caller holds _scope_lock. An expired wake is dropped here (the
+        activity view reports it as "unknown" for a while on its own)."""
+        if self._wake_at is None:
+            return False
+        if time.monotonic() - self._wake_at < _activity.WAKE_PENDING_SECONDS:
+            return True
+        self._wake_at = None
+        if self._implicit_scope is None:
+            self._implicit_done.set()
+        return False
+
+    def _no_turn_locked(self) -> bool:
+        """Caller holds _scope_lock. No turn in progress: no self-woken scope,
+        and no solicited one — or only one whose result is already in (send()
+        clears it a moment later; a completion or init landing in between
+        still announces a wake)."""
+        scope = self._current_scope
+        return self._implicit_scope is None and (scope is None or scope.result_snapshot is not None)
+
+    def _note_wake(self) -> bool:
+        """Reader thread: a self-woken turn is starting with no turn open.
+        False (and nothing recorded) while one is."""
+        with self._scope_lock:
+            if not self._no_turn_locked():
+                return False
+            self._wake_at = time.monotonic()
+            self._implicit_done.clear()
+        return True
+
+    def _clear_wake(self) -> None:
+        with self._scope_lock:
+            self._wake_at = None
+            if self._implicit_scope is None:
+                self._implicit_done.set()
+        self._activity.clear_wake()
 
     @staticmethod
     def _count_existing_lines(p: Path) -> int:
@@ -665,8 +732,9 @@ class PairRuntime:
         )
 
     def _stdout_reader(self) -> None:
-        assert self.proc is not None and self.proc.stdout is not None
-        for raw in iter(self.proc.stdout.readline, b""):
+        proc = self.proc
+        assert proc is not None and proc.stdout is not None
+        for raw in iter(proc.stdout.readline, b""):
             try:
                 line = raw.decode("utf-8", errors="replace")
                 # v0.12.0: attribute/log FIRST, queue SECOND. Otherwise send()
@@ -691,6 +759,65 @@ class PairRuntime:
                     self._stdout_q.put(line)
             except Exception:
                 pass
+        try:
+            self._on_reader_eof(proc)
+        except Exception:
+            pass
+
+    def _on_reader_eof(self, proc: Any) -> None:
+        """Reader thread, stdout closed: the claude process is gone (crash,
+        kill, or its own exit after stdin EOF). v0.16.0: background work dies
+        with it (M2: the CLI kills it ~5 s after EOF), so it is recorded lost
+        HERE, not only when something evicts the runtime — a persistent
+        runtime is never idle-evicted, and its background read "busy"
+        forever (anvil review, 2026-09-25). After stop() this finds nothing
+        left: stop() records its own, more specific losses before the kill."""
+        code: Any = None
+        try:
+            code = proc.wait(timeout=2)
+        except Exception:
+            code = None
+        if self.proc is not None and self.proc is not proc:
+            return  # already respawned (send() after a crash): not ours to clear
+        why = (f"the pair's claude process exited (exit code {code if code is not None else '?'}) "
+               f"— its background work died with it")
+        self._abort_implicit_turn(
+            f"{CRASHED_ERROR_PREFIX}pair runtime exited mid self-woken turn", status="failed")
+        self._record_lost_background(why)
+
+    def _record_lost_background(self, why: str) -> list[dict[str, Any]]:
+        """Pending background work (and a pending wake-up) is gone with the
+        process: activity file, a ⏮ note for the next send, a main.log line.
+        Returns the new lost records ([] when nothing was pending)."""
+        with self._scope_lock:
+            self._bg_tasks.clear()
+            self._wake_at = None
+            if self._implicit_scope is None:
+                self._implicit_done.set()
+        lost = self._activity.lose_background(why)
+        if lost:
+            kinds = ", ".join(str(b.get("kind")) for b in lost)
+            self._record_self_woken({
+                "task_id": None, "status": "background_lost",
+                "log_line_start": self._main_log_lines, "log_line_end": self._main_log_lines,
+                "response_preview": "", "cost_usd": 0.0, "subtype": None,
+                "note": f"{len(lost)} background task(s) lost ({kinds}): {why}",
+            })
+            try:
+                ts = datetime.now().strftime("%H:%M:%S")
+                self._append_main_log_line(f"[{ts}] === BACKGROUND LOST ({kinds}): {why} ===")
+            except Exception:
+                pass
+        return lost
+
+    def expire_background(self, why: str) -> list[dict[str, Any]]:
+        """Drop the tracking of background work whose completion was
+        evidently missed, WITHOUT killing the runtime (a persistent runtime
+        past the 24 h ceiling). Recorded lost with ``why``."""
+        with self._scope_lock:
+            ids = list(self._bg_tasks)
+            self._bg_tasks.clear()
+        return self._activity.lose_background(why, task_ids=ids) if ids else []
 
     def _stderr_reader(self) -> None:
         assert self.proc is not None and self.proc.stderr is not None
@@ -802,24 +929,9 @@ class PairRuntime:
         )
         with self._scope_lock:
             solicited = self._current_scope
-            self._bg_tasks.clear()
         if solicited is not None and solicited.result_snapshot is None:
             self._activity.turn_closed(solicited.task_id, status="stopped", preview=f"({why})")
-        self.last_lost_background = self._activity.lose_background(why)
-        if self.last_lost_background:
-            kinds = ", ".join(str(b.get("kind")) for b in self.last_lost_background)
-            self._record_self_woken({
-                "task_id": None, "status": "background_lost",
-                "log_line_start": self._main_log_lines, "log_line_end": self._main_log_lines,
-                "response_preview": "", "cost_usd": 0.0, "subtype": None,
-                "note": f"{len(self.last_lost_background)} background task(s) lost ({kinds}): {why}",
-            })
-            try:
-                ts = datetime.now().strftime("%H:%M:%S")
-                self._append_main_log_line(
-                    f"[{ts}] === BACKGROUND LOST ({kinds}): {why} ===")
-            except Exception:
-                pass
+        self.last_lost_background = self._record_lost_background(why)
         if self.proc is None:
             return "no runtime"
         pid = self.proc.pid
@@ -931,11 +1043,23 @@ class PairRuntime:
             # v0.16.0: CLI 2.1.280 emits an init ahead of every queued turn,
             # 20-80 ms after the completion that queued it, while the first
             # assistant event can be tens of seconds away at xhigh. With no
-            # scope open that is a self-wake starting: say so, bounded.
-            with self._scope_lock:
-                idle = self._current_scope is None and self._implicit_scope is None
-            if idle:
+            # scope open that is a self-wake starting: say so, bounded —
+            # except the init of the stale resume notice (armed by its
+            # task_notification just before) and anything before this
+            # runtime's first result (a fresh runtime has no work of its own
+            # that could wake it).
+            if self._stale_notice is None and self._result_seq > 0 and self._note_wake():
                 self._activity.expect_wake()
+        elif top_level and ev_type not in ("assistant", "user", "result"):
+            # Anything else the CLI says while a wake is pending (e.g.
+            # system:thinking_tokens during a long think) means the turn is
+            # still coming: push the deadline out.
+            with self._scope_lock:
+                waking = self._no_turn_locked() and self._wake_live_locked()
+                if waking:
+                    self._wake_at = time.monotonic()
+            if waking:
+                self._activity.refresh_wake()
         if ev_type in ("assistant", "user") and top_level:
             with self._scope_lock:
                 needs_open = self._current_scope is None and self._implicit_scope is None
@@ -971,7 +1095,9 @@ class PairRuntime:
                 f"previous runtime ({self._stale_notice[:12]}) as unfinished; not a reply ===")
             self._stale_notice = None
             self._assistant_since_result = False
-            self._activity.turn_closed(None)  # resolves the wake its init announced
+            # Only ever a wake — a send's turn may be open right now, and
+            # this result is not its end (anvil review, 2026-09-25).
+            self._clear_wake()
             return False
 
         # Detect sub-agent SPAWN (assistant.tool_use of Agent) — special-cased for the
@@ -1183,10 +1309,11 @@ class PairRuntime:
         status = ev.get("status") or "?"
         if full_tid and str(status).lower() in self._TASK_TERMINAL_STATUSES:
             self._untrack_background(full_tid, str(status))
-            if full_tid not in self._known_tasks:
+            if full_tid not in self._known_tasks and str(status).lower() == "stopped":
                 # Started by a previous runtime of this session: the CLI's
                 # resume report ("didn't finish before the previous session
-                # ended"). Arms the stale-result guard.
+                # ended", status "stopped" — the only shape measured). Arms
+                # the stale-result guard.
                 self._stale_notice = full_tid
         summary = str(ev.get("summary") or "")[:160].replace("\n", " ")
         # No "the pair will now resume" claim here: this fires for blocking
@@ -1213,6 +1340,9 @@ class PairRuntime:
         with self._scope_lock:
             was_bg = self._bg_tasks.pop(task_id, None) is not None
         if was_bg:
+            # With no turn open the CLI queues a wake-up turn for it (the
+            # activity writer records its own wake_pending).
+            self._note_wake()
             self._activity.background_finished(task_id, status)
 
     def _is_stale_resume_result(self, ev: dict) -> bool:
@@ -1224,14 +1354,21 @@ class PairRuntime:
         ended"), system:init, and a ~50 ms empty ``result`` with no
         ``terminal_reason``. send() took that result as its reply and the
         real reply then ran as a phantom "self-woken" turn. Structural test,
-        all three required, so a real reply can't match: a notification for
-        a task this runtime never saw start, no top-level assistant event
-        since it, and no terminal_reason (real turns report "completed",
-        "aborted_tools", ...). A real reply, however fast, has an assistant
-        event."""
-        return (self._stale_notice is not None
-                and not self._assistant_since_result
-                and not ev.get("terminal_reason"))
+        ALL required, so a real reply or a real failure can't match (anvil
+        review, 2026-09-25: an immediate API error before any assistant event
+        must still reach send()): a "stopped" notification for a task this
+        runtime never saw start, no top-level assistant event since, no
+        terminal_reason (real turns report "completed", "aborted_tools",
+        ...), and exactly the measured shape — subtype success, not
+        is_error, empty result text, under 2 s (measured: 52 ms)."""
+        if self._stale_notice is None or self._assistant_since_result:
+            return False
+        if ev.get("terminal_reason") or ev.get("is_error") or ev.get("subtype") != "success":
+            return False
+        if str(ev.get("result") or "").strip():
+            return False
+        dur = ev.get("duration_ms")
+        return isinstance(dur, (int, float)) and dur < 2000
 
     def _note_live_context(self, ev: dict) -> None:
         """Reader thread: live context fill from a TOP-LEVEL assistant event —
@@ -1292,6 +1429,7 @@ class PairRuntime:
             scope = TurnLogScope(self.main_log_path, start_line)
             self._implicit_scope = scope
             self._implicit_task = None
+            self._wake_at = None  # the wake became this turn
             self._implicit_done.clear()
         # Registration is file I/O — outside the lock (see __init__ note).
         task: AsyncTaskState | None = None
@@ -1386,6 +1524,7 @@ class PairRuntime:
         self._assistant_since_result = False
         self._note_reported_window(ev)
         with self._scope_lock:
+            self._wake_at = None  # any result ends what a wake announced
             solicited = self._current_scope
             if solicited is not None:
                 solicited.result_snapshot = {
@@ -1484,8 +1623,9 @@ class PairRuntime:
             except Exception:
                 pass
         else:
-            # A result with no turn open: resolves a wake its init announced.
-            self._activity.turn_closed(None)
+            # A result with no turn open: resolves a wake its init announced
+            # (never "whatever turn is open" — a one-shot send's could be).
+            self._activity.clear_wake()
         self._record_self_woken(record)
         self._implicit_done.set()
 
@@ -1521,14 +1661,16 @@ class PairRuntime:
         Why wait rather than interleave: a message written while the CLI is
         mid self-woken turn is processed AFTER that turn, and its result would
         arrive after the self-woken turn's — send() would return the wrong one
-        (the original placeholder handback, inverted).
+        (the original placeholder handback, inverted). v0.16.0: the same holds
+        for a wake-up whose turn has not produced its first event yet
+        (``_wake_at``), so that gap is waited out too.
         """
         t0 = time.monotonic()
         end = (t0 + timeout_seconds) if timeout_seconds is not None else None
         last_stop_check = 0.0
         while True:
             with self._scope_lock:
-                open_now = self._implicit_scope is not None
+                open_now = self._implicit_scope is not None or self._wake_live_locked()
             if not open_now:
                 return time.monotonic() - t0
             if end is not None and time.monotonic() >= end:
@@ -1538,6 +1680,8 @@ class PairRuntime:
                     f"{CRASHED_ERROR_PREFIX}pair runtime exited mid self-woken turn",
                     status="failed",
                 )
+                self._record_lost_background(
+                    "the pair's claude process exited while a self-woken turn was starting")
                 raise CLIError(
                     f"{CRASHED_ERROR_PREFIX}pair runtime exited during a self-woken turn "
                     f"(before this message was written)",
@@ -1574,8 +1718,8 @@ class PairRuntime:
             # takes promote -> scope and never the control lock.
             with self._promote_lock:
                 with self._scope_lock:
-                    if self._implicit_scope is not None:
-                        continue  # opened in the gap — wait again
+                    if self._implicit_scope is not None or self._wake_live_locked():
+                        continue  # opened (or announced) in the gap — wait again
                 _async_tasks.mark_task_executing(task_id)
                 # Belt: every queued line was attributed by the reader before
                 # it was queued (and lines with no scope open aren't queued at
@@ -1980,8 +2124,6 @@ class RuntimeRegistry:
                     f"the reaper; the pair's background work may still be running",
                     status="failed",
                 )
-            if rt.spec.persistent:
-                continue
             # v0.9.8: skip runtimes that are mid-turn. The pre-v0.9.8
             # evictor was the root cause of the "exited mid-turn (code ?)"
             # cluster — ``last_activity`` was only bumped at send entry
@@ -2007,10 +2149,22 @@ class RuntimeRegistry:
             # ``pair_status`` reports likely-hung at 120s+.
             if rt._current_scope is not None:  # noqa: SLF001
                 continue
+            # v0.16.0: death and the background ceiling are checked BEFORE the
+            # persistence exemption — a crashed persistent runtime used to
+            # keep its background "pending" forever (anvil review,
+            # 2026-09-25; the reader's EOF records the loss too).
             if not rt.is_alive():
                 to_evict.append((rt, "the pair's claude process had already exited"))
                 continue
-            if rt.pending_background_tasks():
+            if rt.spec.persistent:
+                if rt.pending_background_tasks() and rt.last_activity < ceiling:
+                    # Kept warm on purpose: only the stale tracking goes.
+                    rt.expire_background(
+                        f"no log activity for {BACKGROUND_EVICT_CEILING_SECONDS // 3600} h with "
+                        f"background work still pending — it may already have finished (no "
+                        f"completion event seen); no longer tracked (persistent runtime kept)")
+                continue
+            if rt.pending_work():
                 # v0.16.0: evicting tree-kills the background work (and the
                 # pair would never wake for it). Never, except after a full
                 # day with no log line at all — then the completion event

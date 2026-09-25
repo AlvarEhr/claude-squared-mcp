@@ -296,10 +296,16 @@ class WiringTests(V016Case):
 
     def test_init_with_no_turn_open_expects_a_wake(self):
         rt = self.runtime()
+        self.feed(rt, {"type": "system", "subtype": "init"})  # a fresh runtime's: not a wake
+        self.assertIsNone(self.snap()["wake_pending"])
+        self.assertIsNone(rt._wake_at)
+        rt._result_seq = 1  # this runtime has finished a turn
         self.feed(rt, {"type": "system", "subtype": "init"})
         self.assertIsNotNone(self.snap()["wake_pending"])
+        self.assertIsNotNone(rt._wake_at)
         self.feed(rt, assistant("hi"))
         self.assertIsNone(self.snap()["wake_pending"])
+        self.assertIsNone(rt._wake_at)
 
     def test_context_reported_window_and_compaction(self):
         rt = self.runtime()
@@ -404,7 +410,10 @@ class ProtectionTests(V016Case):
         self.with_background()
         out = tool(S.pair_forget)(self.pair, archive=False)
         self.assertIn("killed and recorded as lost", out)
-        self.assertFalse((self.pairs / "activity" / self.pair / f"{os.getpid()}.json").exists())
+        own = self.pairs / "activity" / self.pair / f"{os.getpid()}.json"
+        data = json.loads(own.read_text(encoding="utf-8"))  # the tombstone
+        self.assertEqual(data["state"], "forgotten")
+        self.assertEqual([b["task_id"] for b in data["background_lost"]], ["bgP"])
 
     def test_soft_stop_reports_surviving_background(self):
         rt = self.with_background()
@@ -614,6 +623,456 @@ class TriageTests(V016Case):
         self.assertEqual(TR.current_mode(), "off")
         with self.assertRaises(ValueError):
             ST.update_defaults(interim_triage="sometimes")
+
+
+def wait_module():
+    """The installed wait.py, loaded in-process so a test can shorten its
+    timing constants (the source is the one wait.py gets)."""
+    import types
+    mod = types.ModuleType("wait_inproc")
+    exec(compile(W.WAIT_SCRIPT_SOURCE, "wait.py", "exec"), mod.__dict__)
+    return mod
+
+
+class ReviewFixTests(V016Case):
+    """Regression tests for the anvil cross-review of 19dcd73 (2026-09-25)."""
+
+    # -- helpers --
+
+    def run_wait(self, mod, *argv):
+        """mod.main(argv) on a thread with captured output. Returns (thread, box)."""
+        from contextlib import redirect_stderr, redirect_stdout
+        box = {"out": io.StringIO(), "err": io.StringIO()}
+
+        def go():
+            with redirect_stdout(box["out"]), redirect_stderr(box["err"]):
+                box["code"] = mod.main(list(argv))
+        t = threading.Thread(target=go, daemon=True)
+        t.start()
+        return t, box
+
+    def open_solicited(self, rt, task_id="t-send"):
+        with patch.object(AT, "mark_task_executing", lambda tid: None):
+            rt._prepare_solicited_turn(5, None, task_id)
+
+    def transcript(self, rt, n=2):
+        """A minimal session JSONL with n genuine user turns (rewind fixture)."""
+        path = ClaudeAdapter().transcript_path(rt.spec)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = []
+        for i in range(n):
+            lines.append({"type": "user", "message": {"role": "user", "content": f"ask {i}"}})
+            lines.append({"type": "assistant", "message": {"content": [{"type": "text", "text": f"ans {i}"}]}})
+        path.write_text("".join(json.dumps(x) + "\n" for x in lines), encoding="utf-8")
+        return path
+
+    def foreign_self_woken_task(self, pid):
+        tid = str(uuid.uuid4())
+        (self.pairs / "async").mkdir(parents=True, exist_ok=True)
+        (self.pairs / "async" / f"{tid}.json").write_text(json.dumps({
+            "task_id": tid, "pair_name": self.pair, "message": AT.SELF_WOKEN_MESSAGE,
+            "status": "running", "started_at": datetime.utcnow().isoformat(),
+            "owner_pid": pid}), encoding="utf-8")
+        return tid
+
+    # -- HIGH 1: force never bypasses a foreign owner --
+
+    def test_force_refuses_under_a_foreign_owner(self):
+        rt = self.live_runtime()
+        self.transcript(rt)
+        self.foreign_activity(self.live.pid, self.live_started, background=[
+            {"task_id": "fbg", "kind": "local_bash", "description": "", "started_at": A._av_iso(A._av_now())}])
+        calls = [lambda: tool(S.pair_clear)(self.pair, force=True),
+                 lambda: tool(S.pair_rewind)(self.pair, to_point=2, force=True),
+                 lambda: tool(S.pair_compact)(self.pair, force=True),
+                 lambda: tool(S.pair_update)(self.pair, permission_mode="read-only", force=True)]
+        for call in calls:
+            with self.assertRaises(PairError) as cm:
+                call()
+            msg = str(cm.exception)
+            self.assertIn(f"another MCP process (PID {self.live.pid}", msg)
+            self.assertIn("force=True can't help", msg)
+        self.assertIs(RT.registry().get_or_none(self.pair), rt)  # nothing was killed here
+        self.assertEqual(len(self.transcript(rt).read_text(encoding="utf-8").splitlines()), 4)
+        out = tool(S.pair_stop)(self.pair, hard=True)
+        self.assertIn("hard reset skipped", out)
+        self.assertNotIn("rotated session", out)
+
+    # -- HIGH 2: a pending wake / open self-woken turn is protected --
+
+    def test_wake_and_self_woken_turn_block_mutations(self):
+        rt = self.live_runtime()
+        self.transcript(rt)
+        self.feed(rt, task_started("bgW"))
+        self.feed(rt, task_done("bgW"))  # no turn open: the wake-up is imminent
+        self.assertEqual(rt.pending_background_tasks(), [])
+        self.assertEqual([w["kind"] for w in rt.pending_work()], ["wake-up"])
+        for call in (lambda: tool(S.pair_clear)(self.pair),
+                     lambda: tool(S.pair_rewind)(self.pair, to_point=2),
+                     lambda: tool(S.pair_compact)(self.pair),
+                     lambda: tool(S.pair_update)(self.pair, permission_mode="read-only")):
+            with self.assertRaises(PairError) as cm:
+                call()
+            self.assertIn("wake-up", str(cm.exception))
+        self.feed(rt, {"type": "system", "subtype": "init"})
+        self.feed(rt, assistant("resuming"))  # the self-woken turn is open now
+        self.assertEqual([w["kind"] for w in rt.pending_work()], ["self-woken turn"])
+        with self.assertRaises(PairError) as cm:
+            tool(S.pair_clear)(self.pair)
+        self.assertIn("self-woken turn", str(cm.exception))
+        self.feed(rt, result("resumed"))
+        self.assertEqual(rt.pending_work(), [])
+
+    def test_foreign_wake_or_self_woken_turn_block_mutations_and_sends(self):
+        self.runtime()
+        self.foreign_activity(self.live.pid, self.live_started, wake_pending={
+            "since": A._av_iso(A._av_now()), "task_id": "b",
+            "until": A._av_iso(A._av_now() + timedelta(seconds=60))})
+        self.assertIn("self-wake pending", S._foreign_activity_blocker(self.pair))
+        with self.assertRaises(PairError) as cm:
+            tool(S.pair_clear)(self.pair, force=True)
+        self.assertIn("wake-up", str(cm.exception))
+        self.foreign_activity(self.live.pid, self.live_started, turn={
+            "task_id": None, "kind": "self_woken", "started_at": A._av_iso(A._av_now())})
+        self.assertIn("self-woken turn running", S._foreign_activity_blocker(self.pair))
+        with self.assertRaises(PairError) as cm:
+            tool(S.pair_compact)(self.pair, force=True)
+        self.assertIn("self-woken turn", str(cm.exception))
+
+    # -- HIGH 3: a send never steals a self-wake's reply --
+
+    def test_send_waits_for_an_announced_wake(self):
+        rt = self.live_runtime()
+        rt._result_seq = 1  # a turn has finished in this runtime
+        self.feed(rt, {"type": "system", "subtype": "init"})  # a queued turn starts, no scope open
+        box = {}
+
+        def promote():
+            with patch.object(AT, "mark_task_executing", lambda tid: None):
+                box["waited"] = rt._prepare_solicited_turn(30, None, "t-send")
+        t = threading.Thread(target=promote, daemon=True)
+        t.start()
+        time.sleep(0.8)
+        self.assertIsNone(rt._current_scope)  # held back: the wake owns the next result
+        self.feed(rt, assistant("continuing on my own"))
+        self.feed(rt, result("self-woken reply"))
+        t.join(10)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(rt._current_scope.task_id, "t-send")
+        rec = R.get_pair(self.pair).self_woken_pending[-1]
+        self.assertEqual((rec["status"], rec["response_preview"]), ("done", "self-woken reply"))
+        # The reply went to the self-woken task, not to the send.
+        self.assertTrue(rt._stdout_q.empty())
+
+    def test_startup_init_and_expiry_do_not_hold_a_send(self):
+        rt = self.live_runtime()
+        self.feed(rt, {"type": "system", "subtype": "init"})  # fresh runtime: not a wake
+        t0 = time.monotonic()
+        self.open_solicited(rt)
+        self.assertLess(time.monotonic() - t0, 1.0)
+        rt._current_scope = None
+        rt._result_seq = 1
+        with patch.object(A, "WAKE_PENDING_SECONDS", 0.6):
+            self.feed(rt, {"type": "system", "subtype": "init"})
+            time.sleep(0.4)
+            self.feed(rt, {"type": "system", "subtype": "thinking_tokens"})  # still coming
+            time.sleep(0.4)
+            self.assertTrue(rt.pending_work())  # refreshed: 0.8 s after the init, still live
+            t0 = time.monotonic()
+            self.open_solicited(rt, "t2")
+            self.assertLess(time.monotonic() - t0, 3.0)  # released at expiry
+        self.assertEqual(rt._current_scope.task_id, "t2")
+
+    # -- HIGH 4: an unchanged pair_update neither refuses nor evicts --
+
+    def test_unchanged_update_does_not_evict(self):
+        rt = self.live_runtime()
+        self.feed(rt, task_started("bgU"))
+        current = R.get_pair(self.pair)
+        tool(S.pair_update)(self.pair, permission_mode=current.permission_mode, model=current.model)
+        self.assertIs(RT.registry().get_or_none(self.pair), rt)
+        self.assertEqual([b["task_id"] for b in rt.pending_background_tasks()], ["bgU"])
+        self.assertEqual(self.snap()["background_lost"], [])
+
+    # -- HIGH 5 + suspected: the phantom guard --
+
+    def test_phantom_during_a_send_closes_nothing(self):
+        rt = self.runtime()
+        self.open_solicited(rt)
+        for ev in (STALE_NOTICE, STALE_INIT, STALE_RESULT):
+            self.feed(rt, ev)
+        snap = self.snap()
+        self.assertEqual(snap["turn"]["task_id"], "t-send")  # still open
+        self.assertEqual(snap["window_turns"], [])
+        self.assertIsNone(rt._current_scope.result_snapshot)
+
+    def test_result_without_scope_never_closes_another_turn(self):
+        rt = self.runtime()
+        A.writer(self.pair).turn_opened("one-shot", "send")  # a per-call override's turn
+        self.feed(rt, result("", terminal=None))
+        self.assertEqual(self.snap()["turn"]["task_id"], "one-shot")
+
+    def test_phantom_guard_only_matches_the_measured_shape(self):
+        rt = self.runtime()
+        # An immediate API error before any assistant event is a real reply.
+        for n, ev in enumerate((
+                dict(STALE_RESULT, is_error=True, result="API Error: 529 overloaded"),
+                dict(STALE_RESULT, result="short but real"),
+                dict(STALE_RESULT, subtype="error_during_execution"),
+                dict(STALE_RESULT, duration_ms=4000)), start=1):
+            rt._current_scope = None
+            self.open_solicited(rt, f"t{n}")
+            self.feed(rt, STALE_NOTICE)
+            self.assertIsNot(self.feed(rt, ev), False)
+            self.assertEqual(rt._result_seq, n)
+        # Only a "stopped" notification arms it.
+        rt._current_scope = None
+        self.feed(rt, dict(STALE_NOTICE, status="completed", task_id="other"))
+        self.assertIsNone(rt._stale_notice)
+
+    # -- HIGH 6: the triage wait revalidates --
+
+    def test_triage_wait_does_not_return_idle_over_new_work(self):
+        mod = wait_module()
+        mod.PAIR_GRACE_S, mod.TRIAGE_WAIT_S = 0.3, 2.0
+        spec = PairSpec(name=self.pair, session_id=str(uuid.uuid4()), cwd=str(self.home))
+        R.add_pair(spec)
+        w = A.writer(self.pair)
+        w.turn_opened("sw", "self_woken")
+        w.turn_closed("sw", triage_pending=True)
+        self.assertTrue(w.flush())
+        time.sleep(0.5)
+        t, box = self.run_wait(mod, self.pair, "--poll", "0.5", "--timeout", "30")
+        time.sleep(0.6)  # the watcher is inside the triage wait
+        w.turn_opened("t2", "send")
+        self.assertTrue(w.flush())
+        t.join(3.5)  # past the 2 s triage wait
+        self.assertTrue(t.is_alive(), box["out"].getvalue())
+        w.turn_closed("t2", preview="second")
+        self.assertTrue(w.flush())
+        t.join(15)
+        self.assertEqual(box.get("code"), 0, box["out"].getvalue() + box["err"].getvalue())
+        self.assertIn("t2", box["out"].getvalue())
+
+    def test_timeout_while_settling_names_the_verdict(self):
+        mod = wait_module()
+        mod.PAIR_GRACE_S = 60.0  # never quiet long enough within the timeout
+        spec = PairSpec(name=self.pair, session_id=str(uuid.uuid4()), cwd=str(self.home))
+        R.add_pair(spec)
+        w = A.writer(self.pair)
+        w.turn_opened("t1", "send")
+        w.turn_closed("t1")
+        self.assertTrue(w.flush())
+        t, box = self.run_wait(mod, self.pair, "--poll", "0.5", "--timeout", "1")
+        t.join(15)
+        self.assertEqual(box.get("code"), 3, box["err"].getvalue())
+        self.assertIn("still working (settling)", box["err"].getvalue())
+
+    # -- HIGH 7: task mode judges a detached child by its own creation time --
+
+    def test_task_mode_child_and_owner_identity(self):
+        mod = wait_module()
+        (self.pairs / "async").mkdir(parents=True, exist_ok=True)
+
+        def task(**fields):
+            tid = str(uuid.uuid4())
+            data = {"task_id": tid, "pair_name": self.pair, "message": "m", "status": "running"}
+            data.update(fields)
+            (self.pairs / "async" / f"{tid}.json").write_text(json.dumps(data), encoding="utf-8")
+            return tid
+        events = self.home / "q.events.jsonl"
+        events.write_text("{}\n", encoding="utf-8")
+        old = time.time() - 60
+        os.utime(events, (old, old))
+        long_ago = datetime.utcfromtimestamp(self.live_started - 600).isoformat()
+        # A queued task whose live child was spawned 10 min after the task started.
+        tid = task(owner_pid=self.dead.pid, events_path=str(events), started_at=long_ago,
+                   child_pid=self.live.pid, child_started_at=self.live_started)
+        t, box = self.run_wait(mod, tid, "--poll", "0.5", "--timeout", "2")
+        t.join(15)
+        self.assertEqual(box.get("code"), 3, box["err"].getvalue())  # still running: keep waiting
+        # An owner PID now held by a process created after the task started is not the owner.
+        tid = task(owner_pid=self.live.pid, started_at=long_ago)
+        t, box = self.run_wait(mod, tid, "--poll", "0.5", "--timeout", "5")
+        t.join(15)
+        self.assertEqual(box.get("code"), 4, box["err"].getvalue())
+
+    # -- MEDIUM 8: a crashed (persistent) runtime --
+
+    def test_reader_eof_records_lost_background(self):
+        rt = self.runtime(persistent=True)
+        self.feed(rt, task_started("bgE"))
+        rt.proc = SimpleNamespace(stdout=io.BytesIO(b""), wait=lambda timeout=None: 3)
+        rt._stdout_reader()  # the process exited: stdout at EOF
+        self.assertEqual(rt.pending_background_tasks(), [])
+        lost = self.snap()["background_lost"]
+        self.assertEqual([b["task_id"] for b in lost], ["bgE"])
+        self.assertIn("exit code 3", lost[0]["reason"])
+        self.assertEqual(R.get_pair(self.pair).self_woken_pending[-1]["status"], "background_lost")
+
+    def test_evictor_handles_dead_and_stale_persistent_runtimes(self):
+        reg = RT.RuntimeRegistry(idle_timeout_seconds=1)
+        rt = self.runtime(persistent=True)
+        rt.proc = _AliveProc()
+        rt.stop = lambda reason=None: "stopped"
+        self.feed(rt, task_started("bgS"))
+        rt.last_activity = datetime.utcnow() - timedelta(hours=25)
+        reg._runtimes[self.pair] = rt
+        reg._evict_idle()
+        self.assertIn(self.pair, reg._runtimes)  # persistent: kept warm ...
+        self.assertEqual(rt.pending_background_tasks(), [])  # ... but the stale tracking is gone
+        self.assertIn("persistent runtime kept", self.snap()["background_lost"][-1]["reason"])
+        rt.proc = SimpleNamespace(poll=lambda: 1, pid=0, returncode=1, stdin=None)
+        reg._evict_idle()
+        self.assertNotIn(self.pair, reg._runtimes)  # dead: evicted despite persistent
+
+    # -- MEDIUM 9: losses reach a running watcher --
+
+    def test_watcher_sees_losses_from_forced_compact_and_forget(self):
+        mod = wait_module()
+        spec = PairSpec(name=self.pair, session_id=str(uuid.uuid4()), cwd=str(self.home))
+        R.add_pair(spec)
+        w = A.writer(self.pair)
+        w.background_started("b1", "local_bash")
+        self.assertTrue(w.flush())
+        t, box = self.run_wait(mod, self.pair, "--poll", "0.5", "--timeout", "30")
+        time.sleep(0.8)
+        w.lose_background("pair_compact(force=True) replaced the runtime")
+        w.turn_opened("c1", "compact")  # the new window must not hide the loss
+        self.assertTrue(w.flush())
+        t.join(15)
+        self.assertEqual(box.get("code"), 9, box["out"].getvalue() + box["err"].getvalue())
+        self.assertIn("pair_compact(force=True)", box["err"].getvalue())
+        w.turn_closed("c1")
+        w.background_started("b2", "local_agent")
+        self.assertTrue(w.flush())
+        t, box = self.run_wait(mod, self.pair, "--poll", "0.5", "--timeout", "30")
+        time.sleep(0.8)
+        A.forget(self.pair)
+        t.join(15)
+        self.assertEqual(box.get("code"), 9, box["out"].getvalue() + box["err"].getvalue())
+        self.assertIn("pair_forget", box["err"].getvalue())
+
+    def test_watcher_sees_a_dead_owners_background_as_lost(self):
+        mod = wait_module()
+        spec = PairSpec(name=self.pair, session_id=str(uuid.uuid4()), cwd=str(self.home))
+        R.add_pair(spec)
+        victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(lambda: (victim.poll() is None and victim.kill(), victim.wait(10)))
+        end = time.monotonic() + 10
+        while A._av_proc(victim.pid)[1] is None and time.monotonic() < end:
+            time.sleep(0.05)
+        self.foreign_activity(victim.pid, A._av_proc(victim.pid)[1], background=[
+            {"task_id": "vbg", "kind": "local_bash", "description": "",
+             "started_at": A._av_iso(A._av_now() - timedelta(minutes=5))}],
+            updated_at=A._av_iso(A._av_now() - timedelta(minutes=5)))
+        t, box = self.run_wait(mod, self.pair, "--poll", "0.5", "--timeout", "30")
+        time.sleep(0.8)
+        victim.kill()  # our own child, by PID
+        victim.wait(10)
+        t.join(15)
+        self.assertEqual(box.get("code"), 9, box["out"].getvalue() + box["err"].getvalue())
+        self.assertIn("vbg", box["err"].getvalue())
+
+    # -- MEDIUM 10: the summary shows the triage verdict that landed later --
+
+    def test_summary_uses_the_latest_triage_verdict(self):
+        mod = wait_module()
+        mod.PAIR_GRACE_S = 0.3
+        spec = PairSpec(name=self.pair, session_id=str(uuid.uuid4()), cwd=str(self.home))
+        R.add_pair(spec)
+        w = A.writer(self.pair)
+        w.background_started("b2", "local_bash")
+        t, box = self.run_wait(mod, self.pair, "--poll", "0.5", "--timeout", "30")
+        time.sleep(0.5)
+        w.turn_opened("sw", "self_woken")
+        w.turn_closed("sw", preview="should I delete the old files?", triage_pending=True)
+        self.assertTrue(w.flush())
+        time.sleep(1.2)  # the watcher has cached "sw" with its triage pending
+        w.set_triage("sw", {"importance": 3, "needs_attention": True, "source": "cli_summary",
+                            "summary": "asks whether to delete the old files"})
+        w.background_finished("b2")
+        w.turn_opened("sw2", "self_woken")
+        w.turn_closed("sw2", preview="all done")
+        self.assertTrue(w.flush())
+        t.join(15)
+        out = box["out"].getvalue()
+        self.assertEqual(box.get("code"), 0, out + box["err"].getvalue())
+        self.assertIn("flagged for attention (1)", out)
+        self.assertIn("asks whether to delete the old files", out)
+        self.assertNotIn("triage pending", out)
+
+    # -- HIGH 11: one deadline for a foreign self-woken turn --
+
+    def test_foreign_self_woken_wait_is_bounded_without_a_hard_timeout(self):
+        self.runtime()
+        self.foreign_self_woken_task(self.live.pid)
+        box = {}
+
+        def go():
+            try:
+                S._wait_for_foreign_self_woken(self.pair, None, None)
+            except PairError as e:
+                box["err"] = str(e)
+        with patch.object(S, "_FOREIGN_BACKGROUND_WAIT_S", 1.0):
+            t = threading.Thread(target=go, daemon=True)
+            t.start()
+            t.join(10)
+        self.assertFalse(t.is_alive())
+        self.assertIn("mid self-woken turn in another MCP process", box.get("err", ""))
+
+    # -- MEDIUM 12: unknown is not idle --
+
+    def test_unknown_exits_10_not_0(self):
+        mod = wait_module()
+        mod.PAIR_GRACE_S = 0.3
+        spec = PairSpec(name=self.pair, session_id=str(uuid.uuid4()), cwd=str(self.home))
+        R.add_pair(spec)
+        (self.pairs / "async").mkdir(parents=True, exist_ok=True)
+        tid = str(uuid.uuid4())
+        (self.pairs / "async" / f"{tid}.json").write_text(json.dumps({
+            "task_id": tid, "pair_name": self.pair, "message": "m", "status": "done",
+            "started_at": (datetime.utcnow() - timedelta(seconds=2)).isoformat(),
+            "finished_at": (datetime.utcnow() - timedelta(seconds=1)).isoformat(),
+            "owner_pid": self.live.pid}), encoding="utf-8")  # a live owner we can't see into
+        t, box = self.run_wait(mod, self.pair, "--poll", "0.5", "--timeout", "30")
+        t.join(15)
+        self.assertEqual(box.get("code"), 10, box["out"].getvalue() + box["err"].getvalue())
+        self.assertIn(f"activity unknown for PID {self.live.pid}", box["err"].getvalue())
+        self.assertIn("part of it is invisible", box["out"].getvalue())
+
+    # -- MEDIUM 13: redirected non-UTF-8 output --
+
+    def test_redirected_cp1252_output_keeps_the_exit_code(self):
+        wait_py = W.install_wait_script(self.pairs / "wait.py")
+        spec = PairSpec(name=self.pair, session_id=str(uuid.uuid4()), cwd=str(self.home))
+        R.add_pair(spec)
+        w = A.writer(self.pair)
+        w.turn_opened("t1", "send")
+        w.note_context(400_000, 1_000_000, window_source="reported")
+        self.assertTrue(w.flush())
+        env = dict(os.environ, CLAUDE_HOME=str(self.home), PYTHONIOENCODING="cp1252:strict")
+        proc = subprocess.Popen([sys.executable, str(wait_py), self.pair, "--each-turn",
+                                 "--poll", "0.5", "--timeout", "30"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        time.sleep(1.5)
+        w.turn_closed("t1", preview="done 🎉 → next: ✅")
+        self.assertTrue(w.flush())
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, (out + err).decode("utf-8", "replace"))
+        self.assertIn("🎉", out.decode("utf-8"))
+        # The context alert path, same encoding.
+        w.turn_opened("t2", "send")
+        self.assertTrue(w.flush())
+        proc = subprocess.Popen([sys.executable, str(wait_py), self.pair,
+                                 "--poll", "0.5", "--timeout", "30"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        time.sleep(1.5)
+        w.note_context(830_000, 1_000_000, window_source="reported")
+        self.assertTrue(w.flush())
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 8, (out + err).decode("utf-8", "replace"))
+        self.assertIn("CONTEXT ALERT", out.decode("utf-8"))
 
 
 class MiscTests(V016Case):

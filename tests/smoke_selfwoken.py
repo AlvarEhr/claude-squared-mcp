@@ -231,6 +231,10 @@ except server.PairError as e:
 check("…and actually waited ~2s", (datetime.utcnow() - t0).total_seconds() >= 1.5)
 async_tasks.finalize_external_task(foreign, status="done")
 check("no wait once it finalizes", server._wait_for_foreign_self_woken("swt", 2, None) < 0.5)
+# v0.16.0: a live owner with no activity file reads as "unknown" to wait.py
+# (#14 expects a verdict) — hand the finished task back to this process.
+foreign.owner_pid = os.getpid()
+async_tasks._save(foreign)
 dead = async_tasks.register_external_task("swt", async_tasks.SELF_WOKEN_MESSAGE)
 dead.owner_pid = 999_999_999
 async_tasks._save(dead)
@@ -296,7 +300,8 @@ wait_py = Path(_TMP.name) / "pairs" / "wait.py"
 check("wait.py installed under CLAUDE_HOME", wait_py.exists())
 if wait_py.exists():
     # latest task for 'swt' is rt3's ABANDONED (failed) one → exit 1, with the self-woken note on stderr
-    pr = subprocess.run([sys.executable, str(wait_py), "swt", "--timeout", "3"],
+    # --timeout > wait.py's 5 s idle grace (the tasks above just finished).
+    pr = subprocess.run([sys.executable, str(wait_py), "swt", "--timeout", "15"],
                         capture_output=True, text=True, env=dict(os.environ, CLAUDE_HOME=_TMP.name))
     # v0.16.0: by name = pair mode (until idle); the last turn failed → exit 1.
     check("exit 1 (failed task)", pr.returncode == 1)

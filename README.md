@@ -289,6 +289,7 @@ Three ways to consume the handle:
    | 7 | finished detached (Codex): the owner died, the turn finished on its own — `pair_poll` collects it |
    | 8 | context alert (below) |
    | 9 | background work was killed while the watcher ran — the pair will not wake for it |
+   | 10 | idle as far as can be seen, but part of the pair is invisible (a pre-0.16 MCP process, an unreadable activity file, or a wake-up that never started) — check `pair_status` |
    | 64 | usage error |
 
    **Context alert (exit 8).** Auto-compaction fires mid-turn at about the
@@ -326,8 +327,8 @@ this with exit code 4.
 
 **Mixed versions.** A pair whose tasks belong to a still-running pre-0.16 MCP
 process has no activity file there: `wait.py <pair>` falls back to the task
-files and says "activity unknown for PID X" instead of calling the pair idle
-with confidence. Restart every session after installing.
+files, says "activity unknown for PID X" and exits 10 instead of calling the
+pair idle (exit 0). Restart every session after installing.
 
 **Universal fallback** (when `python` isn't on the agent's shell PATH):
 
@@ -373,19 +374,29 @@ and the pair never wakes for it. So:
 
 - the idle evictor never evicts a runtime with background work pending (after
   24 h with no log activity at all it does, and records the work as lost — "may
-  already have finished, no completion event seen");
-- `pair_clear`, `pair_rewind`, `pair_compact` and a `pair_update` that changes a
-  spawn-pinned setting (model, effort, permission level, window, cwd,
-  extra_dirs, allowed_tools, connectors, ultracode, fallback model) **refuse**
-  while background work is pending, unless `force=True`, which kills it and
-  records the loss; other `pair_update` fields apply at once;
+  already have finished, no completion event seen"; a persistent runtime is
+  kept and only that stale tracking is dropped). A runtime whose claude
+  process dies records its background work as lost at once;
+- `pair_clear`, `pair_rewind`, `pair_compact` and a `pair_update` that
+  actually changes a spawn-pinned setting (model, effort, permission level,
+  window, cwd, extra_dirs, allowed_tools, connectors, ultracode, fallback
+  model) **refuse** while work is pending — background work, a self-woken
+  turn, or the wake-up between a completion and that turn — unless
+  `force=True`, which kills it and records the loss; other `pair_update`
+  fields, and re-sending a setting's current value, apply without a respawn;
+- `force=True` only reaches **this** MCP process's runtime: while another
+  process has work pending for the pair, those operations (and
+  `pair_stop(hard=True)`'s session rotation) refuse even with `force` — stop it
+  from the session that owns it, or wait;
 - `pair_forget` and `pair_stop(force=True)` / `hard=True` kill and report what
   was lost; a soft `pair_stop` interrupts only the in-flight turn — background
   Bash and agents survive it (verified) and still wake the pair, and the result
   says so;
-- a send from another MCP process waits (up to 30 min) while the process that
-  owns the runtime has background work pending — otherwise that process's later
-  wake-up would write a divergent history;
+- a send from another MCP process waits (up to 30 min in all, or its hard
+  timeout if shorter) while the process that owns the runtime has background
+  work, a wake-up or a self-woken turn pending — otherwise that process's later
+  wake-up would write a divergent history; a send in the owning process waits
+  for its own wake-up the same way, so it never takes the self-woken reply;
 - every loss is recorded (activity file, the next send's footer, `pair_status`,
   and `wait.py` exit 9).
 

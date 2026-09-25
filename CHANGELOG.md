@@ -17,7 +17,9 @@ All notable changes to this project are documented here. Format follows
   `--each-turn` returns at the next turn's end; a task id still waits for that
   task. Default timeout 6 h (the timeout message says the pair is still
   working and gives the re-arm command). New exit codes: 7 finished detached
-  (Codex), 8 context alert, 9 background work lost.
+  (Codex), 8 context alert, 9 background work lost, 10 idle as far as can be
+  seen but part of the pair is invisible (a pre-0.16 MCP process, an
+  unreadable activity file, a wake-up that never started).
 - **Context alert**: `wait.py` exits 8 when the context crosses a level set a
   headroom before the estimated auto-compaction point (window − 30k; headroom
   max(15% of the window, 40k), `pair_settings_set(context_alert_headroom=…)`),
@@ -32,10 +34,15 @@ All notable changes to this project are documented here. Format follows
 
 - **Background work is no longer killed silently.** The idle evictor never
   evicts a runtime with background work pending (24 h ceiling, then recorded
-  as lost). `pair_clear`, `pair_rewind`, `pair_compact` and a `pair_update`
-  that changes a spawn-pinned setting refuse while background work is
-  pending unless `force=True`; `pair_forget` and forced stops report what they
-  killed; a soft `pair_stop` says which background work survives it.
+  as lost); a runtime whose claude process dies records its lost work at once.
+  `pair_clear`, `pair_rewind`, `pair_compact` and a `pair_update` that
+  actually changes a spawn-pinned setting refuse while background work, a
+  self-woken turn or the wake-up before it is pending unless `force=True` —
+  never when another MCP process owns that work (force can't reach it);
+  `pair_forget` and forced stops report what they killed; a soft `pair_stop`
+  says which background work survives it.
+- **A send no longer takes a self-woken turn's reply** when it arrives between
+  a background completion and the first event of the turn it wakes.
 - **Empty reply after a runtime restart.** When a runtime ended with a
   background shell still running, the next resume emitted a stale
   notification plus an empty result before reading our message; the send

@@ -108,6 +108,11 @@ def test_waitpy_exact_id_still_works():
 def test_waitpy_pair_name_still_works():
     print("\n=== 1.4: wait.py pair name still works (no regression) ===")
     _write_task("byname-task-id-99", "by_name_pair", "done")
+    # v0.16.0: as async_tasks.start_task does — the task's (live) owner has an
+    # activity file for the pair, or wait.py can't call it idle (exit 10).
+    from claude_squared import activity
+    activity.touch("by_name_pair")
+    activity.flush_all()
     r = _run_waitpy("by_name_pair")
     # v0.16.0: a pair name FOLLOWS the pair until idle (was: its latest task).
     assert_eq(r.returncode, 0, "pair name resolves (pair mode, idle)")

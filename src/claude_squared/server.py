@@ -1173,7 +1173,7 @@ def _forget_pair(name: str, archive: bool) -> str:
         lost = runtime_mod.registry().evict(name, "the pair was forgotten (pair_forget)")
     except Exception:
         pass
-    _local, foreign_bg = _pending_background_split(name)
+    _local, foreign_bg = _pending_work_split(name)
     if spec.backend == "codex":
         try:
             if not codex_adapter_mod.stop_inflight(name) and async_tasks.list_running_task_ids_for_pair(name):
@@ -1201,8 +1201,8 @@ def _forget_pair(name: str, archive: bool) -> str:
     if note:
         msg += f"\n⚠ {note}"
     if foreign_bg:
-        msg += (f"\n⚠ {len(foreign_bg)} background task(s) still run in another MCP process "
-                f"({_describe_background(foreign_bg)}); they end when that process drops its runtime.")
+        msg += (f"\n⚠ work still pending in another MCP process ({_describe_background(foreign_bg)}); "
+                f"it ends when that process drops its runtime.")
     return msg
 
 
@@ -1321,6 +1321,10 @@ def _foreign_activity_blocker(name: str) -> str | None:
     wake = [w for w in view.get("wake_pending") or [] if w.get("pid") != me]
     if wake:
         return f"a self-wake pending in MCP process {wake[0]['pid']}"
+    woken = [t for t in view.get("turns") or []
+             if t.get("pid") != me and t.get("kind") == "self_woken"]
+    if woken:
+        return f"a self-woken turn running in MCP process {woken[0]['pid']}"
     return None
 
 
@@ -1336,11 +1340,16 @@ def _wait_for_foreign_self_woken(
     its owner pid) is the signal: wait for it like any queued send. Bounded by
     the caller's hard timeout and pair_stop. Own-process turns are handled in
     the adapter (``PairRuntime.wait_for_implicit_idle``), not here.
+
+    v0.16.0: ONE deadline — the hard timeout, capped at
+    ``_FOREIGN_BACKGROUND_WAIT_S`` — across the background, wake-up and
+    self-woken phases. Each phase used to have its own, and with no hard
+    timeout the self-woken phase had none: a stuck foreign turn held this
+    send, and the pair lock with it, indefinitely (anvil review, 2026-09-25).
     """
     t0 = time.monotonic()
-    end = (t0 + timeout_s) if timeout_s is not None else None
-    bg_end = t0 + (_FOREIGN_BACKGROUND_WAIT_S if timeout_s is None
-                   else min(float(timeout_s), _FOREIGN_BACKGROUND_WAIT_S))
+    end = t0 + (_FOREIGN_BACKGROUND_WAIT_S if timeout_s is None
+                else min(float(timeout_s), _FOREIGN_BACKGROUND_WAIT_S))
     while True:
         foreign = _foreign_self_woken_task_ids(name)
         # v0.16.0: ALSO wait while another process's runtime has background
@@ -1350,13 +1359,13 @@ def _wait_for_foreign_self_woken(
         blocker = None if foreign else _foreign_activity_blocker(name)
         if not foreign and blocker is None:
             return time.monotonic() - t0
-        if foreign and end is not None and time.monotonic() >= end:
+        if foreign and time.monotonic() >= end:
             raise PairError(
                 f"Pair '{name}' is mid self-woken turn in another MCP process "
-                f"(task {_short(foreign[0])}; waited {timeout_s}s). Retry later, or "
-                f"pair_stop it from that process."
+                f"(task {_short(foreign[0])}; waited {time.monotonic() - t0:.0f}s). Retry later, "
+                f"or pair_stop it from that process."
             )
-        if blocker is not None and time.monotonic() >= bg_end:
+        if blocker is not None and time.monotonic() >= end:
             raise PairError(
                 f"Pair '{name}' has {blocker}; a send now would fork the pair's history when "
                 f"that process's pair wakes (waited {time.monotonic() - t0:.0f}s). Retry after it "
@@ -1415,19 +1424,40 @@ def _background_pending(name: str) -> tuple[list[str], str]:
     return [], ""
 
 
-def _pending_background_split(name: str) -> tuple[list[dict], list[dict]]:
-    """(this process's runtime, other live MCP processes) pending background."""
+def _pending_work_split(name: str) -> tuple[list[dict], list[dict]]:
+    """v0.16.0: what a kill or a JSONL rewrite would destroy, as (this
+    process's runtime, other live MCP processes): pending background tasks,
+    a wake-up about to start a self-woken turn, an open self-woken turn.
+    Background alone missed the gap between a completion and the turn it
+    wakes (anvil review, 2026-09-25). Foreign items carry their ``pid``."""
     local: list[dict] = []
     try:
         rt = runtime_mod.registry().get_or_none(name)
         if rt is not None and rt.is_alive():
-            local = rt.pending_background_tasks()
+            local = rt.pending_work()
     except Exception:
         pass
     foreign: list[dict] = []
+    me = os.getpid()
     try:
         view = activity_mod.view(name, grace_seconds=0)
-        foreign = [b for b in view.get("background") or [] if b.get("pid") != os.getpid()]
+    except Exception:
+        view = {}
+    foreign += [b for b in view.get("background") or [] if b.get("pid") != me]
+    foreign += [{"kind": "wake-up", "task_id": None, "pid": w.get("pid"),
+                 "description": "background finished; the pair is about to resume"}
+                for w in view.get("wake_pending") or [] if w.get("pid") != me]
+    foreign += [{"kind": "self-woken turn", "task_id": t.get("task_id"), "pid": t.get("pid")}
+                for t in view.get("turns") or []
+                if t.get("pid") != me and t.get("kind") == "self_woken"]
+    listed = {f.get("task_id") for f in foreign if f.get("task_id")}
+    try:
+        # Task files too: a pre-0.16 owner has no activity file.
+        for tid in _foreign_self_woken_task_ids(name):
+            if tid not in listed:
+                st = async_tasks.load_task(tid)
+                foreign.append({"kind": "self-woken turn", "task_id": tid,
+                                "pid": st.owner_pid if st is not None else None})
     except Exception:
         pass
     return local, foreign
@@ -1437,7 +1467,8 @@ def _describe_background(items: list[dict]) -> str:
     parts = []
     for b in items[:5]:
         desc = str(b.get("description") or "")[:60]
-        parts.append(f"{b.get('kind') or 'task'} {str(b.get('task_id') or '?')[:10]}"
+        tid = str(b.get("task_id") or "")[:10]
+        parts.append(f"{b.get('kind') or 'task'}" + (f" {tid}" if tid else "")
                      + (f" ({desc})" if desc else ""))
     more = f" +{len(items) - 5} more" if len(items) > 5 else ""
     return "; ".join(parts) + more
@@ -1445,21 +1476,31 @@ def _describe_background(items: list[dict]) -> str:
 
 def _refuse_if_background(name: str, action: str, force: bool) -> None:
     """v0.16.0 (design rev. D): an operation that kills or rewrites under the
-    pair's runtime refuses while background work is pending, unless force.
-    Killed work never wakes the pair; a rewritten JSONL would be written to
-    later by a self-wake from pre-mutation memory."""
-    if force:
+    pair's runtime refuses while work is pending (``_pending_work_split``),
+    unless force. Killed work never wakes the pair; a rewritten JSONL would
+    be written to later by a self-wake from pre-mutation memory.
+
+    Work in ANOTHER MCP process refuses even with force: force kills only
+    THIS process's runtime, so the other one would self-wake onto the
+    rewritten session (anvil review, 2026-09-25). No cross-process kill here
+    on purpose — an idle owner polls nothing, so it could not acknowledge a
+    stop request before the mutation; its own session can stop it."""
+    local, foreign = _pending_work_split(name)
+    if foreign:
+        pids = ", ".join(sorted({str(f.get("pid")) for f in foreign}))
+        raise PairError(
+            f"Pair '{name}' has work pending in another MCP process (PID {pids}: "
+            f"{_describe_background(foreign)}); {action} now would change the session under that "
+            f"process's runtime, which writes to it again when the pair wakes. force=True can't "
+            f"help — it only kills this process's runtime. Wait for it ({_watcher_cmd(name)}), or "
+            f"pair_stop('{name}', force=True) from the session that owns it."
+        )
+    if force or not local:
         return
-    local, foreign = _pending_background_split(name)
-    if not (local or foreign):
-        return
-    where = _describe_background(local + foreign)
-    extra = (" Work pending in another MCP process can only be stopped from there."
-             if foreign else "")
     raise PairError(
-        f"Pair '{name}' has background work pending ({where}); {action} would kill it and the "
-        f"pair would never wake for it. Wait for it ({_watcher_cmd(name)}), or pass force=True "
-        f"to {action} anyway (the work is killed and recorded as lost).{extra}"
+        f"Pair '{name}' has background work pending ({_describe_background(local)}); {action} "
+        f"would kill it and the pair would never wake for it. Wait for it ({_watcher_cmd(name)}), "
+        f"or pass force=True to {action} anyway (the work is killed and recorded as lost)."
     )
 
 
@@ -2250,8 +2291,9 @@ async def pair_send(
     ``python -m claude_squared wait <id>`` to get fired a completion notification).
     ``wait.py <pair>`` follows the pair until idle (``--each-turn``: until the next turn
     ends); exits 0 done/idle, 1 failed, 2 not found, 3 timeout (re-arm), 4 orphaned,
-    5 stopped, 6 crashed, 7 finished detached, 8 context alert, 9 background lost —
-    exit 1 with empty output means the watcher itself was killed (README "wait.py").
+    5 stopped, 6 crashed, 7 finished detached, 8 context alert, 9 background lost,
+    10 idle but partly invisible — exit 1 with empty output means the watcher itself
+    was killed (README "wait.py").
 
     Args:
         timeout_seconds: Your stated patience (default 45s). Work continues
@@ -2374,8 +2416,9 @@ def pair_send_async(
     README "Async handles" for the full pattern.
     ``wait.py <pair>`` follows the pair until idle (``--each-turn``: until the next turn
     ends); exits 0 done/idle, 1 failed, 2 not found, 3 timeout (re-arm), 4 orphaned,
-    5 stopped, 6 crashed, 7 finished detached, 8 context alert, 9 background lost —
-    exit 1 with empty output means the watcher itself was killed (README "wait.py").
+    5 stopped, 6 crashed, 7 finished detached, 8 context alert, 9 background lost,
+    10 idle but partly invisible — exit 1 with empty output means the watcher itself
+    was killed (README "wait.py").
 
     Args:
         hard_timeout_seconds: Auto-kill ceiling for the underlying claude
@@ -3038,7 +3081,8 @@ def pair_update(
     use ``pair_settings_set`` for user-wide defaults).
 
     A change that respawns the runtime is refused while background work is
-    pending, unless ``force=True`` (the work is killed and recorded as lost).
+    pending, unless ``force=True`` (the work is killed and recorded as lost;
+    work in another MCP process always refuses).
 
     mcp_whitelist is a deliberate per-pair connector opt-in, default none;
     pass [] to disable connectors. Changes apply on the next spawn, with no
@@ -3224,8 +3268,19 @@ def pair_update(
                         if k in fields and fields[k] != getattr(_cur, k, None)]
             if cwd is not None and _normalize_path(cwd) != _cur.cwd:
                 _respawn.append("cwd")
+            # The SAME actual-change set decides the refusal and the eviction:
+            # re-sending a field's current value used to skip the refusal yet
+            # still evict — a silent kill (anvil review, 2026-09-25).
+            lost: list[dict] = []
             if _respawn:
                 _refuse_if_background(name, f"changing {', '.join(_respawn)}", force)
+                # Evict BEFORE the cwd move below (the runtime holds the JSONL
+                # open), and so its losses are reported.
+                try:
+                    lost = runtime_mod.registry().evict(
+                        name, f"pair_update changed {', '.join(_respawn)} (runtime respawned)")
+                except Exception:
+                    pass
             # cwd is special: changing it requires moving the session JSONL between project dirs
             # because --resume looks up the JSONL under the new cwd's encoded project path.
             cwd_move_msg: str | None = None
@@ -3259,14 +3314,8 @@ def pair_update(
                 spec = reg_mod.get_pair(name)
                 return f"No fields to update for '{name}'."
             spec = reg_mod.update_pair(name, **fields)
-            # Material config changes invalidate any live runtime — next send will re-spawn
-            lost: list[dict] = []
-            if any(k in fields for k in _SPAWN_PINNED_FIELDS):
-                try:
-                    lost = runtime_mod.registry().evict(
-                        name, "pair_update changed a spawn-pinned setting (runtime respawned)")
-                except Exception:
-                    pass
+            # Material config changes invalidated the live runtime (evicted
+            # above) — the next send re-spawns it.
             lost_note = _lost_note(lost)
             if lost_note:
                 transparency_msgs.append(lost_note)
@@ -3927,7 +3976,8 @@ def pair_settings_reset() -> str:
 @mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False})
 def pair_clear(name: str, archive_old: bool = True, verbose: bool = False, force: bool = False) -> str:
     """Reset a pair's conversation history while preserving its config.
-    Refused while background work is pending unless ``force=True``.
+    Refused while background work is pending unless ``force=True`` (work in
+    another MCP process always refuses).
 
     Implementation: rotates to a new session_id and starts a fresh session with the same
     pinned config (system prompt, allowed_tools, MCP scope). Optionally archives the old
@@ -4410,7 +4460,8 @@ def pair_rewind_points(name: str, last_n: int = 20, verbose: bool = False) -> st
 def pair_rewind(name: str, to_point: int, archive: bool = True, verbose: bool = False,
                 force: bool = False) -> str:
     """Rewind a pair's conversation to BEFORE a chosen user message (like /rewind).
-    Refused while background work is pending unless ``force=True``.
+    Refused while background work is pending unless ``force=True`` (work in
+    another MCP process always refuses).
 
     **Conversation only.** This truncates the pair's session history so the next
     send continues from the chosen point — it does NOT revert files the pair
@@ -4519,7 +4570,8 @@ def pair_compact(
     force: bool = False,
 ) -> str:
     """Compact a pair's conversation in place (a summary replaces the history).
-    Refused while background work is pending unless ``force=True``.
+    Refused while background work is pending unless ``force=True`` (work in
+    another MCP process always refuses).
 
     Claude pairs: native ``/compact`` via stream-json; ``steering_prompt``
     becomes the ``/compact <text>`` argument. **Codex pairs: compaction runs
@@ -4773,8 +4825,15 @@ def pair_stop(
 
     if hard and foreign_implicit:
         actions.append("hard reset skipped: self-woken work must first be stopped by its owner")
+    # v0.16.0: rotating the session under another process's pending work would
+    # let that process's pair wake onto a session this pair no longer uses —
+    # force/hard only ever kill THIS process's runtime (anvil review, 2026-09-25).
+    hard_foreign = _pending_work_split(name)[1] if hard and not foreign_implicit else []
+    if hard_foreign:
+        actions.append(f"hard reset skipped: work pending in another MCP process "
+                       f"({_describe_background(hard_foreign)}) must first be stopped by its owner")
 
-    if hard and not foreign_implicit:
+    if hard and not foreign_implicit and not hard_foreign:
         # Rotate session: pair_clear logic inline. Don't call pair_clear via
         # mcp.call_tool to avoid extra lock-acquire choreography — just do it
         # directly. We acquire the lock briefly; should succeed quickly since

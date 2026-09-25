@@ -593,6 +593,10 @@ def start_task(pair_name: str, message: str,
         execution_started_at=None if queued else datetime.utcnow(),
     )
     _save(state)
+    # v0.16.0: the owner of a task must have an activity file for the pair,
+    # or readers can't tell "idle" from "invisible" (activity.touch).
+    from claude_squared import activity as _activity
+    _activity.touch(pair_name)
     event = _get_or_create_event(task_id)
     with _states_guard:
         _local_states[task_id] = state

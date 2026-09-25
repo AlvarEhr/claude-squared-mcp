@@ -33,6 +33,7 @@ Writer API — both backends (Claude runtime reader thread, Codex exec loop)::
     w.background_started(task_id, kind, description)
     w.background_finished(task_id, status)      # no turn open -> bounded wake_pending
     w.expect_wake(task_id=None)                 # a turn is starting with none open
+    w.refresh_wake() / w.clear_wake()           # still coming / resolved without a turn
     w.lose_background(reason, task_ids=None)    -> the lost entries (runtime killed)
     w.note_context(used, window, window_source=, source=)
     w.note_reported_window(tokens, model_key=, model=, source=)
@@ -43,7 +44,9 @@ Writer API — both backends (Claude runtime reader thread, Codex exec loop)::
 Module level: ``announce()`` (MCP startup: write the beacon), ``sweep()``
 (startup: mark dead owners' files, drop old ones), ``shutdown(reason)``
 (atexit: remaining background -> lost, state "exited", synchronous flush),
-``forget(pair)`` (pair_forget), ``view(pair)`` / ``pair_activity_view(...)``
+``touch(pair)`` (a task was created: make sure the file exists),
+``forget(pair)`` (pair_forget: a "forgotten" tombstone), ``view(pair)`` /
+``pair_activity_view(...)``
 (the merged reader view), ``reported_window(pair, model_key)``.
 
 Threading contract. Every ``ActivityWriter`` mutator only changes memory under
@@ -97,6 +100,11 @@ _AV_OWNER_LOOKBACK_S = 24 * 3600
 # Codex detach contract (HANDOFF "v0.16.0" Codex detach contract): an
 # events file written this recently proves a detached turn is still active.
 _AV_EVENTS_GRACE_S = 2.0
+# A wake-up whose deadline passed without the self-woken turn opening (and
+# without anything clearing it) is not proof of idle — inference can still be
+# before its first event (anvil review, 2026-09-25). For this long past the
+# deadline the verdict is "unknown"; after that the stale wake is ignored.
+_AV_WAKE_STALE_S = 600
 _AV_K32 = []
 
 
@@ -371,12 +379,17 @@ def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,
 
     ``verdict``: "busy" (a turn is open, background is pending, a wake-up is
     expected, or a task is running/queued/detached), "unknown" (nothing busy
-    is visible, but a live owner can't be seen: pre-0.16 process or an
-    unreadable file), "settling" (quiet for less than ``grace_seconds``), or
-    "idle". ``reasons`` says why for busy/unknown; ``notes`` carries
-    non-blocking facts (dead owners, orphaned tasks). The window lists
-    (window_turns, background_finished, background_lost, compactions) hold
-    only entries since the latest solicited send across all owners.
+    is visible, but part of the pair can't be seen: a pre-0.16 owner, an
+    unreadable file, a live owner of a recent task with no activity file for
+    this pair, or a wake-up that expired without its turn opening),
+    "settling" (quiet for less than ``grace_seconds``), or "idle".
+    ``reasons`` says why for busy/unknown; ``notes`` carries non-blocking
+    facts (dead owners, orphaned tasks). The window lists (window_turns,
+    background_finished, background_lost, compactions) hold only entries
+    since the latest solicited send across all owners; ``losses`` is every
+    background_lost entry still on file, unfiltered — a loss recorded just
+    before a new window opens (a forced compact) must still reach a watcher.
+    ``quiet_since`` / ``quiet_for_s`` are set for "unknown" too.
     ``live_states`` maps pid -> in-memory state (the caller's own writer,
     fresher than its file). Never writes anything.
     """
@@ -389,7 +402,7 @@ def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,
         "turns": [], "background": [], "wake_pending": [], "running_tasks": [],
         "context": None, "reported_window": None, "window_started_at": None,
         "window_turns": [], "background_finished": [], "background_lost": [],
-        "compactions": [], "quiet_since": None, "quiet_for_s": None,
+        "compactions": [], "losses": [], "quiet_since": None, "quiet_for_s": None,
     }
     busy, unknown, notes, quiet = [], [], [], []
     owners = []
@@ -462,16 +475,23 @@ def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,
                                 "should resume by %s)" % (pid, wake.get("since"), wake.get("until")))
                 elif until is not None:
                     quiet.append(until)
+                    if (now - until).total_seconds() < _AV_WAKE_STALE_S:
+                        unknown.append("a wake-up announced in PID %d at %s never started (nothing "
+                                       "seen since %s) — the pair may still be about to resume"
+                                       % (pid, wake.get("since"), wake.get("until")))
         for key, tkey in list_keys:
             for e in d.get(key) or []:
                 if isinstance(e, dict) and _in_window(e.get(tkey)):
                     view[key].append(dict(e, pid=pid))
+        for e in d.get("background_lost") or []:
+            if isinstance(e, dict):
+                view["losses"].append(dict(e, pid=pid))
         ctx = d.get("context")
         if isinstance(ctx, dict):
             at = _av_parse(ctx.get("at"))
             if at is not None and (ctx_best is None or at > ctx_best[0]):
                 ctx_best = (at, dict(ctx, pid=pid))
-    for key, tkey in list_keys:
+    for key, tkey in list_keys + (("losses", "at"),):
         view[key].sort(key=lambda e: str(e.get(tkey) or ""))
     view["context"] = ctx_best[1] if ctx_best else None
     meta, _err = _av_read_json(pairs_dir / "activity" / pair / "pair.json")
@@ -525,28 +545,37 @@ def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,
             fin = _av_parse(t.get("finished_at"))
             if fin is not None:
                 quiet.append(fin)
-        # Mixed-version fleet: a live owner of a recent task that never wrote a
-        # beacon can have self-woken turns / background we cannot see.
+        # A live owner of a recent task with no activity file for this pair
+        # can have self-woken turns / background we cannot see: a pre-0.16
+        # process (no beacon), or a 0.16 one whose writes to this pair's
+        # file failed — a beacon proves the capability, not per-pair
+        # visibility (0.16 writers create the file when the task starts).
         if (has_owner and owner not in owner_pids and started is not None
                 and started >= lookback):
             if owner not in checked:
-                checked[owner] = (_av_task_owner_alive(owner, started)
-                                  and not _av_beacon_ok(pairs_dir, owner))
+                checked[owner] = None
+                if _av_task_owner_alive(owner, started):
+                    if not _av_beacon_ok(pairs_dir, owner):
+                        checked[owner] = ("activity unknown for PID %d (owns task %s; a pre-0.16 "
+                                          "MCP process — its background work and self-woken turns "
+                                          "are invisible here)" % (owner, tid[:8]))
+                    else:
+                        checked[owner] = ("activity unknown for PID %d (owns task %s but has no "
+                                          "activity file for this pair — its writes may be "
+                                          "failing)" % (owner, tid[:8]))
                 if checked[owner]:
-                    unknown.append("activity unknown for PID %d (owns task %s; a pre-0.16 MCP "
-                                   "process — its background work and self-woken turns are "
-                                   "invisible here)" % (owner, tid[:8]))
+                    unknown.append(checked[owner])
 
     view["notes"] = notes
+    qs = max(quiet) if quiet else None
+    if not busy and qs is not None:
+        view["quiet_since"] = _av_iso(qs)
+        view["quiet_for_s"] = round((now - qs).total_seconds(), 1)
     if busy:
         view["verdict"] = "busy"
     elif unknown:
         view["verdict"] = "unknown"
     else:
-        qs = max(quiet) if quiet else None
-        if qs is not None:
-            view["quiet_since"] = _av_iso(qs)
-            view["quiet_for_s"] = round((now - qs).total_seconds(), 1)
         settling = qs is not None and (now - qs).total_seconds() < grace_seconds
         view["verdict"] = "settling" if settling else "idle"
     view["reasons"] = busy + unknown
@@ -697,7 +726,11 @@ class ActivityWriter:
                     new_window: bool | None = None) -> None:
         """A turn started. ``kind`` "self_woken" continues the current window;
         any other kind (a solicited send, compact, invoke) starts a new one,
-        clearing this owner's window lists. Clears a pending wake-up."""
+        clearing this owner's window lists — except ``background_lost``
+        (capped, filtered by the window in the view): a forced compact
+        records its losses right before it opens its window, and a running
+        watcher must still see them (anvil review, 2026-09-25). Clears a
+        pending wake-up."""
         if new_window is None:
             new_window = kind != "self_woken"
         now = _av_now()
@@ -710,7 +743,7 @@ class ActivityWriter:
             if new_window:
                 st["window_started_at"] = iso
                 st["window_task_id"] = task_id
-                for key in ("window_turns", "background_finished", "background_lost", "compactions"):
+                for key in ("window_turns", "background_finished", "compactions"):
                     st[key] = []
             st["turn"] = {"task_id": task_id, "kind": kind, "started_at": iso}
             st["wake_pending"] = None
@@ -740,25 +773,34 @@ class ActivityWriter:
     def turn_closed(self, task_id: str | None = None, *, status: str = "done",
                     preview: str = "", triage_pending: bool = False) -> dict | None:
         """The open turn ended. Returns its window_turns entry, or None when no
-        turn is open or ``task_id`` names a different one (idempotent). With no
-        turn open it resolves a pending wake-up instead: a result arrived for a
-        turn that never opened (e.g. the CLI's stale resume notice)."""
+        turn is open or ``task_id`` names a different one (idempotent). Never
+        touches a pending wake-up: a result that belongs to no turn resolves
+        one with ``clear_wake`` — closing "whatever is open" there once
+        published a real send as finished (anvil review, 2026-09-25)."""
         now = _av_now()
-        out = None
         with self._lock:
             turn = self._state["turn"]
             if turn is None:
-                if self._state["wake_pending"] is None:
-                    return None
-                self._state["wake_pending"] = None
-                self._state["last_transition_at"] = _av_iso(now)
-            elif task_id and turn.get("task_id") and task_id != turn.get("task_id"):
                 return None
-            else:
-                out = dict(self._close_turn_locked(task_id, status, preview, triage_pending, now))
+            if task_id and turn.get("task_id") and task_id != turn.get("task_id"):
+                return None
+            out = dict(self._close_turn_locked(task_id, status, preview, triage_pending, now))
             self._mark(_URGENT)
         _poke()
         return out
+
+    def clear_wake(self) -> bool:
+        """A result arrived for a turn that never opened (the CLI's stale
+        resume notice, or a wake that produced no top-level event): resolve
+        the pending wake-up, if any. Never closes a turn."""
+        with self._lock:
+            if self._state["wake_pending"] is None:
+                return False
+            self._state["wake_pending"] = None
+            self._state["last_transition_at"] = _av_iso(_av_now())
+            self._mark(_URGENT)
+        _poke()
+        return True
 
     # -- background --
 
@@ -836,6 +878,20 @@ class ActivityWriter:
             self._set_wake(task_id, now)
             self._state["last_transition_at"] = _av_iso(now)
             self._mark(_URGENT)
+        _poke()
+
+    def refresh_wake(self) -> None:
+        """The CLI is still producing events ahead of the self-woken turn's
+        first assistant event (e.g. ``system:thinking_tokens``): push the
+        pending wake-up's deadline out. No-op without one. Written lazily."""
+        now = _av_now()
+        with self._lock:
+            wake = self._state["wake_pending"]
+            if wake is None or self._state["turn"] is not None:
+                return
+            self._set_wake(wake.get("task_id"), now)
+            self._state["wake_pending"]["since"] = wake.get("since")
+            self._mark(_LAZY)
         _poke()
 
     def lose_background(self, reason: str, *, task_ids: list[str] | None = None) -> list[dict]:
@@ -1020,18 +1076,43 @@ _FLUSH_STATE = {"poked": False, "thread": None}
 
 def writer(pair: str, backend: str = "claude") -> ActivityWriter:
     """This process's writer for ``pair`` (created on first use, no I/O).
-    Always pass the pair's backend; the latest caller's value wins."""
+    Always pass the pair's backend; the latest caller's value wins. A new
+    writer is flushed at once, so its file exists as soon as the process has
+    anything to do with the pair — readers treat a live task owner with no
+    file as "unknown" (see pair_activity_view)."""
     home = _home_pairs()
     key = (str(home), pair)
+    created = False
     with _WRITERS_LOCK:
         w = _WRITERS.get(key)
         if w is None:
             w = _WRITERS[key] = ActivityWriter(pair, backend, home)
-    if w.backend != backend:
+            created = True
+    if w.backend != backend or created:
         with w._lock:  # noqa: SLF001
             w.backend = w._state["backend"] = backend  # noqa: SLF001
             w._mark(_URGENT)  # noqa: SLF001
+        _poke()
     return w
+
+
+def touch(pair: str) -> None:
+    """Make sure this process has an activity file for ``pair`` — called when
+    a task for it is created (async_tasks.start_task), so even a task that
+    fails before any turn opens leaves its owner visible. Never raises."""
+    try:
+        with _WRITERS_LOCK:
+            if (str(_home_pairs()), pair) in _WRITERS:
+                return
+        backend = "claude"
+        try:
+            from claude_squared.registry import get_pair
+            backend = get_pair(pair).backend or "claude"
+        except Exception:
+            pass
+        writer(pair, backend)
+    except Exception:
+        pass
 
 
 def _writers_snapshot() -> list[ActivityWriter]:
@@ -1092,30 +1173,38 @@ def shutdown(reason: str = "the owning MCP process exited") -> None:
             _BEACONS.discard(key)
 
 
-def forget(pair: str) -> None:
-    """pair_forget: drop this process's writer and files for ``pair``. Other
-    owners' files are theirs (they go when those processes exit/are swept)."""
+def forget(pair: str, reason: str = "the pair was forgotten (pair_forget)") -> None:
+    """pair_forget: retire this process's writer for ``pair``. Its file stays
+    as a tombstone (state "forgotten", swept like an exited owner's) instead
+    of being deleted: a wait.py already following the pair must still see
+    the background work the forget killed and exit 9 (anvil review,
+    2026-09-25). The per-pair meta file goes. Other owners' files are theirs
+    (they go when those processes exit/are swept)."""
     home = _home_pairs()
     with _WRITERS_LOCK:
         w = _WRITERS.pop((str(home), pair), None)
-    paths = [home / "activity" / pair / f"{os.getpid()}.json", home / "activity" / pair / "pair.json"]
     if w is not None:
-        with w._io_lock:  # noqa: SLF001 — no flush may land after the unlink
+        now = _av_now()
+        with w._io_lock:  # noqa: SLF001 — no flush may land after the tombstone
             with w._lock:  # noqa: SLF001
+                st = w._state  # noqa: SLF001
+                if st["turn"] is not None:
+                    w._close_turn_locked(None, "aborted", "", False, now)["note"] = reason  # noqa: SLF001
+                for e in st["background"]:
+                    st["background_lost"].append(dict(e, reason=reason, at=_av_iso(now)))
+                w._cap(st["background_lost"], LIST_CAP)  # noqa: SLF001
+                st.update(background=[], wake_pending=None, state="forgotten",
+                          closed_at=_av_iso(now), closed_reason=reason,
+                          updated_at=_av_iso(now), seq=st["seq"] + 1)
+                text = json.dumps(st, indent=1)
                 w._forgotten = True  # noqa: SLF001
-            for p in paths:
-                try:
-                    p.unlink(missing_ok=True)
-                except OSError:
-                    pass
-    else:
-        for p in paths:
             try:
-                p.unlink(missing_ok=True)
+                _atomic_write(w._path, text)  # noqa: SLF001
             except OSError:
                 pass
     try:
-        (home / "activity" / pair).rmdir()  # only if empty
+        (home / "activity" / pair / "pair.json").unlink(missing_ok=True)
+        (home / "activity" / pair).rmdir()  # only if empty (no tombstone, no other owner)
     except OSError:
         pass
 

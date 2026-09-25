@@ -173,13 +173,33 @@ class WriterTests(ActivityTestCase):
         self.assertIsNotNone(w.turn_closed("t1"))
         self.assertIsNone(w.turn_closed("t1"))
 
-    def test_result_with_no_turn_resolves_a_pending_wake(self):
+    def test_clear_wake_resolves_a_wake_and_never_a_turn(self):
         w = A.writer(self.pair)
         w.expect_wake("init")
+        self.assertIsNone(w.turn_closed(None))  # no turn open: the wake is not its business
         self.assertIsNotNone(w.snapshot()["wake_pending"])
-        self.assertIsNone(w.turn_closed(None))
+        self.assertTrue(w.clear_wake())
         self.assertIsNone(w.snapshot()["wake_pending"])
-        self.assertEqual(w.snapshot()["window_turns"], [])
+        self.assertFalse(w.clear_wake())
+        # A phantom result while a real send is open must not publish that
+        # send as finished (anvil review, 2026-09-25).
+        w.turn_opened("t-send", "send")
+        self.assertFalse(w.clear_wake())
+        snap = w.snapshot()
+        self.assertEqual(snap["turn"]["task_id"], "t-send")
+        self.assertEqual(snap["window_turns"], [])
+
+    def test_refresh_wake_extends_only_an_existing_wake(self):
+        w = A.writer(self.pair)
+        w.refresh_wake()
+        self.assertIsNone(w.snapshot()["wake_pending"])
+        w.background_finished("b1")
+        first = w.snapshot()["wake_pending"]
+        time.sleep(0.01)
+        w.refresh_wake()
+        wake = w.snapshot()["wake_pending"]
+        self.assertEqual((wake["since"], wake["task_id"]), (first["since"], "b1"))
+        self.assertGreater(A._av_parse(wake["until"]), A._av_parse(first["until"]))
 
     def test_context_alert_threshold(self):
         self.assertEqual(A.compaction_point(1_000_000), 970_000)
@@ -299,18 +319,49 @@ class WriterTests(ActivityTestCase):
         self.assertEqual(view["owners"][0]["status"], "exited")
         self.assertEqual(view["background_lost"][0]["task_id"], "b1")
 
-    def test_forget_removes_files_and_never_rewrites_them(self):
+    def test_forget_leaves_a_tombstone_and_never_rewrites_it(self):
         w = A.writer(self.pair)
         w.turn_opened("t1", "send")
+        w.background_started("b1", "local_bash")
         w.note_reported_window(200_000, model_key="haiku|default")
         self.assertTrue(w.flush())
-        self.assertTrue(self.own_file().exists())
+        self.assertTrue((self.pairs / "activity" / self.pair / "pair.json").exists())
         A.forget(self.pair)
+        # The tombstone: a running wait.py must still see what the forget
+        # killed (anvil review, 2026-09-25).
+        data = self.read_own()
+        self.assertEqual(data["state"], "forgotten")
+        self.assertEqual([r["task_id"] for r in data["background_lost"]], ["b1"])
+        self.assertEqual(data["window_turns"][-1]["status"], "aborted")
+        self.assertIsNone(data["turn"])
+        self.assertFalse((self.pairs / "activity" / self.pair / "pair.json").exists())
+        seq = data["seq"]
         w.turn_closed("t1")  # a straggling reader-thread event after forget
+        w.background_started("b2")
         time.sleep(0.3)
-        self.assertFalse(self.own_file().exists())
-        self.assertFalse((self.pairs / "activity" / self.pair).exists())
+        self.assertEqual(self.read_own()["seq"], seq)
+        view = self.view()
+        self.assertNotEqual(view["verdict"], "busy")
+        self.assertEqual(view["owners"][0]["status"], "forgotten")
+        self.assertEqual([b["task_id"] for b in view["losses"]], ["b1"])
         self.assertIsNot(A.writer(self.pair), w)
+        # A pair forgotten with no writer here leaves no directory behind.
+        A.forget(self.pair + "-none")
+        self.assertFalse((self.pairs / "activity" / (self.pair + "-none")).exists())
+
+    def test_losses_survive_a_new_window(self):
+        # pair_compact(force=True): evict (loss) THEN open the compact's window.
+        w = A.writer(self.pair)
+        w.background_started("b1", "local_bash")
+        w.lose_background("pair_compact(force=True) replaced the runtime")
+        time.sleep(0.01)
+        w.turn_opened("c1", "compact")
+        snap = w.snapshot()
+        self.assertEqual([r["task_id"] for r in snap["background_lost"]], ["b1"])
+        self.assertTrue(w.flush())
+        view = self.view()
+        self.assertEqual(view["background_lost"], [])  # the window list: since the compact
+        self.assertEqual([r["task_id"] for r in view["losses"]], ["b1"])  # unfiltered
 
 
 class FlushTests(ActivityTestCase):
@@ -474,8 +525,25 @@ class ViewTests(ActivityTestCase):
         view = self.view()
         self.assertEqual(view["verdict"], "unknown")
         self.assertIn(f"activity unknown for PID {self.live.pid}", view["reasons"][0])
-        self.beacon(self.live.pid, self.live_started)  # a 0.16 process with no activity here
+        self.assertIn("pre-0.16", view["reasons"][0])
+        self.assertIsNotNone(view["quiet_for_s"])
+
+    def test_beacon_without_a_pair_file_is_unknown_not_idle(self):
+        # A beacon proves the capability, not this pair's visibility: an
+        # owner whose first write here failed must not read as idle while
+        # its background may be out (anvil review, 2026-09-25).
+        self.task(owner_pid=self.live.pid, finished=A._av_now())
+        self.beacon(self.live.pid, self.live_started)
+        view = self.view()
+        self.assertEqual(view["verdict"], "unknown")
+        self.assertIn("no activity file for this pair", view["reasons"][0])
+        self.foreign(self.live.pid, owner_started_at=self.live_started)
         self.assertIn(self.view()["verdict"], ("idle", "settling"))
+
+    def test_a_new_writer_writes_its_file_at_once(self):
+        A.touch(self.pair)
+        self.assertTrue(self.wait_for(lambda: self.own_file().exists()))
+        self.assertEqual(self.read_own()["state"], "live")
 
     def test_old_or_dead_task_owners_are_not_unknown(self):
         old = A._av_now() - timedelta(hours=30)
@@ -545,15 +613,21 @@ class ViewTests(ActivityTestCase):
         self.assertEqual(later["verdict"], "idle")
         self.assertGreaterEqual(later["quiet_for_s"], 5.0)
 
-    def test_expired_wake_counts_as_quiet_from_its_deadline(self):
+    def test_expired_wake_is_unknown_not_idle_for_a_while(self):
+        # Inference can still be before the self-woken turn's first event
+        # when the deadline passes (anvil review, 2026-09-25).
         w = A.writer(self.pair)
         w.background_finished("b1")
         self.assertTrue(w.flush())
         now = A._av_now()
         self.assertEqual(self.view(now=now)["verdict"], "busy")
         until = A._av_parse(w.snapshot()["wake_pending"]["until"])
-        self.assertEqual(self.view(now=until + timedelta(seconds=1))["verdict"], "settling")
-        self.assertEqual(self.view(now=until + timedelta(seconds=10))["verdict"], "idle")
+        view = self.view(now=until + timedelta(seconds=1))
+        self.assertEqual(view["verdict"], "unknown")
+        self.assertIn("never started", view["reasons"][0])
+        self.assertEqual(view["quiet_since"], A._av_iso(until))
+        stale = until + timedelta(seconds=A._AV_WAKE_STALE_S + 1)
+        self.assertEqual(self.view(now=stale)["verdict"], "idle")
 
     def test_unreadable_or_newer_schema_is_unknown(self):
         path = self.pairs / "activity" / self.pair / f"{self.live.pid}.json"

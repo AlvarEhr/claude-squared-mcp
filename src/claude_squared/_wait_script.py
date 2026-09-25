@@ -61,6 +61,9 @@ Exit codes:
        pair_poll collects the result)
     8  context alert (see above)
     9  background work lost (killed while the watcher ran)
+   10  idle as far as can be seen, but part of the pair is invisible (a
+       pre-0.16 MCP process, an unreadable activity file, or a wake-up that
+       never started) — check pair_status before relying on it
    64  usage error
 Exit 1 with EMPTY output means the watcher process itself was killed.
 """
@@ -168,13 +171,6 @@ def _headroom():
     return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
 
 
-def _pid_alive(pid) -> bool:
-    """Biased toward alive on uncertainty (never abandon a healthy task).
-    Asks the exit code too: an exited process whose handle is still held
-    elsewhere used to read as alive (fixed v0.16.0)."""
-    return _av_proc(pid)[0] is not False
-
-
 def _hms(iso) -> str:
     dt = _av_parse(iso)
     return dt.astimezone().strftime("%H:%M:%S") if dt else "?"
@@ -244,8 +240,8 @@ def _alert_message(pair, used, window, level, rearm_base):
     if point:
         lines.append(f"  Auto-compaction fires near {point:,} ({max(0, point - used):,} tokens away) — "
                      f"mid-turn, with a generic summary.")
-    lines.append(f"  To compact cleanly: pair_stop('{pair}') → pair_compact('{pair}', steering_prompt=...) "
-                 f"→ pair_send('{pair}', 'continue').")
+    lines.append(f"  To compact cleanly: pair_stop('{pair}') -> pair_compact('{pair}', steering_prompt=...) "
+                 f"-> pair_send('{pair}', 'continue').")
     lines.append(f"  Keep watching:  {_cmd(*rearm_base, '--context-alert', str(nxt))}")
     lines.append(f"  or without the alert:  {_cmd(*rearm_base, '--no-context-alert')}")
     return "\n".join(lines)
@@ -272,13 +268,20 @@ def _task_exit(data) -> int | None:
 
 def _dead_owner_exit(data, now) -> int | None:
     """A running task whose owner MCP process died. None = keep waiting
-    (a detached Codex turn still runs), else the exit code."""
+    (a detached Codex turn still runs), else the exit code. Same identity
+    rules as the activity view: the owner can't have been created after its
+    task started (PID reuse); the child is judged by its OWN recorded
+    creation time — it is spawned after the task starts, minutes later when
+    queued (anvil review, 2026-09-25)."""
     owner = data.get("owner_pid")
-    if not (isinstance(owner, int) and owner > 0) or _pid_alive(owner):
+    if not (isinstance(owner, int) and owner > 0):
         return None
     started = _av_parse(data.get("started_at"))
+    if _av_task_owner_alive(owner, started):
+        return None
     child = data.get("child_pid")
-    if isinstance(child, int) and child > 0 and _av_task_owner_alive(child, started):
+    if (isinstance(child, int) and child > 0
+            and _av_owner_alive(child, data.get("child_started_at"))):
         return None
     events = data.get("events_path")
     if _av_events_active(events, now):
@@ -351,9 +354,12 @@ def _turn_line(t) -> str:
 
 
 def _summary(pair, view, observed, t0_wall, started_iso, mode) -> str:
+    # The view's copy of a turn is the fresher one (a triage verdict lands
+    # on it after the turn closed); observed keeps turns a newer window has
+    # since cleared from the view.
     turns = dict((_turn_key(t), t) for t in observed)
     for t in view.get("window_turns") or []:
-        turns.setdefault(_turn_key(t), t)
+        turns[_turn_key(t)] = t
     turns = sorted(turns.values(), key=lambda t: str(t.get("ended_at") or t.get("started_at") or ""))
     sends = [t for t in turns if t.get("kind") != "self_woken"]
     woken = [t for t in turns if t.get("kind") == "self_woken"]
@@ -407,6 +413,18 @@ def _summary(pair, view, observed, t0_wall, started_iso, mode) -> str:
     return "\n".join(out)
 
 
+def _quiet(view) -> bool:
+    """Nothing left to follow: "idle", or "unknown" once it has been quiet
+    as long as idle must be (a just-created owner's file can lag its task)."""
+    if view.get("running_tasks"):
+        return False
+    verdict = view.get("verdict")
+    if verdict == "idle":
+        return True
+    quiet_for = view.get("quiet_for_s")
+    return verdict == "unknown" and (quiet_for is None or quiet_for >= PAIR_GRACE_S)
+
+
 def _idle_exit(pair, turns) -> int:
     """Exit code once the pair is idle: the outcome of whichever is newer —
     the latest task (it may have failed before any turn opened) or the last
@@ -424,6 +442,36 @@ def _idle_exit(pair, turns) -> int:
     return _turn_exit(last.get("status"))
 
 
+def _lost_key(b):
+    return (b.get("pid"), b.get("task_id"), b.get("at"))
+
+
+def _observe(view, seen, observed, started) -> list:
+    """Record the turns in ``view``; returns those that ended while we watch
+    and weren't seen before. A turn seen again is refreshed in place — its
+    triage verdict can land after it closed."""
+    new_turns = []
+    for t in view.get("window_turns") or []:
+        key = _turn_key(t)
+        if key in seen:
+            seen[key].clear()
+            seen[key].update(t)
+            continue
+        seen[key] = t
+        ended = _av_parse(t.get("ended_at"))
+        if ended is not None and ended >= started:
+            observed.append(t)
+            new_turns.append(t)
+    return new_turns
+
+
+def _forgotten(pair, view) -> bool:
+    """pair_forget left only tombstones: no registry entry, no live owner."""
+    owners = view.get("owners") or []
+    return (_registry_pair(pair) is None and any(o.get("status") == "forgotten" for o in owners)
+            and not any(o.get("status") == "live" for o in owners))
+
+
 def wait_pair(pair: str, each_turn: bool, timeout_s: float, poll_s: float, alert: Alert,
               extra: list) -> int:
     t0_wall = time.time()
@@ -433,7 +481,11 @@ def wait_pair(pair: str, each_turn: bool, timeout_s: float, poll_s: float, alert
     cache: dict = {}
     seen: dict = {}
     observed: list = []
-    lost_seen: set = set()
+    # Losses on file when we start are old news; any other that appears is
+    # fresh — whatever its timestamp (a dead owner's synthesized loss
+    # carries its last write time, a forced compact's lands before the
+    # window it opens).
+    lost_seen = None
     base = [pair] + extra
     while True:
         now = _av_now()
@@ -441,16 +493,7 @@ def wait_pair(pair: str, each_turn: bool, timeout_s: float, poll_s: float, alert
                                   task_cache=cache)
         # Turns that ended while we watch (the window list is cleared by a new
         # send, so remember them).
-        new_turns = []
-        for t in view.get("window_turns") or []:
-            key = _turn_key(t)
-            if key in seen:
-                continue
-            seen[key] = t
-            ended = _av_parse(t.get("ended_at"))
-            if ended is not None and ended >= started:
-                observed.append(t)
-                new_turns.append(t)
+        new_turns = _observe(view, seen, observed, started)
         hit = alert.check(view.get("context"), view.get("reported_window"))
         if hit:
             print(_alert_message(pair, *hit, base))
@@ -462,12 +505,14 @@ def wait_pair(pair: str, each_turn: bool, timeout_s: float, poll_s: float, alert
                 if code is not None:
                     print(_summary(pair, view, observed, t0_wall, started_iso, "stopped being watched"))
                     return code
-        fresh_lost = [b for b in view.get("background_lost") or []
-                      if (_av_parse(b.get("at")) or started) >= started
-                      and (b.get("pid"), b.get("task_id"), b.get("at")) not in lost_seen]
+        losses = view.get("losses") or []
+        if lost_seen is None:
+            lost_seen = set(_lost_key(b) for b in losses
+                            if (_av_parse(b.get("at")) or started) < started)
+        fresh_lost = [b for b in losses if _lost_key(b) not in lost_seen]
         if fresh_lost:
             for b in fresh_lost:
-                lost_seen.add((b.get("pid"), b.get("task_id"), b.get("at")))
+                lost_seen.add(_lost_key(b))
             print("BACKGROUND LOST: " + "; ".join(
                 f"{b.get('kind')} {str(b.get('task_id'))[:10]} — {b.get('reason')}" for b in fresh_lost),
                 file=sys.stderr)
@@ -475,6 +520,9 @@ def wait_pair(pair: str, each_turn: bool, timeout_s: float, poll_s: float, alert
                   "re-send if it is still needed.", file=sys.stderr)
             print(_summary(pair, view, observed, t0_wall, started_iso, "lost background work"))
             return 9
+        if _forgotten(pair, view):
+            print(f"pair '{pair}' was forgotten (pair_forget) while being watched", file=sys.stderr)
+            return 2
         if each_turn and new_turns:
             t = new_turns[-1]
             print(f"turn ended ({'self-woken' if t.get('kind') == 'self_woken' else t.get('kind')}, "
@@ -485,29 +533,52 @@ def wait_pair(pair: str, each_turn: bool, timeout_s: float, poll_s: float, alert
             if t.get("task_id"):
                 print(f"  full reply: pair_poll('{t['task_id']}', with_turn_log=True)")
             return _turn_exit(t.get("status"))
-        verdict = view.get("verdict")
-        if verdict in ("idle", "unknown") and not (view.get("running_tasks") or []):
+        if _quiet(view):
             pend = time.monotonic() + TRIAGE_WAIT_S
             while any(isinstance(t.get("triage"), dict) and t["triage"].get("state") == "pending"
                       for t in (view.get("window_turns") or [])) and time.monotonic() < pend:
                 time.sleep(1.0)
                 view = pair_activity_view(_pairs_dir(), pair, grace_seconds=PAIR_GRACE_S,
                                           task_cache=cache)
-            if verdict == "unknown":
-                for r in view.get("reasons") or []:
-                    print(f"note: {r}", file=sys.stderr)
-            print(_summary(pair, view, observed, t0_wall, started_iso,
-                           "idle" if verdict == "idle" else "idle as far as can be seen"))
-            return _idle_exit(pair, list(seen.values()))
+                _observe(view, seen, observed, started)
+                if not _quiet(view):
+                    break
+            # Revalidate: new work may have started during the triage wait
+            # (anvil review, 2026-09-25) — then keep following the pair.
+            if _quiet(view):
+                verdict = view.get("verdict")
+                if verdict == "unknown":
+                    for r in view.get("reasons") or []:
+                        print(f"note: {r}", file=sys.stderr)
+                    print(_summary(pair, view, observed, t0_wall, started_iso,
+                                   "idle as far as can be seen (part of it is invisible)"))
+                    return 10
+                print(_summary(pair, view, observed, t0_wall, started_iso, "idle"))
+                return _idle_exit(pair, list(seen.values()))
+            continue
         if time.monotonic() >= deadline:
-            why = "; ".join((view.get("reasons") or [])[:3]) or verdict
+            why = "; ".join((view.get("reasons") or [])[:3]) or str(view.get("verdict"))
             print(f"watcher gave up after {_dur(timeout_s)}; pair '{pair}' is still working "
                   f"({why}). Re-arm:\n  {_cmd(pair, *extra)}", file=sys.stderr)
             return 3
         time.sleep(poll_s)
 
 
+def _utf8_output() -> None:
+    """Redirected output on Windows defaults to the ANSI code page (cp1252),
+    and a model's reply preview or a note can hold characters it can't
+    encode: the print raised UnicodeEncodeError and the watcher died with
+    exit 1 instead of its real code (anvil review, 2026-09-25). UTF-8 with
+    replacement never raises (not even on a lone surrogate from JSON)."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def main(argv: list[str]) -> int:
+    _utf8_output()
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__, file=sys.stderr)
         return 64
