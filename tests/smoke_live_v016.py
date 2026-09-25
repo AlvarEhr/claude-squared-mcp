@@ -103,7 +103,10 @@ def call(fn, *a, **kw) -> str:
 # 2026-09-25: at "auto" the CLI asked for approval of a backgrounded
 # powershell in a temp cwd (denied headless) — pre-approve exactly this shape.
 if os.name == "nt":
-    ALLOWED = ["Bash(powershell -NoProfile -Command *)"]
+    # Haiku sometimes picks the PowerShell TOOL for these despite the prompt
+    # (run 2026-09-25: auto mode then refused the unapproved call); the
+    # workspace is a throwaway temp dir, so approve that tool outright.
+    ALLOWED = ["Bash(powershell -NoProfile -Command *)", "PowerShell"]
 
     def bg_cmd(tag: str, secs: int) -> str:
         return (f"powershell -NoProfile -Command \"'s' | Out-File started-{tag}.txt; "
@@ -284,10 +287,12 @@ try:
         check("live context recorded for the pair", used0 > 0 and window > 0, json.dumps(ctx))
         if used0 and window:
             pct = math.ceil((used0 + 4000) * 1000 / window) / 10.0  # 4k tokens above the fill now
-            w8 = watch(PAIR_IDLE, "--context-alert", str(pct), "--poll", "0.5", "--timeout", "240")
-            time.sleep(2.0)  # the watcher's first observation = the fill at start
+            # Send FIRST: a watcher started while the pair is idle correctly
+            # returns idle at once (first run, 2026-09-25). Its first
+            # observation (the turn just opened) is the fill it measures from.
             tid = send_async(PAIR_IDLE, "Use the Read tool on big.txt with NO offset and NO limit (the "
                                         "whole file), then reply with exactly its last line and nothing else.")
+            w8 = watch(PAIR_IDLE, "--context-alert", str(pct), "--poll", "0.5", "--timeout", "240")
             code8, out8, err8, _t = done_watching(w8, 150)
             check("exit 8 on the crossing", code8 == 8, f"code={code8} out={out8} err={err8}")
             check("the alert gives the numbers + the clean-compaction recipe",
