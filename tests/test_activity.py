@@ -505,6 +505,21 @@ class ViewTests(ActivityTestCase):
         view = self.view()
         self.assertEqual((view["verdict"], view["running_tasks"][0]["state"]), ("busy", "detached"))
 
+    def test_detached_child_is_judged_by_its_own_creation_time(self):
+        # A queued Codex task spawns its child long after the task started;
+        # the owner rule ("created after the task = PID reuse") must not
+        # declare that live child gone (integration fix, 2026-09-25).
+        tid = self.task(owner_pid=self.dead.pid, status="running", child_pid=self.live.pid,
+                        child_started_at=self.live_started,
+                        started=datetime.fromtimestamp(self.live_started - 600, timezone.utc))
+        view = self.view()
+        self.assertEqual((view["verdict"], view["running_tasks"][0]["state"]), ("busy", "detached"))
+        os.remove(self.pairs / "async" / f"{tid}.json")
+        # A recorded creation time that doesn't match = the PID was reused.
+        self.task(owner_pid=self.dead.pid, status="running", child_pid=self.live.pid,
+                  child_started_at=self.live_started - 3600)
+        self.assertNotEqual(self.view()["running_tasks"][0]["state"], "detached")
+
     def test_detach_contract_states(self):
         events = self.home / "run.events.jsonl"
         events.write_text("{}\n", encoding="utf-8")

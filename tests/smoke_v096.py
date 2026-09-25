@@ -54,8 +54,10 @@ def _write_task(task_id, pair_name, status, started_at, owner_pid=None):
 def test_latest_task_resolver():
     print("=== latest_task_id_for_pair picks max started_at ===")
     _write_task("taskold", "pr", "done", datetime(2026, 1, 1, 10, 0, 0))
-    _write_task("tasknew", "pr", "running", datetime(2026, 1, 1, 12, 0, 0))
-    _write_task("taskother", "otherpair", "running", datetime(2026, 1, 1, 13, 0, 0))
+    # Running tasks must start after their owner process: orphan supervision
+    # now detects recycled PIDs whose creation time is newer than the task.
+    _write_task("tasknew", "pr", "running", datetime.utcnow())
+    _write_task("taskother", "otherpair", "running", datetime.utcnow())
     assert_eq(latest_task_id_for_pair("pr"), "tasknew", "latest task for 'pr' is t-new")
     assert_eq(latest_task_id_for_pair("otherpair"), "taskother", "other pair unaffected")
     assert_eq(latest_task_id_for_pair("nonexistent"), None, "no tasks → None")
