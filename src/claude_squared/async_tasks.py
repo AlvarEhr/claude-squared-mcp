@@ -27,10 +27,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from filelock import FileLock
+from filelock import FileLock, Timeout as FileLockTimeout
 
 from claude_squared.models import AsyncTaskState, SendResult
-from claude_squared.errors import TaskStopped
+from claude_squared.errors import PairError, TaskStopped
 from claude_squared.registry import async_dir
 
 
@@ -84,13 +84,26 @@ def _is_pid_alive(pid: int) -> bool:
     if sys.platform == "win32":
         try:
             import ctypes
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            handle = ctypes.windll.kernel32.OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
-            )
+            from ctypes import wintypes
+
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel.OpenProcess.restype = wintypes.HANDLE
+            kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            kernel.WaitForSingleObject.restype = wintypes.DWORD
+            kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel.CloseHandle.restype = wintypes.BOOL
+            # 2026-09-25: OpenProcess succeeds on an EXITED process while a
+            # Popen/observer still holds its handle. Test the signaled state,
+            # not object existence; HANDLE types also avoid 64-bit truncation.
+            SYNCHRONIZE = 0x00100000
+            WAIT_TIMEOUT = 258
+            handle = kernel.OpenProcess(SYNCHRONIZE, False, pid)
             if handle:
-                ctypes.windll.kernel32.CloseHandle(handle)
-                return True
+                try:
+                    return kernel.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+                finally:
+                    kernel.CloseHandle(handle)
             return False
         except Exception:
             return False
@@ -158,6 +171,67 @@ _ORPHAN_MESSAGE = (
 )
 
 
+def _orphan_message(state: AsyncTaskState) -> str:
+    from claude_squared import registry
+    try:
+        backend = registry.get_pair(state.pair_name).backend
+    except Exception:
+        backend = "codex" if state.events_path else None
+    if backend == "claude":
+        return _ORPHAN_MESSAGE
+    return (ORPHAN_ERROR_PREFIX + "the owning MCP server died mid-turn. "
+            + ("No completed Codex turn could be recovered. Older PIPE-backed Codex "
+               "children die at their next event write after owner death. "
+               if backend == "codex" else "The backend's completion is unknown. ")
+            + "Inspect pair_transcript and your git/file state before resuming; "
+            "partial work may have landed.")
+
+
+# An advancing file is additional evidence when PID queries fail. A recent
+# mtime grants a short grace on first observation; silence alone never defeats
+# a live PID (Astra high+ can reason silently for minutes, 2026-09-19).
+_event_observations: dict[str, tuple[int, float]] = {}
+
+
+def codex_child_alive(state: AsyncTaskState) -> bool:
+    if state.child_pid and _is_pid_alive(state.child_pid):
+        return True
+    if not state.events_path:
+        return False
+    try:
+        stat = Path(state.events_path).stat()
+    except OSError:
+        return False
+    now = time.monotonic()
+    previous = _event_observations.get(state.events_path)
+    if previous is None:
+        advanced = now if time.time() - stat.st_mtime < 2 else now - 3
+    else:
+        advanced = now if stat.st_mtime_ns != previous[0] else previous[1]
+    _event_observations[state.events_path] = (stat.st_mtime_ns, advanced)
+    return now - advanced < 2
+
+
+def is_detached(state: AsyncTaskState) -> bool:
+    return bool(state.status == "running" and state.events_path and state.owner_pid
+                and not _is_pid_alive(state.owner_pid))
+
+
+def mark_codex_child(task_id: str | None, child_pid: int, events_path: str) -> None:
+    """Publish immediately after spawn; mutate the worker's local object too."""
+    if task_id is None:
+        return
+    with _states_guard:
+        state = _local_states.get(task_id)
+    state = state or load_task(task_id)
+    if state is None or state.status != "running":
+        raise TaskStopped("task disappeared before Codex child publication")
+    with control_lock(state.pair_name):
+        state.child_pid = child_pid
+        state.events_path = events_path
+        _save(state)
+
+
 def _task_path(task_id: str) -> Path:
     return async_dir() / f"{task_id}.json"
 
@@ -204,41 +278,76 @@ def load_task(task_id: str) -> AsyncTaskState | None:
     return AsyncTaskState.model_validate_json(p.read_text(encoding="utf-8"))
 
 
-def reap_orphan(task_id: str) -> AsyncTaskState | None:
-    """Finalize a task whose owning MCP server process has died, the moment we
-    observe it — instead of waiting for the next server's startup sweep.
+def reap_orphan(task_id: str, *, pair_locked: bool = False,
+                legacy: bool = False) -> AsyncTaskState | None:
+    """Recover before declaring an orphan. Observation NEVER waits for a send.
 
-    Returns the (possibly-updated) state, or None if the task is unknown.
-
-    Only flips a task whose ``status == "running"`` AND whose ``owner_pid`` is a
-    real PID that is no longer alive — i.e. a genuine orphan. A task owned by a
-    still-live server (this one or another coexisting MCP process) is left
-    untouched, so this is safe to call from any observation path (pair_poll). A
-    legacy task with no owner_pid is left for the startup sweep (we can't safely
-    distinguish "old orphan" from "just-created" without the PID at runtime).
-
-    Atomic write + event fire so an in-process ``wait_for_task`` wakes immediately.
-    Idempotent across processes: concurrent reaps write identical content.
+    Recovery appends logs and changes registry totals, so it is not an
+    idempotent blind write. The pair's OS file lock excludes both local and
+    foreign _PairLock holders (they acquire it before their thread lock).
+    Re-read and compare state under that lock. Sends already holding it pass
+    pair_locked=True; never call that form under the stop/control lock.
     """
+    from claude_squared import registry
+
     state = load_task(task_id)
-    if state is None:
-        return None
-    if state.status != "running":
+    if state is None or state.status != "running":
         return state
-    pid = state.owner_pid
-    if pid is None or pid <= 0 or _is_pid_alive(int(pid)):
-        return state  # no PID to judge, or owner still alive → not an orphan
-    # Owner is confirmed dead → finalize as an orphan.
-    state.status = "failed"
-    state.error = _ORPHAN_MESSAGE
-    state.finished_at = datetime.utcnow()
-    _save(state)
-    with _task_events_lock:
-        ev = _task_events.get(task_id)
-    if ev is not None:
-        ev.set()
-    _clear_stopped(task_id)  # drop a <task>.cancel the dead owner never consumed
+    if state.owner_pid and _is_pid_alive(state.owner_pid):
+        return state
+    if not state.owner_pid and not legacy:
+        return state
+    if state.events_path and not pair_locked:
+        path = registry.pairs_dir() / "locks" / f"{state.pair_name}.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with FileLock(str(path), timeout=0):
+                return reap_orphan(task_id, pair_locked=True, legacy=legacy)
+        except FileLockTimeout:
+            return state
+    # The recursive call re-read the task after acquiring the lock. No other
+    # recovery or send can pass this point for the pair until we release it.
+    if state.events_path:
+        if codex_child_alive(state):
+            return state
+        from claude_squared.adapters.codex import recover_turn
+        try:
+            result = recover_turn(state)
+        except (OSError, ValueError, KeyError, PairError) as exc:
+            # Preserve recoverable work on a transient receipt/log/store error.
+            logger.warning("Codex recovery deferred for %s: %s", task_id, exc)
+            return state
+        if result is not None:
+            state.result = result
+            state.status = "done"
+            state.error = None
+            state.recovered_at = datetime.utcnow()
+            state.recovered_by_pid = os.getpid()
+    if state.status == "running":
+        state.status = "stopped" if _was_stopped(task_id) else "failed"
+        state.error = "stopped by pair_stop" if state.status == "stopped" else _orphan_message(state)
+    state.child_pid = None
+    _finish_task(state, _get_or_create_event(task_id))
     return state
+
+
+def wait_for_detached(pair_name: str, should_stop: Callable[[], bool] | None = None,
+                      task_id: str | None = None) -> None:
+    """Called with the pair lock held, BEFORE promoting the successor send."""
+    while True:
+        waiting = False
+        if should_stop and should_stop():
+            raise TaskStopped("stopped while waiting for a detached Codex turn")
+        for tid in list_running_task_ids_for_pair(pair_name):
+            if tid == task_id:
+                continue
+            state = load_task(tid)
+            if state and is_detached(state):
+                state = reap_orphan(tid, pair_locked=True)
+                waiting |= bool(state and state.status == "running")
+        if not waiting:
+            return
+        time.sleep(0.2)
 
 
 # In-memory task-completion events for fast in-process wakeup. These are an
@@ -329,6 +438,7 @@ def mark_task_executing(task_id: str | None) -> None:
 
 def _finish_task(state: AsyncTaskState, event: threading.Event) -> None:
     """Finalize without reading metadata back from disk, and always wake waiters."""
+    state.child_pid = None
     state.finished_at = datetime.utcnow()
     try:
         _save(state)
@@ -726,6 +836,15 @@ def _sweep_running_tasks(predicate: Callable[[dict], bool], message: str) -> Non
                 if data.get("status") != "running":
                     continue
                 if not predicate(data):
+                    continue
+                # A file-backed exec is deliberately allowed to outlive this
+                # process. Startup/observation performs recovery after death.
+                if data.get("events_path"):
+                    if data.get("owner_pid") != os.getpid():
+                        reap_orphan(data["task_id"], legacy=True)
+                    continue
+                if message == _ORPHAN_MESSAGE:
+                    reap_orphan(data["task_id"], legacy=True)
                     continue
                 data["status"] = "failed"
                 data["error"] = message

@@ -2,7 +2,7 @@
 
 Phase 1 = one-shot subprocess per turn (no warm runtime, no self-woken
 machinery): every send is ``codex exec --json … resume <thread-id> <message>``
-with stdin CLOSED (exec blocks on an open stdin even with a prompt argument),
+with stdin at EOF (exec blocks on an open pipe even with a prompt argument),
 options BEFORE the subcommand, and ``--skip-git-repo-check -C <cwd>`` on every
 call. Model + effort + sandbox are per-invocation in Codex (never inherited
 from the thread), so they are re-passed every time — same discipline as
@@ -148,6 +148,107 @@ def stop_inflight(name: str) -> str | None:
     if proc is None:
         return None
     return _tree_kill(proc)
+
+
+def stop_detached(state) -> str | None:
+    """Stop exactly a persisted detached child, never the former owner PID.
+
+    Caller holds the control lock, so task selection and cancellation agree.
+    Do not acquire the pair lock here: sends take pair -> control.
+    """
+    from claude_squared import async_tasks
+
+    current = async_tasks.load_task(state.task_id)
+    if (current is None or not async_tasks.is_detached(current)
+            or current.child_pid != state.child_pid or not current.child_pid
+            or not async_tasks._is_pid_alive(current.child_pid)):
+        return None
+    pid = current.child_pid
+    try:
+        if os.name == "nt":
+            result = subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                                    capture_output=True, timeout=10, check=False,
+                                    creationflags=subprocess.CREATE_NO_WINDOW)
+            return "tree-killed" if result.returncode == 0 else "kill-failed"
+        import signal
+        os.killpg(pid, signal.SIGKILL)  # exec starts its own session/process group
+        return "tree-killed"
+    except ProcessLookupError:
+        return "already-exited"
+    except (OSError, subprocess.TimeoutExpired):
+        return "kill-failed"
+
+
+def recover_turn(state) -> SendResult | None:
+    """Collect an exited exec under the pair lock; reuse the live result builder."""
+    from claude_squared import codex_turns
+
+    events_path = Path(state.events_path)
+    try:
+        with open(events_path, "rb") as stream:
+            lines = list(codex_turns.complete_lines(stream))
+    except FileNotFoundError:
+        return None
+    events = []
+    offsets = []
+    for offset, line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+            offsets.append(offset)
+    completed = any(e.get("type") == "turn.completed" for e in events)
+    failed = any(e.get("type") == "turn.failed" for e in events)
+    # A store conflict can fail before turn.started/turn.failed. Preserve it
+    # as a work error instead of disguising it as supervision loss.
+    conflict = any(e.get("type") == "error" and "thread-store conflict" in str(e.get("message", "")).lower()
+                   for e in events)
+    stderr_path = events_path.parent / events_path.name.replace(".events.jsonl", ".stderr.log")
+    stderr = stderr_path.read_text(encoding="utf-8", errors="replace") if stderr_path.exists() else ""
+    conflict |= "thread-store conflict" in stderr.lower()
+    if not completed and not failed and not conflict:
+        return None
+    receipt = codex_turns.read_receipt(events_path)
+    spec = PairSpec.model_validate(receipt["spec"])
+    adapter = CodexAdapter()
+    codex_turns.finish_pending_log(events_path, receipt)
+    result_data = receipt.get("recovery_result")
+    if result_data:
+        result = SendResult.model_validate(result_data)
+    else:
+        log_dir = logs_dir() / spec.name
+        main_log = Path(receipt["log_path"])
+        # Persist the replay scope before appending; a recovering process may
+        # itself die. The append receipt prevents duplicate replay on retry.
+        if "replay_start" not in receipt:
+            receipt["replay_start"] = adapter._count_lines(main_log) + 1
+            codex_turns.save_receipt(events_path, receipt)
+            codex_turns.append_log(events_path, receipt,
+                                  [f"[{datetime.now().strftime('%H:%M:%S')}] === recovered after owner death ==="],
+                                  receipt["logged_offset"])
+        counter = ToolCounter(index_path=log_dir / "main.idx.json")
+        tags: dict[str, str] = {}
+        for offset, event in zip(offsets, events):
+            if offset <= receipt["logged_offset"]:
+                continue
+            output = adapter._format_event(event, counter, tags, detail_dir=log_dir,
+                                            run_id=receipt["run_id"])
+            codex_turns.append_log(events_path, receipt, output, offset)
+        events.append({"type": "_log_scope", "log_path": str(main_log),
+                       "start_line": receipt["replay_start"],
+                       "end_line": adapter._count_lines(main_log)})
+        dur_ms = int(max(0, events_path.stat().st_mtime - receipt["started_epoch"]) * 1000)
+        result = adapter._build_send_result(
+            spec, events, stderr, 0 if completed else 1, dur_ms, receipt["started_epoch"],
+            model_used=receipt["model_used"], permission_level=receipt["permission_level"],
+        )
+        result.notes.append("recovered after owner death")
+        receipt["recovery_result"] = result.model_dump(mode="json")
+        codex_turns.save_receipt(events_path, receipt)
+    codex_turns.bookkeep_send(events_path, result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -863,16 +964,21 @@ class CodexAdapter(PairAdapter):
             raise SessionMissing(spec.name, spec.session_id)
         args = self._exec_args(spec, model=model, effort=effort, permission_mode=permission_mode)
         args += ["resume", spec.session_id, "-"]   # message over stdin (see create)
+        run_spec = spec.model_copy(update={
+            "model": self._model_for(spec, model),
+            "effort": effort if effort is not None else spec.effort,
+            "permission_mode": normalize_permission(permission_mode or spec.permission_mode),
+        })
         started = time.time()
         events, stderr, code, dur_ms = self._run(
-            args, spec, timeout_seconds=timeout_seconds, task_label="send", log=True,
+            args, run_spec, timeout_seconds=timeout_seconds, task_label="send", log=True,
             on_event=on_event, should_stop=should_stop, task_id=task_id,
             stdin_text=message,
         )
         return self._build_send_result(
             spec, events, stderr, code, dur_ms, started,
-            model_used=self._model_for(spec, model),
-            permission_level=normalize_permission(permission_mode or spec.permission_mode),
+            model_used=run_spec.model,
+            permission_level=run_spec.permission_mode,
         )
 
     def fork(self, spec: PairSpec, sentinel: str | None = None, timeout_seconds: int = 300) -> str:
@@ -1180,170 +1286,190 @@ class CodexAdapter(PairAdapter):
              task_id: str | None = None,
              stdin_text: str | None = None,
              ) -> tuple[list[dict], str, int | None, int]:
-        """Spawn codex, stream stdout JSONL, write main.log lines as items
-        arrive, honor should_stop (tree-kill) and the hard timeout (tree-kill +
-        CommandTimeout). stdin is CLOSED (DEVNULL) unless ``stdin_text`` is
-        given, in which case it is written whole and closed immediately (the
-        prompt path — exec proceeds on EOF). Returns (events, stderr, exit
-        code, duration_ms)."""
-        log_dir = logs_dir() / spec.name
-        log_dir.mkdir(parents=True, exist_ok=True)
+        """File-backed exec: parent death must not break the child's next write.
+
+        Verified 2026-09-19: Codex dies writing to orphaned PIPEs; ordinary
+        files survive. Tail complete lines only, without locking/renaming any
+        file inherited by the child. Prompt EOF is supplied by a regular file.
+        """
+        from claude_squared import async_tasks, codex_turns
+
+        log_dir = (logs_dir() / spec.name).resolve()
+        turn_dir = log_dir / "turns"
+        turn_dir.mkdir(parents=True, exist_ok=True)
+        codex_turns.prune_turns(turn_dir)
         main_log = log_dir / "main.log"
         counter = ToolCounter(index_path=log_dir / "main.idx.json") if log else None
-        line_count = self._count_lines(main_log)
-        start_line = line_count + 1
-        # Item ids seen so we can tag completions with the same T-N.
+        start_line = self._count_lines(main_log) + 1
         tags: dict[str, str] = {}
         run_id = task_id or uuid.uuid4().hex
-
-        log_lock = threading.Lock()
-
-        def _log(line: str) -> None:
-            nonlocal line_count
-            if not log:
-                return
-            line = line.replace("\r", "").replace("\n", " / ")  # exactly one physical line
-            try:
-                with log_lock:
-                    with open(main_log, "a", encoding="utf-8") as f:
-                        f.write(line + "\n")
-                    line_count += 1
-            except Exception:
-                pass
-
-        popen_kwargs: dict[str, Any] = {
-            "stdin": subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.PIPE, "cwd": spec.cwd or None,
+        events_path = turn_dir / f"{run_id}.events.jsonl"
+        stderr_path = turn_dir / f"{run_id}.stderr.log"
+        stdin_path = turn_dir / f"{run_id}.stdin.txt"
+        stdin_path.write_bytes((stdin_text or "").encode("utf-8"))
+        started_at = datetime.utcnow()
+        # send passes the effective per-call spec, including overrides. Keep
+        # the result builder's permission level, even with native bo overrides.
+        model_used = args[args.index("-m") + 1] if "-m" in args else self._model_for(spec)
+        permission = normalize_permission(spec.permission_mode)
+        receipt = {
+            "run_id": run_id, "task_id": task_id, "spec": spec.model_dump(mode="json"),
+            "model_used": model_used, "permission_level": permission,
+            "started_epoch": time.time(), "log_path": str(main_log),
+            "logged_offset": 0, "start_line": start_line, "log": log,
         }
+        codex_turns.save_receipt(events_path, receipt)
+
+        log_available = log
+        log_lock = threading.Lock()
+        reader_closed = threading.Event()
+
+        def _log(lines: list[str], offset: int | None = None) -> None:
+            nonlocal log_available
+            with log_lock:
+                if reader_closed.is_set() and threading.current_thread() is reader:
+                    return
+                if log_available:
+                    try:
+                        codex_turns.append_log(events_path, receipt, lines,
+                                               receipt["logged_offset"] if offset is None else offset)
+                    except OSError:
+                        # Logging was best-effort before file-backed exec too.
+                        # Don't kill useful work on a main.log/receipt disk error,
+                        # or overwrite a pending append with the next event. The
+                        # durable checkpoint lets recovery replay the remainder.
+                        log_available = False
+
+        popen_kwargs: dict[str, Any] = {"cwd": spec.cwd or None}
         if os.name == "nt":
-            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
         else:
             popen_kwargs["start_new_session"] = True
         t0 = time.monotonic()
-        started_at = datetime.utcnow()
         try:
-            proc = subprocess.Popen(args, **popen_kwargs)
+            with open(stdin_path, "rb") as inp, open(events_path, "wb") as out, open(stderr_path, "wb") as err:
+                proc = subprocess.Popen(args, stdin=inp, stdout=out, stderr=err, **popen_kwargs)
         except OSError as e:
             raise CLIError(f"could not start codex ({args[0]}): {e}")
-        if stdin_text is not None:
-            # Write the whole prompt and close — from a thread, so a prompt
-            # larger than the pipe buffer can't deadlock against our readers.
-            def _feed() -> None:
-                try:
-                    assert proc.stdin is not None
-                    proc.stdin.write(stdin_text.encode("utf-8"))
-                    proc.stdin.flush()
-                except Exception:
-                    pass
-                finally:
-                    try:
-                        proc.stdin.close()  # type: ignore[union-attr]
-                    except Exception:
-                        pass
-            threading.Thread(target=_feed, daemon=True).start()
+        try:
+            receipt["child_pid"] = proc.pid
+            codex_turns.save_receipt(events_path, receipt)
+            async_tasks.mark_codex_child(task_id, proc.pid, str(events_path))
+        except BaseException:
+            # Never leave an unobservable child if publishing its identity fails.
+            _tree_kill(proc)
+            raise
         with _INFLIGHT_LOCK:
             _INFLIGHT[spec.name] = {"proc": proc, "task_id": task_id, "started_at": started_at,
-                                    "last_activity": started_at, "label": task_label}
-        if log:
-            ts = datetime.now().strftime("%H:%M:%S")
-            _log(f"[{ts}] === CODEX TURN START (pair={spec.name}, model={self._model_for(spec)}, "
-                 f"thread={spec.session_id[:8] if spec.session_id else 'new'}) ===")
+                                    "last_activity": started_at, "label": task_label, "effort": spec.effort}
 
         events: list[dict] = []
         stderr_chunks: list[str] = []
-        q_lock = threading.Lock()
-
-        def _touch() -> None:
-            with _INFLIGHT_LOCK:
-                info = _INFLIGHT.get(spec.name)
-                if info is not None and info.get("proc") is proc:
-                    info["last_activity"] = datetime.utcnow()
+        reader_errors: list[Exception] = []
 
         def _reader() -> None:
-            assert proc.stdout is not None
-            for raw in iter(proc.stdout.readline, b""):
-                try:
-                    line = raw.decode("utf-8", errors="replace").strip()
-                    if not line:
-                        continue
-                    try:
-                        ev = json.loads(line)
-                    except Exception:
-                        continue
-                    with q_lock:
-                        events.append(ev)
-                    _touch()
-                    if log:
-                        for out_line in self._format_event(ev, counter, tags, detail_dir=log_dir, run_id=run_id):
-                            _log(out_line)
-                    if on_event is not None:
-                        try:
-                            on_event(ev)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+            try:
+                with open(events_path, "rb") as stdout, open(stderr_path, "rb") as stderr_file:
+                    while True:
+                        if reader_closed.is_set():
+                            return
+                        # Poll BEFORE draining: once exit is known, this drain
+                        # includes the final writes (no read-EOF/exit race).
+                        exited = proc.poll() is not None
+                        for offset, line in codex_turns.complete_lines(stdout, max_lines=None if exited else 64):
+                            if reader_closed.is_set():
+                                return
+                            try:
+                                ev = json.loads(line)
+                            except (ValueError, TypeError):
+                                continue
+                            if not isinstance(ev, dict):
+                                continue
+                            events.append(ev)
+                            with _INFLIGHT_LOCK:
+                                info = _INFLIGHT.get(spec.name)
+                                if info is not None and info.get("proc") is proc:
+                                    info["last_activity"] = datetime.utcnow()
+                            _log(self._format_event(ev, counter, tags, detail_dir=log_dir,
+                                                    run_id=run_id) if log else [], offset)
+                            if on_event is not None:
+                                try:
+                                    on_event(ev)
+                                except Exception:
+                                    pass
+                        for _, line in codex_turns.complete_lines(stderr_file, max_lines=None if exited else 64):
+                            if "Reading additional input from stdin" in line:
+                                continue
+                            stderr_chunks.append(line)
+                            if _DENIAL_RE.search(line):
+                                ts = datetime.now().strftime("%H:%M:%S")
+                                _log([f"[{ts}] [sandbox/approval DENIED] {line.strip()[:300]}"])
+                        if exited:
+                            # Stderr can end without a newline; JSONL cannot.
+                            stderr_chunks.append(stderr_file.read().decode("utf-8", errors="replace"))
+                            return
+                        time.sleep(0.1)
+            except Exception as exc:
+                reader_errors.append(exc)
 
-        def _err_reader() -> None:
-            assert proc.stderr is not None
-            for raw in iter(proc.stderr.readline, b""):
-                try:
-                    s = raw.decode("utf-8", errors="replace")
-                    if "Reading additional input from stdin" in s:
-                        continue
-                    stderr_chunks.append(s)
-                    if log and _DENIAL_RE.search(s):
-                        ts = datetime.now().strftime("%H:%M:%S")
-                        _log(f"[{ts}] [sandbox/approval DENIED] {s.strip()[:300]}")
-                except Exception:
-                    pass
-
-        rt = threading.Thread(target=_reader, daemon=True)
-        et = threading.Thread(target=_err_reader, daemon=True)
-        rt.start()
-        et.start()
         deadline = (t0 + timeout_seconds) if timeout_seconds else None
         killed_reason: str | None = None
         last_stop_check = 0.0
-        while proc.poll() is None:
-            now = time.monotonic()
-            if should_stop is not None and now - last_stop_check >= 1.0:
-                last_stop_check = now
-                try:
-                    if should_stop():
+        reader = threading.Thread(target=_reader, daemon=True)
+        try:
+            ts = datetime.now().strftime("%H:%M:%S")
+            _log([f"[{ts}] === CODEX TURN START (pair={spec.name}, model={model_used}, "
+                  f"thread={spec.session_id[:8] if spec.session_id else 'new'}) ==="])
+            reader.start()
+            # Keep supervision independent of on_event: a slow consumer must
+            # not delay cancellation or the hard timeout (same as PIPE reader).
+            while proc.poll() is None:
+                now = time.monotonic()
+                if reader_errors:
+                    raise reader_errors[0]
+                if should_stop is not None and now - last_stop_check >= 1.0:
+                    last_stop_check = now
+                    try:
+                        stop = should_stop()
+                    except Exception:
+                        stop = False
+                    if stop:
                         killed_reason = "stopped"
                         _tree_kill(proc)
                         break
-                except Exception:
-                    pass
-            if deadline is not None and now >= deadline:
-                killed_reason = "timeout"
-                _tree_kill(proc)
-                break
-            time.sleep(0.2)
-        rt.join(timeout=5)
-        et.join(timeout=5)
+                if deadline is not None and now >= deadline:
+                    killed_reason = "timeout"
+                    _tree_kill(proc)
+                    break
+                time.sleep(0.2)
+            reader.join(timeout=5)
+            if reader_errors:
+                raise reader_errors[0]
+        except BaseException:
+            _tree_kill(proc)
+            raise
+        finally:
+            # A callback may outlast the bounded join. It must not later
+            # overwrite the receipt after the send's bookkeeping has started.
+            with log_lock:
+                reader_closed.set()
+            with _INFLIGHT_LOCK:
+                if _INFLIGHT.get(spec.name, {}).get("proc") is proc:
+                    _INFLIGHT.pop(spec.name, None)
         code = proc.poll()
-        with _INFLIGHT_LOCK:
-            if _INFLIGHT.get(spec.name, {}).get("proc") is proc:
-                _INFLIGHT.pop(spec.name, None)
         dur_ms = int((time.monotonic() - t0) * 1000)
         stderr = "".join(stderr_chunks)
-        if log:
-            ts = datetime.now().strftime("%H:%M:%S")
-            if killed_reason:
-                _log(f"[{ts}] === TURN {killed_reason.upper()} ({dur_ms}ms) ===")
-            elif not any(e.get("type") in ("turn.completed", "turn.failed") for e in events):
-                _log(f"[{ts}] === TURN ERROR ({dur_ms}ms) exit={code} ===")
+        if killed_reason:
+            _log([f"[{datetime.now().strftime('%H:%M:%S')}] === TURN {killed_reason.upper()} ({dur_ms}ms) ==="])
+        elif not any(e.get("type") in ("turn.completed", "turn.failed") for e in events):
+            _log([f"[{datetime.now().strftime('%H:%M:%S')}] === TURN ERROR ({dur_ms}ms) exit={code} ==="])
         if killed_reason == "timeout":
             raise CommandTimeout(spec.name, int(timeout_seconds or 0))
         if killed_reason == "stopped":
             raise CLIError("turn stopped by pair_stop (codex process tree-killed; the thread "
                            "resumes cleanly on the next send)", stderr=stderr)
-        # Stash the log range on the events list for _build_send_result.
         events.append({"type": "_log_scope", "log_path": str(main_log),
-                       "start_line": start_line, "end_line": line_count})
+                       "start_line": start_line, "end_line": self._count_lines(main_log)})
         return events, stderr, code, dur_ms
 
     @staticmethod
@@ -1443,7 +1569,9 @@ class CodexAdapter(PairAdapter):
         reply = ""
         errors: list[str] = []
         for e in events:
-            if e.get("type") == "item.completed":
+            if e.get("type") == "error":
+                errors.append(str(e.get("message") or ""))
+            elif e.get("type") == "item.completed":
                 it = e.get("item") or {}
                 if it.get("type") == "agent_message":
                     reply = str(it.get("text") or "")

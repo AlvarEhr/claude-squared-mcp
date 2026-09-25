@@ -753,6 +753,13 @@ class AsyncTaskState(BaseModel):
     error: str | None = None
     # PID of the MCP server process that owns this task (orphan supervision).
     owner_pid: int | None = None
+    # Codex exec survives owner death with file-backed stdio (2026-09-19).
+    # Keep the child identity until terminal task persistence, including the
+    # interval after child exit but before the owner's bookkeeping finishes.
+    child_pid: int | None = None
+    events_path: str | None = None
+    recovered_at: datetime | None = None
+    recovered_by_pid: int | None = None
     # Additive metadata: old task files are treated as already executing.
     queued: bool = False
     execution_started_at: datetime | None = None
