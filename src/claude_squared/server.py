@@ -1302,6 +1302,10 @@ def _foreign_self_woken_task_ids(name: str) -> list[str]:
 # v0.16.0: how long a send waits for ANOTHER MCP process's pending background
 # work (and the self-wake it leads to) before failing with a clear message.
 _FOREIGN_BACKGROUND_WAIT_S = 1800.0
+# An expired wake-up or 24 h-stale background is already past its own
+# bound (likely dead): a foreign send gives it a short grace, not the full
+# wait above (main-session review, 2026-09-25).
+_FOREIGN_UNRESOLVED_GRACE_S = 60.0
 
 
 def _foreign_activity_blocker(name: str) -> str | None:
@@ -1314,7 +1318,7 @@ def _foreign_activity_blocker(name: str) -> str | None:
     except Exception:
         return None
     me = os.getpid()
-    bg = [b for b in view.get("background") or [] if b.get("pid") != me]
+    bg = [b for b in view.get("background") or [] if b.get("pid") != me and not b.get("stale")]
     if bg:
         kinds = ", ".join(sorted({str(b.get("kind")) for b in bg}))
         return f"{len(bg)} background task(s) ({kinds}) pending in MCP process {bg[0]['pid']}"
@@ -1328,8 +1332,32 @@ def _foreign_activity_blocker(name: str) -> str | None:
     return None
 
 
+def _foreign_unresolved(name: str) -> str | None:
+    """Work in ANOTHER live MCP process that is past its deadline but was
+    never resolved: a wake-up announced and not started, background with no
+    completion event for 24 h (v0.16.0). No evidence either way — a send
+    waits for it within its bound, then proceeds with a note (anvil
+    re-review, 2026-09-25: a timeout limits waiting, it doesn't establish
+    that the work ended)."""
+    try:
+        view = activity_mod.view(name, grace_seconds=0)
+    except Exception:
+        return None
+    me = os.getpid()
+    wake = [w for w in view.get("wake_stale") or [] if w.get("pid") != me]
+    if wake:
+        return (f"a wake-up MCP process {wake[0]['pid']} announced at {wake[0].get('since')} "
+                f"never started")
+    stale = [b for b in view.get("background") or [] if b.get("pid") != me and b.get("stale")]
+    if stale:
+        return (f"{len(stale)} background task(s) in MCP process {stale[0]['pid']} have had no "
+                f"completion event for 24 h")
+    return None
+
+
 def _wait_for_foreign_self_woken(
     name: str, timeout_s: float | None, should_stop: "Callable[[], bool] | None",
+    notes: list[str] | None = None,
 ) -> float:
     """Cross-process FIFO for self-woken turns (v0.12.0). Returns seconds waited.
 
@@ -1346,10 +1374,14 @@ def _wait_for_foreign_self_woken(
     self-woken phases. Each phase used to have its own, and with no hard
     timeout the self-woken phase had none: a stuck foreign turn held this
     send, and the pair lock with it, indefinitely (anvil review, 2026-09-25).
+    Unresolved foreign work (``_foreign_unresolved``: an expired wake-up or
+    24 h-stale background) gets only ``_FOREIGN_UNRESOLVED_GRACE_S``; then the
+    send proceeds and says so in ``notes``.
     """
     t0 = time.monotonic()
     end = t0 + (_FOREIGN_BACKGROUND_WAIT_S if timeout_s is None
                 else min(float(timeout_s), _FOREIGN_BACKGROUND_WAIT_S))
+    unresolved_end = min(end, t0 + _FOREIGN_UNRESOLVED_GRACE_S)
     while True:
         foreign = _foreign_self_woken_task_ids(name)
         # v0.16.0: ALSO wait while another process's runtime has background
@@ -1357,7 +1389,15 @@ def _wait_for_foreign_self_woken(
         # above missed it: that process's later self-wake ran on its stale
         # memory and wrote a divergent turn (design rev. D).
         blocker = None if foreign else _foreign_activity_blocker(name)
-        if not foreign and blocker is None:
+        unresolved = None if foreign or blocker else _foreign_unresolved(name)
+        if not foreign and blocker is None and unresolved is None:
+            return time.monotonic() - t0
+        if unresolved is not None and time.monotonic() >= unresolved_end:
+            if notes is not None:
+                notes.append(
+                    f"sent although {unresolved} (waited {time.monotonic() - t0:.0f}s): if that "
+                    f"process's pair still resumes, its turn is written on its own copy of the "
+                    f"history — check pair_transcript('{name}')")
             return time.monotonic() - t0
         if foreign and time.monotonic() >= end:
             raise PairError(
@@ -1409,7 +1449,9 @@ def _background_pending(name: str) -> tuple[list[str], str]:
         kinds = [str(b.get("kind") or "task") for b in view.get("background") or []]
         if kinds:
             return kinds, "activity"
-        if view.get("verdict") != "unknown":
+        # The disk heuristic stands in only for an owner we can't see into
+        # at all (pre-0.16 / no file) — not for a file that merely lags.
+        if not any(r.startswith("activity unknown for PID") for r in view.get("reasons") or []):
             return [], ""
     except Exception:
         pass
@@ -1443,10 +1485,15 @@ def _pending_work_split(name: str) -> tuple[list[dict], list[dict]]:
         view = activity_mod.view(name, grace_seconds=0)
     except Exception:
         view = {}
-    foreign += [b for b in view.get("background") or [] if b.get("pid") != me]
+    foreign += [dict(b, description=f"{b.get('description') or ''} — stale: no completion "
+                                    f"event for 24 h".lstrip(" —")) if b.get("stale") else b
+                for b in view.get("background") or [] if b.get("pid") != me]
     foreign += [{"kind": "wake-up", "task_id": None, "pid": w.get("pid"),
                  "description": "background finished; the pair is about to resume"}
                 for w in view.get("wake_pending") or [] if w.get("pid") != me]
+    foreign += [{"kind": "wake-up", "task_id": None, "pid": w.get("pid"),
+                 "description": f"unconfirmed: announced {w.get('since')}, never started"}
+                for w in view.get("wake_stale") or [] if w.get("pid") != me]
     foreign += [{"kind": "self-woken turn", "task_id": t.get("task_id"), "pid": t.get("pid")}
                 for t in view.get("turns") or []
                 if t.get("pid") != me and t.get("kind") == "self_woken"]
@@ -1548,6 +1595,13 @@ def _activity_status_lines(name: str) -> list[str]:
         out.append(line)
     if view.get("wake_pending"):
         out.append("  wake-up pending: background work finished; the pair should resume shortly")
+    for w in view.get("wake_stale") or []:
+        out.append(f"  ⚠ wake-up announced {w.get('since')} (PID {w.get('pid')}) never started — "
+                   f"unconfirmed; still protected until a turn opens or the runtime ends")
+    stale = [b for b in view.get("background") or [] if b.get("stale")]
+    if stale:
+        out.append(f"  ⚠ stale background (no completion event for 24 h; may have finished unseen): "
+                   f"{_describe_background(stale)}")
     lost = view.get("background_lost") or []
     if lost:
         out.append(f"  ⚠ background lost since the last send: {_describe_background(lost)} — "
@@ -1620,7 +1674,8 @@ def _build_send_runner(
             # in ANOTHER MCP process doesn't hold this pair's lock (no send
             # behind it), so without this we'd spawn our own claude on a JSONL
             # that process is mid-writing. Its on-disk task is the signal.
-            _wait_for_foreign_self_woken(name, hard_timeout_seconds, should_stop)
+            wait_notes: list[str] = []
+            _wait_for_foreign_self_woken(name, hard_timeout_seconds, should_stop, wait_notes)
             adapter = _adapter_for(current)
             # Claude promotes immediately before opening its solicited scope,
             # after any local self-woken turn. Other adapters start here.
@@ -1658,6 +1713,7 @@ def _build_send_runner(
                 if writer is not None:
                     writer.turn_closed(task_id, status="failed")
                 raise
+            result.notes.extend(wait_notes)
             if writer is not None:
                 if result.context is not None:
                     writer.note_context(result.context.tokens_used, result.context.tokens_max,
@@ -4682,6 +4738,10 @@ def pair_compact(
     return _format_async_handle(state.task_id, framing, pair_name=name)
 
 
+class _HardResetSkipped(Exception):
+    """pair_stop(hard=True): foreign work found under the pair lock."""
+
+
 @mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False})
 def pair_stop(
     name: str,
@@ -4845,6 +4905,13 @@ def pair_stop(
         try:
             with _with_pair_lock(name, timeout_s=10.0):
                 _refuse_detached_codex(name)
+                # Re-checked under the lock: foreign work can appear between
+                # the check above and taking it (anvil re-review, 2026-09-25).
+                hard_foreign = _pending_work_split(name)[1]
+                if hard_foreign:
+                    raise _HardResetSkipped(
+                        f"hard reset skipped: work pending in another MCP process "
+                        f"({_describe_background(hard_foreign)}) must first be stopped by its owner")
                 # Tear down any live runtime — soft interrupt left it alive
                 try:
                     hard_lost = runtime_mod.registry().evict(
@@ -4866,6 +4933,8 @@ def pair_stop(
                 actions.append(f"rotated session: {_short(cur_spec.session_id)} → {_short(new_sid)} (hard reset)")
         except FileLockTimeout:
             actions.append("hard rotate skipped: pair is busy in another process")
+        except _HardResetSkipped as skipped:
+            actions.append(str(skipped))
 
     if not actions:
         return f"Pair '{name}': nothing to stop (no live runtime or in-flight tasks)"

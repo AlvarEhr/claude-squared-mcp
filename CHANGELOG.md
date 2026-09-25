@@ -18,8 +18,10 @@ All notable changes to this project are documented here. Format follows
   task. Default timeout 6 h (the timeout message says the pair is still
   working and gives the re-arm command). New exit codes: 7 finished detached
   (Codex), 8 context alert, 9 background work lost, 10 idle as far as can be
-  seen but part of the pair is invisible (a pre-0.16 MCP process, an
-  unreadable activity file, a wake-up that never started).
+  seen but part of the pair is invisible or unresolved (a pre-0.16 MCP
+  process, an activity file that is unreadable or lags its owner's finished
+  tasks, a wake-up that never started, background with no completion event
+  for 24 h — a deadline limits waiting, it never proves work ended).
 - **Context alert**: `wait.py` exits 8 when the context crosses a level set a
   headroom before the estimated auto-compaction point (window − 30k; headroom
   max(15% of the window, 40k), `pair_settings_set(context_alert_headroom=…)`),

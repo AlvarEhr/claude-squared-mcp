@@ -35,6 +35,9 @@ Writer API — both backends (Claude runtime reader thread, Codex exec loop)::
     w.expect_wake(task_id=None)                 # a turn is starting with none open
     w.refresh_wake() / w.clear_wake()           # still coming / resolved without a turn
     w.lose_background(reason, task_ids=None)    -> the lost entries (runtime killed)
+    w.mark_background_stale(reason)             # no completion for 24 h: "unknown", kept
+                                                # (the Claude runtime passes gen= to the
+                                                # background/wake calls: its generation)
     w.note_context(used, window, window_source=, source=)
     w.note_reported_window(tokens, model_key=, model=, source=)
     w.note_compaction(trigger, pre=, post=)
@@ -45,6 +48,7 @@ Module level: ``announce()`` (MCP startup: write the beacon), ``sweep()``
 (startup: mark dead owners' files, drop old ones), ``shutdown(reason)``
 (atexit: remaining background -> lost, state "exited", synchronous flush),
 ``touch(pair)`` (a task was created: make sure the file exists),
+``mutation_seq(pair)`` (the watermark a finishing task is stamped with),
 ``forget(pair)`` (pair_forget: a "forgotten" tombstone), ``view(pair)`` /
 ``pair_activity_view(...)``
 (the merged reader view), ``reported_window(pair, model_key)``.
@@ -59,7 +63,9 @@ changes immediately, context-only changes at most once per
 ``LAZY_WRITE_INTERVAL_S``. File writes are atomic (unique tmp + replace, with
 ``async_tasks._save``'s PermissionError retry for Windows readers). A file's
 writes are serialized by the writer's ``_io_lock`` (flusher vs ``flush()``),
-taken only on I/O threads, always before the leaf lock.
+taken only on I/O threads, always before the leaf lock. ``forget()`` alone
+holds ``_WRITERS_LOCK`` across both (``_WRITERS_LOCK`` -> ``_io_lock`` ->
+leaf); nothing takes ``_WRITERS_LOCK`` while holding a writer lock.
 
 The reader half between the BEGIN/END markers below is stdlib-only and
 Python 3.7-compatible because wait.py embeds it verbatim;
@@ -100,11 +106,6 @@ _AV_OWNER_LOOKBACK_S = 24 * 3600
 # Codex detach contract (HANDOFF "v0.16.0" Codex detach contract): an
 # events file written this recently proves a detached turn is still active.
 _AV_EVENTS_GRACE_S = 2.0
-# A wake-up whose deadline passed without the self-woken turn opening (and
-# without anything clearing it) is not proof of idle — inference can still be
-# before its first event (anvil review, 2026-09-25). For this long past the
-# deadline the verdict is "unknown"; after that the stale wake is ignored.
-_AV_WAKE_STALE_S = 600
 _AV_K32 = []
 
 
@@ -255,6 +256,7 @@ def _av_task_summary(data):
         "queued": bool(data.get("queued")),
         "started_at": data.get("started_at"),
         "finished_at": data.get("finished_at"),
+        "activity_seq": data.get("activity_seq"),
         "self_woken": isinstance(msg, str) and msg.startswith(_AV_SELF_WOKEN_PREFIX),
     }
 
@@ -385,19 +387,26 @@ def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,
 
     ``verdict``: "busy" (a turn is open, background is pending, a wake-up is
     expected, or a task is running/queued/detached), "unknown" (nothing busy
-    is visible, but part of the pair can't be seen: a pre-0.16 owner, an
-    unreadable file, a live owner of a recent task with no activity file for
-    this pair, or a wake-up that expired without its turn opening),
-    "settling" (quiet for less than ``grace_seconds``), or "idle".
-    ``reasons`` says why for busy/unknown; ``notes`` carries non-blocking
-    facts (dead owners, orphaned tasks). The window lists (window_turns,
-    background_finished, background_lost, compactions) hold only entries
-    since the latest solicited send across all owners; ``losses`` is every
-    background_lost entry still on file, unfiltered — a loss recorded just
-    before a new window opens (a forced compact) must still reach a watcher.
+    is visible, but part of the pair can't be seen or hasn't resolved: a
+    pre-0.16 owner, an unreadable file, a live owner of a recent task with no
+    activity file for this pair or whose file lags that task, a wake-up past
+    its deadline that no turn has resolved, or background with no completion
+    event for 24 h), "settling" (quiet for less than ``grace_seconds``), or
+    "idle". A deadline limits how long something counts as busy; it never
+    establishes that work ended — only evidence does (a turn opens or
+    closes, the runtime dies, the owner clears it). ``reasons`` says why for
+    busy/unknown; ``notes`` carries non-blocking facts (dead owners, orphaned
+    tasks). The window lists (window_turns, background_finished,
+    background_lost, compactions) hold only entries since the latest
+    solicited send across all owners; ``losses`` is every background_lost
+    entry still on file, unfiltered — a loss recorded just before a new
+    window opens (a forced compact) must still reach a watcher.
+    ``wake_stale`` lists wake-ups past their deadline (``wake_pending`` only
+    live ones); ``background`` entries carry ``stale`` once past 24 h.
     ``quiet_since`` / ``quiet_for_s`` are set for "unknown" too.
     ``live_states`` maps pid -> in-memory state (the caller's own writer,
-    fresher than its file). Never writes anything.
+    fresher than its file; its ``published_seq`` says how much of it is on
+    disk). Never writes anything.
     """
     now = now or _av_now()
     pairs_dir = Path(pairs_dir)
@@ -405,7 +414,7 @@ def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,
     view = {
         "version": ACTIVITY_SCHEMA_VERSION, "pair": pair, "now": _av_iso(now),
         "verdict": "idle", "reasons": [], "notes": [], "owners": [],
-        "turns": [], "background": [], "wake_pending": [], "running_tasks": [],
+        "turns": [], "background": [], "wake_pending": [], "wake_stale": [], "running_tasks": [],
         "context": None, "reported_window": None, "window_started_at": None,
         "window_turns": [], "background_finished": [], "background_lost": [],
         "compactions": [], "losses": [], "quiet_since": None, "quiet_for_s": None,
@@ -456,11 +465,15 @@ def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,
     ctx_best = None
     list_keys = (("window_turns", "started_at"), ("background_finished", "ended_at"),
                  ("background_lost", "at"), ("compactions", "at"))
+    published = {}  # live owner pid -> the mutation seq its published state reached
+    births = {}     # live owner pid -> its process creation time
     for pid, status, d in owners:
         lt = _av_parse(d.get("last_transition_at"))
         if lt is not None:
             quiet.append(lt)
         if status == "live":
+            published[pid] = d.get("published_seq", d.get("mut_seq"))
+            births[pid] = d.get("owner_started_at")
             turn = d.get("turn")
             if isinstance(turn, dict):
                 view["turns"].append(dict(turn, pid=pid))
@@ -469,9 +482,14 @@ def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,
             bg = [b for b in (d.get("background") or []) if isinstance(b, dict)]
             for b in bg:
                 view["background"].append(dict(b, pid=pid))
-            if bg:
+            fresh = [b for b in bg if not b.get("stale")]
+            if fresh:
                 busy.append("%d background task(s) pending in PID %d (%s)" % (
-                    len(bg), pid, ", ".join(str(b.get("kind")) for b in bg)))
+                    len(fresh), pid, ", ".join(str(b.get("kind")) for b in fresh)))
+            if len(fresh) < len(bg):
+                unknown.append("%d background task(s) in PID %d have had no completion event "
+                               "for 24 h — they may have finished unseen, or still be running"
+                               % (len(bg) - len(fresh), pid))
             wake = d.get("wake_pending")
             if isinstance(wake, dict):
                 until = _av_parse(wake.get("until"))
@@ -480,11 +498,13 @@ def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,
                     busy.append("wake-up pending in PID %d (background finished %s; the pair "
                                 "should resume by %s)" % (pid, wake.get("since"), wake.get("until")))
                 elif until is not None:
+                    # Past its deadline but never resolved: unknown until a
+                    # turn opens, the runtime dies or the owner clears it.
+                    view["wake_stale"].append(dict(wake, pid=pid))
                     quiet.append(until)
-                    if (now - until).total_seconds() < _AV_WAKE_STALE_S:
-                        unknown.append("a wake-up announced in PID %d at %s never started (nothing "
-                                       "seen since %s) — the pair may still be about to resume"
-                                       % (pid, wake.get("since"), wake.get("until")))
+                    unknown.append("a wake-up announced in PID %d at %s never started (nothing "
+                                   "seen since %s) — the pair may still resume"
+                                   % (pid, wake.get("since"), wake.get("until")))
         for key, tkey in list_keys:
             for e in d.get(key) or []:
                 if isinstance(e, dict) and _in_window(e.get(tkey)):
@@ -507,6 +527,7 @@ def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,
     owner_pids = set(p for p, _s, _d in owners)
     lookback = now - timedelta(seconds=_AV_OWNER_LOOKBACK_S)
     checked = {}
+    watermark = {}  # live owner pid -> (highest activity_seq stamped on its tasks, task id)
     for t in _av_scan_tasks(pairs_dir, task_cache):
         if t.get("pair") != pair:
             continue
@@ -551,6 +572,20 @@ def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,
             fin = _av_parse(t.get("finished_at"))
             if fin is not None:
                 quiet.append(fin)
+            # Publication watermark: an owner stamps a finished task with its
+            # writer's mutation count, so a live owner whose file hasn't
+            # reached that count (writes failing or lagging) can't read as
+            # idle — a file that merely exists proves nothing (anvil
+            # re-review, 2026-09-25).
+            aseq = t.get("activity_seq")
+            birth = births.get(owner) if has_owner else None
+            if (has_owner and owner in published and isinstance(aseq, int)
+                    and not isinstance(aseq, bool) and aseq > watermark.get(owner, (-1, ""))[0]
+                    # a task older than the owner process is a previous
+                    # holder of that PID's
+                    and not (isinstance(birth, (int, float)) and started is not None
+                             and started.timestamp() < birth - _AV_START_TOLERANCE_S)):
+                watermark[owner] = (aseq, tid)
         # A live owner of a recent task with no activity file for this pair
         # can have self-woken turns / background we cannot see: a pre-0.16
         # process (no beacon), or a 0.16 one whose writes to this pair's
@@ -571,6 +606,12 @@ def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,
                                           "failing)" % (owner, tid[:8]))
                 if checked[owner]:
                     unknown.append(checked[owner])
+    for owner in sorted(watermark):
+        aseq, tid = watermark[owner]
+        pub = published.get(owner)
+        if not (isinstance(pub, int) and pub >= aseq):
+            unknown.append("activity of PID %d is behind its task %s (published %s of %d "
+                           "changes) — its writes are failing or lagging" % (owner, tid[:8], pub, aseq))
 
     view["notes"] = notes
     qs = max(quiet) if quiet else None
@@ -694,12 +735,20 @@ class ActivityWriter:
         self._meta_dirty = False
         self._last_write = 0.0
         self._forgotten = False  # forget() ran: never write this file again
+        # The mut_seq the file on disk has reached (see _mark / mutation_seq).
+        self._published_seq = -1
         now = _av_iso(_av_now())
         self._state: dict = {
             "version": ACTIVITY_SCHEMA_VERSION, "pair": pair, "backend": backend,
             "owner_pid": os.getpid(), "owner_started_at": _owner_started_at(),
             "package_version": _PACKAGE_VERSION,
             "state": "live", "created_at": now, "updated_at": now, "seq": 0,
+            # Bumped by every mutation; a finished task is stamped with it
+            # (async_tasks.start_task / finalize_external_task), so readers
+            # can tell a file that lags its owner's completed work from one
+            # that is current — the publication watermark (anvil re-review,
+            # 2026-09-25).
+            "mut_seq": 0,
             "closed_at": None, "closed_reason": None,
             "last_transition_at": None,
             "window_started_at": None, "window_task_id": None,
@@ -712,19 +761,28 @@ class ActivityWriter:
     # -- internals (callers hold self._lock) --
 
     def _mark(self, level: int) -> None:
+        self._state["mut_seq"] += 1
         if level > self._dirty:
             self._dirty = level
+
+    @staticmethod
+    def _gen_ok(entry: dict | None, gen: str | None) -> bool:
+        """``gen`` None acts on everything; else only on what that runtime
+        generation recorded (see PairRuntime._gen)."""
+        return gen is None or not isinstance(entry, dict) or entry.get("gen") in (None, gen)
 
     @staticmethod
     def _cap(items: list, n: int) -> None:
         if len(items) > n:
             del items[:len(items) - n]
 
-    def _set_wake(self, task_id: str | None, now) -> None:
+    def _set_wake(self, task_id: str | None, now, gen: str | None = None) -> None:
         self._state["wake_pending"] = {
             "since": _av_iso(now), "task_id": task_id,
             "until": _av_iso(now + timedelta(seconds=WAKE_PENDING_SECONDS)),
         }
+        if gen is not None:
+            self._state["wake_pending"]["gen"] = gen
 
     # -- turns --
 
@@ -795,12 +853,14 @@ class ActivityWriter:
         _poke()
         return out
 
-    def clear_wake(self) -> bool:
+    def clear_wake(self, *, gen: str | None = None) -> bool:
         """A result arrived for a turn that never opened (the CLI's stale
         resume notice, or a wake that produced no top-level event): resolve
-        the pending wake-up, if any. Never closes a turn."""
+        the pending wake-up, if any (only ``gen``'s, when given). Never
+        closes a turn."""
         with self._lock:
-            if self._state["wake_pending"] is None:
+            wake = self._state["wake_pending"]
+            if wake is None or not self._gen_ok(wake, gen):
                 return False
             self._state["wake_pending"] = None
             self._state["last_transition_at"] = _av_iso(_av_now())
@@ -810,10 +870,12 @@ class ActivityWriter:
 
     # -- background --
 
-    def background_started(self, task_id: str, kind: str = "task", description: str = "") -> None:
+    def background_started(self, task_id: str, kind: str = "task", description: str = "", *,
+                           gen: str | None = None) -> None:
         """Pass only BACKGROUNDED tasks: foreground Bash calls and blocking Agent
         calls emit ``task_started`` too, with ``is_backgrounded: false``
-        (verified CLI 2.1.280, 2026-09-25)."""
+        (verified CLI 2.1.280, 2026-09-25). ``gen`` tags the entry with the
+        runtime generation that owns it (see ``lose_background``)."""
         now = _av_iso(_av_now())
         with self._lock:
             bg = self._state["background"]
@@ -825,6 +887,8 @@ class ActivityWriter:
                 bg.append({"task_id": task_id, "kind": kind,
                            "description": (description or "")[:160],
                            "started_at": now, "outlived_turn": False})
+                if gen is not None:
+                    bg[-1]["gen"] = gen
             if len(bg) > BACKGROUND_CAP:
                 # A leak of missed completions must not grow the file forever.
                 dropped = bg[:len(bg) - BACKGROUND_CAP]
@@ -839,7 +903,8 @@ class ActivityWriter:
             self._mark(_URGENT)
         _poke()
 
-    def background_finished(self, task_id: str, status: str = "completed") -> None:
+    def background_finished(self, task_id: str, status: str = "completed", *,
+                            gen: str | None = None) -> None:
         """A background task ended. With no turn open the pair is about to wake
         (the CLI emits task_notification BEFORE the self-woken turn's first
         event — 1.4-1.5 s on Haiku, tens of seconds at xhigh), so readers see
@@ -865,12 +930,12 @@ class ActivityWriter:
             })
             self._cap(st["background_finished"], LIST_CAP)
             if st["turn"] is None:
-                self._set_wake(task_id, now)
+                self._set_wake(task_id, now, gen)
             st["last_transition_at"] = iso
             self._mark(_URGENT)
         _poke()
 
-    def expect_wake(self, task_id: str | None = None) -> None:
+    def expect_wake(self, task_id: str | None = None, *, gen: str | None = None) -> None:
         """A turn is about to start with none open — e.g. a ``system:init``
         arriving with no scope open: CLI 2.1.280 emits one ahead of every
         queued turn (20-80 ms after the previous result or the completion;
@@ -881,40 +946,49 @@ class ActivityWriter:
         with self._lock:
             if self._state["turn"] is not None:
                 return
-            self._set_wake(task_id, now)
+            self._set_wake(task_id, now, gen)
             self._state["last_transition_at"] = _av_iso(now)
             self._mark(_URGENT)
         _poke()
 
-    def refresh_wake(self) -> None:
+    def refresh_wake(self, *, gen: str | None = None) -> None:
         """The CLI is still producing events ahead of the self-woken turn's
         first assistant event (e.g. ``system:thinking_tokens``): push the
-        pending wake-up's deadline out. No-op without one. Written lazily."""
+        pending wake-up's deadline out — also one already past it. No-op
+        without one. Written at once when it revives an expired wake, else
+        lazily."""
         now = _av_now()
         with self._lock:
             wake = self._state["wake_pending"]
-            if wake is None or self._state["turn"] is not None:
+            if wake is None or self._state["turn"] is not None or not self._gen_ok(wake, gen):
                 return
-            self._set_wake(wake.get("task_id"), now)
+            expired = (_av_parse(wake.get("until")) or now) <= now
+            self._set_wake(wake.get("task_id"), now, wake.get("gen"))
             self._state["wake_pending"]["since"] = wake.get("since")
-            self._mark(_LAZY)
+            self._mark(_URGENT if expired else _LAZY)
         _poke()
 
-    def lose_background(self, reason: str, *, task_ids: list[str] | None = None) -> list[dict]:
+    def lose_background(self, reason: str, *, task_ids: list[str] | None = None,
+                        gen: str | None = None) -> list[dict]:
         """The runtime is going away with background still pending (evict,
         pair_update/clear/rewind/compact, pair_stop force, crash, atexit): move
         it to ``background_lost``. A pending wake-up is lost too. Returns the
-        new ``background_lost`` records."""
+        new ``background_lost`` records. ``gen`` limits it to what that
+        runtime generation recorded: this writer is shared with any
+        replacement runtime of the pair, and a late cleanup of the old one
+        once reported the replacement's work as lost (anvil re-review,
+        2026-09-25)."""
         now = _av_iso(_av_now())
         with self._lock:
             st = self._state
             keep, gone = [], []
             for e in st["background"]:
-                (gone if task_ids is None or e.get("task_id") in task_ids else keep).append(e)
+                mine = (task_ids is None or e.get("task_id") in task_ids) and self._gen_ok(e, gen)
+                (gone if mine else keep).append(e)
             st["background"] = keep
             recs = [dict(e, reason=reason, at=now) for e in gone]
             wake = st["wake_pending"]
-            if task_ids is None and isinstance(wake, dict):
+            if task_ids is None and isinstance(wake, dict) and self._gen_ok(wake, gen):
                 recs.append({"task_id": wake.get("task_id"), "kind": "wake-up",
                              "description": "the pair was about to resume after background "
                                             "work finished", "reason": reason, "at": now})
@@ -925,6 +999,28 @@ class ActivityWriter:
                 st["last_transition_at"] = now
                 self._mark(_URGENT)
             out = [dict(r) for r in recs]
+        if out:
+            _poke()
+        return out
+
+    def mark_background_stale(self, reason: str, *, task_ids: list[str] | None = None,
+                              gen: str | None = None) -> list[dict]:
+        """No completion event for a long time (the 24 h ceiling on a runtime
+        kept alive): flag the entries ``stale`` instead of dropping them — a
+        timeout doesn't establish that work ended, so protection stays and
+        the view reads "unknown" rather than busy or idle. A later completion
+        removes them normally. Returns the newly flagged entries."""
+        now = _av_iso(_av_now())
+        with self._lock:
+            out = []
+            for e in self._state["background"]:
+                if (not e.get("stale") and self._gen_ok(e, gen)
+                        and (task_ids is None or e.get("task_id") in task_ids)):
+                    e.update(stale=True, stale_since=now, stale_reason=reason)
+                    out.append(dict(e))
+            if out:
+                self._state["last_transition_at"] = now
+                self._mark(_URGENT)
         if out:
             _poke()
         return out
@@ -1019,6 +1115,18 @@ class ActivityWriter:
         with self._lock:
             return copy.deepcopy(self._state)
 
+    def mutation_seq(self) -> int:
+        with self._lock:
+            return self._state["mut_seq"]
+
+    def published_seq(self) -> int:
+        """The ``mut_seq`` this writer's file on disk has reached (-1: never
+        written). ``view()`` hands it to the reader with the in-memory state,
+        so this process too sees "unknown" while its own file lags what it
+        has finished."""
+        with self._lock:
+            return self._published_seq
+
     # -- I/O (flusher thread, flush(), shutdown) --
 
     def _flush(self, force: bool) -> bool:
@@ -1033,6 +1141,7 @@ class ActivityWriter:
                 if not due:
                     return False
                 text = None
+                text_seq = self._state["mut_seq"]
                 if self._dirty:
                     self._state["updated_at"] = _av_iso(_av_now())
                     self._state["seq"] += 1
@@ -1040,18 +1149,22 @@ class ActivityWriter:
                 meta = json.dumps(self._meta, indent=1) if self._meta_dirty else None
                 self._dirty = _CLEAN
                 self._meta_dirty = False
+            wrote_text = False
             try:
                 _ensure_beacon(self._home)
                 if text is not None:
                     _atomic_write(self._path, text)
+                    wrote_text = True
+                    with self._lock:
+                        self._published_seq = max(self._published_seq, text_seq)
                 if meta is not None:
                     _atomic_write(self._meta_path, meta)
                 ok = True
             except (OSError, ValueError):
                 ok = False
-                with self._lock:  # retry at the lazy pace
-                    if text is not None:
-                        self._mark(_LAZY)
+                with self._lock:  # retry at the lazy pace (not a mutation: no mut_seq bump)
+                    if text is not None and not wrote_text:
+                        self._dirty = max(self._dirty, _LAZY)
                     if meta is not None:
                         self._meta_dirty = True
             self._last_write = time.monotonic()
@@ -1085,6 +1198,8 @@ class ActivityWriter:
 
 _WRITERS: dict[tuple[str, str], ActivityWriter] = {}
 _WRITERS_LOCK = threading.Lock()
+# forget() -> the next writer() for that key: {"background_lost", "mut_seq"}.
+_RETIRED: dict[tuple[str, str], dict] = {}
 _FLUSH_COND = threading.Condition()
 _FLUSH_STATE = {"poked": False, "thread": None}
 
@@ -1101,7 +1216,15 @@ def writer(pair: str, backend: str = "claude") -> ActivityWriter:
     with _WRITERS_LOCK:
         w = _WRITERS.get(key)
         if w is None:
-            w = _WRITERS[key] = ActivityWriter(pair, backend, home)
+            w = ActivityWriter(pair, backend, home)
+            # Same pair, same process, same file name as a forgotten writer:
+            # carry its loss history (the tombstone this file replaces) and
+            # its mutation count (tasks stamped by it) into the new one.
+            retired = _RETIRED.pop(key, None)
+            if retired is not None:
+                w._state["background_lost"] = retired["background_lost"]  # noqa: SLF001
+                w._state["mut_seq"] = retired["mut_seq"]  # noqa: SLF001
+            _WRITERS[key] = w
             created = True
     if w.backend != backend or created:
         with w._lock:  # noqa: SLF001
@@ -1128,6 +1251,15 @@ def touch(pair: str) -> None:
         writer(pair, backend)
     except Exception:
         pass
+
+
+def mutation_seq(pair: str) -> int | None:
+    """This process's current mutation count for ``pair`` (None without a
+    writer): the publication watermark a finishing task is stamped with
+    (``AsyncTaskState.activity_seq``). Memory only — safe on the reader."""
+    with _WRITERS_LOCK:
+        w = _WRITERS.get((str(_home_pairs()), pair))
+    return w.mutation_seq() if w is not None else None
 
 
 def _writers_snapshot() -> list[ActivityWriter]:
@@ -1194,29 +1326,40 @@ def forget(pair: str, reason: str = "the pair was forgotten (pair_forget)") -> N
     of being deleted: a wait.py already following the pair must still see
     the background work the forget killed and exit 9 (anvil review,
     2026-09-25). The per-pair meta file goes. Other owners' files are theirs
-    (they go when those processes exit/are swept)."""
+    (they go when those processes exit/are swept).
+
+    A later writer() for the same pair in this process reuses the file name:
+    it inherits the tombstone's loss history and mutation count, so a
+    recreated pair can't erase what a watcher hasn't seen yet (anvil
+    re-review, 2026-09-25). ``_WRITERS_LOCK`` is held throughout so no new
+    writer can exist before the tombstone is on disk (lock order
+    _WRITERS_LOCK -> _io_lock -> _lock; forget only)."""
     home = _home_pairs()
+    key = (str(home), pair)
     with _WRITERS_LOCK:
-        w = _WRITERS.pop((str(home), pair), None)
-    if w is not None:
-        now = _av_now()
-        with w._io_lock:  # noqa: SLF001 — no flush may land after the tombstone
-            with w._lock:  # noqa: SLF001
-                st = w._state  # noqa: SLF001
-                if st["turn"] is not None:
-                    w._close_turn_locked(None, "aborted", "", False, now)["note"] = reason  # noqa: SLF001
-                for e in st["background"]:
-                    st["background_lost"].append(dict(e, reason=reason, at=_av_iso(now)))
-                w._cap(st["background_lost"], LIST_CAP)  # noqa: SLF001
-                st.update(background=[], wake_pending=None, state="forgotten",
-                          closed_at=_av_iso(now), closed_reason=reason,
-                          updated_at=_av_iso(now), seq=st["seq"] + 1)
-                text = json.dumps(st, indent=1)
-                w._forgotten = True  # noqa: SLF001
-            try:
-                _atomic_write(w._path, text)  # noqa: SLF001
-            except OSError:
-                pass
+        w = _WRITERS.pop(key, None)
+        if w is not None:
+            now = _av_now()
+            with w._io_lock:  # noqa: SLF001 — no flush may land after the tombstone
+                with w._lock:  # noqa: SLF001
+                    st = w._state  # noqa: SLF001
+                    if st["turn"] is not None:
+                        w._close_turn_locked(None, "aborted", "", False, now)["note"] = reason  # noqa: SLF001
+                    for e in st["background"]:
+                        st["background_lost"].append(dict(e, reason=reason, at=_av_iso(now)))
+                    w._cap(st["background_lost"], LIST_CAP)  # noqa: SLF001
+                    st.update(background=[], wake_pending=None, state="forgotten",
+                              closed_at=_av_iso(now), closed_reason=reason,
+                              updated_at=_av_iso(now), seq=st["seq"] + 1,
+                              mut_seq=st["mut_seq"] + 1)
+                    text = json.dumps(st, indent=1)
+                    _RETIRED[key] = {"background_lost": [dict(e) for e in st["background_lost"]],
+                                     "mut_seq": st["mut_seq"]}
+                    w._forgotten = True  # noqa: SLF001
+                try:
+                    _atomic_write(w._path, text)  # noqa: SLF001
+                except OSError:
+                    pass
     try:
         (home / "activity" / pair / "pair.json").unlink(missing_ok=True)
         (home / "activity" / pair).rmdir()  # only if empty (no tombstone, no other owner)
@@ -1247,7 +1390,10 @@ def view(pair: str, *, grace_seconds: float = 5.0) -> dict:
     announce()  # our own tasks must never read as a pre-0.16 owner
     with _WRITERS_LOCK:
         w = _WRITERS.get((str(home), pair))
-    live = {os.getpid(): w.snapshot()} if w is not None else None
+    live = None
+    if w is not None:
+        published = w.published_seq()  # first: never ahead of the snapshot's truth
+        live = {os.getpid(): dict(w.snapshot(), published_seq=published)}
     return pair_activity_view(home, pair, grace_seconds=grace_seconds,
                               task_cache=_TASK_CACHE, live_states=live)
 

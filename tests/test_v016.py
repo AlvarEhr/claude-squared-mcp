@@ -634,10 +634,8 @@ def wait_module():
     return mod
 
 
-class ReviewFixTests(V016Case):
-    """Regression tests for the anvil cross-review of 19dcd73 (2026-09-25)."""
-
-    # -- helpers --
+class ReviewHelpers(V016Case):
+    """Helpers shared by the review regression tests (no tests of its own)."""
 
     def run_wait(self, mod, *argv):
         """mod.main(argv) on a thread with captured output. Returns (thread, box)."""
@@ -674,6 +672,10 @@ class ReviewFixTests(V016Case):
             "status": "running", "started_at": datetime.utcnow().isoformat(),
             "owner_pid": pid}), encoding="utf-8")
         return tid
+
+
+class ReviewFixTests(ReviewHelpers):
+    """Regression tests for the anvil cross-review of 19dcd73 (2026-09-25)."""
 
     # -- HIGH 1: force never bypasses a foreign owner --
 
@@ -920,8 +922,22 @@ class ReviewFixTests(V016Case):
         reg._runtimes[self.pair] = rt
         reg._evict_idle()
         self.assertIn(self.pair, reg._runtimes)  # persistent: kept warm ...
-        self.assertEqual(rt.pending_background_tasks(), [])  # ... but the stale tracking is gone
-        self.assertIn("persistent runtime kept", self.snap()["background_lost"][-1]["reason"])
+        # ... and still protected: flagged stale, never dropped (anvil
+        # re-review, 2026-09-25 — the work may be real and wake the pair).
+        self.assertEqual([b["task_id"] for b in rt.pending_background_tasks()], ["bgS"])
+        self.assertIn("stale", rt.pending_work()[0]["description"])
+        entry = self.snap()["background"][0]
+        self.assertEqual((entry["task_id"], entry["stale"]), ("bgS", True))
+        self.assertEqual(self.snap()["background_lost"], [])
+        RT.registry()._runtimes[self.pair] = rt  # the tools consult the process registry
+        with self.assertRaises(PairError) as cm:
+            tool(S.pair_clear)(self.pair)
+        self.assertIn("stale", str(cm.exception))
+        view = A.view(self.pair, grace_seconds=0)
+        self.assertEqual(view["verdict"], "unknown")
+        self.assertIn("no completion event for 24 h", " ".join(view["reasons"]))
+        reg._evict_idle()  # idempotent: nothing new flagged
+        self.assertEqual(len(self.snap()["background"]), 1)
         rt.proc = SimpleNamespace(poll=lambda: 1, pid=0, returncode=1, stdin=None)
         reg._evict_idle()
         self.assertNotIn(self.pair, reg._runtimes)  # dead: evicted despite persistent
@@ -1073,6 +1089,217 @@ class ReviewFixTests(V016Case):
         out, err = proc.communicate(timeout=30)
         self.assertEqual(proc.returncode, 8, (out + err).decode("utf-8", "replace"))
         self.assertIn("CONTEXT ALERT", out.decode("utf-8"))
+
+
+class ReReviewFixTests(ReviewHelpers):
+    """Regression tests for the anvil re-review of 93289a1 (2026-09-25)."""
+
+    def spec(self):
+        spec = PairSpec(name=self.pair, session_id=str(uuid.uuid4()), cwd=str(self.home))
+        R.add_pair(spec)
+        return spec
+
+    # -- 1: the hard reset re-checks foreign work under the pair lock --
+
+    def test_hard_reset_rechecks_foreign_work_under_the_lock(self):
+        rt = self.live_runtime()
+        calls = []
+        real = S._pending_work_split
+
+        def split(name):
+            calls.append(name)
+            local, _foreign = real(name)
+            if len(calls) == 1:
+                return local, []  # nothing foreign yet at the unlocked check
+            return local, [{"kind": "local_bash", "task_id": "fbg", "pid": 4242}]
+        with patch.object(S, "_pending_work_split", split), \
+                patch.object(ClaudeAdapter, "create", side_effect=AssertionError("rotated")):
+            out = tool(S.pair_stop)(self.pair, hard=True)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("hard reset skipped", out)
+        self.assertNotIn("rotated session", out)
+        self.assertIs(RT.registry().get_or_none(self.pair), rt)
+
+    # -- 2+S2: a wake past its deadline limits waiting, not protection --
+
+    def test_expired_wake_limits_waiting_not_protection(self):
+        rt = self.live_runtime()
+        rt._result_seq = 1
+        with patch.object(A, "WAKE_PENDING_SECONDS", 0.3):
+            self.feed(rt, {"type": "system", "subtype": "init"})
+            time.sleep(0.5)
+            work = rt.pending_work()
+            self.assertEqual(work[0]["kind"], "wake-up")
+            self.assertIn("unconfirmed", work[0]["description"])
+            with self.assertRaises(PairError) as cm:
+                tool(S.pair_clear)(self.pair)
+            self.assertIn("wake-up", str(cm.exception))
+            self.assertEqual(A.view(self.pair, grace_seconds=0)["verdict"], "unknown")
+            reg = RT.RuntimeRegistry(idle_timeout_seconds=1)
+            reg._runtimes[self.pair] = rt
+            rt.last_activity = datetime.utcnow() - timedelta(hours=2)
+            reg._evict_idle()
+            self.assertIn(self.pair, reg._runtimes)  # still protected from idle eviction
+            t0 = time.monotonic()
+            self.open_solicited(rt)  # waiting is what the deadline limits
+            self.assertLess(time.monotonic() - t0, 1.0)
+        self.feed(rt, assistant("reply"))
+        self.feed(rt, result("reply"))  # evidence: a result resolves it
+        rt._current_scope = None
+        self.assertEqual(rt.pending_work(), [])
+
+    def test_foreign_unresolved_work_protects_and_a_send_proceeds_with_a_note(self):
+        self.runtime()
+        past = A._av_now() - timedelta(hours=1)
+        self.foreign_activity(self.live.pid, self.live_started, wake_pending={
+            "since": A._av_iso(past - timedelta(minutes=2)), "task_id": "b", "until": A._av_iso(past)})
+        view = A.view(self.pair, grace_seconds=0)
+        self.assertEqual((view["verdict"], len(view["wake_stale"])), ("unknown", 1))
+        with self.assertRaises(PairError) as cm:
+            tool(S.pair_clear)(self.pair, force=True)
+        self.assertIn("unconfirmed", str(cm.exception))
+        self.assertIsNone(S._foreign_activity_blocker(self.pair))
+        notes = []
+        with patch.object(S, "_FOREIGN_BACKGROUND_WAIT_S", 1.0):
+            waited = S._wait_for_foreign_self_woken(self.pair, None, None, notes)
+        self.assertGreaterEqual(waited, 0.9)  # waited its bound ...
+        self.assertIn("never started", notes[0])  # ... then proceeded, saying so
+        # Unresolved work is already past its own bound: a short grace, not the
+        # full foreign wait (main-session review, 2026-09-25).
+        notes = []
+        with patch.object(S, "_FOREIGN_BACKGROUND_WAIT_S", 60.0), \
+                patch.object(S, "_FOREIGN_UNRESOLVED_GRACE_S", 1.0):
+            waited = S._wait_for_foreign_self_woken(self.pair, None, None, notes)
+        self.assertLess(waited, 5.0)
+        self.assertIn("never started", notes[0])
+        self.foreign_activity(self.live.pid, self.live_started, background=[
+            {"task_id": "old", "kind": "local_bash", "description": "", "stale": True,
+             "started_at": A._av_iso(past - timedelta(days=1))}])
+        self.assertIsNone(S._foreign_activity_blocker(self.pair))
+        self.assertIn("no completion event for 24 h", S._foreign_unresolved(self.pair))
+        self.assertIn("stale", S._describe_background(S._pending_work_split(self.pair)[1]))
+
+    def test_unresolved_wake_exits_10(self):
+        mod = wait_module()
+        mod.PAIR_GRACE_S = 0.3
+        self.spec()
+        past = A._av_now() - timedelta(hours=1)
+        self.foreign_activity(self.live.pid, self.live_started, wake_pending={
+            "since": A._av_iso(past), "task_id": "b", "until": A._av_iso(past)})
+        t, box = self.run_wait(mod, self.pair, "--poll", "0.5", "--timeout", "30")
+        t.join(15)
+        self.assertEqual(box.get("code"), 10, box["out"].getvalue() + box["err"].getvalue())
+        self.assertIn("never started", box["err"].getvalue())
+
+    # -- 3: a wake published during promotion is caught at the commit --
+
+    def test_wake_published_during_promotion_is_revalidated(self):
+        rt = self.live_runtime()
+        self.feed(rt, task_started("bgR"))  # background out, no turn open
+        calls = []
+
+        def promote(tid):
+            calls.append(tid)
+            self.feed(rt, task_done("bgR"))  # the reader publishes the wake mid-promotion
+        box = {}
+
+        def go():
+            with patch.object(AT, "mark_task_executing", promote):
+                box["waited"] = rt._prepare_solicited_turn(30, None, "t-send")
+        th = threading.Thread(target=go, daemon=True)
+        th.start()
+        time.sleep(0.8)
+        self.assertEqual(calls, ["t-send"])
+        self.assertIsNone(rt._current_scope)  # not committed over the wake
+        self.feed(rt, {"type": "system", "subtype": "init"})
+        self.feed(rt, assistant("bgR finished"))
+        self.feed(rt, result("bgR finished"))
+        th.join(10)
+        self.assertFalse(th.is_alive())
+        self.assertEqual(rt._current_scope.task_id, "t-send")
+        self.assertEqual(calls, ["t-send"])  # promoted once
+        self.assertEqual(R.get_pair(self.pair).self_woken_pending[-1]["response_preview"], "bgR finished")
+
+    # -- 9: a recreated pair keeps what its forget killed --
+
+    def test_recreated_pair_does_not_hide_a_forget_loss_from_a_watcher(self):
+        mod = wait_module()
+        self.spec()
+        w = A.writer(self.pair)
+        w.background_started("b1", "local_bash")
+        self.assertTrue(w.flush())
+        t, box = self.run_wait(mod, self.pair, "--poll", "2", "--timeout", "30")
+        time.sleep(0.5)  # the watcher polled once and sleeps 2 s
+        A.forget(self.pair)
+        self.assertTrue(A.writer(self.pair).flush())  # recreated: same file name, tombstone gone
+        t.join(15)
+        self.assertEqual(box.get("code"), 9, box["out"].getvalue() + box["err"].getvalue())
+        self.assertIn("b1", box["err"].getvalue())
+
+    # -- 13: tasks carry the publication watermark --
+
+    def test_tasks_are_stamped_with_the_publication_watermark(self):
+        rt = self.runtime()  # registers the pair
+        w = A.writer(self.pair)
+
+        def runner(tid):
+            w.background_started("b1", "local_bash")
+            return SendResult(name=self.pair, response="ok", session_id="s", model_used="haiku",
+                              duration_ms=1)
+        st = AT.start_task(self.pair, "m", runner)
+        AT.wait_for_task(st.task_id, 10)
+        self.assertEqual(AT.load_task(st.task_id).activity_seq, w.mutation_seq())
+        self.feed(rt, assistant("on my own"))
+        tid = rt._implicit_task.task_id
+        self.feed(rt, result("done"))
+        stamped = AT.load_task(tid).activity_seq
+        self.assertIsInstance(stamped, int)
+        self.assertLessEqual(stamped, w.mutation_seq())
+
+    # -- A: a stopped runtime's late reader can't touch its replacement --
+
+    def test_late_reader_cleanup_cannot_touch_the_replacement(self):
+        rt1 = self.live_runtime()
+        rt1._reader_gen = 1  # as start() would have
+        self.feed(rt1, task_started("old"))
+        rt1.stop("replaced by a new runtime")
+        rt2 = PairRuntime(rt1.spec, ClaudeAdapter())
+        rt2.proc = _AliveProc()
+        RT.registry()._runtimes[self.pair] = rt2
+        self.feed(rt2, task_started("new"))
+        # The old reader wakes up late: buffered output, then EOF.
+        rt1.proc = SimpleNamespace(stdout=io.BytesIO(json.dumps(assistant("late")).encode() + b"\n"),
+                                   wait=lambda timeout=None: 0)
+        rt1._stdout_reader(1)
+        self.assertIsNone(rt1._implicit_scope)  # retired: opened nothing
+        snap = self.snap()
+        self.assertEqual([b["task_id"] for b in snap["background"]], ["new"])
+        self.assertEqual([b["task_id"] for b in snap["background_lost"]], ["old"])
+        self.assertEqual(rt1._record_lost_background("late cleanup"), [])  # generation-scoped
+        self.assertEqual([b["task_id"] for b in rt2.pending_background_tasks()], ["new"])
+        self.assertEqual([b["task_id"] for b in self.snap()["background"]], ["new"])
+
+    # -- C: --each-turn sees a turn that ends during the triage wait --
+
+    def test_each_turn_sees_a_turn_that_ends_during_the_triage_wait(self):
+        mod = wait_module()
+        mod.PAIR_GRACE_S, mod.TRIAGE_WAIT_S = 0.3, 5.0
+        self.spec()
+        w = A.writer(self.pair)
+        w.turn_opened("sw", "self_woken")
+        w.turn_closed("sw", triage_pending=True)
+        self.assertTrue(w.flush())
+        time.sleep(0.5)
+        t, box = self.run_wait(mod, self.pair, "--each-turn", "--poll", "0.5", "--timeout", "30")
+        time.sleep(1.0)  # inside the triage wait
+        w.turn_opened("t2", "send")
+        w.turn_closed("t2", preview="second")
+        self.assertTrue(w.flush())
+        t.join(15)
+        out = box["out"].getvalue()
+        self.assertEqual(box.get("code"), 0, out + box["err"].getvalue())
+        self.assertIn("turn ended", out)
+        self.assertIn("t2", out)
 
 
 class MiscTests(V016Case):

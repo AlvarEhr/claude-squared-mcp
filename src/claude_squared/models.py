@@ -767,6 +767,10 @@ class AsyncTaskState(BaseModel):
     # Additive metadata: old task files are treated as already executing.
     queued: bool = False
     execution_started_at: datetime | None = None
+    # v0.16.0 publication watermark: the owner's activity-writer mutation
+    # count when this task finished (activity.mutation_seq). A live owner
+    # whose activity file hasn't reached it reads "unknown", not idle.
+    activity_seq: int | None = None
 
 
 class ActionInfo(BaseModel):

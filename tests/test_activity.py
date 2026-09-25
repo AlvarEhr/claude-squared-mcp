@@ -613,9 +613,9 @@ class ViewTests(ActivityTestCase):
         self.assertEqual(later["verdict"], "idle")
         self.assertGreaterEqual(later["quiet_for_s"], 5.0)
 
-    def test_expired_wake_is_unknown_not_idle_for_a_while(self):
-        # Inference can still be before the self-woken turn's first event
-        # when the deadline passes (anvil review, 2026-09-25).
+    def test_expired_wake_stays_unknown_until_evidence(self):
+        # A deadline limits waiting; it never establishes that the wake won't
+        # come (anvil re-review, 2026-09-25): unknown until something resolves it.
         w = A.writer(self.pair)
         w.background_finished("b1")
         self.assertTrue(w.flush())
@@ -626,8 +626,79 @@ class ViewTests(ActivityTestCase):
         self.assertEqual(view["verdict"], "unknown")
         self.assertIn("never started", view["reasons"][0])
         self.assertEqual(view["quiet_since"], A._av_iso(until))
-        stale = until + timedelta(seconds=A._AV_WAKE_STALE_S + 1)
-        self.assertEqual(self.view(now=stale)["verdict"], "idle")
+        self.assertEqual([x["task_id"] for x in view["wake_stale"]], ["b1"])
+        self.assertEqual(view["wake_pending"], [])
+        self.assertEqual(self.view(now=until + timedelta(days=2))["verdict"], "unknown")
+        # Evidence: a sign of life revives it; a clear (or a turn) resolves it.
+        with patch.object(A, "_av_now", lambda: until + timedelta(seconds=30)):
+            w.refresh_wake()
+        self.assertTrue(w.flush())
+        self.assertEqual(self.view(now=until + timedelta(seconds=31))["verdict"], "busy")
+        self.assertTrue(w.clear_wake())
+        self.assertTrue(w.flush())
+        self.assertNotEqual(self.view(now=until + timedelta(days=2))["verdict"], "unknown")
+
+    def test_stale_background_is_unknown_not_busy_and_stays_listed(self):
+        w = A.writer(self.pair)
+        w.background_started("b1", "local_bash", "long job", gen="g1")
+        w.background_started("b2", "local_bash", "other runtime", gen="g2")
+        flagged = w.mark_background_stale("no completion event for 24 h", gen="g1")
+        self.assertEqual([e["task_id"] for e in flagged], ["b1"])
+        self.assertEqual(w.mark_background_stale("again", gen="g1"), [])  # idempotent
+        self.assertTrue(w.flush())
+        view = self.view()
+        self.assertEqual(view["verdict"], "busy")  # b2 is fresh
+        w.background_finished("b2", gen="g2")
+        w.clear_wake()
+        self.assertTrue(w.flush())
+        view = self.view(now=A._av_now() + timedelta(seconds=10))
+        self.assertEqual(view["verdict"], "unknown")
+        self.assertIn("no completion event for 24 h", " ".join(view["reasons"]))
+        self.assertEqual([(b["task_id"], b["stale"]) for b in view["background"]], [("b1", True)])
+
+    def test_generation_scoped_cleanup_never_touches_another_runtime(self):
+        w = A.writer(self.pair)
+        w.background_started("old", gen="g-old")
+        w.background_started("new", gen="g-new")
+        w.background_finished("x", gen="g-new")  # the new runtime's wake
+        self.assertEqual(w.lose_background("late EOF of the old runtime", gen="g-old")[0]["task_id"], "old")
+        snap = w.snapshot()
+        self.assertEqual([b["task_id"] for b in snap["background"]], ["new"])
+        self.assertIsNotNone(snap["wake_pending"])  # not the old runtime's to lose
+        self.assertFalse(w.clear_wake(gen="g-old"))
+        self.assertTrue(w.clear_wake(gen="g-new"))
+
+    def test_publication_watermark(self):
+        w = A.writer(self.pair)
+        self.assertTrue(w.flush())
+        good = w.mutation_seq()
+        self.task(owner_pid=os.getpid(), finished=A._av_now() - timedelta(seconds=10), activity_seq=good)
+        self.assertIn(self.view()["verdict"], ("idle", "settling"))
+        with patch.object(A, "_atomic_write", side_effect=OSError("disk says no")):
+            w.background_started("b1", "local_bash")  # never reaches the file
+            self.assertFalse(w.flush(timeout=0.2))
+            self.task(owner_pid=os.getpid(), finished=A._av_now() - timedelta(seconds=10),
+                      activity_seq=A.mutation_seq(self.pair))
+            file_view = self.view(now=A._av_now() + timedelta(seconds=10))  # the file's story
+            self.assertEqual(file_view["verdict"], "unknown")
+            self.assertIn("is behind its task", " ".join(file_view["reasons"]))
+            own = A.view(self.pair)  # this process, from memory: its own file lags too
+            self.assertIn("is behind its task", " ".join(own["reasons"]))
+        self.assertTrue(w.flush())
+        self.assertEqual(self.view()["verdict"], "busy")  # published: b1 visible
+
+    def test_recreated_pair_keeps_the_tombstone_history(self):
+        w = A.writer(self.pair)
+        w.background_started("b1", "local_bash")
+        self.assertTrue(w.flush())
+        A.forget(self.pair)
+        seq = self.read_own()["mut_seq"]
+        w2 = A.writer(self.pair)  # recreated in the same process: same file name
+        self.assertTrue(w2.flush())
+        data = self.read_own()
+        self.assertEqual(data["state"], "live")
+        self.assertEqual([b["task_id"] for b in data["background_lost"]], ["b1"])
+        self.assertGreater(data["mut_seq"], seq)
 
     def test_unreadable_or_newer_schema_is_unknown(self):
         path = self.pairs / "activity" / self.pair / f"{self.live.pid}.json"

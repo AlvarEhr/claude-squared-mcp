@@ -61,9 +61,10 @@ Exit codes:
        pair_poll collects the result)
     8  context alert (see above)
     9  background work lost (killed while the watcher ran)
-   10  idle as far as can be seen, but part of the pair is invisible (a
-       pre-0.16 MCP process, an unreadable activity file, or a wake-up that
-       never started) — check pair_status before relying on it
+   10  idle as far as can be seen, but part of the pair is invisible or
+       unresolved (a pre-0.16 MCP process, an activity file that is
+       unreadable or behind, a wake-up that never started, background with
+       no completion event for 24 h) — check pair_status before relying on it
    64  usage error
 Exit 1 with EMPTY output means the watcher process itself was killed.
 """
@@ -394,8 +395,11 @@ def _summary(pair, view, observed, t0_wall, started_iso, mode) -> str:
     lost = view.get("background_lost") or []
     still = view.get("background") or []
     if fin or lost or still:
+        stale = [b for b in still if b.get("stale")]
         out.append(f"background: {len(fin) + len(lost) + len(still)} started, {len(fin)} finished, "
-                   f"{len(lost)} lost, {len(still)} still running")
+                   f"{len(lost)} lost, {len(still)} still running"
+                   + (f" ({len(stale)} stale: no completion event for 24 h — may have finished "
+                      f"unseen)" if stale else ""))
         for b in lost[-5:]:
             out.append(f"  lost {b.get('kind')} {str(b.get('task_id'))[:10]}: {b.get('reason')}")
     comps = view.get("compactions") or []
@@ -490,6 +494,7 @@ def wait_pair(pair: str, each_turn: bool, timeout_s: float, poll_s: float, alert
     # carries its last write time, a forced compact's lands before the
     # window it opens).
     lost_seen = None
+    triage_until = None  # set while quiet with triage pending (TRIAGE_WAIT_S)
     base = [pair] + extra
     while True:
         now = _av_now()
@@ -538,28 +543,27 @@ def wait_pair(pair: str, each_turn: bool, timeout_s: float, poll_s: float, alert
                 print(f"  full reply: pair_poll('{t['task_id']}', with_turn_log=True)")
             return _turn_exit(t.get("status"))
         if _quiet(view):
-            pend = time.monotonic() + TRIAGE_WAIT_S
-            while any(isinstance(t.get("triage"), dict) and t["triage"].get("state") == "pending"
-                      for t in (view.get("window_turns") or [])) and time.monotonic() < pend:
-                time.sleep(1.0)
-                view = pair_activity_view(_pairs_dir(), pair, grace_seconds=PAIR_GRACE_S,
-                                          task_cache=cache)
-                _observe(view, seen, observed, started)
-                if not _quiet(view):
-                    break
-            # Revalidate: new work may have started during the triage wait
-            # (anvil review, 2026-09-25) — then keep following the pair.
-            if _quiet(view):
-                verdict = view.get("verdict")
-                if verdict == "unknown":
-                    for r in view.get("reasons") or []:
-                        print(f"note: {r}", file=sys.stderr)
-                    print(_summary(pair, view, observed, t0_wall, started_iso,
-                                   "idle as far as can be seen (part of it is invisible)"))
-                    return 10
-                print(_summary(pair, view, observed, t0_wall, started_iso, "idle"))
-                return _idle_exit(pair, list(seen.values()))
-            continue
+            # A short wait for pending triage is a state of THIS loop, not a
+            # loop of its own: every refreshed snapshot goes through the same
+            # checks above (a turn ending then reaches --each-turn, a loss
+            # exits 9, new work keeps us following) — a separate inner loop
+            # swallowed those (anvil reviews, 2026-09-25).
+            if any(isinstance(t.get("triage"), dict) and t["triage"].get("state") == "pending"
+                   for t in (view.get("window_turns") or [])):
+                if triage_until is None:
+                    triage_until = time.monotonic() + TRIAGE_WAIT_S
+                if time.monotonic() < triage_until:
+                    time.sleep(min(poll_s, 1.0))
+                    continue
+            if view.get("verdict") == "unknown":
+                for r in view.get("reasons") or []:
+                    print(f"note: {r}", file=sys.stderr)
+                print(_summary(pair, view, observed, t0_wall, started_iso,
+                               "idle as far as can be seen (part of it is invisible)"))
+                return 10
+            print(_summary(pair, view, observed, t0_wall, started_iso, "idle"))
+            return _idle_exit(pair, list(seen.values()))
+        triage_until = None
         if time.monotonic() >= deadline:
             why = "; ".join((view.get("reasons") or [])[:3]) or str(view.get("verdict"))
             print(f"watcher gave up after {_dur(timeout_s)}; pair '{pair}' is still working "

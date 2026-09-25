@@ -289,7 +289,7 @@ Three ways to consume the handle:
    | 7 | finished detached (Codex): the owner died, the turn finished on its own — `pair_poll` collects it |
    | 8 | context alert (below) |
    | 9 | background work was killed while the watcher ran — the pair will not wake for it |
-   | 10 | idle as far as can be seen, but part of the pair is invisible (a pre-0.16 MCP process, an unreadable activity file, or a wake-up that never started) — check `pair_status` |
+   | 10 | idle as far as can be seen, but part of the pair is invisible or unresolved (a pre-0.16 MCP process, an activity file that is unreadable or behind, a wake-up that never started, background with no completion event for 24 h) — check `pair_status` |
    | 64 | usage error |
 
    **Context alert (exit 8).** Auto-compaction fires mid-turn at about the
@@ -375,8 +375,13 @@ and the pair never wakes for it. So:
 - the idle evictor never evicts a runtime with background work pending (after
   24 h with no log activity at all it does, and records the work as lost — "may
   already have finished, no completion event seen"; a persistent runtime is
-  kept and only that stale tracking is dropped). A runtime whose claude
-  process dies records its background work as lost at once;
+  kept, its background stays protected and is marked *stale*). A runtime whose
+  claude process dies records its background work as lost at once;
+- a deadline only limits **waiting**, it never proves work ended: a wake-up
+  that doesn't start within 2 min, or background with no completion event for
+  24 h, stays protected and reads as *unknown* (`wait.py` exit 10) until
+  something resolves it — a turn opens or ends, the runtime ends, or it is
+  killed with `force=True`;
 - `pair_clear`, `pair_rewind`, `pair_compact` and a `pair_update` that
   actually changes a spawn-pinned setting (model, effort, permission level,
   window, cwd, extra_dirs, allowed_tools, connectors, ultracode, fallback
@@ -396,7 +401,9 @@ and the pair never wakes for it. So:
   timeout if shorter) while the process that owns the runtime has background
   work, a wake-up or a self-woken turn pending — otherwise that process's later
   wake-up would write a divergent history; a send in the owning process waits
-  for its own wake-up the same way, so it never takes the self-woken reply;
+  for its own wake-up the same way, so it never takes the self-woken reply.
+  For unresolved work (a wake-up that never started, stale background) the
+  send waits the same bound, then goes ahead and says so in its result;
 - every loss is recorded (activity file, the next send's footer, `pair_status`,
   and `wait.py` exit 9).
 

@@ -30,6 +30,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING
@@ -547,8 +548,22 @@ class PairRuntime:
         # its scope open first, and the continuation's result was taken as
         # its reply (anvil review, 2026-09-25) — so send() waits for it like
         # an open self-woken turn. Bounded by activity.WAKE_PENDING_SECONDS
-        # since the latest sign. Guarded by _scope_lock.
+        # since the latest sign for WAITING only: past that a send proceeds,
+        # but the wake stays pending — protected, and "unknown" in the view —
+        # until evidence resolves it (a turn opens or ends, the runtime dies,
+        # it is cleared): a timeout limits waiting, it doesn't establish that
+        # work ended (anvil re-review, 2026-09-25). Guarded by _scope_lock.
         self._wake_at: float | None = None
+        # This runtime OBJECT's identity in the pair's process-wide activity
+        # writer, which a replacement runtime shares: background and wakes
+        # are tagged with it, and cleanup only ever touches its own — a late
+        # reader-EOF cleanup of a stopped runtime once reported its
+        # replacement's background as lost (anvil re-review, 2026-09-25).
+        self._gen = uuid.uuid4().hex[:12]
+        # Bumped by start() and stop(): a reader thread serves only the
+        # generation it was started for. A retired reader (stop()) drains its
+        # pipe and acts on nothing — no late turn, wake or loss.
+        self._reader_gen = 0
         # v0.16.0 activity file (pair_status / pair_poll / wait.py read it from
         # any process). Mutators touch memory only — safe on this reader thread.
         self._activity = _activity.writer(spec.name, "claude")
@@ -576,27 +591,28 @@ class PairRuntime:
         co. through in that gap (anvil review, 2026-09-25)."""
         with self._scope_lock:
             items = [dict(v, task_id=k) for k, v in self._bg_tasks.items()]
+            for item in items:
+                if item.get("stale"):
+                    item["description"] = (f"{item.get('description') or ''} — stale: no "
+                                           f"completion event for 24 h").lstrip(" —")
             if self._implicit_scope is not None:
                 task = self._implicit_task
                 items.append({"kind": "self-woken turn",
                               "task_id": task.task_id if task is not None else None,
                               "description": "the pair is working on its own"})
-            elif self._wake_live_locked():
-                items.append({"kind": "wake-up", "task_id": None,
-                              "description": "background finished; the pair is about to resume"})
+            elif self._wake_at is not None:
+                items.append({"kind": "wake-up", "task_id": None, "description": (
+                    "background finished; the pair is about to resume" if self._wake_live_locked()
+                    else f"announced {time.monotonic() - self._wake_at:.0f}s ago and not started "
+                         f"yet — unconfirmed; the pair may still resume")})
         return items
 
     def _wake_live_locked(self) -> bool:
-        """Caller holds _scope_lock. An expired wake is dropped here (the
-        activity view reports it as "unknown" for a while on its own)."""
-        if self._wake_at is None:
-            return False
-        if time.monotonic() - self._wake_at < _activity.WAKE_PENDING_SECONDS:
-            return True
-        self._wake_at = None
-        if self._implicit_scope is None:
-            self._implicit_done.set()
-        return False
+        """Caller holds _scope_lock. A wake within its waiting bound: sends
+        wait for it. Past the bound it is still pending (``_wake_at`` stays
+        set: pending_work, the evictor) — only waiting stops."""
+        return (self._wake_at is not None
+                and time.monotonic() - self._wake_at < _activity.WAKE_PENDING_SECONDS)
 
     def _no_turn_locked(self) -> bool:
         """Caller holds _scope_lock. No turn in progress: no self-woken scope,
@@ -621,7 +637,7 @@ class PairRuntime:
             self._wake_at = None
             if self._implicit_scope is None:
                 self._implicit_done.set()
-        self._activity.clear_wake()
+        self._activity.clear_wake(gen=self._gen)
 
     @staticmethod
     def _count_existing_lines(p: Path) -> int:
@@ -721,7 +737,9 @@ class PairRuntime:
             popen_kwargs["start_new_session"] = True
         self.proc = subprocess.Popen(args, **popen_kwargs)
         self.started_at = datetime.utcnow()
-        self._reader_thread = threading.Thread(target=self._stdout_reader, daemon=True)
+        self._reader_gen += 1
+        self._reader_thread = threading.Thread(target=self._stdout_reader, args=(self._reader_gen,),
+                                               daemon=True)
         self._reader_thread.start()
         self._stderr_thread = threading.Thread(target=self._stderr_reader, daemon=True)
         self._stderr_thread.start()
@@ -731,10 +749,13 @@ class PairRuntime:
             f"(pair={self.spec.name}, model={self.spec.model}, cwd={self.spec.cwd}) ==="
         )
 
-    def _stdout_reader(self) -> None:
+    def _stdout_reader(self, gen: int | None = None) -> None:
         proc = self.proc
+        gen = self._reader_gen if gen is None else gen
         assert proc is not None and proc.stdout is not None
         for raw in iter(proc.stdout.readline, b""):
+            if self._reader_gen != gen:
+                continue  # retired by stop(): drain, act on nothing
             try:
                 line = raw.decode("utf-8", errors="replace")
                 # v0.12.0: attribute/log FIRST, queue SECOND. Otherwise send()
@@ -759,6 +780,8 @@ class PairRuntime:
                     self._stdout_q.put(line)
             except Exception:
                 pass
+        if self._reader_gen != gen:
+            return  # stop() retired this reader and recorded its own losses
         try:
             self._on_reader_eof(proc)
         except Exception:
@@ -794,7 +817,7 @@ class PairRuntime:
             self._wake_at = None
             if self._implicit_scope is None:
                 self._implicit_done.set()
-        lost = self._activity.lose_background(why)
+        lost = self._activity.lose_background(why, gen=self._gen)
         if lost:
             kinds = ", ".join(str(b.get("kind")) for b in lost)
             self._record_self_woken({
@@ -810,14 +833,17 @@ class PairRuntime:
                 pass
         return lost
 
-    def expire_background(self, why: str) -> list[dict[str, Any]]:
-        """Drop the tracking of background work whose completion was
-        evidently missed, WITHOUT killing the runtime (a persistent runtime
-        past the 24 h ceiling). Recorded lost with ``why``."""
+    def mark_background_stale(self, why: str) -> list[dict[str, Any]]:
+        """A runtime kept alive past the 24 h ceiling (persistent): its
+        background has had no completion event for a day. It stays tracked
+        and protected — the work may be real and still wake the pair — but
+        is flagged stale, which the view reports as "unknown" (anvil
+        re-review, 2026-09-25: dropping it let foreign sends and mutations
+        through). Idempotent; returns the newly flagged entries."""
         with self._scope_lock:
-            ids = list(self._bg_tasks)
-            self._bg_tasks.clear()
-        return self._activity.lose_background(why, task_ids=ids) if ids else []
+            for entry in self._bg_tasks.values():
+                entry["stale"] = True
+        return self._activity.mark_background_stale(why, gen=self._gen)
 
     def _stderr_reader(self) -> None:
         assert self.proc is not None and self.proc.stderr is not None
@@ -918,6 +944,9 @@ class PairRuntime:
         Returns a short outcome string for telemetry.
         """
         why = reason or "the pair's runtime was stopped (process tree killed)"
+        # v0.16.0: retire the reader before anything else — whatever it would
+        # still read belongs to the process being killed.
+        self._reader_gen += 1
         # v0.12.0: finalize any self-woken turn FIRST — after the tree-kill no
         # result event will ever arrive to close it, and its task would sit
         # "running" forever (owner alive → orphan reaping never touches it).
@@ -1049,17 +1078,17 @@ class PairRuntime:
             # runtime's first result (a fresh runtime has no work of its own
             # that could wake it).
             if self._stale_notice is None and self._result_seq > 0 and self._note_wake():
-                self._activity.expect_wake()
+                self._activity.expect_wake(gen=self._gen)
         elif top_level and ev_type not in ("assistant", "user", "result"):
             # Anything else the CLI says while a wake is pending (e.g.
             # system:thinking_tokens during a long think) means the turn is
-            # still coming: push the deadline out.
+            # still coming: push the deadline out — also one already past it.
             with self._scope_lock:
-                waking = self._no_turn_locked() and self._wake_live_locked()
+                waking = self._no_turn_locked() and self._wake_at is not None
                 if waking:
                     self._wake_at = time.monotonic()
             if waking:
-                self._activity.refresh_wake()
+                self._activity.refresh_wake(gen=self._gen)
         if ev_type in ("assistant", "user") and top_level:
             with self._scope_lock:
                 needs_open = self._current_scope is None and self._implicit_scope is None
@@ -1332,7 +1361,7 @@ class PairRuntime:
                 "kind": kind, "description": desc,
                 "started_at": datetime.utcnow().isoformat(),
             }
-        self._activity.background_started(task_id, kind, desc)
+        self._activity.background_started(task_id, kind, desc, gen=self._gen)
 
     def _untrack_background(self, task_id: str, status: str) -> None:
         # task_updated(terminal) and task_notification both arrive for one
@@ -1343,7 +1372,7 @@ class PairRuntime:
             # With no turn open the CLI queues a wake-up turn for it (the
             # activity writer records its own wake_pending).
             self._note_wake()
-            self._activity.background_finished(task_id, status)
+            self._activity.background_finished(task_id, status, gen=self._gen)
 
     def _is_stale_resume_result(self, ev: dict) -> bool:
         """v0.16.0: the phantom result of a resume. When a runtime ends with a
@@ -1488,6 +1517,7 @@ class PairRuntime:
             self._implicit_task = None
         if task is not None:
             try:
+                task.activity_seq = self._activity.mutation_seq()
                 _async_tasks.finalize_external_task(task, status=status, error=reason)
             except Exception:
                 pass
@@ -1599,6 +1629,8 @@ class PairRuntime:
                 status = "failed"
             if task is not None:
                 try:
+                    # Publication watermark (see AsyncTaskState.activity_seq).
+                    task.activity_seq = self._activity.mutation_seq()
                     _async_tasks.finalize_external_task(
                         task, status=status, result=result, error=error,
                     )
@@ -1625,7 +1657,7 @@ class PairRuntime:
         else:
             # A result with no turn open: resolves a wake its init announced
             # (never "whatever turn is open" — a one-shot send's could be).
-            self._activity.clear_wake()
+            self._activity.clear_wake(gen=self._gen)
         self._record_self_woken(record)
         self._implicit_done.set()
 
@@ -1709,6 +1741,7 @@ class PairRuntime:
         waited. Loops because a new self-woken turn can open between the
         wait returning and the lock being taken."""
         waited = 0.0
+        promoted = False
         while True:
             waited += self.wait_for_implicit_idle(timeout_seconds, should_stop)
             # Same order as implicit opening: promote -> scope. Never hold
@@ -1720,7 +1753,9 @@ class PairRuntime:
                 with self._scope_lock:
                     if self._implicit_scope is not None or self._wake_live_locked():
                         continue  # opened (or announced) in the gap — wait again
-                _async_tasks.mark_task_executing(task_id)
+                if not promoted:
+                    _async_tasks.mark_task_executing(task_id)
+                    promoted = True
                 # Belt: every queued line was attributed by the reader before
                 # it was queued (and lines with no scope open aren't queued at
                 # all), so anything here belongs to a finished turn.
@@ -1732,6 +1767,14 @@ class PairRuntime:
                 with self._main_log_lock:
                     scope = TurnLogScope(self.main_log_path, self._main_log_lines + 1)
                 with self._scope_lock:
+                    # v0.16.0: revalidate at the commit. The reader publishes a
+                    # wake under _scope_lock alone (it never waits on the
+                    # control FileLock mark_task_executing takes), so one can
+                    # land during the promotion above; committing anyway sent
+                    # this message behind the queued wake, and the wake's
+                    # reply came back as ours (anvil re-review, 2026-09-25).
+                    if self._implicit_scope is not None or self._wake_live_locked():
+                        continue
                     scope.task_id = task_id
                     self._current_scope = scope
                 self._last_turn_summary = None
@@ -2158,11 +2201,12 @@ class RuntimeRegistry:
                 continue
             if rt.spec.persistent:
                 if rt.pending_background_tasks() and rt.last_activity < ceiling:
-                    # Kept warm on purpose: only the stale tracking goes.
-                    rt.expire_background(
+                    # Kept warm on purpose, and its background stays
+                    # protected: flagged stale ("unknown"), not dropped.
+                    rt.mark_background_stale(
                         f"no log activity for {BACKGROUND_EVICT_CEILING_SECONDS // 3600} h with "
                         f"background work still pending — it may already have finished (no "
-                        f"completion event seen); no longer tracked (persistent runtime kept)")
+                        f"completion event seen)")
                 continue
             if rt.pending_work():
                 # v0.16.0: evicting tree-kills the background work (and the

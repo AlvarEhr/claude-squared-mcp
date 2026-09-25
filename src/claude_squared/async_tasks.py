@@ -640,6 +640,12 @@ def start_task(pair_name: str, message: str,
                 # conventional ``"<TypeName>: <message>"`` wrapping for clarity.
                 state.error = _format_task_error(e)
         finally:
+            # v0.16.0 publication watermark: everything this task did to the
+            # pair's activity is at or below this count (see activity.view).
+            try:
+                state.activity_seq = _activity.mutation_seq(pair_name)
+            except Exception:
+                pass
             _finish_task(state, event)
 
     threading.Thread(target=_go, daemon=True).start()
