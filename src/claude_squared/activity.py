@@ -94,7 +94,7 @@ _AV_START_TOLERANCE_S = 2.0
 # How far back a task counts when looking for live pre-0.16 owners (the same
 # 24 h the design uses as the background-work ceiling).
 _AV_OWNER_LOOKBACK_S = 24 * 3600
-# Codex detach contract (feat/v0.16-codex docs/codex-detach-contract.md): an
+# Codex detach contract (HANDOFF "v0.16.0" Codex detach contract): an
 # events file written this recently proves a detached turn is still active.
 _AV_EVENTS_GRACE_S = 2.0
 _AV_K32 = []
@@ -242,6 +242,7 @@ def _av_task_summary(data):
         "status": data.get("status"),
         "owner_pid": data.get("owner_pid"),
         "child_pid": data.get("child_pid"),
+        "child_started_at": data.get("child_started_at"),
         "events_path": data.get("events_path"),
         "queued": bool(data.get("queued")),
         "started_at": data.get("started_at"),
@@ -495,7 +496,12 @@ def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,
                 row["state"] = "queued" if t.get("queued") else "running"
                 busy.append("task %s %s in PID %d%s" % (
                     tid[:8], row["state"], owner, " (self-woken)" if t.get("self_woken") else ""))
-            elif isinstance(child, int) and child > 0 and _av_task_owner_alive(child, started):
+            # The child is spawned AFTER its task starts (a queued task can
+            # spawn it minutes later), so the owner rule "created after the
+            # task = PID reuse" would misread a live child as gone; the task
+            # records the child's own creation time instead (integration fix,
+            # 2026-09-25).
+            elif isinstance(child, int) and child > 0 and _av_owner_alive(child, t.get("child_started_at")):
                 row["state"] = "detached"
                 busy.append("task %s detached: owner PID %s is gone, its turn process PID %d "
                             "still runs" % (tid[:8], owner, child))

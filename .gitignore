@@ -45,6 +45,9 @@ Thumbs.db
 # not published to the repo (per the lean-repo cleanup pass).
 HANDOFF.md
 
+# Local, opt-in live probes (never run by the offline test runner).
+probes/
+
 # Lock files / temp state from running the MCP locally — these live under
 # ~/.claude/pairs/ in user home, not in the repo, but extra defense:
 *.lock.owner

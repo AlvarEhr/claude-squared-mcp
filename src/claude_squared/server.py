@@ -673,6 +673,21 @@ def _adapter_for(spec: PairSpec) -> PairAdapter:
     raise PairError(f"Unsupported backend '{spec.backend}' (known: {list(BACKENDS)})")
 
 
+def _refuse_detached_codex(name: str) -> None:
+    """Under the pair lock, settle dead execs before a user mutation; never wait."""
+    if reg_mod.get_pair(name).backend != "codex":
+        return
+    for tid in async_tasks.list_running_task_ids_for_pair(name):
+        state = async_tasks.load_task(tid)
+        if state is None or not async_tasks.is_detached(state):
+            continue
+        if not async_tasks.codex_child_alive(state):
+            state = async_tasks.reap_orphan(tid, pair_locked=True)
+        if state and state.status == "running":
+            raise PairError(f"a detached Codex turn is in flight (child PID {state.child_pid}) "
+                            "— wait for it (pair_poll) or pair_stop it")
+
+
 def _require_claude(spec: PairSpec, tool: str, why: str) -> None:
     """Hard-error for tools that only exist on the Claude backend."""
     if spec.backend != "claude":
@@ -989,6 +1004,7 @@ def pair_create(
         # layer (Claude Desktop's RPC timeout is typically ~60s; an Opus briefing
         # reading 5 docs can take minutes).
         with _with_pair_lock(name):
+            _refuse_detached_codex(name)
             adapter = _adapter_for(spec)
             result = adapter.create(spec, initial_message=None)
             reg_mod.update_pair(name, session_id=result.session_id, turn_count=0)
@@ -1135,6 +1151,17 @@ def pair_forget(name: str, archive: bool = True) -> str:
         archive: If True, copy the pair's JSONL transcript to ~/.claude/pairs/archive/
             before removal. Default True.
     """
+    if reg_mod.get_pair(name).backend == "codex":
+        try:
+            with _with_pair_lock(name):
+                _refuse_detached_codex(name)
+                return _forget_pair(name, archive)
+        except FileLockTimeout:
+            raise PairError(f"Pair '{name}' is busy; pair_stop it before forgetting.")
+    return _forget_pair(name, archive)
+
+
+def _forget_pair(name: str, archive: bool) -> str:
     reg_mod.assert_writable()
     # Stop any live runtime / in-flight turn for this pair before removing it
     # (a Codex turn is a one-shot process with no runtime — tree-kill it here,
@@ -1541,6 +1568,9 @@ def _build_send_runner(
             should_stop = _make_stop_checker(name, task_id) if task_id else None
             current = reg_mod.get_pair(name)
             _check_model_backend(current, override_model)
+            if current.backend == "codex":
+                async_tasks.wait_for_detached(name, should_stop, task_id)
+                current = reg_mod.get_pair(name)
             # v0.12.0 cross-process FIFO for self-woken turns: a self-woken turn
             # in ANOTHER MCP process doesn't hold this pair's lock (no send
             # behind it), so without this we'd spawn our own claude on a JSONL
@@ -1671,7 +1701,13 @@ def _build_send_runner(
                 )
                 if drift_persist is not None:
                     update_fields["last_drift_notice"] = drift_persist
-                reg_mod.update_pair(name, **update_fields)
+                task_state = async_tasks.load_task(task_id) if task_id and current.backend == "codex" else None
+                if task_state and task_state.events_path:
+                    from claude_squared.codex_turns import bookkeep_send
+                    extra = {"last_drift_notice": drift_persist} if drift_persist is not None else {}
+                    bookkeep_send(Path(task_state.events_path), result, **extra)
+                else:
+                    reg_mod.update_pair(name, **update_fields)
             except Exception as exc:
                 result.notes.append(
                     f"registry bookkeeping failed after the turn completed ({exc}); "
@@ -1724,11 +1760,13 @@ def _build_compact_runner(
         with _with_pair_lock(name, timeout_s=lock_acquire_timeout_s):
             async_tasks.raise_if_stopped(task_id)
             should_stop = _make_stop_checker(name, task_id) if task_id else None
-            async_tasks.mark_task_executing(task_id)
             current = reg_mod.get_pair(name)
             # v0.16.0: re-checked under the lock — background may have started
             # since pair_compact's entry check.
             _refuse_if_background(name, "compacting", force)
+            if current.backend == "codex":
+                async_tasks.wait_for_detached(name, should_stop, task_id)
+            async_tasks.mark_task_executing(task_id)
             # Compaction rewrites the session JSONL — any warm runtime has
             # stale in-memory state and would write a turn against a JSONL
             # that no longer matches its view. Evict NOW, under the lock,
@@ -2603,7 +2641,7 @@ def pair_poll(
         # state regardless of whether it fired or timed out.
         waited_state = async_tasks.wait_for_task(task_id, timeout_s=float(effective_wait))
         if waited_state is not None:
-            state = waited_state
+            state = async_tasks.reap_orphan(task_id) or waited_state
 
     if verbose:
         return _verbose_dump(state)
@@ -2616,6 +2654,9 @@ def pair_poll(
             f"running for {dur_s:.0f}s on pair '{state.pair_name}' "
             f"(started {_fmt_local(state.started_at)})"
         )
+        if async_tasks.is_detached(state):
+            headline += (f" — DETACHED (owner died; child PID {state.child_pid}; "
+                         "pair_poll collects the result after exit)")
         if async_tasks.is_self_woken_task(state):
             headline += (
                 " — SELF-WOKEN turn: the pair resumed on its own after background "
@@ -2629,7 +2670,8 @@ def pair_poll(
             detail = err[len(async_tasks.ORPHAN_ERROR_PREFIX):]
             headline = (
                 f"⚠ ORPHANED (pair '{state.pair_name}') — the owner MCP server died "
-                f"mid-turn. This is NOT a work failure; the work may well have completed.\n"
+                f"mid-turn. This is a SUPERVISION event, NOT a work failure; "
+                f"completion could not be confirmed.\n"
                 f"  {detail}"
             )
         elif err.startswith(async_tasks.CRASHED_ERROR_PREFIX):
@@ -2687,6 +2729,7 @@ def pair_poll(
     if state.status == "running" and not state.queued:
         runtime_obj = runtime_mod.registry().get_or_none(state.pair_name)
         _last_act = None
+        _cx = None
         if runtime_obj is not None and runtime_obj._last_log_activity_at is not None:  # noqa: SLF001
             _last_act = runtime_obj._last_log_activity_at  # noqa: SLF001
         else:
@@ -2697,7 +2740,12 @@ def pair_poll(
                 _last_act = _cx["last_activity"]
         if _last_act is not None:
             idle_s = (datetime.utcnow() - _last_act).total_seconds()
-            if idle_s > 120:
+            poll_spec = reg_mod.get_pair(state.pair_name) if _cx else None
+            effort = _cx.get("effort", poll_spec.effort) if _cx and poll_spec else None
+            if idle_s > 120 and poll_spec and poll_spec.backend == "codex" and effort in ("high", "xhigh", "max", "ultra"):
+                lines.append(f"  (no event for {idle_s:.0f}s — Codex high+ reasoning can be silent "
+                             "for 3–6 minutes; silence alone does not show a hang)")
+            elif idle_s > 120:
                 lines.append(
                     f"  ⚠ no log activity for {idle_s:.0f}s — pair may be hung. "
                     f"Re-poll with with_turn_log=True to inspect, then pair_stop if truly stuck."
@@ -3022,6 +3070,7 @@ def pair_update(
     transparency_msgs: list[str] = []
     try:
         with _with_pair_lock(name):
+            _refuse_detached_codex(name)
             fields: dict[str, Any] = {}
             cur_spec = reg_mod.get_pair(name)
             if model is not None:
@@ -3889,6 +3938,7 @@ def pair_clear(name: str, archive_old: bool = True, verbose: bool = False, force
     """
     try:
         with _with_pair_lock(name):
+            _refuse_detached_codex(name)
             spec = reg_mod.get_pair(name)
             adapter = _adapter_for(spec)
             old_sid = spec.session_id
@@ -4270,6 +4320,7 @@ def pair_fork(name: str, new_name: str | None = None, verbose: bool = False) -> 
     from claude_squared.transcript import find_sentinel_line, truncate_jsonl_before_line
     try:
         with _with_pair_lock(name, timeout_s=360.0):
+            _refuse_detached_codex(name)
             spec = reg_mod.get_pair(name)
             # Pick a non-colliding new name.
             existing = set(reg_mod.load().pairs.keys())
@@ -4383,6 +4434,7 @@ def pair_rewind(name: str, to_point: int, archive: bool = True, verbose: bool = 
     )
     try:
         with _with_pair_lock(name):
+            _refuse_detached_codex(name)
             spec = reg_mod.get_pair(name)
             adapter = _adapter_for(spec)
             path = adapter.transcript_path(spec)
@@ -4677,6 +4729,11 @@ def pair_stop(
                 outcome = codex_adapter_mod._tree_kill(info["proc"])
                 if outcome:
                     actions.append(f"{outcome} the in-flight codex turn (thread intact; next send resumes it)")
+            for detached in selected.values():
+                if async_tasks.is_detached(detached):
+                    outcome = codex_adapter_mod.stop_detached(detached)
+                    if outcome:
+                        actions.append(f"{outcome} detached codex child PID {detached.child_pid}")
         elif runtime_obj is not None and runtime_obj.is_alive():
             active = runtime_obj.active_task_ids()
             untracked = runtime_obj.has_untracked_turn()
@@ -4724,6 +4781,7 @@ def pair_stop(
         # we just torn down the in-flight work.
         try:
             with _with_pair_lock(name, timeout_s=10.0):
+                _refuse_detached_codex(name)
                 # Tear down any live runtime — soft interrupt left it alive
                 try:
                     hard_lost = runtime_mod.registry().evict(
@@ -5033,7 +5091,9 @@ def _codex_status(spec: PairSpec, *, last_n_log: int, verbose: bool) -> str:
     name = spec.name
     now = datetime.utcnow()
     info = codex_adapter_mod.inflight_info(name)
-    inflight_tasks = async_tasks.list_running_task_ids_for_pair(name)
+    observed = [async_tasks.reap_orphan(tid) for tid in async_tasks.list_running_task_ids_for_pair(name)]
+    inflight_tasks = [state.task_id for state in observed if state and state.status == "running"]
+    detached = [state for state in observed if state and async_tasks.is_detached(state)]
     main_log = runtime_mod.logs_dir() / name / "main.log"
     last_activity: datetime | None = None
     if info and info.get("last_activity") is not None:
@@ -5050,9 +5110,16 @@ def _codex_status(spec: PairSpec, *, last_n_log: int, verbose: bool) -> str:
             heuristic = f"active — codex turn running in this process for {age:.0f}s"
         elif idle_seconds < 120:
             heuristic = f"slow — codex turn running for {age:.0f}s, {idle_seconds:.0f}s since the last event"
+        elif info.get("effort", spec.effort) in ("high", "xhigh", "max", "ultra"):
+            heuristic = (f"reasoning or working — no event for {idle_seconds:.0f}s; healthy "
+                         "Codex high+ turns can be silent for 3–6 minutes; inspect before stopping")
         else:
             heuristic = (f"likely-hung — codex turn running for {age:.0f}s with no event for "
                          f"{idle_seconds:.0f}s (pair_log to inspect, pair_stop to tree-kill)")
+    elif detached:
+        heuristic = ("DETACHED — owner died; Codex child/result is still in flight "
+                     f"(PIDs {', '.join(str(state.child_pid) for state in detached)}); "
+                     "pair_poll collects after exit; pair_stop tree-kills the child")
     elif inflight_tasks:
         heuristic = (f"codex turn in flight in ANOTHER MCP process"
                      f"{f' ({idle_seconds:.0f}s since last log line)' if idle_seconds is not None else ''}; "
@@ -5071,7 +5138,7 @@ def _codex_status(spec: PairSpec, *, last_n_log: int, verbose: bool) -> str:
     if verbose:
         return json.dumps({
             "name": name, "backend": "codex",
-            "runtime_alive": bool(info),
+            "runtime_alive": bool(info) or any(async_tasks.codex_child_alive(state) for state in detached),
             "started_at": info["started_at"].isoformat() if info and info.get("started_at") else None,
             "last_log_activity_at": last_activity.isoformat() if last_activity else None,
             "idle_seconds": idle_seconds,

@@ -38,6 +38,10 @@ def main() -> int:
         "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
         "-p", "test_handoff.py", "-v",
     ]))
+    commands.append(("codex_detach", [
+        "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
+        "-p", "test_codex_detach.py", "-v",
+    ]))
     commands.append(("connectors", [
         "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
         "-p", "test_connectors.py", "-v",
@@ -59,6 +63,7 @@ def main() -> int:
             env = os.environ.copy()
             env.update({
                 "CLAUDE_HOME": str(Path(tmp) / "claude"),
+                "CODEX_HOME": str(Path(tmp) / "codex"),
                 "PYTHONPATH": str(ROOT / "src"),
                 "PYTHONIOENCODING": "utf-8",
                 "PYTHONDONTWRITEBYTECODE": "1",
