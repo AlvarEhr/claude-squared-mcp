@@ -1091,7 +1091,7 @@ class PairRuntime:
         # turn — they arrive between turns constantly and have no result of
         # their own (→ a phantom task that never closes, forever in-flight).
         # system.init is deliberately NOT part of the predicate: a self-woken
-        # continuation doesn't necessarily start with one (par6 log: the parent
+        # continuation doesn't necessarily start with one (a real pair's log: the parent
         # kept working for 10 min after a result with no init in between).
         ev_type = ev.get("type")
         top_level = not ev.get("parent_tool_use_id")
