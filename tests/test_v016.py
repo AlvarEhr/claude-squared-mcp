@@ -880,6 +880,8 @@ class ReviewFixTests(ReviewHelpers):
     # -- HIGH 7: task mode judges a detached child by its own creation time --
 
     def test_task_mode_child_and_owner_identity(self):
+        if self.live_started is None:
+            self.skipTest("no process creation times on this platform")
         mod = wait_module()
         (self.pairs / "async").mkdir(parents=True, exist_ok=True)
 
@@ -1006,6 +1008,11 @@ class ReviewFixTests(ReviewHelpers):
         R.add_pair(spec)
         w = A.writer(self.pair)
         w.background_started("b2", "local_bash")
+        # Published BEFORE the watcher starts: on a slow CI runner the watcher's
+        # first look otherwise saw no activity and returned idle at once
+        # (every CI job, 2026-09-27; in real use a send's task is already
+        # running before any watcher starts).
+        self.assertTrue(w.flush())
         t, box = self.run_wait(mod, self.pair, "--poll", "0.5", "--timeout", "30")
         time.sleep(0.5)
         w.turn_opened("sw", "self_woken")

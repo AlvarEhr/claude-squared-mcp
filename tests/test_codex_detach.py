@@ -257,6 +257,8 @@ class DetachTests(unittest.TestCase):
         self.assertEqual(A.reap_orphan(state.task_id).status, "done")
 
     def test_reused_owner_pid_is_dead_for_poll_and_startup_sweep(self):
+        if P.started_at(os.getpid()) is None:
+            self.skipTest("no process creation times on this platform")
         state, _ = self.task()
         state.owner_pid = os.getpid()
         state.started_at = datetime.utcfromtimestamp(P.started_at(os.getpid()) - 10)
@@ -267,10 +269,16 @@ class DetachTests(unittest.TestCase):
 
     def test_process_creation_time_matches_and_rejects_a_different_lifetime(self):
         created = P.started_at(os.getpid())
-        self.assertIsNotNone(created)
+        # Unknown identity falls back to liveness (v0.16.1 — macOS CI read
+        # every live child as gone when "unknown" meant "no match").
+        self.assertTrue(P.matches(os.getpid(), None))
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        self.assertFalse(P.matches(dead.pid, None))
+        if created is None:
+            self.skipTest("no process creation times on this platform")
         self.assertTrue(P.matches(os.getpid(), created))
         self.assertFalse(P.matches(os.getpid(), created - 10))
-        self.assertFalse(P.matches(os.getpid(), None))
 
     def test_mutating_tools_refuse_live_detached_turn_before_side_effects(self):
         state, _ = self.task(child_pid=os.getpid())

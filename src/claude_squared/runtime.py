@@ -1449,9 +1449,11 @@ class PairRuntime:
         if self._reported_window:
             window, source = self._reported_window, "reported"
         else:
-            # Brand-new pair only: nothing reported yet (design rev. B).
-            window = 1_000_000 if (self.spec.context_window == "1m"
-                                   or "1m" in (self.spec.model or "").lower()) else 200_000
+            # Nothing reported yet — a new pair, or the first turn after a
+            # model change / upgrade. _note_reported_window corrects it at the
+            # turn's result (v0.16.1).
+            from claude_squared.models import default_claude_window
+            window = default_claude_window(self.spec.model, self.spec.context_window)
             source = "inferred"
         self._activity.note_context(used, window, window_source=source, source="stream")
 

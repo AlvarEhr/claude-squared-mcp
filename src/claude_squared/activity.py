@@ -146,6 +146,31 @@ def _av_kernel32():
     return _AV_K32[0]
 
 
+def _av_darwin_started(pid):
+    """macOS process start time (epoch seconds) via sysctl(KERN_PROC_PID) —
+    kinfo_proc begins with kp_proc.p_starttime (a struct timeval), the field
+    psutil reads too. None when unavailable or the PID doesn't exist (v0.16.1:
+    macOS had no creation time at all, so identity checks read live
+    processes as gone)."""
+    try:
+        import ctypes
+        import ctypes.util
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.dylib", use_errno=True)
+        libc.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+                                ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
+        mib = (ctypes.c_int * 4)(1, 14, 1, int(pid))  # CTL_KERN, KERN_PROC, KERN_PROC_PID
+        size = ctypes.c_size_t(0)
+        if libc.sysctl(mib, 4, None, ctypes.byref(size), None, 0) != 0 or size.value < 16:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(mib, 4, buf, ctypes.byref(size), None, 0) != 0 or size.value < 16:
+            return None  # a missing PID answers with an empty buffer
+        sec = int.from_bytes(buf.raw[0:8], sys.byteorder, signed=True)
+        usec = int.from_bytes(buf.raw[8:12], sys.byteorder, signed=True)
+        return sec + usec / 1000000.0 if sec > 0 else None
+    except Exception:
+        return None
+
 def _av_proc(pid):
     """(alive, started_at) for a PID. alive is True/False, or None when the OS
     won't say (access denied: the process exists). started_at is the process
@@ -181,6 +206,8 @@ def _av_proc(pid):
         return False, None
     except OSError:
         return None, None
+    if sys.platform == "darwin":
+        return True, _av_darwin_started(pid)
     started = None
     try:  # Linux: /proc/<pid>/stat field 22 = start time in clock ticks since boot
         with open("/proc/%d/stat" % pid) as f:
@@ -523,6 +550,17 @@ def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,
     meta, _err = _av_read_json(pairs_dir / "activity" / pair / "pair.json")
     if isinstance(meta, dict):
         view["reported_window"] = meta.get("reported_window")
+    # v0.16.1: a context noted against a GUESSED window (a runtime's first
+    # turn, before its result reported the real one) defers to the reported
+    # window — also repairs files written by 0.16.0.
+    rep = view["reported_window"] if isinstance(view["reported_window"], dict) else {}
+    ctx = view["context"]
+    if (isinstance(ctx, dict) and ctx.get("window_source") == "inferred"
+            and isinstance(rep.get("tokens"), int) and rep.get("tokens") > 0
+            and (rep.get("backend") or "claude") == (ctx.get("backend") or "claude")):
+        used = ctx.get("used")
+        ctx.update(window=rep["tokens"], window_source="reported",
+                   pct=round(used * 100.0 / rep["tokens"], 1) if isinstance(used, int) and used else None)
 
     owner_pids = set(p for p, _s, _d in owners)
     lookback = now - timedelta(seconds=_AV_OWNER_LOOKBACK_S)
@@ -1083,6 +1121,15 @@ class ActivityWriter:
         if self.backend == "codex":
             rec.update(backend="codex", auto_compact_token_limit=auto_compact_token_limit)
         with self._lock:
+            # v0.16.1: the first turn of a runtime notes its live context
+            # against a GUESSED window before the result reports the real one;
+            # correct that entry now instead of leaving it until the next turn.
+            ctx = self._state.get("context")
+            if isinstance(ctx, dict) and ctx.get("window_source") == "inferred":
+                used = ctx.get("used")
+                ctx.update(window=int(tokens), window_source="reported",
+                           pct=round(used * 100.0 / int(tokens), 1) if used else None)
+                self._mark(_URGENT)
             old = (self._meta or {}).get("reported_window") or {}
             if all(old.get(k) == rec.get(k) for k in
                    ("tokens", "model_key", "model", "backend", "auto_compact_token_limit")):

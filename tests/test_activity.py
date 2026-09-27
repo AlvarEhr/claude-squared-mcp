@@ -150,7 +150,8 @@ class WriterTests(ActivityTestCase):
         self.assertTrue(w.flush())
         data = self.read_own()
         self.assertEqual(data["owner_pid"], os.getpid())
-        self.assertIsNotNone(data["owner_started_at"])
+        if A._av_proc(os.getpid())[1] is not None:  # platforms with creation times
+            self.assertIsNotNone(data["owner_started_at"])
         self.assertEqual(data["window_task_id"], "t1")
         self.assertTrue(data["background"][0]["outlived_turn"])
         self.assertIsNone(data["turn"])
@@ -513,6 +514,8 @@ class ViewTests(ActivityTestCase):
         self.assertEqual(self.read_own()["background"][0]["task_id"], "mine")
 
     def test_pid_reuse_guard(self):
+        if self.live_started is None:
+            self.skipTest("no process creation times on this platform")
         self.foreign(self.live.pid, owner_started_at=self.live_started - 3600,
                      background=[{"task_id": "b", "kind": "k", "description": "",
                                   "started_at": A._av_iso(A._av_now())}])
@@ -546,6 +549,8 @@ class ViewTests(ActivityTestCase):
         self.assertEqual(self.read_own()["state"], "live")
 
     def test_old_or_dead_task_owners_are_not_unknown(self):
+        if self.live_started is None:
+            self.skipTest("no process creation times on this platform")
         old = A._av_now() - timedelta(hours=30)
         self.task(owner_pid=self.live.pid, started=old, finished=old)
         self.task(owner_pid=self.dead.pid, finished=A._av_now())
@@ -574,6 +579,8 @@ class ViewTests(ActivityTestCase):
         self.assertEqual((view["verdict"], view["running_tasks"][0]["state"]), ("busy", "detached"))
 
     def test_detached_child_is_judged_by_its_own_creation_time(self):
+        if self.live_started is None:
+            self.skipTest("no process creation times on this platform")
         # A queued Codex task spawns its child long after the task started;
         # the owner rule ("created after the task = PID reuse") must not
         # declare that live child gone (integration fix, 2026-09-25).
@@ -600,6 +607,36 @@ class ViewTests(ActivityTestCase):
         self.assertEqual(view["running_tasks"][0]["state"], "finished_detached")
         self.assertNotEqual(view["verdict"], "busy")
         self.assertIn("pair_poll(", view["notes"][0])
+
+    def test_reported_window_corrects_a_guessed_context(self):
+        # v0.16.1 (found after the v0.16.0 release): a runtime's first turn
+        # notes its live context against a GUESSED window; the result's
+        # reported window must correct it — in the writer, and in the view for
+        # files 0.16.0 already wrote.
+        w = A.writer(self.pair)
+        w.note_context(276_679, 200_000, window_source="inferred", source="stream")
+        w.note_reported_window(1_000_000, model_key="claude-opus-5-5|default", model="claude-opus-5-5")
+        ctx = w.snapshot()["context"]
+        self.assertEqual((ctx["window"], ctx["window_source"], ctx["pct"]), (1_000_000, "reported", 27.7))
+        # A 0.16.0 file: guessed context, reported window only in pair.json.
+        self.foreign(self.live.pid, owner_started_at=self.live_started, context={
+            "used": 276_679, "window": 200_000, "pct": 138.3, "window_source": "inferred",
+            "source": "stream", "at": A._av_iso(A._av_now() + timedelta(seconds=5))})
+        meta = self.pairs / "activity" / self.pair / "pair.json"
+        meta.write_text(json.dumps({"version": 1, "pair": self.pair, "reported_window": {
+            "tokens": 1_000_000, "model_key": "claude-opus-5-5|default", "model": "claude-opus-5-5",
+            "source": "result", "at": A._av_iso(A._av_now())}}), encoding="utf-8")
+        ctx = self.view()["context"]
+        self.assertEqual((ctx["used"], ctx["window"], ctx["window_source"]), (276_679, 1_000_000, "reported"))
+
+    def test_default_window_guess(self):
+        from claude_squared.models import default_claude_window as dw
+        for model, cw, want in (("opus", "default", 1_000_000), ("claude-opus-5-5", None, 1_000_000),
+                                ("claude-opus-5", "default", 1_000_000), ("fable", None, 1_000_000),
+                                ("claude-opus-4-8", "default", 200_000), ("claude-opus-4-8", "1m", 1_000_000),
+                                ("claude-opus-4-8[1m]", None, 1_000_000), ("sonnet", None, 200_000),
+                                ("haiku", "default", 200_000)):
+            self.assertEqual(dw(model, cw), want, (model, cw))
 
     def test_settling_then_idle(self):
         w = A.writer(self.pair)
@@ -801,6 +838,8 @@ class ViewTests(ActivityTestCase):
 
 class ProcessTests(ActivityTestCase):
     def test_process_liveness_and_start_time(self):
+        if A._av_proc(os.getpid())[1] is None:
+            self.skipTest("no process creation times on this platform")
         alive, started = A._av_proc(os.getpid())
         self.assertTrue(alive)
         self.assertLessEqual(started, time.time())

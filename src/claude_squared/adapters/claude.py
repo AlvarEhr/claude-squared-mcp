@@ -640,8 +640,8 @@ class ClaudeAdapter(PairAdapter):
         ctx_window = model_usage.get(model_used, {}).get("contextWindow")
         window_source = "reported" if ctx_window else "estimated"
         if not ctx_window:
-            ctx_window = (1_000_000 if ("1m" in (model_used or "").lower()
-                                        or spec.context_window == "1m") else 200_000)
+            from claude_squared.models import default_claude_window
+            ctx_window = default_claude_window(model_used or spec.model, spec.context_window)
         # True context fill = the LAST assistant sub-call's prompt size, NOT the
         # cumulative across the agentic loop. The stream-json `result` event's
         # usage block sums every sub-call's input — useful for billing but

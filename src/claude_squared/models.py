@@ -433,6 +433,23 @@ def parse_model_id(model: str) -> tuple[str | None, tuple[int, ...]]:
     return family, tuple(ver_parts)
 
 
+def default_claude_window(model: str | None, context_window: str | None = None) -> int:
+    """Best guess at a Claude pair's context window BEFORE the CLI has
+    reported one. Opus 5+ and Fable run 1M even on the bare `default` tier
+    (ml-editor, default window, auto-compacted at 970,682 on 2026-09-25); a
+    floating family alias ("opus") follows the current generation, which is
+    1M. Everything else (Sonnet, Haiku, pinned pre-5 Opus) is 200k unless the
+    pair asked for the 1m tier. The CLI-reported window always wins once known
+    (v0.16.1: a 200k guess on a 1M pair fired false context alerts)."""
+    m = (model or "").lower()
+    if context_window == "1m" or "1m" in m:
+        return 1_000_000
+    family, version = parse_model_id(model or "")
+    if family == "fable" or (family == "opus" and (not version or version >= (5,))):
+        return 1_000_000
+    return 200_000
+
+
 def model_substitution_note(requested: str, served: str) -> str | None:
     """Note if ``served`` looks like a downgrade/substitution of ``requested``
     (Claude). ``None`` when either side is unparseable or for Codex ids."""

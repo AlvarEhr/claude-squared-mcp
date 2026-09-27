@@ -4,6 +4,26 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.1] — 2026-09-27
+
+### Fixed
+
+- **False context alerts on a runtime's first turn.** Before the CLI reported
+  the context window, a Claude pair's live context was measured against a
+  guessed 200k — wrong for Opus 5 / 5.5 / Fable, which run 1M even on the
+  `default` window — so the first turn after a restart or a model change
+  showed >100% fill and a watcher could exit 8 falsely. The guess now knows
+  those models are 1M, the reported window corrects the entry the moment it
+  arrives, and readers prefer a reported window over a guess (which also
+  repairs activity files 0.16.0 wrote).
+- **macOS: process identity.** Process creation times weren't read on macOS
+  at all, and "unknown identity" counted as "a different process", so a live
+  detached Codex turn read as gone there. Creation times now come from
+  `sysctl` on macOS, and where they can't be read the checks fall back to
+  plain liveness.
+- A CI-only race in one watcher test (every CI job failed on 0.16.0; the
+  released code was unaffected).
+
 ## [0.16.0] — 2026-09-27
 
 **Restart every open Claude and Codex session after installing** (a running
