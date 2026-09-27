@@ -452,6 +452,8 @@ A selected connector the backend can't see is stored and reported as "not availa
 | Pinned-at-create | `allowed_tools`, `system_prompt_append` | **Only after `pair_clear`** — the existing session was started with the OLD values; rotation creates a fresh session with the new pinned config |
 | Pinned-at-spawn | `cwd`, `extra_dirs` | Next spawn after eviction. A Claude `cwd` change ALSO moves the session JSONL across project dirs (rejected with recovery hint if the move fails); Codex threads aren't cwd-keyed |
 
+Since 0.16.0 only an *actual* change evicts the runtime — a `pair_update` that sends the current values is a no-op (restart a warm runtime with `pair_stop(name, force=True)`), and a change to a spawn-pinned field refuses while the pair has background work pending unless you pass `force=True` (the work is killed and recorded).
+
 ## Per-pair invocation allow-list (v0.8.1+)
 
 `PairSpec.allowed_invocations: list[str] | None` gates which slash commands the calling agent may run via `pair_invoke`. Patterns use `fnmatch` glob syntax (stdlib).
