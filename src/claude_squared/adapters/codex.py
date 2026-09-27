@@ -448,7 +448,7 @@ def recover_turn(state) -> SendResult | None:
 # Binary + config resolution
 # ---------------------------------------------------------------------------
 
-_EXE_CACHE: dict[str, str] = {}
+_EXE_CACHE: dict[str, Any] = {}
 
 
 def _codex_version(exe: str) -> tuple[int, ...]:
@@ -500,8 +500,10 @@ def codex_executable(*, refresh: bool = False) -> str:
     and a long-lived MCP process must follow it (it once cached the old path,
     and every Codex spawn failed with WinError 2 until a restart). A config
     path counts only once the file exists (the config may be rewritten before
-    the new binary is in place). Only the scan is cached, and a cached path is
-    reused only while the file exists; ``refresh=True`` rescans."""
+    the new binary is in place). The scan's answer (``--version`` of every
+    candidate) is cached only while its file exists and the set of candidate
+    folders is unchanged — a new ``bin/<hash>/`` triggers a rescan even if the
+    old one survives; ``refresh=True`` rescans."""
     env = os.environ.get("CLAUDE_PAIR_CODEX_PATH")
     if env and Path(env).exists():
         return env
@@ -513,35 +515,34 @@ def codex_executable(*, refresh: bool = False) -> str:
         cand = (envblk or {}).get("CODEX_CLI_PATH") if isinstance(envblk, dict) else None
         if cand and os.path.isfile(str(cand)):
             return str(cand)
-    cached = _EXE_CACHE.get("exe")
-    if cached and not refresh and os.path.isfile(cached):
-        return cached
-    _EXE_CACHE.pop("exe", None)
     local = os.environ.get("LOCALAPPDATA")
+    candidates = tuple(sorted(glob.glob(os.path.join(local, "OpenAI", "Codex", "bin", "*", "codex.exe")))) \
+        if local else ()
+    cached = _EXE_CACHE.get("exe")
+    if (cached and not refresh and _EXE_CACHE.get("candidates") == candidates
+            and os.path.isfile(cached)):
+        return cached
+    _EXE_CACHE.clear()
     best: tuple[tuple[int, ...], str] | None = None
-    if local:
-        for cand in glob.glob(os.path.join(local, "OpenAI", "Codex", "bin", "*", "codex.exe")):
-            v = _codex_version(cand)
-            if best is None or v > best[0]:
-                best = (v, cand)
-    if best:
-        _EXE_CACHE["exe"] = best[1]
-        return best[1]
-    found = shutil.which("codex")
+    for cand in candidates:
+        v = _codex_version(cand)
+        if best is None or v > best[0]:
+            best = (v, cand)
+    found = best[1] if best else shutil.which("codex")
     if found:
-        _EXE_CACHE["exe"] = found
+        _EXE_CACHE.update(exe=found, candidates=candidates)
         return found
     return "codex"
 
 
-def popen_codex(args: list[str], **kwargs: Any) -> subprocess.Popen:
-    """``subprocess.Popen`` for a command whose ``args[0]`` came from
+def _with_fresh_codex(spawn: Callable, args: list[str], **kwargs: Any):
+    """Run ``spawn(args, …)`` for a command whose ``args[0]`` came from
     :func:`codex_executable`. The updater can delete the binary between
     resolution and spawn, so a binary that is gone is re-resolved once and the
     spawn retried; ``args[0]`` is updated in place so callers report the
     binary that ran (or was last tried)."""
     try:
-        return subprocess.Popen(args, **kwargs)
+        return spawn(args, **kwargs)
     except FileNotFoundError:
         if os.path.isfile(args[0]):
             raise  # the binary is there; something else is missing (the cwd)
@@ -549,7 +550,17 @@ def popen_codex(args: list[str], **kwargs: Any) -> subprocess.Popen:
         if fresh == args[0]:
             raise
         args[0] = fresh
-        return subprocess.Popen(args, **kwargs)
+        return spawn(args, **kwargs)
+
+
+def popen_codex(args: list[str], **kwargs: Any) -> subprocess.Popen:
+    """``subprocess.Popen`` with :func:`_with_fresh_codex`'s one retry."""
+    return _with_fresh_codex(subprocess.Popen, args, **kwargs)
+
+
+def run_codex(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+    """``subprocess.run`` with :func:`_with_fresh_codex`'s one retry."""
+    return _with_fresh_codex(subprocess.run, args, **kwargs)
 
 
 def codex_spawn_error(args: list[str], exc: OSError, cwd: str | None, what: str = "codex") -> str:
@@ -1030,8 +1041,8 @@ def delete_thread(thread_id: str) -> None:
     """Delete an imported thread; callers must report failures as orphaned IDs."""
     args = [codex_executable(), "delete", "--force", thread_id]
     try:
-        result = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True,
-                                text=True, encoding="utf-8", errors="replace", timeout=30)
+        result = run_codex(args, stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=30)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise CLIError(f"could not delete Codex thread {thread_id}: {exc}") from exc
     if result.returncode:

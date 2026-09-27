@@ -76,10 +76,10 @@ def _json_file(path: Path) -> dict:
 def _list_output(backend: str, cwd: str | None) -> str:
     if backend == "claude":
         from claude_squared.adapters.claude import _claude_executable
-        exe = _claude_executable()
+        exe, spawn = _claude_executable(), subprocess.run
     else:
-        from claude_squared.adapters.codex import codex_executable
-        exe = codex_executable()
+        from claude_squared.adapters.codex import codex_executable, run_codex
+        exe, spawn = codex_executable(), run_codex  # retries once if an update removed the binary
     working_dir = os.path.abspath(cwd or os.getcwd())
     key = (backend, exe, working_dir)
     with _CACHE_LOCK:
@@ -88,9 +88,9 @@ def _list_output(backend: str, cwd: str | None) -> str:
             return cached[1]
     try:
         args = [exe, "mcp", "list"] + (["--json"] if backend == "codex" else [])
-        result = subprocess.run(args, cwd=working_dir, stdin=subprocess.DEVNULL,
-                                capture_output=True, text=True, encoding="utf-8",
-                                errors="replace", timeout=20)
+        result = spawn(args, cwd=working_dir, stdin=subprocess.DEVNULL,
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=20)
         output = result.stdout or ""  # Claude can list unhealthy servers with a nonzero exit.
     except (OSError, subprocess.SubprocessError):
         output = ""

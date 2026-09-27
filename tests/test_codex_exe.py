@@ -26,7 +26,9 @@ TEST_HOME = tempfile.TemporaryDirectory(prefix="cs-exe-", ignore_cleanup_errors=
 os.environ["CLAUDE_HOME"] = str(Path(TEST_HOME.name) / "claude")
 os.environ["CODEX_HOME"] = str(Path(TEST_HOME.name) / "codex")
 
-from claude_squared import registry as R
+from types import SimpleNamespace
+
+from claude_squared import connectors as N, registry as R, server as S
 from claude_squared.adapters import codex as C
 from claude_squared.adapters.appserver import AppServerClient
 from claude_squared.errors import CLIError
@@ -111,13 +113,19 @@ class CodexExeTests(unittest.TestCase):
         self.assertEqual(C.codex_executable(), second)
         self.assertGreater(self.versions.call_count, scans)
 
-    def test_refresh_rescans_even_when_the_cached_binary_exists(self):
+    def test_a_new_bin_folder_is_picked_up_even_if_the_old_one_survives(self):
         first = self.fake_binary("80f78947ad880e6e")
         self.assertEqual(C.codex_executable(), first)
         newer = self.fake_binary("faa963e871dd422c")
         self.versions.side_effect = lambda exe: (0, 156, 0) if exe == newer else (0, 155, 0)
+        self.assertEqual(C.codex_executable(), newer)
+
+    def test_refresh_rescans_an_unchanged_folder_set(self):
+        first = self.fake_binary("80f78947ad880e6e")
         self.assertEqual(C.codex_executable(), first)
-        self.assertEqual(C.codex_executable(refresh=True), newer)
+        scans = self.versions.call_count
+        self.assertEqual(C.codex_executable(refresh=True), first)
+        self.assertGreater(self.versions.call_count, scans)
 
     def test_nothing_found_is_not_cached(self):
         self.assertEqual(C.codex_executable(), "codex")
@@ -158,6 +166,21 @@ class CodexExeTests(unittest.TestCase):
         msg = C.codex_spawn_error(args, caught.exception, missing_cwd)
         self.assertIn("working directory does not exist", msg)
         self.assertNotIn("no Codex binary found", msg)
+
+    def test_run_codex_retries_once_and_delete_and_listing_use_it(self):
+        gone = str(self.dir / "gone" / "codex.exe")
+        args = [gone, "-c", "print('ran')"]
+        with patch.dict(os.environ, {"CLAUDE_PAIR_CODEX_PATH": sys.executable}):
+            done = C.run_codex(args, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30)
+        self.assertEqual(done.stdout.strip(), "ran")
+        self.assertEqual(args[0], sys.executable)
+        ok = SimpleNamespace(returncode=0, stdout="[]", stderr="")
+        with patch.object(C, "run_codex", return_value=ok) as run:
+            C.delete_thread("some-thread")
+            self.assertEqual(run.call_args.args[0][1:], ["delete", "--force", "some-thread"])
+            N._CACHE.clear()
+            self.assertEqual(N._list_output("codex", str(self.dir)), "[]")
+            self.assertEqual(run.call_args.args[0][1:], ["mcp", "list", "--json"])
 
     def test_app_server_spawn_retries_with_the_fresh_binary(self):
         gone = str(self.dir / "gone" / "codex.exe")
@@ -215,10 +238,13 @@ class CodexRunSpawnTests(unittest.TestCase):
         self.assertIn("=== TURN ERROR: could not start codex", lines[-1])
         self.assertTrue(lines[-1].endswith("==="))
         self.assertEqual(list(self.turns.iterdir()), [], "no child ran: nothing to recover")
+        # pair_poll(with_turn_log=True) slices the failed attempt as its own turn.
+        turn, _ = S._read_current_or_last_turn_log(self.spec.name, task_finished=True)
+        self.assertTrue(any("TURN ERROR: could not start codex" in line for line in turn), turn)
 
     def test_send_path_survives_the_binary_being_deleted_under_it(self):
         script = self.dir / "fake_codex.py"
-        script.write_text("import json, sys\nsys.stdin.read()\n"
+        script.write_text("import json, sys\nassert sys.stdin.read() == 'hi', 'the retried child lost its prompt'\n"
                           f"for e in {EVENTS!r}:\n print(json.dumps(e), flush=True)\n", encoding="utf-8")
         gone = str(self.dir / "gone" / "codex.exe")
         with patch.dict(os.environ, {"CLAUDE_PAIR_CODEX_PATH": sys.executable}):

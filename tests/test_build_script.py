@@ -56,6 +56,19 @@ class BuildScriptMetadataTests(unittest.TestCase):
         with self.dist("0.15.0", None):
             B.check_editable_metadata("0.16.2")
 
+    def test_a_checkout_path_with_spaces_is_recognised(self):
+        # pip percent-encodes the file URL (``file:///C:/my%20code/...``)
+        root = B.PROJECT_ROOT.parent / "my code" / "claude squared"
+        with patch.object(B, "PROJECT_ROOT", root), self.dist("0.15.0", root):
+            self.assertIn("%20", importlib.metadata.distribution("x").read_text("direct_url.json"))
+            with self.assertRaises(RuntimeError):
+                B.check_editable_metadata("0.16.2")
+
+    def test_a_legacy_install_without_direct_url_is_skipped(self):
+        with self.dist("0.15.0", None):
+            self.assertEqual(B._editable_install_of_this_checkout(), ("0.15.0", False))
+            B.check_editable_metadata("0.16.2")
+
     def test_not_installed_passes(self):
         with patch.object(importlib.metadata, "distribution",
                           side_effect=importlib.metadata.PackageNotFoundError("claude-squared")):

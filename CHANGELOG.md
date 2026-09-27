@@ -16,14 +16,17 @@ All notable changes to this project are documented here. Format follows
   failed with `could not start codex (…): [WinError 2]` until that session
   restarted. The binary is now re-resolved on every spawn
   (`CLAUDE_PAIR_CODEX_PATH`, then the config's `CODEX_CLI_PATH` once that
-  file exists; only the fallback scan of the app's `bin` folder is cached,
-  and only while its file exists), and a spawn whose binary vanished between
-  lookup and launch retries once with a fresh lookup.
-- **A Codex spawn failure left no trace in the pair's `main.log`.** It is now
-  logged (`CODEX TURN START` + `TURN ERROR: could not start codex …`), the
-  run's empty turn files are removed, and the error names the likely cause —
-  a working directory that no longer exists, or no Codex binary found
-  anywhere. Every `CODEX TURN START` line names the binary it ran.
+  file exists; the fallback scan of the app's `bin` folder is cached only
+  while its file exists and no new folder has appeared), and a Codex process
+  whose binary vanished between lookup and launch — a turn, compaction,
+  handoff import, thread deletion or connector listing — retries once with a
+  fresh lookup.
+- **A Codex turn that could not start left no trace in the pair's
+  `main.log`.** It is now logged (`CODEX TURN START` + `TURN ERROR: could not
+  start codex …`), the run's empty turn files are removed, and the error
+  names the likely cause — a working directory that no longer exists, or no
+  Codex binary found anywhere. Every `CODEX TURN START` line names the binary
+  it ran.
 - **`pip show` / `importlib.metadata` reported an old version** (0.15.0
   through the 0.16.x releases): an editable install's metadata is written at
   install time and never follows `__version__`. The build script's `--bump`
