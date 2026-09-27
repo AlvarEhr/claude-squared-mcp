@@ -744,8 +744,13 @@ def _cmd_wait(argv: list[str]) -> int:
 
 
 def _cmd_serve() -> int:
-    from claude_squared.server import mcp
-    mcp.run()
+    # server.run(), not mcp.run(): it announces this process's activity
+    # beacon, sweeps dead owners' activity files and installs the single exit
+    # handler before serving. `python -m claude_squared` is how EVERY MCP host
+    # starts us, so calling mcp.run() here skipped all three (found in the
+    # v0.16.0 real-MCP test, 2026-09-27).
+    from claude_squared.server import run
+    run()
     return 0
 
 

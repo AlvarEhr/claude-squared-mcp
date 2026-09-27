@@ -1555,7 +1555,7 @@ def _refuse_if_background(name: str, action: str, force: bool) -> None:
         raise PairError(
             f"Pair '{name}' has unconfirmed work in another MCP process (PID {pids}: "
             f"{_describe_background(foreign)}) — past its deadline, and nothing says whether it "
-            f"ended. force=True {action} anyway (that process's pair, if it does resume, writes "
+            f"ended. force=True proceeds anyway (that process's pair, if it does resume, writes "
             f"onto the old history), or wait ({_watcher_cmd(name)})."
         )
     if force or not local:
@@ -1563,7 +1563,7 @@ def _refuse_if_background(name: str, action: str, force: bool) -> None:
     raise PairError(
         f"Pair '{name}' has background work pending ({_describe_background(local)}); {action} "
         f"would kill it and the pair would never wake for it. Wait for it ({_watcher_cmd(name)}), "
-        f"or pass force=True to {action} anyway (the work is killed and recorded as lost)."
+        f"or pass force=True to proceed anyway (the work is killed and recorded as lost)."
     )
 
 

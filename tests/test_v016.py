@@ -1456,6 +1456,17 @@ class RoundFourFixTests(ReviewHelpers):
 
 
 class MiscTests(V016Case):
+    def test_python_m_serves_through_server_run(self):
+        # Every MCP host starts `python -m claude_squared` with no arguments;
+        # that path must go through server.run() (activity beacon, dead-owner
+        # sweep, exit handler), not mcp.run() — found in the real-MCP test,
+        # 2026-09-27.
+        from claude_squared import __main__ as M
+        with patch.object(S, "run") as run, patch.object(S.mcp, "run") as bare:
+            self.assertEqual(M._cmd_serve(), 0)
+        run.assert_called_once_with()
+        bare.assert_not_called()
+
     def test_pid_liveness_reads_exit_codes(self):
         self.assertFalse(AT._is_pid_alive(self.dead.pid))  # exited, handle still held
         self.assertTrue(AT._is_pid_alive(self.live.pid))
