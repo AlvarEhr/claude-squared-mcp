@@ -4,7 +4,7 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.16.0] — 2026-09-27
 
 **Restart every open Claude and Codex session after installing** (a running
 MCP process keeps the code it loaded; a pre-0.16 process writes no activity
