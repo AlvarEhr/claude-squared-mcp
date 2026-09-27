@@ -25,7 +25,7 @@ A pair is a `claude --print --resume <uuid>` session (or a `codex exec resume <t
 pip install -e .
 ```
 
-Requires Python ≥3.10 and at least one backend CLI: `claude` (Claude Code 2.1.117+ for `--session-id` support) and/or `codex` (the Codex CLI, 0.153+; the Desktop-managed build under `%LOCALAPPDATA%/OpenAI/Codex/bin/` is found automatically, or set `CLAUDE_PAIR_CODEX_PATH`).
+Requires Python ≥3.10 and at least one backend CLI: `claude` (Claude Code 2.1.117+ for `--session-id` support) and/or `codex` (the Codex CLI, 0.153+; the Desktop-managed build under `%LOCALAPPDATA%/OpenAI/Codex/bin/` is found automatically and followed across the Codex app's updates, or set `CLAUDE_PAIR_CODEX_PATH`).
 
 ## Install — two paths
 
@@ -116,6 +116,7 @@ A denied action produces a `⛔ PAIR HANDOFF` block in the reply with the pair's
 
 ### Codex specifics worth knowing
 
+- **Which `codex` runs.** Re-resolved on every spawn: `CLAUDE_PAIR_CODEX_PATH`, else the `CODEX_CLI_PATH` the Codex app records in `~/.codex/config.toml`, else the newest `%LOCALAPPDATA%/OpenAI/Codex/bin/<hash>/codex.exe`, else `codex` on `PATH`. The app's updater replaces that folder and rewrites the path, so open sessions follow an update without a restart (0.16.2); each turn's `CODEX TURN START` line in `main.log` names the binary it ran.
 - **Config isolation.** Pairs run with `--ignore-user-config` (your `~/.codex/config.toml` mounts MCP servers, Desktop plugins and hooks a pair shouldn't inherit — including this MCP itself) and re-add a whitelist of keys the sandbox needs: `windows.sandbox`, `sandbox_workspace_write`, `model_provider(s)`, `web_search`, `shell_environment_policy`. Extra `-c key=value` overrides go through `backend_options={"config": {...}}`.
 - **Per-call model + effort + sandbox.** Codex never inherits them from the thread; the adapter re-passes them on every send, exactly like `claude --model`.
 - **System prompt.** `codex exec` has no system-prompt flag; `system_prompt_append` / `profile_name` become the thread's first user message (persisted in the thread history).

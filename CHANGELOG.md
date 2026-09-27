@@ -4,6 +4,31 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.2] — 2026-09-27
+
+### Fixed
+
+- **Codex pairs stopped working after the Codex app updated itself.** The
+  app's updater installs a new `bin/<hash>/codex.exe`, rewrites
+  `CODEX_CLI_PATH` in `~/.codex/config.toml` and deletes the old folder, but
+  an MCP process cached the first binary path it resolved — so every Codex
+  send, compaction and handoff in a session that was open during the update
+  failed with `could not start codex (…): [WinError 2]` until that session
+  restarted. The binary is now re-resolved on every spawn
+  (`CLAUDE_PAIR_CODEX_PATH`, then the config's `CODEX_CLI_PATH` once that
+  file exists; only the fallback scan of the app's `bin` folder is cached,
+  and only while its file exists), and a spawn whose binary vanished between
+  lookup and launch retries once with a fresh lookup.
+- **A Codex spawn failure left no trace in the pair's `main.log`.** It is now
+  logged (`CODEX TURN START` + `TURN ERROR: could not start codex …`), the
+  run's empty turn files are removed, and the error names the likely cause —
+  a working directory that no longer exists, or no Codex binary found
+  anywhere. Every `CODEX TURN START` line names the binary it ran.
+- **`pip show` / `importlib.metadata` reported an old version** (0.15.0
+  through the 0.16.x releases): an editable install's metadata is written at
+  install time and never follows `__version__`. The build script's `--bump`
+  now refreshes it, and a build stops when it lags the source.
+
 ## [0.16.1] — 2026-09-27
 
 ### Fixed

@@ -488,17 +488,22 @@ def _load_user_config() -> dict[str, Any]:
         return {}
 
 
-def codex_executable() -> str:
+def codex_executable(*, refresh: bool = False) -> str:
     """Locate the codex binary. Order: ``CLAUDE_PAIR_CODEX_PATH`` env →
     ``CODEX_CLI_PATH`` recorded in the user's config.toml (the Desktop-managed
     build, which is the only one whose updater works) → newest
     ``%LOCALAPPDATA%/OpenAI/Codex/bin/<hash>/codex.exe`` by ``--version`` →
-    ``codex`` on PATH."""
-    if "exe" in _EXE_CACHE:
-        return _EXE_CACHE["exe"]
+    ``codex`` on PATH.
+
+    The first two are read on EVERY call: the Codex app's updater installs a
+    new ``bin/<hash>/``, rewrites CODEX_CLI_PATH and deletes the old folder,
+    and a long-lived MCP process must follow it (it once cached the old path,
+    and every Codex spawn failed with WinError 2 until a restart). A config
+    path counts only once the file exists (the config may be rewritten before
+    the new binary is in place). Only the scan is cached, and a cached path is
+    reused only while the file exists; ``refresh=True`` rescans."""
     env = os.environ.get("CLAUDE_PAIR_CODEX_PATH")
     if env and Path(env).exists():
-        _EXE_CACHE["exe"] = env
         return env
     cfg = _load_user_config()
     # The Desktop writes CODEX_CLI_PATH into an MCP server's env block; scan
@@ -506,9 +511,12 @@ def codex_executable() -> str:
     for srv in (cfg.get("mcp_servers") or {}).values():
         envblk = (srv or {}).get("env") if isinstance(srv, dict) else None
         cand = (envblk or {}).get("CODEX_CLI_PATH") if isinstance(envblk, dict) else None
-        if cand and Path(cand).exists():
-            _EXE_CACHE["exe"] = str(cand)
+        if cand and os.path.isfile(str(cand)):
             return str(cand)
+    cached = _EXE_CACHE.get("exe")
+    if cached and not refresh and os.path.isfile(cached):
+        return cached
+    _EXE_CACHE.pop("exe", None)
     local = os.environ.get("LOCALAPPDATA")
     best: tuple[tuple[int, ...], str] | None = None
     if local:
@@ -520,8 +528,42 @@ def codex_executable() -> str:
         _EXE_CACHE["exe"] = best[1]
         return best[1]
     found = shutil.which("codex")
-    _EXE_CACHE["exe"] = found or "codex"
-    return _EXE_CACHE["exe"]
+    if found:
+        _EXE_CACHE["exe"] = found
+        return found
+    return "codex"
+
+
+def popen_codex(args: list[str], **kwargs: Any) -> subprocess.Popen:
+    """``subprocess.Popen`` for a command whose ``args[0]`` came from
+    :func:`codex_executable`. The updater can delete the binary between
+    resolution and spawn, so a binary that is gone is re-resolved once and the
+    spawn retried; ``args[0]`` is updated in place so callers report the
+    binary that ran (or was last tried)."""
+    try:
+        return subprocess.Popen(args, **kwargs)
+    except FileNotFoundError:
+        if os.path.isfile(args[0]):
+            raise  # the binary is there; something else is missing (the cwd)
+        fresh = codex_executable(refresh=True)
+        if fresh == args[0]:
+            raise
+        args[0] = fresh
+        return subprocess.Popen(args, **kwargs)
+
+
+def codex_spawn_error(args: list[str], exc: OSError, cwd: str | None, what: str = "codex") -> str:
+    """Error text for a codex process that could not be started, naming the
+    likely cause: a missing working directory (Windows reports it as WinError
+    3/267, much like a missing binary) or no Codex binary at all."""
+    msg = f"could not start {what} ({args[0]}): {exc}"
+    if cwd and not os.path.isdir(cwd):
+        return msg + f" — the working directory does not exist: {cwd} (pair_update(cwd=…) to move the pair)"
+    if not os.path.isfile(args[0]) and not shutil.which(args[0]):
+        msg += (" — no Codex binary found (CLAUDE_PAIR_CODEX_PATH, CODEX_CLI_PATH in the Codex "
+                "config.toml, the Codex app's bin folder and PATH are re-read on every spawn). "
+                "Install or repair Codex, or set CLAUDE_PAIR_CODEX_PATH.")
+    return msg
 
 
 def _toml_literal(v: Any) -> str:
@@ -1598,9 +1640,23 @@ class CodexAdapter(PairAdapter):
             activity_turn.poll(force=True)
         try:
             with open(stdin_path, "rb") as inp, open(events_path, "wb") as out, open(stderr_path, "wb") as err:
-                proc = subprocess.Popen(args, stdin=inp, stdout=out, stderr=err, **popen_kwargs)
+                proc = popen_codex(args, stdin=inp, stdout=out, stderr=err, **popen_kwargs)
         except OSError as e:
-            raise CLIError(f"could not start codex ({args[0]}): {e}")
+            msg = codex_spawn_error(args, e, spec.cwd)
+            # No child was published, so there is nothing to recover: record
+            # the attempt in the pair's own log and drop the run's files.
+            if log:
+                ts = datetime.now().strftime("%H:%M:%S")
+                try:
+                    with open(main_log, "a", encoding="utf-8") as f:
+                        f.write(f"[{ts}] === CODEX TURN START (pair={spec.name}, model={model_used}, "
+                                f"exe={args[0]}) ===\n"
+                                f"[{ts}] === TURN ERROR: {msg.replace(chr(10), ' / ')[:500]} ===\n")
+                except OSError:
+                    pass
+            for suffix in ("events.jsonl", "events.receipt.json", "stderr.log", "stdin.txt"):
+                (turn_dir / f"{run_id}.{suffix}").unlink(missing_ok=True)
+            raise CLIError(msg)
         try:
             from claude_squared import process_identity
             receipt["child_pid"] = proc.pid
@@ -1680,7 +1736,7 @@ class CodexAdapter(PairAdapter):
         try:
             ts = datetime.now().strftime("%H:%M:%S")
             _log([f"[{ts}] === CODEX TURN START (pair={spec.name}, model={model_used}, "
-                  f"thread={spec.session_id[:8] if spec.session_id else 'new'}) ==="])
+                  f"thread={spec.session_id[:8] if spec.session_id else 'new'}, exe={args[0]}) ==="])
             reader.start()
             # Keep supervision independent of on_event: a slow consumer must
             # not delay cancellation or the hard timeout (same as PIPE reader).

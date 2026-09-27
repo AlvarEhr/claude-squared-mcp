@@ -146,6 +146,54 @@ def bump_version(part: str) -> str:
     return new
 
 
+def _editable_install_of_this_checkout() -> tuple[str, bool] | None:
+    """(installed metadata version, installed from THIS checkout) for the
+    running interpreter's ``claude-squared``, or None when it isn't installed."""
+    import importlib.metadata as metadata
+    from urllib.parse import urlparse
+    from urllib.request import url2pathname
+
+    try:
+        dist = metadata.distribution("claude-squared")
+    except metadata.PackageNotFoundError:
+        return None
+    ours = False
+    try:
+        info = json.loads(dist.read_text("direct_url.json") or "{}")
+        if (info.get("dir_info") or {}).get("editable") and str(info.get("url", "")).startswith("file:"):
+            path = Path(url2pathname(urlparse(info["url"]).path)).resolve()
+            ours = path == PROJECT_ROOT.resolve()
+    except (OSError, ValueError, TypeError):
+        pass
+    return dist.version, ours
+
+
+def refresh_editable_metadata(version: str) -> None:
+    """After a bump: an editable install's pip metadata (what ``pip show`` and
+    ``importlib.metadata`` report) is written at install time and never
+    follows ``__version__`` — it sat at 0.15.0 through the 0.16.x releases.
+    Re-install (``--no-deps``) when the install points at this checkout."""
+    import subprocess
+
+    found = _editable_install_of_this_checkout()
+    if not found or not found[1] or found[0] == version:
+        return
+    print(f"  pip metadata:   {found[0]} -> {version} (pip install -e . --no-deps)")
+    subprocess.run([sys.executable, "-m", "pip", "install", "-e", str(PROJECT_ROOT),
+                    "--no-deps", "--quiet"], check=True)
+
+
+def check_editable_metadata(version: str) -> None:
+    """Refuse to build while this checkout's editable install reports a
+    different version than the source (see refresh_editable_metadata)."""
+    found = _editable_install_of_this_checkout()
+    if found and found[1] and found[0] != version:
+        raise RuntimeError(
+            f"The editable install of this checkout reports version {found[0]} (pip metadata) but the "
+            f"source is {version}. Refresh it, then build again:\n"
+            f"    {sys.executable} -m pip install -e \"{PROJECT_ROOT}\" --no-deps")
+
+
 def stamp_extension_pyproject(version: str) -> None:
     """Keep extension/pyproject.toml's version equal to manifest.json's.
 
@@ -310,12 +358,14 @@ def main() -> int:
 
     if args.bump:
         print("== bump version ==")
-        bump_version(args.bump)
+        refresh_editable_metadata(bump_version(args.bump))
+
+    version = read_version()
+    check_editable_metadata(version)
 
     print("== sync source ==")
     sync_source_into_extension()
 
-    version = read_version()
     stamp_extension_pyproject(version)
     print(f"== pack v{version} ==")
     mcpb = pack(version)

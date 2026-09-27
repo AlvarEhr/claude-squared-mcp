@@ -46,29 +46,44 @@ process with a temporary `CLAUDE_HOME`):
 python scripts/run_offline_tests.py
 ```
 
-That runs the 17 maintained `tests/smoke_*.py` scripts (each prints `PASS:`
-and exits non-zero on any failed assertion) plus the `unittest` suites in
-`tests/test_maintenance*.py`. CI runs the same command on every push across
-the OS/Python matrix. Four legacy scripts (`smoke.py`, `smoke_runtime.py`,
-`smoke_streamjson.py`, `smoke_v05.py`) predate the v0.10 API and are not part
-of the run.
+That runs every suite listed in the script (26 as of 0.16.2): the maintained
+`tests/smoke_*.py` scripts (each prints `PASS:` and exits non-zero on any
+failed assertion) and the `unittest` suites in `tests/test_*.py`. CI runs the
+same command on every push across the OS/Python matrix. Four legacy scripts
+(`smoke.py`, `smoke_runtime.py`, `smoke_streamjson.py`, `smoke_v05.py`)
+predate the v0.10 API and are not part of the run. A new test file needs its
+own entry in `scripts/run_offline_tests.py`.
 
-Live tests exist for the Codex backend — `python tests/smoke_codex.py --live`
-(a temporary `CLAUDE_HOME`, real `codex` auth, ~15 calls on the cheapest
-model) — for Claude lifecycle races, `python tests/smoke_live_0140.py`
-(a handful of short Opus turns), for `pair_handoff`,
-`python tests/smoke_live_handoff.py` (Haiku + Luna turns; the size gate uses
-a synthetic oversized session and spends nothing), and for connectors,
-`python tests/smoke_live_connectors.py` (uses the throwaway server in
-`tests/fixtures/mcp_probe_server.py`; it temporarily registers that server
-with `codex mcp add` and always removes it), and for the v0.16 pair watcher,
-background protection, interim triage and context alert,
-`python tests/smoke_live_v016.py` (four Haiku pairs, ~6–8 min), and for Codex
-turns surviving their MCP server and the Codex context alert,
-`python tests/smoke_live_codex_detach.py` and
-`python tests/smoke_live_codex_context.py` (a few short Luna turns each; both
-delete the threads they create). They cost real usage; run them before a
-release — and after a Codex CLI update — not in CI.
+Live tests cost real usage; run them before a release — and after a Codex CLI
+update — not in CI. Each uses a temporary `CLAUDE_HOME`; the Codex ones use
+your real `codex` auth and delete the threads they create.
+
+- `python tests/smoke_codex.py --live` — the Codex backend (~15 calls on the
+  cheapest model)
+- `python tests/smoke_live_0140.py` — Claude lifecycle races (a handful of
+  short Opus turns)
+- `python tests/smoke_live_handoff.py` — `pair_handoff` (Haiku + Luna turns;
+  the size gate uses a synthetic oversized session and spends nothing)
+- `python tests/smoke_live_connectors.py` — connectors (uses the throwaway
+  server in `tests/fixtures/mcp_probe_server.py`; it temporarily registers
+  that server with `codex mcp add` and always removes it)
+- `python tests/smoke_live_v016.py` — the pair watcher, background
+  protection, interim triage and context alert (four Haiku pairs, ~6–8 min)
+- `python tests/smoke_live_codex_detach.py`,
+  `python tests/smoke_live_codex_context.py` — Codex turns surviving their
+  MCP server, and the Codex context alert (a few short Luna turns each)
+- `python tests/smoke_live_codex_update.py` — a running server following a
+  Codex app update, including the binary vanishing between lookup and spawn
+  (a create probe + three one-line Luna turns)
+
+## Releasing
+
+`python scripts/build_and_install_extension.py --bump patch` bumps the
+version, refreshes the editable install's pip metadata (`pip show` and
+`importlib.metadata` otherwise keep reporting the version from install time),
+and packs `dist/claude-squared-<version>.mcpb`. A build without `--bump`
+stops if that metadata lags the source, and prints the
+`pip install -e . --no-deps` command that fixes it.
 
 ## Code organization
 

@@ -40,10 +40,12 @@ class AppServerClient:
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             kwargs["start_new_session"] = True
+        from claude_squared.adapters.codex import codex_spawn_error, popen_codex
+
         try:
-            self.proc = subprocess.Popen(self.args, **kwargs)
+            self.proc = popen_codex(self.args, **kwargs)
         except OSError as exc:
-            raise CLIError(f"could not start codex app-server ({self.args[0]}): {exc}") from exc
+            raise CLIError(codex_spawn_error(self.args, exc, self.cwd, "codex app-server")) from exc
         self.deadline = time.monotonic() + max(30, int(self.timeout_seconds))
         for stream, is_error in ((self.proc.stdout, False), (self.proc.stderr, True)):
             reader = threading.Thread(target=self._read, args=(stream, is_error), daemon=True)
