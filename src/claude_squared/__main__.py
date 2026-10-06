@@ -584,6 +584,7 @@ def _print_top_usage(to_stderr: bool = False) -> None:
         "  python -m claude_squared status <pair>       Liveness (in-flight tasks + log recency)\n"
         "  python -m claude_squared log <pair> [N]      Tail last N main.log activity lines\n"
         "  python -m claude_squared wait <task|pair>    Block until an async task finishes\n"
+        "  python -m claude_squared notifications       Read Codex completion-delivery records\n"
         "  python -m claude_squared stop <pair> [-y]    Interrupt a pair's current turn (asks Y/N)\n"
         "\n"
         "  python -m claude_squared                     (no args) Run the MCP server\n"
@@ -755,6 +756,17 @@ def _cmd_serve() -> int:
 
 
 # Re-export for tests / external callers that want the command table.
+def _cmd_notifications(argv: list[str]) -> int:
+    """Read the completion outbox without starting the server or dispatcher."""
+    if argv:
+        print("Usage: python -m claude_squared notifications", file=sys.stderr)
+        return 64
+    import json
+    from claude_squared.completion import records
+    print(json.dumps(records(), indent=2, ensure_ascii=False))
+    return 0
+
+
 _SUBCOMMANDS = {
     "list": _cmd_list,
     "info": _cmd_info,
@@ -765,6 +777,7 @@ _SUBCOMMANDS = {
     "log": _cmd_log,
     "wait": _cmd_wait,
     "stop": _cmd_stop,
+    "notifications": _cmd_notifications,
 }
 
 
@@ -794,6 +807,8 @@ def main() -> None:
 
     cmd = argv[0]
     rest = argv[1:]
+    if cmd == "notifications":
+        sys.exit(_cmd_notifications(rest))
     if cmd == "wait":
         sys.exit(_cmd_wait(rest))
     if cmd == "list":

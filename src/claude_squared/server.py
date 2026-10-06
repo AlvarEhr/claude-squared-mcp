@@ -27,6 +27,7 @@ from claude_squared import agents as agents_mod
 from claude_squared import async_tasks
 from claude_squared import codex_models
 from claude_squared import connectors
+from claude_squared import completion
 from claude_squared import registry as reg_mod
 from claude_squared import transcript as transcript_mod
 from claude_squared import runtime as runtime_mod
@@ -759,6 +760,7 @@ def pair_create(
     session_id: str | None = None,
     parent_model: str | None = None,
     verbose: bool = False,
+    ctx: Context | None = None,
 ) -> str:
     """Create a new long-running addressable pair — a Claude Code CLI sub-session
     (``backend="claude"``, default) or an OpenAI Codex CLI thread (``backend="codex"``).
@@ -1044,6 +1046,7 @@ def pair_create(
     if initial_message:
         try:
             current = reg_mod.get_pair(name)
+            notification_context = completion.prepare(ctx, current)
             runner = _build_send_runner(
                 name, initial_message,
                 hard_timeout_seconds=None,  # no auto-kill ceiling — full briefing time
@@ -1054,6 +1057,9 @@ def pair_create(
                 lock_acquire_timeout_s=3600.0,
             )
             state = async_tasks.start_task(name, initial_message, runner, queued=True)
+            notification = completion.arm(state, ctx, notification_context)
+            if notification is not None:
+                transparency_msgs.append(f"Initial message task: {state.task_id}. {notification}")
             # Reuse the standard async-handle framing so initial-message guidance
             # matches what agents see from pair_send / pair_send_async — keeps
             # the imperative "RUN THIS NOW" wording consistent across all paths.
@@ -1062,6 +1068,7 @@ def pair_create(
                 "Initial message queued as an async task (long Opus briefings "
                 "can take minutes; this avoids the host RPC timeout).",
                 pair_name=name,
+                notification=notification,
             )
         except Exception as e:
             line += f"\n(initial_message queue failed: {e}; send manually via pair_send)"
@@ -1930,7 +1937,8 @@ def _watcher_cmd(ref: str) -> str:
     return f"{py} -m claude_squared wait {shlex.quote(ref)}"
 
 
-def _format_async_handle(task_id: str, why: str, pair_name: str | None = None) -> str:
+def _format_async_handle(task_id: str, why: str, pair_name: str | None = None,
+                         notification: str | None = None) -> str:
     """Terse runtime hint when an operation degrades to async.
 
     Returns the task_id, three concrete poll commands, and a one-line nudge to
@@ -1979,10 +1987,12 @@ def _format_async_handle(task_id: str, why: str, pair_name: str | None = None) -
         f"  pair_poll('{poll_ref}', wait_seconds=30)         # block-wait up to 30s for terminal state\n"
         f"  pair_poll('{poll_ref}', with_turn_log=True)      # status + current/last-turn content\n"
         f"{name_hint}"
-        f"  Bash(run_in_background=True, command=\"{wait_cmd}\")  # auto-notify on done\n"
-        f"{follow_hint}"
-        f"Tip: Bash watcher = hands-off notification. No background Bash (e.g. Cowork)? "
-        f"Use pair_poll(wait_seconds=N) to avoid spam-polling."
+        + (notification if notification is not None else (
+            f"  Bash(run_in_background=True, command=\"{wait_cmd}\")  # auto-notify on done\n"
+            f"{follow_hint}"
+            f"Tip: Bash watcher = hands-off notification. No background Bash (e.g. Cowork)? "
+            f"Use pair_poll(wait_seconds=N) to avoid spam-polling."
+        ))
     )
 
 
@@ -2417,7 +2427,9 @@ async def pair_send(
         )
 
     # Sanity: pair must exist before we spawn a worker
-    _check_model_backend(reg_mod.get_pair(name), override_model)
+    send_spec = reg_mod.get_pair(name)
+    _check_model_backend(send_spec, override_model)
+    notification_context = completion.prepare(ctx, send_spec)
 
     # Build the same runner the async path uses, but with the MCP progress callback
     # wired in so live events surface to the host UI during the sync wait window.
@@ -2439,9 +2451,20 @@ async def pair_send(
         raise PairError(f"Internal: task {state.task_id} disappeared after creation.")
 
     if final.status == "done" and final.result is not None:
+        # A placeholder is an inline reply, but background work has not ended.
+        # Arm the same follow-until-idle notification for that case only.
+        notification = (completion.arm(state, ctx, notification_context)
+                        if (("hint" not in notification_context or notification_context["hint"] is not None)
+                            and getattr(final.result, "background_launches", None)
+                            and completion.background_followup(state)) else None)
         if verbose:
-            return _verbose_dump(final.result)
-        return _fmt_send_result(final.result)
+            if notification is None:
+                return _verbose_dump(final.result)
+            value = final.result.model_dump(mode="json")
+            if notification is not None:
+                value["codex_completion_notification"] = notification
+            return json.dumps(value, ensure_ascii=False, indent=2)
+        return _fmt_send_result(final.result) + ("\n" + notification if notification else "")
 
     if final.status == "failed":
         raise PairError(f"pair_send to '{name}' failed: {final.error or '(no error message)'}")
@@ -2475,7 +2498,8 @@ async def pair_send(
             f"Sync wait timed out at {rpc_hold_s}s (pair '{name}' still working "
             f"under hard_timeout={hard_str})."
         )
-    return _format_async_handle(state.task_id, framing, pair_name=name)
+    return _format_async_handle(state.task_id, framing, pair_name=name,
+                                notification=completion.arm(state, ctx, notification_context))
 
 
 @mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False})
@@ -2486,12 +2510,14 @@ def pair_send_async(
     override_model: str | None = None,
     override_effort: str | None = None,
     override_permission_mode: str | None = None,
+    ctx: Context | None = None,
 ) -> str:
     """Send a message to a pair asynchronously. Returns task_id immediately.
 
-    Use ``pair_poll(task_id)`` for status. For notification-on-completion (no
-    manual polling), background-run the wait script via the Bash tool — see
-    README "Async handles" for the full pattern.
+    Use ``pair_poll(task_id)`` for status. An opt-in Codex Desktop completion
+    adapter can wake the calling full-access manager; the returned handle says
+    whether it was armed. Other hosts: background-run wait.py through your
+    harness's notification mechanism — see README "Async handles".
     ``wait.py <pair>`` follows the pair until idle (``--each-turn``: until the next turn
     ends); exits 0 done/idle, 1 failed, 2 not found, 3 timeout (re-arm), 4 orphaned,
     5 stopped, 6 crashed, 7 finished detached, 8 context alert, 9 background lost,
@@ -2519,7 +2545,9 @@ def pair_send_async(
     per-pair lock.
     """
     # Sanity: pair must exist before we spawn a worker
-    _check_model_backend(reg_mod.get_pair(name), override_model)
+    send_spec = reg_mod.get_pair(name)
+    _check_model_backend(send_spec, override_model)
+    notification_context = completion.prepare(ctx, send_spec)
 
     runner = _build_send_runner(
         name, message,
@@ -2536,7 +2564,8 @@ def pair_send_async(
         ),
     )
     state = async_tasks.start_task(name, message, runner, queued=True)
-    return _format_async_handle(state.task_id, f"Started async task for pair '{name}'.", pair_name=name)
+    return _format_async_handle(state.task_id, f"Started async task for pair '{name}'.", pair_name=name,
+                                notification=completion.arm(state, ctx, notification_context))
 
 
 def _read_current_or_last_turn_log(
@@ -2837,6 +2866,9 @@ def pair_poll(
         headline = f"unknown status: {state.status}"
 
     lines = [headline]
+    notification_status = completion.status(state.task_id)
+    if notification_status:
+        lines.append(notification_status)
     # If we resolved a pair name (or prefix) to a concrete task, say so — the
     # agent should never be guessing which task it's looking at.
     if resolved_note:
@@ -4163,6 +4195,7 @@ def pair_handoff(
     probe: str | None = None,
     timeout_seconds: int = 45,
     verbose: bool = False,
+    ctx: Context | None = None,
 ) -> str:
     """Hand off a settled Claude conversation to a NEW Codex pair (Claude -> Codex only).
 
@@ -4392,6 +4425,7 @@ def pair_handoff(
     state = None
     final = None
     try:
+        notification_context = completion.prepare(ctx, spec)
         runner = _build_send_runner(target, message, hard_timeout_seconds=None,
                                     override_model=None, override_effort=None,
                                     override_permission_mode=None, on_event=None)
@@ -4410,6 +4444,7 @@ def pair_handoff(
                 state.task_id,
                 f"Sync wait held for {rpc_hold}s (stated patience {timeout_seconds}s); "
                 f"handoff briefing for '{target}' continues with no auto-kill.", pair_name=target,
+                notification=completion.arm(state, ctx, notification_context),
             ))
     except Exception as exc:
         lines.append(f"Pair '{target}' remains registered, but its briefing could not be completed: {exc}. "
@@ -4646,6 +4681,7 @@ def pair_compact(
     compact_timeout_seconds: int = 600,
     verbose: bool = False,
     force: bool = False,
+    ctx: Context | None = None,
 ) -> str:
     """Compact a pair's conversation in place (a summary replaces the history).
     Refused while background work is pending unless ``force=True`` (work in
@@ -4683,8 +4719,9 @@ def pair_compact(
     # Sanity: pair must exist (raises PairNotFound if not). Codex pairs compact
     # through the app-server (CodexAdapter.compact); steering text is ignored
     # there with a note in the result.
-    reg_mod.get_pair(name)
+    compact_spec = reg_mod.get_pair(name)
     _refuse_if_background(name, "compacting", force)
+    notification_context = completion.prepare(ctx, compact_spec)
 
     # Decouple stated patience (agent's "how long I'll wait inline") from the
     # actual RPC-hold (server-cap-bounded to stay below host's RPC timeout).
@@ -4753,7 +4790,8 @@ def pair_compact(
             f"Sync wait timed out at {rpc_hold_s}s (compaction of '{name}' "
             f"still running under compact_timeout={hard_str})."
         )
-    return _format_async_handle(state.task_id, framing, pair_name=name)
+    return _format_async_handle(state.task_id, framing, pair_name=name,
+                                notification=completion.arm(state, ctx, notification_context))
 
 
 class _HardResetSkipped(Exception):
@@ -5470,4 +5508,8 @@ def run() -> None:
     # One exit handler for the whole process: runtimes first, then the
     # activity files (runtime.install_exit_handler).
     runtime_mod.install_exit_handler()
-    mcp.run()
+    completion.start()
+    try:
+        mcp.run()
+    finally:
+        completion.shutdown()
