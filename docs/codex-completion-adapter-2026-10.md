@@ -1,6 +1,6 @@
 # Codex Desktop completion adapter — implementation and work record
 
-Status, 2026-10-06: implemented and tested on `codex/desktop-callback-2026-10-06`, based on v0.16.2 / `8644cd8`. Disabled by default. Not merged, installed, enabled in Alvar's config, or released. This document separates the Codex agent's changes from Claude's earlier work.
+Status, 2026-10-07: implemented and tested on `codex/desktop-callback-2026-10-06`, based on v0.16.2 / `8644cd8`. The branch keeps callbacks disabled by default and is not merged or released. A separate Codex-only `codex_squared` clone is now registered with callbacks enabled, pinned to implementation commit `d4fbcb8`. The original installed main and `pair` registration remain unchanged. This document separates the Codex agent's changes from Claude's earlier work.
 
 ## What changed
 
@@ -29,6 +29,18 @@ The tested Desktop records full access as `sandbox_policy.type = danger-full-acc
 October's prototype test showed a CLI-created read-only thread resuming with the app's full-access setting. The private route exposes no sandbox override or atomic expected-policy precondition. Restrictive manager modes remain unsupported: checking after generation would be too late.
 
 ## Enabling after integration
+
+### Current Codex-only clone
+
+Alvar requested a parallel installation on 2026-10-07. `codex_squared` runs an exported snapshot of `d4fbcb8` under `%USERPROFILE%/.codex/mcp/codex-squared/releases/d4fbcb8/`, using the existing Python 3.11 and dependencies. It does not point at an editable worktree or replace the existing package installation. Its only local source adjustments are the displayed MCP name `Codex Squared` and recognizing its own alias in the self-recursive connector guard. `installation-manifest.json` records original and installed SHA-256 values for every exported file.
+
+The new Codex config entry supplies that snapshot's `src` through `PYTHONPATH` and `CLAUDE_PAIR_CODEX_COMPLETION=desktop`. The old `pair` entry and Claude configuration were not changed. Pair/task/activity state remains shared; no registry was copied or edited by hand. Child Codex execs still ignore user config, and the cloned connector selector refuses `codex_squared` itself.
+
+In a fresh chat, use the `mcp__codex_squared__pair_*` tools, not the original `mcp__pair__*` namespace, for wake-up support. Existing chats retain the servers they already loaded. Codex's local app, CLI and IDE share this user-level Codex config; this registration was not added to Claude.
+
+Verification: the isolated initialization/list smoke found the correct display name and all 31 tools; the clone manifest and original `pair` entry were verified. A fresh native Codex chat then called `codex_squared` create/send_async, ended its turn with `CODEX_SQUARED_WAITING`, woke from one completion notice, polled the finished result once and forgot only its disposable worker. Its final reply was `CLONE_WAKE_OK`; model, workspace and permissions stayed unchanged. The test chat was archived and evidence kept in this task's local outputs. No existing pair, MCP or app process was restarted or stopped.
+
+### Future integration into the original installation
 
 Do not merge or switch the installed editable checkout while Alvar's pairs are active. Integration into main is deployment. No version bump or bundle rebuild was performed on this branch.
 
