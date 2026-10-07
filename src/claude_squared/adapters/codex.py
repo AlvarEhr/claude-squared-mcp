@@ -744,6 +744,17 @@ def _reverse_complete_lines(stream, chunk_size: int = 64 * 1024):
         yield b"".join(reversed(fragments))
 
 
+def current_context_tokens(info: dict[str, Any]) -> int:
+    """Latest context size; thread-lifetime usage is NEVER a context size.
+
+    Codex 0.162 compaction emits input/output=0 but last.total_tokens contains
+    the compacted context estimate. Prefer that over the cumulative total.
+    """
+    last = info.get("last_token_usage") or {}
+    return int(last.get("total_tokens") or
+               (int(last.get("input_tokens") or 0) + int(last.get("output_tokens") or 0)))
+
+
 def read_last_token_count(rollout: Path | None) -> dict[str, Any] | None:
     """The LAST ``token_count`` event_msg payload in a rollout: carries
     ``info.total_token_usage``, ``info.last_token_usage``,
@@ -1316,14 +1327,13 @@ class CodexAdapter(PairAdapter):
         rollout = self.transcript_path(spec)
         tc0 = read_last_token_count(rollout) or {}
         info0 = tc0.get("info") or {}
-        pre = int((info0.get("last_token_usage") or {}).get("input_tokens")
-                  or (info0.get("total_token_usage") or {}).get("total_tokens") or 0)
+        pre = current_context_tokens(info0)
         t0 = time.monotonic()
         outcome = self._appserver_compact(spec, timeout_seconds=timeout_seconds, should_stop=should_stop)
         dur_ms = int((time.monotonic() - t0) * 1000)
         tc1 = read_last_token_count(rollout) or {}
         info1 = tc1.get("info") or {}
-        post = int((info1.get("total_token_usage") or {}).get("total_tokens") or 0)
+        post = current_context_tokens(info1)
         notes: list[str] = []
         if not post:
             # Codex's post-compaction token_count reports zeros (verified on a
@@ -1427,7 +1437,7 @@ class CodexAdapter(PairAdapter):
         last = info.get("last_token_usage") or {}
         total = info.get("total_token_usage") or {}
         window = int(info.get("model_context_window") or 0)
-        used = int(last.get("input_tokens") or 0) + int(last.get("output_tokens") or 0)
+        used = current_context_tokens(info)
         pct = (used / window * 100) if window else 0.0
         cw = context_windows(spec.model)
         md = [

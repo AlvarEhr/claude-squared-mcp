@@ -367,6 +367,31 @@ class CompletionTests(unittest.TestCase):
         self.assertEqual(path.read_text(), original)
         self.assertFalse(self.sent)
 
+    def test_supported_dispatcher_claims_legacy_backoff_without_old_reader_interference(self):
+        path = self.arm(); r=N._read(path); r.update(version=1,retry_at=time.time()+600,detail="old build refused")
+        N._save(path,r); N.process_one(path)
+        claimed=json.loads(path.read_text())
+        self.assertEqual(claimed["version"],2)
+        self.assertEqual(claimed["status"],"delivered")
+        # The installed v1 reader's exact schema gate now rejects this ticket.
+        self.assertNotEqual(claimed["version"],1)
+        self.assertEqual(len(self.sent),1)
+
+    def test_unsupported_dispatcher_does_not_mutate_legacy_ticket(self):
+        path=self.arm(); r=N._read(path); r["version"]=1; N._save(path,r)
+        before=path.read_bytes()
+        with patch.object(B,"desktop_ancestor",side_effect=B.Unavailable("new build")):
+            N.process_one(path)
+        self.assertEqual(path.read_bytes(),before)
+        self.assertFalse(self.sent)
+
+    def test_legacy_uncertain_send_is_not_retransmitted_during_claim_upgrade(self):
+        path=self.arm(); r=N._read(path); r.update(version=1,status="sending"); N._save(path,r)
+        N.process_one(path)
+        self.assertEqual(N._read(path)["status"],"uncertain")
+        self.assertEqual(N._read(path)["version"],2)
+        self.assertFalse(self.sent)
+
     def test_atomic_record_write_retries_transient_windows_reader_lock(self):
         path = self.arm(); record = N._read(path)
         original = Path.replace
@@ -446,6 +471,13 @@ class CompletionTests(unittest.TestCase):
 
 
 class BridgeTests(unittest.TestCase):
+    def test_compaction_context_counter_never_uses_lifetime_total(self):
+        from claude_squared.adapters.codex import current_context_tokens
+        self.assertEqual(current_context_tokens({"last_token_usage":{"input_tokens":0,"output_tokens":0,"total_tokens":5094},
+                                                "total_token_usage":{"total_tokens":66533}}),5094)
+        self.assertEqual(current_context_tokens({"last_token_usage":{"input_tokens":100,"output_tokens":5},
+                                                "total_token_usage":{"total_tokens":999999}}),105)
+        self.assertEqual(current_context_tokens({"total_token_usage":{"total_tokens":999999}}),0)
     def test_destination_ack_required(self):
         thread = str(uuid.uuid4())
         B.validate_delivery({"success": True, "contentItems": [{"type": "inputText", "text": json.dumps({"threadId": thread})}]}, thread)
