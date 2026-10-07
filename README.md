@@ -252,7 +252,8 @@ on Codex).
 ## Async handles
 
 **Codex Desktop:** an optional completion adapter can wake a manager already
-using full access. It is disabled by default; the returned handle says whether
+using full access. It validates the live protocol across app updates and is
+disabled by default; the returned handle says whether
 it was armed. A terminal watcher alone does not wake an idle Codex chat. See
 [setup, restrictions and tested behavior](docs/codex-completion-adapter-2026-10.md).
 

@@ -22,10 +22,10 @@ from claude_squared import desktop_bridge as bridge
 from claude_squared.registry import claude_home
 
 logger = logging.getLogger(__name__)
-# Version 2 is intentionally unreadable to the first prototype's dispatcher.
+# Version 3 is intentionally unreadable to the older build-gated dispatchers.
 # Otherwise an old, unsupported Desktop bridge can claim a newer sender's
 # ticket and impose shared retry_at backoff indefinitely.
-VERSION = 2
+VERSION = 3
 MAX_WAIT = 6 * 3600
 MAX_ROLLOUT = 128 * 1024 * 1024
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -59,7 +59,7 @@ def _read(path):
         if path.stat().st_size > 128 * 1024:
             return None
         data = json.loads(path.read_text(encoding="utf-8"))
-        if (not isinstance(data, dict) or data.get("version") not in (1, VERSION)
+        if (not isinstance(data, dict) or data.get("version") not in (1, 2, VERSION)
                 or not UUID.fullmatch(str(data.get("id", "")))
                 or path.stem != data.get("id")
                 or not UUID.fullmatch(str(data.get("thread", "")))
@@ -297,6 +297,8 @@ def arm(task, ctx, prepared=None):
                          "pair": task.pair_name, "session": session, "tasks": [], "cwd": prepared["cwd"],
                          "created": time.time(), "status": "watching", "attempts": 0,
                          "loss_baseline": prepared["loss_baseline"]}
+                if r["version"] != VERSION:
+                    r["retry_at"] = 0  # discard an old bridge's build-refusal backoff
                 r["version"] = VERSION
                 if task.task_id not in r["tasks"]:
                     if len(r["tasks"]) >= 64:
@@ -354,7 +356,7 @@ def process_one(path):
             r = _read(path)
             if not r or r["status"] in TERMINAL:
                 return
-            if r["version"] == 1:
+            if r["version"] != VERSION:
                 # Claim legacy work only if THIS dispatcher can use the current
                 # Desktop. Upgrade under the same kernel lock before any I/O;
                 # old readers then skip it. Uncertain intent remains uncertain.

@@ -1,6 +1,6 @@
-"""Opt-in, build-gated Windows Desktop bridge. No app-server is launched here.
+"""Opt-in, protocol-validated Windows Desktop bridge. No app-server is launched here.
 
-Private protocol, smoke-verified 2026-10-06. Unknown builds fail closed.
+Private protocol: validate the live endpoint rather than an app-build allowlist.
 """
 from __future__ import annotations
 
@@ -14,8 +14,6 @@ import struct
 import sys
 import time
 
-# Idle/active delivery and unchanged manager policy verified 2026-10-06/07.
-SUPPORTED_BUILDS = frozenset({"26.930.7945.0", "26.1002.6548.0"})
 PIPE_PATTERN = re.compile(r"^\\\\\.\\pipe\\codex-browser-use-[0-9a-f-]{36}$")
 MAX_FRAME = 1024 * 1024
 
@@ -92,8 +90,6 @@ def desktop_ancestor():
             match = re.search(r"[\\/]OpenAI\.Codex_([\d.]+)_.*[\\/]app[\\/](?:ChatGPT|Codex)\.exe$",
                               image, re.I)
             if match:
-                if match[1] not in SUPPORTED_BUILDS:
-                    raise Unavailable("Desktop build %s has not passed callback compatibility tests" % match[1])
                 birth = started_at(pid)
                 own_birth = started_at(os.getpid())
                 if birth is None or own_birth is None or birth > own_birth:
@@ -102,7 +98,7 @@ def desktop_ancestor():
         pid = parent
     if candidate is not None:
         return candidate
-    raise Unavailable("this process is not descended from a supported Codex Desktop")
+    raise Unavailable("this process is not descended from a verified Codex Desktop")
 
 
 class Overlapped(C.Structure):

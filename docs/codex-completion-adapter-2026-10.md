@@ -1,12 +1,12 @@
 # Codex Desktop completion adapter — implementation and work record
 
-Status, 2026-10-07: implemented and tested on `codex/desktop-callback-2026-10-06`, based on v0.16.2 / `8644cd8`. The branch keeps callbacks disabled by default and is not merged or released. The separate Codex-only `codex_squared` clone is registered with callbacks enabled, now pinned to `c2eaf4f` after new-build and lifecycle fixes. Original main and `pair` remain unchanged. This document separates the Codex agent's changes from Claude's earlier work.
+Status, 2026-10-07: implemented and tested on `codex/desktop-callback-2026-10-06`, based on v0.16.2 / `8644cd8`. The branch keeps callbacks disabled by default and is not merged or released. The separate Codex-only `codex_squared` clone is registered with callbacks enabled; its current pinned revision is recorded in the local `installation.json`. App build allowlisting has been removed at Alvar's request; live protocol and identity checks remain. Original main and `pair` remain unchanged. This document separates the Codex agent's changes from Claude's earlier work.
 
 ## What changed
 
 The adapter wakes the **calling Codex Desktop manager chat** when a pair settles, through the existing Desktop tool-output route. Either pair backend is supported. This is separate from Claude pairs waking themselves after background work.
 
-`completion.py` owns caller capture, pending registrations, the dispatcher and delivery status. `desktop_bridge.py` owns the private, build-gated Windows pipe transport. Integration in `server.py` adds injected Context metadata to shared async entry points. Context is not an argument exposed to the model.
+`completion.py` owns caller capture, pending registrations, the dispatcher and delivery status. `desktop_bridge.py` owns the private, protocol-validated Windows pipe transport. Integration in `server.py` adds injected Context metadata to shared async entry points. Context is not an argument exposed to the model.
 
 Covered entry points:
 
@@ -32,7 +32,7 @@ October's prototype test showed a CLI-created read-only thread resuming with the
 
 ### Current Codex-only clone
 
-Alvar requested a parallel installation on 2026-10-07. `codex_squared` runs the exported `c2eaf4f` snapshot under `%USERPROFILE%/.codex/mcp/codex-squared/releases/c2eaf4f/`, using existing Python 3.11/dependencies. Earlier `d4fbcb8` and `c651d08` snapshots are retained unchanged. This is not an editable checkout or a replacement package installation. Local adjustments are the display name and self-recursive alias guard; each release's manifest records original/installed SHA-256 values.
+Alvar requested a parallel installation on 2026-10-07. `codex_squared` runs a pinned exported snapshot under `%USERPROFILE%/.codex/mcp/codex-squared/releases/`, using existing Python 3.11/dependencies. The local `installation.json` records its current commit and path; earlier snapshots are retained unchanged. This is not an editable checkout or a replacement package installation. Local adjustments are the display name and self-recursive alias guard; each release's manifest records original/installed SHA-256 values.
 
 The new Codex config entry supplies that snapshot's `src` through `PYTHONPATH` and `CLAUDE_PAIR_CODEX_COMPLETION=desktop`. The old `pair` entry and Claude configuration were not changed. Pair/task/activity state remains shared; no registry was copied or edited by hand. Child Codex execs still ignore user config, and the cloned connector selector refuses `codex_squared` itself.
 
@@ -66,13 +66,13 @@ The existing `activity.view()` merged view tracks background tasks, pending wake
 
 The dispatcher runs inside the MCP, outside the manager's model/terminal turn. No new Windows service or process launcher is added. A stopped MCP leaves a durable outbox; another enabled MCP startup can recover it and collect Codex detached-turn receipts. With all enabled MCPs stopped, delivery waits until one starts. The adapter does not keep Desktop alive or deliver while it is closed.
 
-State lives in `pairs/completion-v1/`, separate from the registry. New tickets use record schema **2**, so the original v1 dispatcher cannot claim them. A supported v2 dispatcher can claim a legacy pending ticket under its kernel lock, preserve intent/ID, upgrade schema and clear obsolete bridge retry backoff; uncertain sends are still never blindly retransmitted. Unknown schemas remain untouched. Unique temporary files and bounded Windows replacement retries publish atomically. No pair/runtime/registry/activity lock is held over network I/O. Disabled mode creates no outbox, dispatcher or pipe probes. Unchanged terminal records are skipped during dispatch scans.
+State lives in `pairs/completion-v1/`, separate from the registry. New tickets use record schema **3**, so older v1/v2 build-gated dispatchers cannot claim them or impose unsupported-build backoff. The current dispatcher with verified Desktop ancestry can claim legacy v1/v2 pending tickets under their kernel lock, preserve intent/ID, upgrade schema and clear obsolete bridge retry backoff; uncertain sends are still never blindly retransmitted. Unknown schemas remain untouched. Unique temporary files and bounded Windows replacement retries publish atomically. No pair/runtime/registry/activity lock is held over network I/O. Disabled mode creates no outbox, dispatcher or pipe probes. Unchanged terminal records are skipped during dispatch scans.
 
 ## Delivery and fail-closed behavior
 
 Executable path, Desktop ancestry, creation times and pipe owner are checked. Catalog/schema validation must identify exactly one callback endpoint. Frame sizes and I/O deadlines are bounded; rejected candidates close handles. The response must acknowledge the intended destination.
 
-Compatibility is gated by `SUPPORTED_BUILDS`: Desktop `26.930.7945.0` / CLI `0.160.1` was tested on October 6; Desktop `26.1002.6548.0` / CLI `0.162.0-alpha.2` was tested on October 7. Idle and active callbacks preserved manager policy/model/cwd on both. Unknown builds still fail closed. The request includes `callerSource: codex`, absent from September's prototype.
+Compatibility is checked against the live callback catalog/schema, not a fixed build list. Alvar requested removal of the allowlist on October 7 after `26.1002.7124.0` was refused solely because it was new. Regression tests accept that build and a synthetic future build while still rejecting invalid executable identity or creation times. Read-only endpoint discovery passed on actual Desktop `26.1002.7124.0`; that check sends no callback. Earlier full idle/active tests on Desktop `26.930.7945.0` / CLI `0.160.1` and Desktop `26.1002.6548.0` / CLI `0.162.0-alpha.2` preserved manager policy/model/cwd. Newer builds are attempted automatically; incompatible catalogs/protocols still fail closed. The request includes `callerSource: codex`, absent from September's prototype.
 
 Current manager policy/cwd and source are checked before transmission, and pair generation/activity are rechecked after discovery. A new turn with unpublished/mismatched context defers instead of inheriting older permissions. Any rollback marker after the source invalidates that registration. User-turn replay is deliberately not approximated by counting task-start events; new work can arm a fresh record.
 
@@ -82,7 +82,7 @@ The adapter provides an event and result references under the manager's existing
 
 ## Validation and review
 
-Final checks: all **27 maintained offline suites passed**, including **48 completion/regression tests** after the October 7 fixes. `git diff --check` passed; original main remained clean.
+Final checks: all **27 maintained offline suites passed** after build-gate removal. The completion suite was rerun after the schema-3 coexistence fix: **51 completion/regression tests passed**, including legacy-registration coalescing and uncertain-send preservation. `git diff --check` passed; original main remained clean.
 
 The offline runner includes the completion suite. It covers disabled behavior, metadata injection/schema hiding, origin/policy/profile/plan checks, coalescing, fast completion/loss/generation races, pending/background work, context publication lag, cwd changes, clear/forget/archive/rewind, concurrent dispatchers, atomic failures, malformed catalogs/frames, handle cleanup, destination acknowledgments, uncertain sends and reconciliation. Real stdio fixtures validate dispatch after the RPC returns and an owned-server restart with no model calls.
 
@@ -100,13 +100,13 @@ The restarted chat exposed all 31 clone tools. Native checks passed conversation
 
 Three real failures were found:
 
-- The restart installed a new Desktop build; the old allowlist correctly refused callbacks. Idle/active compatibility checks passed before commit `c651d08` added the build.
-- Old loaded dispatchers could claim a newer dispatcher’s ticket and impose shared unsupported-build backoff. Schema-2 tickets and safe legacy claims isolate that coexistence; new callback tests passed with old processes still running.
+- The restart installed a new Desktop build and the original allowlist refused callbacks. Idle/active checks passed before commit `c651d08` added that build. A subsequent update to `26.1002.7124.0` led Alvar to request removing the allowlist entirely; current code validates the live protocol instead.
+- Old loaded dispatchers could claim a newer dispatcher’s ticket and impose shared unsupported-build backoff. Schema-2 tickets initially isolated the v1 dispatcher. Build-gate removal now uses schema 3 to fence both v1 and v2 build-gated processes; safe legacy claims preserve uncertain-send handling without restarting old servers.
 - Codex compaction incorrectly used lifetime usage as post-context size (showing 16,772 -> 66,533). It now uses the latest context total, including the new CLI's compaction shape with zero input/output and nonzero last.total_tokens. The live corrected result was **16,395 -> 4,608**, with retained `DELTA-662` / 76 and `V2_COMPACT_CALLBACK_PASS`.
 
 The default elevated Windows sandbox also failed to start a command (`helper_unknown_error: setup refresh had errors`). This upstream/environment failure is **not fixed globally**. A documented per-test-pair `windows.sandbox=unelevated` fallback retained read-only/workspace permissions and allowed the I/O checks. No global sandbox setting, full-access pair mode or other pair was changed. Evidence/logs are in this Codex task's `outputs/codex-squared-daylife-2026-10-07/` and `work/daylife-*` artifacts.
 
-Existing MCP processes retain their loaded snapshot. Current-chat direct lifecycle tests used the older loaded clone; updated callback/metric checks used fresh native managers. Start a fresh chat to load `c2eaf4f`; no forced process/app restart was performed.
+Existing MCP processes retain their loaded snapshot. Current-chat direct lifecycle tests used the older loaded clone; updated callback/metric checks used fresh native managers. Start a fresh chat to load the current installed revision; no forced process/app restart was performed. Build-gate removal and read-only discovery evidence are in this task's `work/callback-no-build-gate-2026-10-07.log` and installation receipt.
 
 ## Files and release handoff
 

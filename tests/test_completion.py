@@ -368,14 +368,16 @@ class CompletionTests(unittest.TestCase):
         self.assertFalse(self.sent)
 
     def test_supported_dispatcher_claims_legacy_backoff_without_old_reader_interference(self):
-        path = self.arm(); r=N._read(path); r.update(version=1,retry_at=time.time()+600,detail="old build refused")
-        N._save(path,r); N.process_one(path)
-        claimed=json.loads(path.read_text())
-        self.assertEqual(claimed["version"],2)
-        self.assertEqual(claimed["status"],"delivered")
-        # The installed v1 reader's exact schema gate now rejects this ticket.
-        self.assertNotEqual(claimed["version"],1)
-        self.assertEqual(len(self.sent),1)
+        for version in (1, 2):
+            with self.subTest(version=version):
+                path = self.arm(); r=N._read(path); r.update(version=version,retry_at=time.time()+600,detail="old build refused")
+                N._save(path,r); N.process_one(path)
+                claimed=json.loads(path.read_text())
+                self.assertEqual(claimed["version"],N.VERSION)
+                self.assertEqual(claimed["status"],"delivered")
+                # Both installed build-gated readers reject new tickets.
+                self.assertNotIn(claimed["version"],(1,2))
+        self.assertEqual(len(self.sent),2)
 
     def test_unsupported_dispatcher_does_not_mutate_legacy_ticket(self):
         path=self.arm(); r=N._read(path); r["version"]=1; N._save(path,r)
@@ -385,11 +387,28 @@ class CompletionTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(),before)
         self.assertFalse(self.sent)
 
+    def test_coalescing_legacy_registration_drops_obsolete_build_backoff(self):
+        for version in (1, 2):
+            with self.subTest(version=version):
+                first = self.task(); path = self.arm(first); record = N._read(path)
+                record.update(version=version, retry_at=time.time()+600)
+                N._save(path, record)
+                second = self.task(); self.arm(second)
+                upgraded = N._read(path)
+                self.assertEqual(upgraded["version"], N.VERSION)
+                self.assertEqual(upgraded["retry_at"], 0)
+                self.assertEqual(set(upgraded["tasks"]), {first.task_id, second.task_id})
+                N.process_one(path)
+                self.assertEqual(N._read(path)["status"], "delivered")
+        self.assertEqual(len(self.sent), 2)
+
     def test_legacy_uncertain_send_is_not_retransmitted_during_claim_upgrade(self):
-        path=self.arm(); r=N._read(path); r.update(version=1,status="sending"); N._save(path,r)
-        N.process_one(path)
-        self.assertEqual(N._read(path)["status"],"uncertain")
-        self.assertEqual(N._read(path)["version"],2)
+        for version in (1, 2):
+            with self.subTest(version=version):
+                path=self.arm(); r=N._read(path); r.update(version=version,status="sending"); N._save(path,r)
+                N.process_one(path)
+                self.assertEqual(N._read(path)["status"],"uncertain")
+                self.assertEqual(N._read(path)["version"],N.VERSION)
         self.assertFalse(self.sent)
 
     def test_atomic_record_write_retries_transient_windows_reader_lock(self):
@@ -534,6 +553,43 @@ class BridgeTests(unittest.TestCase):
             with self.assertRaises(B.Unavailable):
                 with B.endpoint(): pass
             connection.close.assert_called_once()
+
+
+class DesktopAncestryTests(unittest.TestCase):
+    def ancestry(self, build, birth=100.0, image=None):
+        """Exercise actual ancestry discovery without Windows handles or live state."""
+        from unittest.mock import Mock
+        entries = iter([(10, 20, "python.exe"), (20, 0, "ChatGPT.exe")])
+        def advance(handle, pointer):
+            entry = next(entries, None)
+            if entry is None:
+                return False
+            pointer._obj.pid, pointer._obj.ppid, pointer._obj.exe = entry
+            return True
+        kernel = SimpleNamespace(CreateToolhelp32Snapshot=Mock(return_value=123),
+                                 Process32FirstW=Mock(side_effect=advance),
+                                 Process32NextW=Mock(side_effect=advance), CloseHandle=Mock())
+        image = image or ("C:/Program Files/WindowsApps/OpenAI.Codex_" + build
+                          + "_x64__fixture/app/ChatGPT.exe")
+        with patch.object(B, "kernel", return_value=kernel), patch.object(B.os, "getpid", return_value=10), \
+                patch.object(B, "process_image", return_value=image), \
+                patch("claude_squared.process_identity.started_at", side_effect=lambda pid: 200.0 if pid == 10 else birth):
+            return B.desktop_ancestor()
+
+    def test_new_and_future_desktop_builds_use_live_protocol_checks(self):
+        for build in ("26.1002.7124.0", "99.9999.9999.0"):
+            with self.subTest(build=build):
+                app = self.ancestry(build)
+                self.assertEqual(app["build"], build)
+                self.assertEqual(app["pid"], 20)
+                self.assertEqual(app["started_at"], 100.0)
+
+    def test_process_identity_checks_remain_required(self):
+        for birth in (None, 300.0):
+            with self.subTest(birth=birth), self.assertRaises(B.Unavailable):
+                self.ancestry("26.1002.7124.0", birth=birth)
+        with self.assertRaises(B.Unavailable):
+            self.ancestry("26.1002.7124.0", image="C:/unrelated/ChatGPT.exe")
 
 
 if __name__ == "__main__":
