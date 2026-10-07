@@ -14,7 +14,8 @@ import struct
 import sys
 import time
 
-SUPPORTED_BUILDS = frozenset({"26.930.7945.0"})
+# Idle/active delivery and unchanged manager policy verified 2026-10-06/07.
+SUPPORTED_BUILDS = frozenset({"26.930.7945.0", "26.1002.6548.0"})
 PIPE_PATTERN = re.compile(r"^\\\\\.\\pipe\\codex-browser-use-[0-9a-f-]{36}$")
 MAX_FRAME = 1024 * 1024
 
