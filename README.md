@@ -485,7 +485,7 @@ Mutable via `pair_update(allowed_invocations=...)` **without runtime eviction** 
 - **Dynamic model availability.** The Claude CLI is the authority for Claude ids (unknown families pass through); `~/.codex/models_cache.json` is the authority for Codex (default choice, aliases, effort levels, windows, deprecations) — nothing model-specific is hardcoded beyond the never-default policy.
 - **Path encoding** for `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` lookups uses a single source: `cli_paths.encode_cwd_for_project()`.
 - **CCD/Cowork users**: this MCP is intended to be loaded by vanilla `claude` CLI sessions. The CCD harness loads MCPs differently and may or may not surface these tools.
-- **Further reading**: `docs/design-2026-05.md` (the original design plan, historical), `docs/codex-maintenance-2026-09-08.md` (the 0.14.0 maintenance branch and Desktop-callback prototype), and [Codex completion-adapter work record](docs/codex-completion-adapter-2026-10.md) (October implementation, validation and Codex-only clone setup).
+- **Further reading**: `docs/design-2026-05.md` (the original design plan, historical), `docs/codex-maintenance-2026-09-08.md` (the 0.14.0 maintenance branch and Desktop-callback prototype), and [Codex completion-adapter work record](docs/codex-completion-adapter-2026-10.md) (implementation, pinned clone setup and October 7 native lifecycle findings/fixes).
 
 ## Limits / known issues
 
