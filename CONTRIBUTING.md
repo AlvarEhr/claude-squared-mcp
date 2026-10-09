@@ -46,7 +46,7 @@ process with a temporary `CLAUDE_HOME`):
 python scripts/run_offline_tests.py
 ```
 
-That runs every suite listed in the script (26 as of 0.16.2): the maintained
+That runs every suite listed in the script (27 as of 0.17.0): the maintained
 `tests/smoke_*.py` scripts (each prints `PASS:` and exits non-zero on any
 failed assertion) and the `unittest` suites in `tests/test_*.py`. CI runs the
 same command on every push across the OS/Python matrix. Four legacy scripts

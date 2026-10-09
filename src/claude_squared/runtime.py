@@ -2101,7 +2101,13 @@ class RuntimeRegistry:
                         or rt.spec.effort != spec.effort
                         or rt.spec.cwd != spec.cwd
                         or rt.spec.mcp_whitelist != spec.mcp_whitelist
-                        or rt.spec.permission_mode != spec.permission_mode):
+                        or rt.spec.permission_mode != spec.permission_mode
+                        # v0.17.0: re-applied at every spawn like the connector
+                        # flags. pair_update evicts only its own process's
+                        # runtime; another process's warm one notices here.
+                        or rt.spec.disallowed_tools != spec.disallowed_tools
+                        or rt.spec.backend_options != spec.backend_options
+                        or rt.spec.ultracode != spec.ultracode):
                     old = self._runtimes.pop(spec.name)
                     rt = None
             if rt is None or not rt.is_alive():

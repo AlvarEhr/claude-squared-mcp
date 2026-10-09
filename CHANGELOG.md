@@ -4,6 +4,65 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] — 2026-10-09
+
+Per-pair tool removal, raw Claude options, and a per-pair context alert.
+
+**Restart every open Claude and Codex session after installing.** The
+registry version is unchanged — the new fields are additive and omitted unless
+set, and a 0.16 MCP process keeps them when it writes the registry — but a 0.16
+process that spawns such a pair runs it without the new flags.
+
+### Added
+
+- **Per-pair tool removal (Claude): `disallowed_tools`** on `pair_create` /
+  `pair_update`, passed as `--disallowed-tools` at every spawn (warm runtime,
+  per-send override, compaction, fork, `/context`, `pair_invoke`) alongside
+  the connector flags, so a `pair_update` applies at the next send without
+  `pair_clear`. Per Claude Code's docs a bare tool name (e.g. `Artifact`)
+  removes that tool's schema from the model's context, cutting the fixed
+  context a pair carries; a rule like `Bash(git push *)` only denies matching
+  calls. Every spawn path sends the same tool list, so compaction and override
+  sends keep hitting the prompt cache; changing the list costs one uncached
+  turn on the next send. `[]` clears it; like the other spawn-pinned settings,
+  a change refuses while background work is pending unless `force=True`.
+  Codex pairs refuse it.
+- **`backend_options` for Claude pairs:** `settings` (a settings JSON object)
+  is merged with the `ultracode` key into ONE `--settings` flag; `args` (a
+  list of raw CLI tokens, starting with a flag) is appended verbatim. Both are
+  re-applied at every spawn. Flags the pair manages itself (`--settings`,
+  `--model`, `--permission-mode`, `--disallowed-tools`, `--output-format`,
+  `--resume`, …) are refused in `args` with a pointer to the field to use;
+  `settings` may not carry `ultracode` (use the parameter); `settings` is
+  refused on Codex (Codex uses `config`). A malformed stored value refuses the
+  spawn rather than silently dropping, e.g., a permission rule.
+- **Per-pair context alert: `context_alert_at`** (tokens) on `pair_create` /
+  `pair_update` (`0` clears it). The alert fires at this or the global level
+  (`context_alert_headroom`), whichever comes first — so a smaller window
+  still alerts before auto-compaction. It drives `wait.py`'s exit 8 (a running
+  watcher picks up a change at its next poll), the send result's context
+  warning (replacing the 60%/85% bands for that pair only; other pairs are
+  unchanged) and `pair_status`. No respawn. Example: `context_alert_at=350000`
+  on a 1M-window pair.
+
+### Changed
+
+- **Ultracode's `--settings` now reaches every spawn path** — the per-send
+  override, compaction, fork, `/context` and `pair_invoke` spawns as well as
+  the warm runtime and create, which were the only ones it reached before.
+- **`backend_options` keys a Claude pair doesn't read are refused** at
+  `pair_create` / `pair_update` (they used to be stored and ignored). Keys
+  stored by an earlier version are still ignored at spawn.
+- A warm runtime owned by another MCP process now also respawns at its next
+  send when `ultracode`, `backend_options` or `disallowed_tools` changed (it
+  already did for model, effort, window, cwd, connectors and permission level).
+- `profile_name` and `system_prompt_append` combine: profile text first, then
+  the append. This already worked; the docs now say so, and `pair_create`
+  notes a `profile_name` with no file (the pair starts without that text).
+- `pair_handoff` lists `disallowed_tools` and Claude `backend_options` as
+  omitted (no Codex equivalent) and carries `context_alert_at` over.
+- `pair_info` shows `disallowed_tools` and the pair's context alert.
+
 ## [0.16.2] — 2026-09-27
 
 ### Fixed

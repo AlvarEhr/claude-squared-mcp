@@ -76,7 +76,7 @@ pair_create(name="impl", backend="codex", model="sol", context_window="1m",
 # Send a message — the reply comes back with a footer (ctx %, model, duration, log range)
 pair_send(name="reviewer", message="Review the changes in src/auth.py")
 
-# When context fills up (≥60% triggers a warning in the footer)
+# When context fills up (≥60% triggers a warning in the footer — or context_alert_at, if the pair sets one)
 pair_compact(name="reviewer")  # native /compact via stream-json (Claude only)
 pair_compact(name="reviewer", steering_prompt="Focus on what was reviewed and any unresolved findings.")
 ```
@@ -99,6 +99,8 @@ pair_compact(name="reviewer", steering_prompt="Focus on what was reviewed and an
 **Floating vs pinned models.** A family/tier alias (`opus`, `sol`) follows whatever generation the backend currently resolves it to — a 5.6 → 5.7 bump upgrades the pair automatically. A numbered id (`claude-opus-5`, `gpt-5.6-sol`) stays pinned; you get a one-time `🆕` nudge when a newer generation of that tier is listed. Codex deprecation notices from the cache (e.g. `gpt-5.4-mini` retiring) surface the same way.
 
 **Context window for Codex.** The default window is what Codex itself uses (~258k usable tokens). `context_window="1m"` passes `model_context_window=1000000` (what the Codex app writes); the server clamps it to the model's ceiling — 828,400 usable on the 5.6 family — and the auto-compact threshold is set to 90% of that effective window (the documented 900,000 would sit above the clamp and never fire). It costs more tokens per turn. **If the pair will scour large files or whole repos, pick `1m`** — a compaction (manual or automatic) costs a full-context turn and loses detail, so the window is the budget. `pair_create` says so when a Codex pair is created with the default window.
+
+**`backend_options` on Claude (0.17.0).** Two keys, both re-applied at every spawn: `settings`, a settings JSON object merged with the `ultracode` key into the pair's one `--settings` flag (set Ultracode with its parameter, not here), and `args`, raw CLI tokens appended verbatim (the list starts with a flag). `args` may not carry flags the pair manages itself (`--settings`, `--model`, `--permission-mode`, `--disallowed-tools`, `--output-format`, `--resume` …); the refusal names the field to use instead. Other keys are refused on Claude, and `settings` on Codex (Codex takes `config`). A stored value that can't be used refuses the spawn rather than silently dropping, say, a permission rule in `settings`.
 
 ### Permission levels (one vocabulary, translated per backend)
 
@@ -135,12 +137,12 @@ A pair's backend is fixed, so "switching" a Claude pair to Codex means creating 
 
 What carries over: every user message and reply, and each tool call with its result as a marked record (`[external_agent_tool_call]` / `[external_agent_tool_result]`) of the previous agent's work. What doesn't: the model's reasoning (signed on Claude, encrypted on Codex — it never crosses providers), the content of written or edited files (recorded by path only; the files are on disk), sub-agent internals (description + final report only), and the pairing of parallel tool calls. The pair's pinned instructions arrive as a user message rather than a system instruction. The result lists all of this and asks the calling agent to tell you unless you already know.
 
-Gates: a busy source is refused; a source with a Claude tool allow-list needs an explicit `permission_mode` (Codex can't enforce the allow-list); and the imported history is measured after import and refused at ≥70% of the chosen window, with the numbers for both windows and three remedies — compact the source first, start a fresh Codex pair, or pass `context_window="1m"`. Codex → Claude is not supported yet.
+Gates: a busy source is refused; a source with a Claude tool allow-list needs an explicit `permission_mode` (Codex can't enforce the allow-list); and the imported history is measured after import and refused at ≥70% of the chosen window, with the numbers for both windows and three remedies — compact the source first, start a fresh Codex pair, or pass `context_window="1m"`. Claude-only settings (`disallowed_tools`, `backend_options`) are dropped and listed as omitted; `context_alert_at` carries over. Codex → Claude is not supported yet.
 
 ## Tools
 
 ### Lifecycle
-- `pair_create(name, purpose, model?, effort?, permission_mode?, backend?, context_window?, system_prompt_append?, profile_name?, allowed_tools?, mcp_whitelist?, cwd?, extra_dirs?, persistent?, ultracode?, fallback_model?, allowed_invocations?, backend_options?, initial_message?, session_id?, parent_model?)`
+- `pair_create(name, purpose, model?, effort?, permission_mode?, backend?, context_window?, system_prompt_append?, profile_name?, allowed_tools?, mcp_whitelist?, cwd?, extra_dirs?, persistent?, ultracode?, fallback_model?, allowed_invocations?, backend_options?, disallowed_tools?, context_alert_at?, initial_message?, session_id?, parent_model?)`
 - `pair_adopt(name, session_id, model?, effort?, permission_mode?, cwd?, backend?, context_window?)` — register an existing claude session / codex thread
 - `pair_handoff(name, new_name?, model?, effort?, permission_mode?, context_window?, briefing?, probe?)` — hand a Claude pair's conversation to a NEW Codex pair (source untouched; see "Handing a Claude pair to Codex")
 - `pair_forget(name, archive=True)` — remove from registry; optionally archives transcript
@@ -160,7 +162,7 @@ Gates: a busy source is refused; a source with a Claude tool allow-list needs an
 
 ### Mutation
 - `pair_stop(name, force?, hard?, drain_queue?)` — cancel the executing turn (Claude: in-band interrupt, the pair stays alive; Codex: tree-kill, the thread resumes). Works across MCP processes (per-task cancel file; foreign self-woken turns must be stopped by their owner). `force` tree-kills a wedged runtime, `hard` also rotates the session (context gone), `drain_queue` cancels queued sends too (default: they still run)
-- `pair_update(name, model?, effort?, permission_mode?, context_window?, backend_options?, allowed_tools?, allowed_invocations?, cwd?, extra_dirs?, ultracode?, fallback_model?, purpose?)` — the backend is fixed; a model from the other backend is refused
+- `pair_update(name, model?, effort?, permission_mode?, context_window?, backend_options?, disallowed_tools?, context_alert_at?, mcp_whitelist?, allowed_tools?, allowed_invocations?, cwd?, extra_dirs?, ultracode?, fallback_model?, purpose?, force?)` — the backend is fixed; a model from the other backend is refused
 - `pair_clear(name, archive_old=True)` — rotate to a fresh session/thread; pinned config preserved
 - `pair_compact(name, steering_prompt?, timeout_seconds=45, compact_timeout_seconds=600)` — Claude: native /compact via stream-json; Codex: `codex app-server` `thread/compact/start` (steering ignored). Async-wrapped, degrades gracefully to an async handle past the sync cap.
 - `pair_fork(name, new_name?)` — branch a pair into a new independent pair, keeping both (Claude: native `--fork-session`; Codex: native `exec fork`)
@@ -177,7 +179,7 @@ Gates: a busy source is refused; a source with a Claude tool allow-list needs an
 - `pair_settings_set(model?, effort?, permission_mode?, backend?, context_window?, persistent?, ultracode?, fallback_model?, extra_dirs?, allowed_invocations?)` — fill defaults for new pairs (per-call args ALWAYS override defaults)
 - `pair_settings_reset()` — delete defaults file → fall back to hardcoded fallbacks (claude / `opus`, high, auto, default window)
 
-> **Ultracode (v0.9.10+, Claude)**: Anthropic's "Ultracode" mode (xhigh effort + dynamic workflows) is surfaced via `--settings '{"ultracode": true}'`, **not** `--effort ultracode`. Use `pair_create(ultracode=True)` or `pair_settings_set(ultracode=True)`. On Codex the equivalent opt-in is `effort="ultra"` (maximum reasoning + automatic task delegation).
+> **Ultracode (v0.9.10+, Claude)**: Anthropic's "Ultracode" mode (xhigh effort + dynamic workflows) is surfaced via `--settings '{"ultracode": true}'`, **not** `--effort ultracode` — merged with any `backend_options.settings` into one `--settings` flag and passed on every spawn path (0.17.0). Use `pair_create(ultracode=True)` or `pair_settings_set(ultracode=True)`. On Codex the equivalent opt-in is `effort="ultra"` (maximum reasoning + automatic task delegation).
 
 > **Model-handling hardening (v0.11.0+)**: Anthropic silently downgrades a session's model when a conversation trips a cyber/bio safety classifier, and flags subscription/trial model access as revocable. The `pair_send` reply footer surfaces both: **`🔄 MODEL CHANGED`** when the model that actually ran differs from what the pair requested, and **`⚠ SAFETY/BLOCK SIGNAL`** on a content-safety refusal (`⚠ TURN ENDED ABNORMALLY` for transient API errors). Set **`fallback_model`** (Claude) so a send whose primary is unavailable transparently continues on the fallback. A **`🆕 newer model available`** notice fires when a newer generation of the pair's family/tier is available (Claude: compared against your parent session; Codex: against the models cache). *Limitation*: a hard **pause** that returns no result at all looks like a slow turn (an async handle), not a flagged signal.
 
@@ -233,7 +235,7 @@ on Codex).
 |---|---|
 | `~/.claude/pairs/registry.json` | Pair registry (filelock-protected; v3 since 0.13.0, `registry.v2.backup.json` kept at migration) |
 | `~/.claude/pairs/defaults.json` | Per-user defaults for new pairs |
-| `~/.claude/pairs/profiles/<name>.md` | Reusable system-prompt profiles for `pair_create(profile_name=...)` |
+| `~/.claude/pairs/profiles/<name>.md` | Reusable system-prompt profiles for `pair_create(profile_name=...)`; combined with `system_prompt_append` (profile first, then the append) |
 | `~/.claude/pairs/archive/<name>-<ts>.jsonl` | Archived transcripts on `pair_forget(archive=True)`, `pair_clear`, `pair_rewind` |
 | `~/.claude/pairs/async/<task_id>.json` | Async task state (poll-able across process restarts); `<task_id>.cancel` next to it = a stop request any process can honor (0.14.0) |
 | `~/.claude/pairs/async/control/<name>.lock` | Short per-pair control lock: stop selection vs. queued-task promotion (0.14.0) |
@@ -306,8 +308,15 @@ Three ways to consume the handle:
    window, 40k) tokens — 820k on a 1M window, 130k on 200k (where the
    compaction point is an estimate). `pair_settings_set(context_alert_headroom=N)`
    changes the headroom; the window is the one the CLI last reported for the
-   pair. `pair_status` and a running `pair_poll` show the live context and
-   whether it is past the alert.
+   pair. A pair's own `context_alert_at` (tokens, on `pair_create` /
+   `pair_update`; `0` clears it; 0.17.0) sets its level: the alert fires at
+   this or the global level, whichever comes first, so a smaller window than
+   expected still alerts before auto-compaction — e.g. `context_alert_at=350000`
+   on a 1M-window pair. It also replaces that pair's 60%/85% footer warnings
+   with one at the same level (other pairs keep the bands); no respawn, and a
+   running watcher picks up a change at its next poll. `--context-alert PCT`
+   overrides both. `pair_status` and a running `pair_poll` show the live
+   context and whether it is past the alert.
 
 2. **Manual quick status**: `pair_poll(task_id)` returns one-line status; if
    `status="done"` includes the full response text. **You can poll by pair
@@ -386,9 +395,10 @@ and the pair never wakes for it. So:
   killed with `force=True`;
 - `pair_clear`, `pair_rewind`, `pair_compact` and a `pair_update` that
   actually changes a spawn-pinned setting (model, effort, permission level,
-  window, cwd, extra_dirs, allowed_tools, connectors, ultracode, fallback
-  model) **refuse** while work is pending — background work, a self-woken
-  turn, or the wake-up between a completion and that turn — unless
+  window, cwd, extra_dirs, allowed_tools, disallowed_tools, connectors,
+  ultracode, backend_options, fallback model) **refuse** while work is
+  pending — background work, a self-woken turn, or the wake-up between a
+  completion and that turn — unless
   `force=True`, which kills it and records the loss; other `pair_update`
   fields, and re-sending a setting's current value, apply without a respawn;
 - `force=True` only reaches **this** MCP process's runtime: while another
@@ -442,14 +452,20 @@ Neither backend sandboxes a connector's own process — once a call is allowed, 
 
 A selected connector the backend can't see is stored and reported as "not available and not activated" — never an error — and each turn notes a selected connector that failed to start or needs authentication. `pair_fork` keeps the selection; `pair_handoff` carries over the connectors Codex can see and warns about the rest. Connectors are heavy (one can add dozens of tool definitions to a pair's context), so select only what the pair needs.
 
+## Trimming a pair's fixed context (Claude, 0.17.0)
+
+Tool definitions are part of the fixed context a pair carries on every turn. `disallowed_tools=[...]` on `pair_create` / `pair_update` passes each entry as `--disallowed-tools`. Per Claude Code's docs, a bare tool name (`"Artifact"`) removes that tool's schema from the model's context; a rule (`"Bash(git push *)"`) only denies matching calls and leaves the tool in context. Good candidates are tools a headless pair rarely needs, such as `Artifact` or the plugin- and skill-suggestion tools; `pair_context` shows the effect. (`AskUserQuestion` is always removed — it can't work headless.)
+
+The list is re-applied at every spawn — warm runtime, per-send override, compaction, fork, `/context`, `pair_invoke` — so a `pair_update` applies at the next send without a `pair_clear`, and every path sends the same tool list, which keeps compaction and override sends on the prompt cache. Changing the list costs one uncached turn on the next send. `[]` clears it, `pair_fork` keeps it, `pair_handoff` drops it, and Codex pairs refuse it (limit a Codex pair with its permission level).
+
 ## Mid-flight config changes
 
 `pair_update` propagation depends on the field category — three buckets:
 
 | Category | Fields | When change takes effect |
 |---|---|---|
-| Per-send | `model`, `effort`, `permission_mode`, `context_window`, `backend_options`, `ultracode`, `fallback_model`, `mcp_whitelist` | Next `pair_send` (registry write + runtime eviction → respawn with new values; Codex: every send is a fresh process) |
-| Server-side | `allowed_invocations` | Next `pair_invoke` — no eviction needed (MCP-layer enforcement, not pinned to CLI subprocess). Mutable freely. |
+| Per-send | `model`, `effort`, `permission_mode`, `context_window`, `backend_options`, `ultracode`, `fallback_model`, `mcp_whitelist`, `disallowed_tools` | Next `pair_send` (registry write + runtime eviction → respawn with new values; Codex: every send is a fresh process) |
+| Server-side | `allowed_invocations`, `context_alert_at` | No eviction needed (MCP-layer, not pinned to the CLI subprocess). `allowed_invocations`: next `pair_invoke`. `context_alert_at`: next send's result, `pair_status`, and running `wait.py` watchers at their next poll. Mutable freely. |
 | Pinned-at-create | `allowed_tools`, `system_prompt_append` | **Only after `pair_clear`** — the existing session was started with the OLD values; rotation creates a fresh session with the new pinned config |
 | Pinned-at-spawn | `cwd`, `extra_dirs` | Next spawn after eviction. A Claude `cwd` change ALSO moves the session JSONL across project dirs (rejected with recovery hint if the move fails); Codex threads aren't cwd-keyed |
 
@@ -473,7 +489,7 @@ Mutable via `pair_update(allowed_invocations=...)` **without runtime eviction** 
 
 - **One vocabulary, translated per backend.** Permission levels, effort names, `context_window` and model aliases are backend-neutral on the tool surface; each adapter maps them to native flags. The old Claude spellings stay accepted as input aliases so nothing an agent learned before 0.13.0 breaks.
 - **`--model` and `--effort` re-passed every call** because they don't persist on resume in either CLI.
-- **`--append-system-prompt`, `--allowed-tools` pinned at create** because they DO persist (Claude). MCP flags are re-applied on every spawn instead (verified: a resumed session uses the new ones), which is what lets `pair_update(mcp_whitelist=…)` take effect without a `pair_clear`.
+- **`--append-system-prompt`, `--allowed-tools` pinned at create** because they DO persist (Claude). MCP flags are re-applied on every spawn instead (verified: a resumed session uses the new ones), which is what lets `pair_update(mcp_whitelist=…)` take effect without a `pair_clear`. `--disallowed-tools`, `--settings` and Claude `backend_options.args` are re-applied the same way (0.17.0).
 - **Per-pair FIFO lock** in the server: concurrent `pair_send` to the same pair queue automatically (cross-process too; Codex's own thread-store lock is the belt).
 - **Two execution paths in the Claude adapter**: a warm `--print --input-format stream-json` runtime for normal sends; a one-shot stream-json subprocess for slash commands (compact/context/invoke). **Codex is one `exec` process per turn** (phase 1; the `codex app-server` daemon is the warm-runtime candidate).
 - **Auto is the default permission level** — `unrestricted` is refused as a global default.

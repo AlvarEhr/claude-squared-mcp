@@ -14,7 +14,7 @@ from typing import Any
 from claude_squared.adapters.base import PairAdapter
 from claude_squared import connectors
 from claude_squared.cli_paths import encode_cwd_for_project as _encode_cwd_for_project
-from claude_squared.errors import CLIError, CommandTimeout, SessionMissing
+from claude_squared.errors import CLIError, CommandTimeout, PairError, SessionMissing
 from claude_squared.models import (
     CLAUDE_PERMISSION_MAP,
     HEADLESS_INCOMPATIBLE_TOOLS,
@@ -52,6 +52,28 @@ _MODEL_UNAVAILABLE_HELP = (
 )
 # _encode_cwd_for_project: kept as a local alias for backward compat within this
 # module (multiple call sites). Source of truth: cli_paths.encode_cwd_for_project.
+
+# v0.17.0: flags a raw ``backend_options.args`` entry may not carry — the pair
+# sets them from its own fields (a second ``--settings`` would replace the
+# merged JSON, not add to it), or every spawn path sets them itself and a
+# duplicate would break the stream protocol the runtime reads. Value = the
+# field to use instead (None: not configurable).
+_MANAGED_FLAGS: dict[str, str | None] = {
+    "--settings": "backend_options.settings",
+    "--disallowed-tools": "disallowed_tools", "--disallowedTools": "disallowed_tools",
+    "--allowed-tools": "allowed_tools", "--allowedTools": "allowed_tools",
+    "--model": "model", "--fallback-model": "fallback_model", "--effort": "effort",
+    "--permission-mode": "permission_mode",
+    "--dangerously-skip-permissions": "permission_mode",
+    "--allow-dangerously-skip-permissions": "permission_mode",
+    "--append-system-prompt": "system_prompt_append / profile_name",
+    "--mcp-config": "mcp_whitelist", "--strict-mcp-config": "mcp_whitelist",
+    "--add-dir": "extra_dirs",
+    "--print": None, "-p": None, "--resume": None, "-r": None, "--continue": None, "-c": None,
+    "--session-id": None, "--fork-session": None,
+    "--input-format": None, "--output-format": None,
+}
+CLAUDE_BACKEND_OPTION_KEYS = ("settings", "args")
 
 
 def _claude_executable() -> str:
@@ -169,6 +191,63 @@ class ClaudeAdapter(PairAdapter):
         return bare
 
     @staticmethod
+    def validate_backend_options(backend_options: dict[str, Any] | None, *,
+                                 allow_unknown: bool = False) -> dict[str, Any]:
+        """Check (and normalize) a Claude pair's ``backend_options``; raises
+        ValueError. ``settings``: a JSON object (dict or JSON string), merged
+        with the ultracode key into the one ``--settings`` flag. ``args``: a
+        list of raw CLI tokens, none of them a managed flag (``_MANAGED_FLAGS``).
+
+        ``allow_unknown`` is the spawn-time mode: before v0.17.0 a Claude pair
+        accepted any keys and ignored them, so a stored unknown key must not
+        stop the pair from starting — only the two keys it reads are checked.
+        """
+        bo = dict(backend_options or {})
+        unknown = sorted(set(bo) - set(CLAUDE_BACKEND_OPTION_KEYS))
+        if unknown and not allow_unknown:
+            raise ValueError(
+                f"backend_options {unknown} are not Claude options. Claude takes 'settings' (a "
+                f"settings JSON object, passed as --settings) and 'args' (a list of raw CLI args); "
+                f"'config' / 'sandbox' / 'approval' are Codex-only.")
+        if "settings" in bo:
+            settings = bo["settings"]
+            if isinstance(settings, str):
+                try:
+                    settings = json.loads(settings)
+                except ValueError as e:
+                    raise ValueError(f"backend_options.settings must be a JSON object: {e}") from None
+            if not isinstance(settings, dict):
+                raise ValueError("backend_options.settings must be a JSON object (a dict)")
+            if "ultracode" in settings:
+                raise ValueError("set Ultracode with the ultracode parameter, not backend_options.settings "
+                                 "— both go into the same --settings JSON")
+            bo["settings"] = settings
+        if "args" in bo:
+            raw = bo["args"]
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except ValueError:
+                    raw = None
+            if not isinstance(raw, list) or not all(isinstance(a, str) for a in raw):
+                raise ValueError("backend_options.args must be a list of strings, one CLI token each "
+                                 "(e.g. [\"--max-budget-usd\", \"5\"])")
+            if raw and not raw[0].startswith("-"):
+                # It follows a variadic --disallowed-tools on some spawn paths,
+                # which would swallow a leading value as a tool name.
+                raise ValueError(f"backend_options.args must start with a flag (got {raw[0]!r})")
+            for token in raw:
+                flag = token.split("=", 1)[0]
+                if flag in _MANAGED_FLAGS:
+                    field = _MANAGED_FLAGS[flag]
+                    raise ValueError(
+                        f"backend_options.args may not contain {flag}: "
+                        + (f"set it with {field} instead." if field else
+                           "every spawn path sets it itself (the runtime's stream protocol)."))
+            bo["args"] = raw
+        return bo
+
+    @staticmethod
     def native_permission(level: str | None) -> str:
         """Neutral level (or any accepted alias) → ``--permission-mode`` value.
 
@@ -270,6 +349,7 @@ class ClaudeAdapter(PairAdapter):
         ]
         args += self._fallback_args(spec)
         args += self._mcp_args(spec, permission_mode)
+        args += self._option_args(spec)
         if eff is not None:
             args += ["--effort", eff]
         args += [
@@ -325,6 +405,7 @@ class ClaudeAdapter(PairAdapter):
             "-p", sentinel,
         ]
         args += self._mcp_args(spec)
+        args += self._option_args(spec)
         result_json = self._run_print(
             args, timeout_seconds=timeout_seconds, pair_name=spec.name, cwd=spec.cwd,
             **({"connector_spec": spec} if connectors.effective(spec.mcp_whitelist) else {})
@@ -409,9 +490,9 @@ class ClaudeAdapter(PairAdapter):
         # orchestration) is active for the session. Set per session via the
         # 'ultracode' settings key"). Pass it alongside any --effort value —
         # ultracode and effort are independent fields in the CLI's data model
-        # (binary: ``effortValue:_,ultracode:f``).
-        if spec.ultracode:
-            args += ["--settings", '{"ultracode": true}']
+        # (binary: ``effortValue:_,ultracode:f``). v0.17.0: merged with
+        # backend_options.settings into ONE --settings JSON (_settings_args).
+        args += self._settings_args(spec)
 
         # v0.11.0: automatic fallback when the primary model is overloaded or
         # unavailable (e.g. a subscription/trial-flagged model loses access).
@@ -436,6 +517,9 @@ class ClaudeAdapter(PairAdapter):
         if spec.allowed_tools and not connectors.effective(spec.mcp_whitelist):
             args += ["--allowed-tools", " ".join(spec.allowed_tools)]
 
+        # v0.17.0: raw extra args LAST — both callers follow with --print, so a
+        # variadic flag here can't swallow anything.
+        args += self._extra_args(spec)
         return args
 
     def _mcp_args(self, spec: PairSpec, permission_mode: str | None = None) -> list[str]:
@@ -445,7 +529,55 @@ class ClaudeAdapter(PairAdapter):
         # Reapplying disallow flags on resume must retain headless exclusions.
         for tool in HEADLESS_INCOMPATIBLE_TOOLS:
             args += ["--disallowed-tools", tool]
+        # v0.17.0: the pair's own removals ride with the connector flags, so
+        # every spawn path (runtime, override send, compact, fork, /context)
+        # sends the same tool list — a different list on one path would miss
+        # the prompt cache for the whole context — and a pair_update applies
+        # at the next spawn without a pair_clear.
+        for tool in self.disallowed_tools(spec):
+            args += ["--disallowed-tools", tool]
         return args
+
+    @staticmethod
+    def disallowed_tools(spec: PairSpec) -> list[str]:
+        """The pair's ``disallowed_tools``: stripped, de-duplicated in order,
+        minus the headless exclusions ``_mcp_args`` already passes."""
+        out: list[str] = []
+        for tool in spec.disallowed_tools or []:
+            tool = str(tool).strip()
+            if tool and tool not in out and tool not in HEADLESS_INCOMPATIBLE_TOOLS:
+                out.append(tool)
+        return out
+
+    @classmethod
+    def _claude_options(cls, spec: PairSpec) -> dict[str, Any]:
+        """The pair's validated ``backend_options`` (spawn-time mode). A
+        malformed ``settings`` / ``args`` refuses the spawn: silently dropping
+        them could drop a permission rule the user put in ``settings``."""
+        try:
+            return cls.validate_backend_options(spec.backend_options, allow_unknown=True)
+        except ValueError as e:
+            raise PairError(f"pair '{spec.name}' has unusable backend_options: {e}. "
+                           f"Fix it with pair_update(name='{spec.name}', backend_options=...).") from None
+
+    def _settings_args(self, spec: PairSpec) -> list[str]:
+        """ONE ``--settings`` JSON: backend_options.settings plus the ultracode
+        key. Keys sorted so the same config always yields the same argument
+        (ultracode alone is still ``{"ultracode": true}``, as before v0.17)."""
+        merged = dict(self._claude_options(spec).get("settings") or {})
+        if spec.ultracode:
+            merged["ultracode"] = True
+        return ["--settings", json.dumps(merged, sort_keys=True)] if merged else []
+
+    def _extra_args(self, spec: PairSpec) -> list[str]:
+        """backend_options.args, verbatim."""
+        return list(self._claude_options(spec).get("args") or [])
+
+    def _option_args(self, spec: PairSpec) -> list[str]:
+        """Settings + raw args for the resume paths that don't go through
+        ``_common_create_args`` (override send, fork, stream-json one-shots).
+        v0.17.0: ultracode used to reach only create and the runtime."""
+        return self._settings_args(spec) + self._extra_args(spec)
 
     def _resolve_system_prompt(self, spec: PairSpec) -> str | None:
         parts = []
@@ -533,6 +665,7 @@ class ClaudeAdapter(PairAdapter):
                 "--input-format", "stream-json",
                 "--output-format", "stream-json"]
         args += self._mcp_args(spec)
+        args += self._option_args(spec)
 
         stdin_payload = "\n".join(
             json.dumps({"type": "user", "message": {"role": "user", "content": m}})

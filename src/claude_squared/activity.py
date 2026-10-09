@@ -394,18 +394,25 @@ def compaction_point(window, backend="claude", auto_compact_token_limit=None):
     return window - _AV_COMPACT_MARGIN
 
 
-def context_alert_threshold(window, headroom=None, backend="claude", auto_compact_token_limit=None):
+def context_alert_threshold(window, headroom=None, backend="claude", auto_compact_token_limit=None,
+                            alert_at=None):
     """Context size at which to alert: ``headroom`` tokens before the
     estimated compaction point, so a real turn still fits (default
     max(15% of the window, 40k) — the pair_settings default
-    ``context_alert_headroom`` overrides it). None when the window is
+    ``context_alert_headroom`` overrides it). A pair's own ``alert_at``
+    (``PairSpec.context_alert_at``, absolute tokens) wins when it comes
+    first — capped at the global level, so a smaller window or a misjudged
+    value still alerts before auto-compaction. None when the window is
     unknown."""
     point = compaction_point(window, backend, auto_compact_token_limit)
     if point is None:
         return None
     if not isinstance(headroom, int) or headroom < 0:
         headroom = max(int(window * 0.15), 40000)
-    return max(0, point - headroom)
+    level = max(0, point - headroom)
+    if isinstance(alert_at, int) and not isinstance(alert_at, bool) and alert_at > 0:
+        return min(alert_at, level)
+    return level
 
 
 def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,

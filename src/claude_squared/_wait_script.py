@@ -46,7 +46,9 @@ Context alert: exits 8 when the pair's context CROSSES the alert level while
 the watcher runs (never at start, so re-arming is safe). Default level: the
 estimated auto-compaction point (window - 30k) minus a headroom of
 max(15% of the window, 40k) tokens — pair_settings_set(context_alert_headroom=N)
-changes it; --context-alert PCT sets a percentage of the window instead.
+changes it for every pair; a pair's own context_alert_at (pair_update) moves
+it earlier for that pair; --context-alert PCT sets a percentage of the window
+instead.
 
 Exit codes:
     0  done / idle
@@ -172,6 +174,13 @@ def _headroom():
     return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
 
 
+def _alert_at(pair):
+    """The pair's own context alert (``context_alert_at``, v0.17), or None."""
+    spec = _registry_pair(pair) if pair else None
+    v = spec.get("context_alert_at") if isinstance(spec, dict) else None
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else None
+
+
 def _hms(iso) -> str:
     dt = _av_parse(iso)
     return dt.astimezone().strftime("%H:%M:%S") if dt else "?"
@@ -196,14 +205,17 @@ class Alert:
     def __init__(self, mode, pct):
         self.mode, self.pct, self.prev = mode, pct, None
 
-    def level(self, window, backend="claude", auto_compact_token_limit=None):
+    def level(self, window, backend="claude", auto_compact_token_limit=None, pair=None):
         if self.mode == "off" or not window:
             return None
         if self.mode == "pct":
             return int(window * self.pct / 100.0)
-        return context_alert_threshold(window, _headroom(), backend, auto_compact_token_limit)
+        # Re-read each poll, like the headroom: a pair_update applies to a
+        # watcher already running.
+        return context_alert_threshold(window, _headroom(), backend, auto_compact_token_limit,
+                                       _alert_at(pair))
 
-    def check(self, ctx, reported):
+    def check(self, ctx, reported, pair=None):
         """(used, window, level) when this observation crosses the level."""
         if not isinstance(ctx, dict) or not ctx.get("used"):
             return None
@@ -211,7 +223,7 @@ class Alert:
         window = ctx.get("window") or (reported or {}).get("tokens")
         self.backend = ctx.get("backend") or (reported or {}).get("backend") or "claude"
         self.auto_compact_token_limit = ctx.get("auto_compact_token_limit") or (reported or {}).get("auto_compact_token_limit")
-        level = self.level(window, self.backend, self.auto_compact_token_limit)
+        level = self.level(window, self.backend, self.auto_compact_token_limit, pair)
         prev, self.prev = self.prev, used
         if level is None or prev is None:
             return None
@@ -340,7 +352,7 @@ def wait_task(task_id: str, arg: str, timeout_s: float, poll_s: float, alert: Al
         pair = pair or data.get("pair_name")
         if pair:
             view = pair_activity_view(_pairs_dir(), pair, now=now, grace_seconds=0)
-            hit = alert.check(view.get("context"), view.get("reported_window"))
+            hit = alert.check(view.get("context"), view.get("reported_window"), pair)
             if hit:
                 print(_alert_message(pair, *hit, [arg] + extra, alert.backend, alert.auto_compact_token_limit))
                 return 8
@@ -510,7 +522,7 @@ def wait_pair(pair: str, each_turn: bool, timeout_s: float, poll_s: float, alert
         # Turns that ended while we watch (the window list is cleared by a new
         # send, so remember them).
         new_turns = _observe(view, seen, observed, started)
-        hit = alert.check(view.get("context"), view.get("reported_window"))
+        hit = alert.check(view.get("context"), view.get("reported_window"), pair)
         if hit:
             print(_alert_message(pair, *hit, base, alert.backend, alert.auto_compact_token_limit))
             return 8

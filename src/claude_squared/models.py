@@ -581,12 +581,19 @@ class PairSpec(BaseModel):
     # overrides), ``args`` (list of raw extra exec args), ``sandbox`` /
     # ``approval`` (native override of the permission translation:
     # sandbox ∈ read-only|workspace-write|danger-full-access, approval ∈
-    # none|approve-for-me|bypass). Claude: none yet (every native mode is
-    # reachable through the level aliases).
+    # none|approve-for-me|bypass). Claude (v0.17.0): ``settings`` (dict merged
+    # with the ultracode key into the one ``--settings`` JSON) and ``args``
+    # (list of raw extra CLI args) — both re-applied at every spawn
+    # (``ClaudeAdapter.validate_backend_options``).
     backend_options: dict[str, Any] = Field(default_factory=dict)
     system_prompt_append: str | None = None
     profile_name: str | None = None  # references ~/.claude/pairs/profiles/<name>.md
     allowed_tools: list[str] | None = None
+    # v0.17.0 (Claude): ``--disallowed-tools`` entries re-applied at every spawn,
+    # like the connector flags. A bare tool name removes the tool's schema
+    # from the model's context (code.claude.com/docs/en/cli-reference); a
+    # rule like ``Bash(git push *)`` only denies matching calls.
+    disallowed_tools: list[str] | None = None
     mcp_whitelist: list[str] | None = None  # explicit connector opt-in on either backend; default none
     # MCP-level safety rail on ``pair_invoke``: which slash commands the calling
     # agent may invoke through the structured channel. ``None`` = allow all;
@@ -602,6 +609,11 @@ class PairSpec(BaseModel):
     # v0.11.0: automatic fallback model(s) — Claude ``--fallback-model``. Codex
     # has no analog (hard-errors at create if set on a codex pair).
     fallback_model: str | None = None
+    # v0.17.0: per-pair context alert (absolute tokens). The effective level is
+    # this or the global alert level, whichever comes first
+    # (``activity.context_alert_threshold``); drives wait.py's exit 8, the
+    # send result's context warning and pair_status. None = global default.
+    context_alert_at: int | None = None
     # v0.11.0: dedup marker for the "newer model available" notice.
     last_drift_notice: str | None = None
     created_at: datetime = Field(default_factory=datetime.utcnow)

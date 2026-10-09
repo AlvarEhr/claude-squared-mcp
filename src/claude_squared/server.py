@@ -755,6 +755,8 @@ def pair_create(
     fallback_model: str | None = None,
     allowed_invocations: str | list[str] | None = None,
     backend_options: dict | str | None = None,
+    disallowed_tools: str | list[str] | None = None,
+    context_alert_at: int | str | None = None,
     initial_message: str | None = None,
     session_id: str | None = None,
     parent_model: str | None = None,
@@ -814,7 +816,8 @@ def pair_create(
         system_prompt_append: Text appended to the default system prompt. Pinned at
             create. Codex: delivered as the thread's first user message (exec has no
             system-prompt flag); it persists in the thread history.
-        profile_name: ``~/.claude/pairs/profiles/<name>.md`` used as system_prompt_append.
+        profile_name: ``~/.claude/pairs/profiles/<name>.md``, a shared role prompt. Combines
+            with ``system_prompt_append``: profile text first, then the append.
         allowed_tools: Claude permission patterns like ``["Bash(git *)", "Read"]``.
             Pinned at create. Ignored by Codex. Rules match the literal command
             (``*`` = any text, also mid-rule: ``Bash(git -C * log*)``).
@@ -835,7 +838,18 @@ def pair_create(
             ``config`` {toml key: value} extra ``-c`` overrides; ``args`` [raw exec
             args]; ``sandbox`` / ``approval`` native override of the permission
             translation (sandbox: read-only|workspace-write|danger-full-access;
-            approval: none|approve-for-me|bypass).
+            approval: none|approve-for-me|bypass). Claude keys: ``settings`` {settings
+            JSON}, merged with ``ultracode`` into the one ``--settings`` flag; ``args``
+            [raw CLI args] (flags the pair manages itself are refused). Both re-applied
+            at every spawn.
+        disallowed_tools: Claude tools to remove (``--disallowed-tools``, re-applied at
+            every spawn; ``pair_update`` changes it without a clear). A bare name
+            (``"Artifact"``) removes the tool's schema from the pair's context; a rule
+            (``"Bash(git push *)"``) only denies matching calls. Codex: refused.
+        context_alert_at: this pair's context alert, in tokens (e.g. 350000). The
+            alert fires at this or the global level (pair_settings
+            ``context_alert_headroom``), whichever comes first: wait.py exits 8, the
+            send result warns, pair_status flags it. Omit for the global default.
         initial_message: If set, sent as the first turn (as an async task).
         session_id: Claude: caller-supplied UUID (auto-generated if omitted). Codex
             names its own thread — ignored.
@@ -899,12 +913,16 @@ def pair_create(
         context_window=context_window,
     )
     transparency_msgs.extend(connectors.select(mcp_whitelist_norm, be, resolved_cwd)[1])
-    backend_options_norm = _coerce_backend_options(backend_options)
-    if be == "codex" and backend_options_norm:
-        try:
-            CodexAdapter.validate_backend_options(resolved["permission_mode"], backend_options_norm)
-        except ValueError as e:
-            raise PairError(str(e))
+    backend_options_norm = _check_backend_options(
+        be, _coerce_backend_options(backend_options), resolved["permission_mode"])
+    disallowed_tools_norm = _coerce_to_str_list(disallowed_tools)
+    _refuse_codex_disallowed(be, disallowed_tools_norm)
+    context_alert_at_norm = _coerce_alert_at(context_alert_at)
+    if profile_name:
+        _profile = reg_mod.profiles_dir() / f"{profile_name}.md"
+        if not _profile.exists():
+            transparency_msgs.append(f"profile '{profile_name}' has no file at {_profile} — the pair "
+                                     f"starts without that text.")
 
     # v0.12.0 premium-model notice. Fires on the RESOLVED model, so it catches a
     # premium family arriving via defaults.json or match-parent detection, not
@@ -985,6 +1003,7 @@ def pair_create(
         system_prompt_append=system_prompt_append,
         profile_name=profile_name,
         allowed_tools=allowed_tools_norm,
+        disallowed_tools=disallowed_tools_norm,
         mcp_whitelist=mcp_whitelist_norm,
         allowed_invocations=allowed_invocations_norm,
         cwd=resolved_cwd,
@@ -992,6 +1011,7 @@ def pair_create(
         persistent=resolved["persistent"],
         ultracode=resolved["ultracode"],
         fallback_model=resolved["fallback_model"],
+        context_alert_at=context_alert_at_norm,
         last_drift_notice=drift_seed,
     )
     # Register first so concurrent pair_send calls see it
@@ -1574,6 +1594,40 @@ def _lost_note(lost: list[dict]) -> str | None:
             f"{_describe_background(lost)}")
 
 
+def _pair_alert_at(name: str) -> int | None:
+    try:
+        return reg_mod.get_pair(name).context_alert_at
+    except Exception:
+        return None
+
+
+def _apply_context_alert(spec: PairSpec, result: SendResult) -> None:
+    """v0.17.0: a pair with its own ``context_alert_at`` gets its send-result
+    context warning from that level (the one wait.py exits 8 on) instead of
+    the 60%/85% fill bands; pairs without one keep the bands unchanged."""
+    ctx = result.context
+    if ctx is None or not spec.context_alert_at or not ctx.tokens_max:
+        return
+    try:
+        headroom = settings_mod.load_defaults().context_alert_headroom
+    except Exception:
+        headroom = None
+    limit = None
+    if spec.backend == "codex":
+        limit = (activity_mod.reported_window(spec.name) or {}).get("auto_compact_token_limit")
+    level = activity_mod.context_alert_threshold(ctx.tokens_max, headroom, spec.backend, limit,
+                                                 spec.context_alert_at)
+    if level is None:
+        return
+    if ctx.tokens_used < level:
+        ctx.warning = None
+        return
+    compact = (f"pair_compact('{spec.name}')" if spec.backend == "codex"
+               else f"pair_compact('{spec.name}', steering_prompt=...)")
+    ctx.warning = (f"{ctx.tokens_used:,}/{ctx.tokens_max:,} ({ctx.percent:.0f}%) — past this pair's "
+                   f"context alert ({level:,}). Compact at a clean point: {compact}.")
+
+
 def _activity_status_lines(name: str) -> list[str]:
     """v0.16.0: what the activity files add to pair_status / a running
     pair_poll — live context and its alert state, background lost this
@@ -1600,7 +1654,8 @@ def _activity_status_lines(name: str) -> list[str]:
         reported = view.get("reported_window") or {}
         backend = ctx.get("backend") or reported.get("backend") or "claude"
         limit = ctx.get("auto_compact_token_limit") or reported.get("auto_compact_token_limit")
-        threshold = activity_mod.context_alert_threshold(window, headroom, backend, limit)
+        threshold = activity_mod.context_alert_threshold(window, headroom, backend, limit,
+                                                         _pair_alert_at(name))
         if threshold and used >= threshold:
             near = ("estimated Codex auto-compaction point" if backend == "codex"
                     else "auto-compaction fires near")
@@ -1732,6 +1787,7 @@ def _build_send_runner(
                     writer.turn_closed(task_id, status="failed")
                 raise
             result.notes.extend(wait_notes)
+            _apply_context_alert(current, result)
             if writer is not None:
                 if result.context is not None:
                     writer.note_context(result.context.tokens_used, result.context.tokens_max,
@@ -2216,6 +2272,47 @@ def _coerce_backend_options(value: Any) -> dict[str, Any]:
             raise PairError("backend_options must be a JSON object")
         return parsed
     raise PairError(f"backend_options must be a dict or JSON string (got {type(value).__name__})")
+
+
+def _check_backend_options(backend: str, bo: dict[str, Any], level: str) -> dict[str, Any]:
+    """Validate a NEW ``backend_options`` value for the pair's backend; returns
+    it normalized (Claude parses a JSON-string ``settings`` / ``args``)."""
+    if not bo:
+        return bo
+    try:
+        if backend == "codex":
+            if "settings" in bo:
+                raise ValueError("backend_options.settings is Claude-only; Codex takes 'config' "
+                                 "({toml key: value} → -c overrides).")
+            CodexAdapter.validate_backend_options(level, bo)
+            return bo
+        return ClaudeAdapter.validate_backend_options(bo)
+    except ValueError as e:
+        raise PairError(str(e))
+
+
+def _coerce_alert_at(value: Any) -> int | None:
+    """``context_alert_at``: a token count (int, or a string like "350000" /
+    "350_000"); 0 clears it (→ None, the global default)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = int(value.strip().replace("_", "").replace(",", ""))
+        except ValueError:
+            raise PairError(f"context_alert_at must be a token count, e.g. 350000 (got {value!r})")
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise PairError(f"context_alert_at must be a token count, e.g. 350000 (got {value!r})")
+    if value < 0:
+        raise PairError("context_alert_at must be >= 0 tokens (0 clears it)")
+    return value or None
+
+
+def _refuse_codex_disallowed(backend: str, tools: list[str] | None) -> None:
+    if backend == "codex" and tools:
+        raise PairError("disallowed_tools is Claude-only (--disallowed-tools removes tools from a Claude "
+                        "pair's context); claude-squared has no Codex equivalent. Limit a Codex pair "
+                        "with its permission_mode instead.")
 
 
 def _resolve_pair_create_args(
@@ -3003,6 +3100,10 @@ def pair_info(name: str, verbose: bool = False) -> str:
     except Exception:
         pass
     bo = f"\n  backend_options: {json.dumps(spec.backend_options)}" if spec.backend_options else ""
+    if spec.disallowed_tools:
+        bo += f"\n  disallowed_tools: {', '.join(spec.disallowed_tools)}"
+    if spec.context_alert_at:
+        bo += f"\n  context alert at: {spec.context_alert_at:,} tokens (or the global level if earlier)"
     return (
         f"{name}:\n"
         f"  backend: {spec.backend}\n"
@@ -3154,6 +3255,8 @@ def pair_update(
     verbose: bool = False,
     mcp_whitelist: str | list[str] | None = None,
     force: bool = False,
+    disallowed_tools: str | list[str] | None = None,
+    context_alert_at: int | str | None = None,
 ) -> str:
     """Update mutable settings of an existing pair (per-pair, not defaults —
     use ``pair_settings_set`` for user-wide defaults).
@@ -3172,11 +3275,15 @@ def pair_update(
     auto | unrestricted; old spellings accepted). ``context_window`` is
     ``default`` | ``1m``. ``fallback_model`` is pinned at spawn (like ``model``)
     so changing it evicts the runtime; pass ``""`` to clear it.
+    ``disallowed_tools`` (Claude) replaces the pair's tool removals; ``[]``
+    clears them. ``context_alert_at`` sets this pair's context alert in tokens
+    (``0`` clears it back to the global default) — no respawn; wait.py and
+    the next send pick it up.
 
     Three field categories with different propagation semantics — see README
     "Mid-flight config changes":
       - **Per-send** (``model``/``effort``/``permission_mode``/``context_window``/``mcp_whitelist``/
-        ``ultracode``/``backend_options``): registry write + runtime eviction →
+        ``ultracode``/``backend_options``/``disallowed_tools``): registry write + runtime eviction →
         next ``pair_send`` respawns with new values (Codex: every send is a
         fresh process, so they apply immediately).
       - **Server-side** (``allowed_invocations``): MCP-layer only, no eviction;
@@ -3242,7 +3349,14 @@ def pair_update(
                             f"usable tokens on {cur_spec.model} (applies from the next send)."
                         )
             if backend_options is not None:
-                fields["backend_options"] = _coerce_backend_options(backend_options)
+                fields["backend_options"] = _check_backend_options(
+                    cur_spec.backend, _coerce_backend_options(backend_options),
+                    fields.get("permission_mode", cur_spec.permission_mode))
+            if disallowed_tools is not None:
+                fields["disallowed_tools"] = _coerce_to_str_list(disallowed_tools)
+                _refuse_codex_disallowed(cur_spec.backend, fields["disallowed_tools"])
+            if context_alert_at is not None:
+                fields["context_alert_at"] = _coerce_alert_at(context_alert_at)
             if cur_spec.backend == "codex":
                 _bo = fields.get("backend_options", cur_spec.backend_options)
                 _lvl = fields.get("permission_mode", cur_spec.permission_mode)
@@ -3435,7 +3549,7 @@ def pair_update(
 # Fields pinned at runtime spawn: changing one evicts the warm runtime.
 _SPAWN_PINNED_FIELDS = ("model", "effort", "permission_mode", "context_window", "backend_options",
                         "cwd", "extra_dirs", "allowed_tools", "mcp_whitelist", "ultracode",
-                        "fallback_model")
+                        "fallback_model", "disallowed_tools")
 
 
 def _move_session_jsonl_for_cwd_change(old_spec: PairSpec, new_cwd: str) -> str:
@@ -4336,6 +4450,14 @@ def pair_handoff(
         omitted.append("ultracode")
         capability.append("Claude Ultracode mode was dropped; on Codex, effort='ultra' is the closest equivalent "
                           "(maximum reasoning plus automatic task delegation).")
+    if source.disallowed_tools:
+        omitted.append("disallowed_tools")
+        capability.append(f"The source's tool removals {source.disallowed_tools!r} have no Codex equivalent; "
+                          f"the new pair has Codex's full toolset.")
+    if source.backend_options:
+        omitted.append("backend_options")
+        capability.append("The source's Claude backend_options (settings / raw CLI args) don't apply to Codex "
+                          "and were dropped.")
     if source.allowed_invocations is not None:
         omitted.append("allowed_invocations")  # pair_invoke doesn't exist on Codex at all — nothing to warn about
     if instructions:
@@ -4371,7 +4493,7 @@ def pair_handoff(
             model=stored_model, effort=target_effort, permission_mode=level, context_window=window,
             cwd=source.cwd, extra_dirs=source.extra_dirs, persistent=source.persistent,
             system_prompt_append=source.system_prompt_append, profile_name=source.profile_name,
-            mcp_whitelist=carried_names or None,
+            mcp_whitelist=carried_names or None, context_alert_at=source.context_alert_at,
             handoff_from={"name": name, "backend": source.backend, "session_id": source.session_id,
                           "model": source.model, "imported_at": imported["imported_at"],
                           "import_id": imported["import_id"], "omitted": omitted},
@@ -5385,6 +5507,7 @@ def pair_invoke(
                 writer.turn_closed(None, status="failed")
                 raise
             writer.turn_closed(None, preview=result.response or "")
+            _apply_context_alert(spec, result)
             if verbose:
                 return _verbose_dump(result)
             return _fmt_send_result(result)
