@@ -191,6 +191,19 @@ def select(names: list[str] | None, backend: str, cwd: str | None = None,
     return selected, notes
 
 
+# Claude in Chrome is built into the claude CLI, not a configured server; the
+# 2.1.295 binary names it "claude-in-chrome" (also "Claude in Chrome"), tools
+# mcp__claude-in-chrome__*.
+CHROME_CONNECTORS = ("claude-in-chrome", "Claude in Chrome")
+
+
+def chrome_selected(names: list[str] | None) -> bool:
+    """Whether a Claude pair's mcp_whitelist opts in to Claude in Chrome
+    (otherwise every spawn passes --no-chrome)."""
+    chrome = {_key(name) for name in CHROME_CONNECTORS}
+    return any(_key(name) in chrome for name in effective(names))
+
+
 def effective(names: list[str] | None) -> list[str]:
     """The selection that can actually load: stored recursion names removed.
 

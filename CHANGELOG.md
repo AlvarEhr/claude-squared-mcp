@@ -35,7 +35,7 @@ process that spawns such a pair runs it without the new flags.
   `permission_mode` / `allowed_tools` / `extra_dirs` / `mcp_whitelist` is
   refused. `settings` is an allowlist (keys read from the CLI 2.1.295
   settings schema): `permissions` with `deny` / `ask` /
-  `blockReadsOutsideWorkingDirectories`; `env` with Claude Code's own
+  `blockReadsOutsideWorkingDirectories` (`true` only); `env` with Claude Code's own
   timeout, output-limit and telemetry variables (`BASH_*_TIMEOUT_MS`,
   `MAX_THINKING_TOKENS`, `MCP_TIMEOUT`, `DISABLE_TELEMETRY` … — 13 names);
   `model` (inert: every spawn passes `--model`), `outputStyle`, `language`,
@@ -55,17 +55,23 @@ process that spawns such a pair runs it without the new flags.
   `--permission-prompts`, `--plugin-dir` / `--plugin-dir-no-mcp` /
   `--plugin-url`, `--agent` / `--agents` / `--agent-type`, the team-member
   flags (`--agent-id` / `--agent-name` / `--team-name`: a team member's
-  permission requests go to a team lead) and
-  `--dangerously-load-development-channels`; flags that would lose, cut,
-  rewind, move or never start the session (`--no-session-persistence`,
-  `--resume-session-at`, `--rewind-files`, `--worktree`, `--bg`, `--cloud`,
-  `--init-only`, `--version`, `--help`, `--`, `-` …, combined short flags
-  included) or reshape the stream the runtime reads (`--sdk-url`,
-  `--json-schema`, `--await-initialize` …); and flags the pair sets itself
-  or a field covers (`--settings`, `--model`, `--permission-mode`,
-  `--disallowed-tools`, `--tools`, `--output-format`, `--resume`, …, with a
-  pointer to the field to use). The flag list covers every option of the
-  2.1.295 root command, hidden ones included. `settings` may not carry
+  permission requests go to a team lead),
+  `--dangerously-load-development-channels`, `--chrome` (Claude in Chrome:
+  your real, signed-in browser) and `--disable-slash-commands` (it takes
+  `/compact`, `/context` and `pair_invoke` with it); flags that would lose,
+  cut, rewind, move, hand off or never start the session
+  (`--no-session-persistence`, `--resume-session-at`, `--rewind-files`,
+  `--worktree`, `--bg`, `--routine`, `--cloud`, `--exec` / `-m` /
+  `--handle-uri`, `--init-only`, `--version`, `--help`, `--`, `-` …,
+  combined short flags included) or reshape the stream the runtime reads
+  (`--sdk-url`, `--json-schema`, `--await-initialize` …); and flags the pair
+  sets itself or a field covers (`--settings`, `--model`,
+  `--permission-mode`, `--disallowed-tools`, `--tools`, `--output-format`,
+  `--resume`, …, with a pointer to the field to use). Every option the
+  2.1.295 root command defines (hidden ones included) and the flags it acts
+  on before its option parser were reviewed; those that loosen the pair,
+  break its session or duplicate its own flags are refused, the rest pass.
+  `settings` may not carry
   `ultracode` (use the parameter); `settings` is refused on Codex (Codex uses
   `config`). A malformed stored value refuses the spawn rather than silently
   dropping, e.g., a deny rule. Keep secrets out of both — they travel on the
@@ -86,6 +92,16 @@ process that spawns such a pair runs it without the new flags.
 
 ### Changed
 
+- **Claude in Chrome stays off in every Claude pair unless its
+  `mcp_whitelist` names `claude-in-chrome`.** Every Claude spawn (and the
+  interim-triage call) now passes `--no-chrome`. `--strict-mcp-config`
+  doesn't cover Claude in Chrome, and `CLAUDE_CODE_ENABLE_CFC=1` in the
+  environment the MCP server started with would connect your real,
+  signed-in Chrome to every pair. This adds one token to every Claude
+  pair's command line; the tool list, and with it the prompt cache, changes
+  only for a pair that had Chrome connected. Naming it in `mcp_whitelist`
+  only drops the flag: the CLI then decides, and in a headless pair only
+  `CLAUDE_CODE_ENABLE_CFC=1` turns it on.
 - **Ultracode's `--settings` now reaches every spawn path** — the per-send
   override, compaction, fork, `/context` and `pair_invoke` spawns as well as
   the warm runtime and create, which were the only ones it reached before.

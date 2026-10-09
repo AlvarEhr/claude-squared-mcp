@@ -857,6 +857,7 @@ def pair_create(
             (``*`` = any text, also mid-rule: ``Bash(git -C * log*)``).
         mcp_whitelist: Deliberate per-pair connector opt-in on either backend.
             None or [] selects none. Unknown names are stored with a warning.
+            Claude pairs run with ``--no-chrome`` unless it names ``claude-in-chrome``.
             MCP calls act with the server's own privileges, outside the pair sandbox.
         cwd: Absolute workspace root (gates file ops OUTSIDE this path on both
             backends). Default: MCP server's cwd. Use ``extra_dirs`` to widen access.
@@ -876,7 +877,7 @@ def pair_create(
             JSON}, merged with ``ultracode`` into the one ``--settings`` flag; ``args``
             [raw CLI args], appended at the end of every spawn. Both re-applied at every
             spawn. ``settings`` takes only ``permissions`` (``deny`` / ``ask`` /
-            ``blockReadsOutsideWorkingDirectories``), ``env`` (Claude Code's own timeout,
+            ``blockReadsOutsideWorkingDirectories: true``), ``env`` (Claude Code's own timeout,
             output-limit and telemetry variables), ``model``, ``outputStyle``,
             ``language``, ``alwaysThinkingEnabled``, ``attribution``,
             ``includeCoAuthoredBy``, ``includeGitInstructions``, ``bashOutputMaxChars``.

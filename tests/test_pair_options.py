@@ -50,14 +50,17 @@ DEFAULT_LEVEL_1M = 820_000
 
 # The tool-scope flags a pair with no connectors and no disallowed_tools got
 # before v0.17.0 (from `git show HEAD:src/claude_squared/adapters/claude.py`,
-# v0.16.2). Every spawn path sends exactly this block.
-MCP_MINIMAL = [
+# v0.16.2) ...
+MCP_V016 = [
     "--strict-mcp-config", "--mcp-config", '{"mcpServers": {}}',
     "--disallowed-tools", "mcp__claude_ai_*",
     "--disallowed-tools", "mcp__pair__*",
     "--disallowed-tools", "mcp__Claude_Squared__*",
     "--disallowed-tools", "AskUserQuestion",
 ]
+# ... plus --no-chrome since the third review of ac6d2c4. Every spawn path
+# sends exactly this block.
+MCP_MINIMAL = MCP_V016 + ["--no-chrome"]
 
 
 def tool(value):
@@ -172,9 +175,11 @@ class ClaudeArgsTests(PairOptionsCase):
             PairRuntime(spec, CL.ClaudeAdapter()).start()
         return list(popen.call_args.args[0])
 
-    def test_minimal_spec_argv_is_unchanged_from_v016(self):
+    def test_minimal_spec_argv_is_v016_plus_no_chrome(self):
         # A pair without the new options must produce byte-for-byte the argv
-        # v0.16.2 produced (hard-coded from HEAD) — any drift would miss the
+        # v0.16.2 produced (hard-coded from HEAD), plus --no-chrome at the end
+        # of the tool-scope block. That flag changes no tool list unless
+        # CLAUDE_CODE_ENABLE_CFC was set; any other drift could miss the
         # prompt cache of every existing pair after the upgrade.
         cwd = str(self.directory)
         spec = PairSpec(name="p", session_id="sid", model="opus", cwd=cwd)
@@ -190,6 +195,34 @@ class ClaudeArgsTests(PairOptionsCase):
             "claude", "--print", "--verbose", "--resume", "sid", "--model", "opus",
             "--permission-mode", "auto", "--input-format", "stream-json", "--output-format", "stream-json",
             *MCP_MINIMAL])
+        runtime = self.capture_runtime_start(spec)
+        for name, got in [("create", self.capture_create(spec)), ("runtime", runtime), *argv.items()]:
+            with self.subTest(path=name):
+                self.assertEqual(got.count("--no-chrome"), 1)
+
+    def test_chrome_stays_off_unless_the_whitelist_names_it(self):
+        # Claude in Chrome is the user's real, signed-in browser; only an
+        # explicit mcp_whitelist entry leaves the CLI's own decision in place.
+        adapter = CL.ClaudeAdapter()
+        for names in (None, [], ["probe"], ["pair"], ["claude-in-chromex"]):
+            with self.subTest(mcp_whitelist=names):
+                self.assertEqual(adapter._mcp_args(self.spec(mcp_whitelist=names)).count("--no-chrome"), 1)
+        for names in (["claude-in-chrome"], ["Claude in Chrome"], ["probe", "CLAUDE_IN_CHROME"]):
+            with self.subTest(mcp_whitelist=names):
+                spec = self.spec(mcp_whitelist=names)
+                self.assertNotIn("--no-chrome", adapter._mcp_args(spec))
+                self.assertNotIn("--no-chrome", adapter._common_create_args(spec))
+
+    def test_triage_call_passes_no_chrome(self):
+        from claude_squared import triage as TR
+        seen = []
+
+        def fake_popen(argv, **_kwargs):
+            seen.append(list(argv))
+            raise OSError("captured")
+        with patch.object(subprocess, "Popen", side_effect=fake_popen):
+            self.assertIsNone(TR.classify_with_haiku("progress"))
+        self.assertEqual(seen[0].count("--no-chrome"), 1)
 
     def test_ultracode_alone_keeps_the_v016_settings_bytes(self):
         # The merged --settings must not perturb an ultracode-only pair: the
@@ -368,6 +401,9 @@ REFUSED_ARGS = [
     "--rewind-files", "--worktree", "-w", "--deep-link-cwd-b64", "--tmux", "--bg", "--background",
     "--cloud", "--remote", "--desktop", "--environment", "--pool", "--attach-serve",
     "--remote-control", "--rc", "--teleport", "--from-pr", "--ide", "--init-only",
+    # third review of ac6d2c4: the real Chrome past mcp_whitelist; no /compact, /context or
+    # pair_invoke; and the flags the CLI acts on before its option parser
+    "--chrome", "--disable-slash-commands", "--routine", "--exec", "-m", "--handle-uri",
     "--version", "-v", "--help", "-h", "--", "-",
 ]
 REFUSED_SETTINGS = [
@@ -497,7 +533,13 @@ class ValidateBackendOptionsTests(unittest.TestCase):
                                   ({"permissions": {"allow": ["Bash"]}}, "set it with allowed_tools instead"),
                                   ({"permissions": {"defaultMode": "auto"}}, "set it with permission_mode"),
                                   ({"autoMode": {}}, "only permissions, env, model"),
-                                  ({"permissions": {"disableAutoMode": "disable"}}, "only deny / ask")):
+                                  ({"permissions": {"disableAutoMode": "disable"}}, "only deny / ask"),
+                                  ({"permissions": {"blockReadsOutsideWorkingDirectories": False}},
+                                   "may only be true"),
+                                  ({"permissions": {"blockReadsOutsideWorkingDirectories": "true"}},
+                                   "may only be true"),
+                                  ({"permissions": {"blockReadsOutsideWorkingDirectories": 1}},
+                                   "may only be true")):
             with self.subTest(settings=settings):
                 with self.assertRaisesRegex(ValueError, pattern):
                     self.validate({"settings": settings})

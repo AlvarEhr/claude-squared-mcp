@@ -79,9 +79,13 @@ _MANAGED_FLAGS: dict[str, str] = {
 # defines in the 2.1.295 binary, hidden ones included (second review of
 # b07509e found --managed-settings and --plugin-dir-no-mcp there). The
 # hidden flags' reasons come from their own descriptions, not from probes.
+# The third review added --chrome and --disable-slash-commands, plus the
+# flags the CLI acts on BEFORE its option parser (--routine with --bg;
+# --exec, -m, --handle-uri), which a sweep of option definitions can't see.
 _PROTOCOL = "every spawn path sets the stream protocol the runtime reads itself"
 _STREAM = "it adds to or reshapes the messages the runtime reads"
 _OTHER_SESSION = "it starts or attaches a different kind of session than the pair's own"
+_DISPATCH = "it hands the command line to another session instead of starting the pair's"
 _PLUGINS = "plugins bring MCP servers, hooks and agents past the mcp_whitelist opt-in"
 _AGENT = "an agent definition can carry its own permissionMode and tools"
 _MOVED = "the session would move to another directory, where the pair can't find its transcript"
@@ -128,7 +132,12 @@ _REFUSED_FLAGS: dict[str, str] = {
     "--remote": _OTHER_SESSION, "--desktop": _OTHER_SESSION, "--environment": _OTHER_SESSION,
     "--pool": _OTHER_SESSION, "--attach-serve": _OTHER_SESSION,
     "--remote-control": _OTHER_SESSION, "--rc": _OTHER_SESSION, "--teleport": _OTHER_SESSION,
-    "--from-pr": _OTHER_SESSION, "--ide": _OTHER_SESSION,
+    "--from-pr": _OTHER_SESSION, "--ide": _OTHER_SESSION, "--routine": _OTHER_SESSION,
+    "--exec": _DISPATCH, "-m": _DISPATCH, "--handle-uri": _DISPATCH,
+    "--chrome": "it connects Claude in Chrome — your real, signed-in browser, in visible "
+                "windows — past the mcp_whitelist opt-in",
+    "--disable-slash-commands": "it disables skills, and with them /compact, /context and "
+                                "pair_invoke",
     "--init-only": "it runs setup hooks and exits — the pair would never start",
     "--version": "it prints and exits — the pair would never start", "-v": "it prints and exits",
     "--help": "it prints and exits — the pair would never start", "-h": "it prints and exits",
@@ -151,8 +160,10 @@ _ALLOWED_SETTINGS = ("permissions", "env", "model", "outputStyle", "language",
                      "alwaysThinkingEnabled", "attribution", "includeCoAuthoredBy",
                      "includeGitInstructions", "bashOutputMaxChars")
 # Tightening only: blockReadsOutsideWorkingDirectories refuses file-tool reads
-# outside the working directories. (disableBypassPermissionsMode / disableAutoMode
-# would contradict an unrestricted / auto pair, so they stay out too.)
+# outside the working directories, and only ``true`` passes — the schema says
+# true in any settings source wins, but a ``false`` has no use here either.
+# (disableBypassPermissionsMode / disableAutoMode would contradict an
+# unrestricted / auto pair, so they stay out too.)
 _ALLOWED_PERMISSIONS = ("deny", "ask", "blockReadsOutsideWorkingDirectories")
 # settings.env reaches the CLI and every command the pair runs, so the names
 # are an allowlist too: CLAUDE_CODE_SHELL_PREFIX wraps every command,
@@ -204,6 +215,9 @@ def _check_settings(settings: dict[str, Any]) -> None:
         if key not in _ALLOWED_PERMISSIONS:
             raise ValueError(f"backend_options.settings may not contain permissions.{key}: only "
                              f"{' / '.join(_ALLOWED_PERMISSIONS)} pass.")
+        if key == "blockReadsOutsideWorkingDirectories" and perms[key] is not True:
+            raise ValueError(f"backend_options.settings.permissions.{key} may only be true (got "
+                             f"{json.dumps(perms[key])}): it is here to tighten, never to loosen.")
     env = settings.get("env")
     if env is not None and not isinstance(env, dict):
         raise ValueError("backend_options.settings.env must be a JSON object")
@@ -681,6 +695,15 @@ class ClaudeAdapter(PairAdapter):
         # Reapplying disallow flags on resume must retain headless exclusions.
         for tool in HEADLESS_INCOMPATIBLE_TOOLS:
             args += ["--disallowed-tools", tool]
+        # Claude in Chrome drives the user's real, signed-in Chrome, and
+        # --strict-mcp-config doesn't stop it. The 2.1.295 binary decides it
+        # from --chrome / --no-chrome first, then CLAUDE_CODE_ENABLE_CFC in the
+        # environment a pair inherits, then (interactive sessions only)
+        # claudeInChromeDefaultEnabled — so --no-chrome settles it for every
+        # pair whose mcp_whitelist doesn't name it (third review of ac6d2c4).
+        # The flag is in the 2.1.258 and 2.1.280 binaries too.
+        if not connectors.chrome_selected(spec.mcp_whitelist):
+            args.append("--no-chrome")
         # v0.17.0: the pair's own removals ride with the connector flags, so
         # every spawn path (runtime, override send, compact, fork, /context)
         # sends the same tool list — a different list on one path would miss
