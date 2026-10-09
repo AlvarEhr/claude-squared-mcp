@@ -214,19 +214,22 @@ class ClaudeArgsTests(PairOptionsCase):
         # One --settings flag: a second one would REPLACE the first, so the
         # user's settings and the ultracode key must travel together. Sorted
         # keys make the same config always yield the same argument.
-        spec = self.spec(ultracode=True, backend_options={"settings": {"z": 1, "a": {"y": 2, "b": 3}}})
+        spec = self.spec(ultracode=True, backend_options={"settings": {
+            "outputStyle": "x", "env": {"MCP_TIMEOUT": "2", "BASH_MAX_TIMEOUT_MS": "3"}}})
         args = CL.ClaudeAdapter()._common_create_args(spec)
         self.assertEqual(args.count("--settings"), 1)
         value = args[args.index("--settings") + 1]
-        self.assertEqual(value, '{"a": {"b": 3, "y": 2}, "ultracode": true, "z": 1}')
-        self.assertEqual(json.loads(value), {"a": {"y": 2, "b": 3}, "z": 1, "ultracode": True})
+        self.assertEqual(value, '{"env": {"BASH_MAX_TIMEOUT_MS": "3", "MCP_TIMEOUT": "2"}, '
+                                '"outputStyle": "x", "ultracode": true}')
+        self.assertEqual(json.loads(value), {"env": {"MCP_TIMEOUT": "2", "BASH_MAX_TIMEOUT_MS": "3"},
+                                             "outputStyle": "x", "ultracode": True})
 
     def test_settings_stored_as_json_string_still_apply(self):
         # A registry value written by hand (or by a host that JSON-encodes)
         # is parsed at spawn the same way pair_create normalizes it.
-        spec = self.spec(backend_options={"settings": '{"model": "x", "env": {"A": "1"}}'})
+        spec = self.spec(backend_options={"settings": '{"model": "x", "env": {"MCP_TIMEOUT": "1"}}'})
         self.assertEqual(CL.ClaudeAdapter()._settings_args(spec),
-                         ["--settings", '{"env": {"A": "1"}, "model": "x"}'])
+                         ["--settings", '{"env": {"MCP_TIMEOUT": "1"}, "model": "x"}'])
 
     def test_disallowed_tools_are_stripped_deduplicated_and_skip_headless(self):
         spec = self.spec(disallowed_tools=[" Artifact ", "Artifact", "", "AskUserQuestion", "Bash(git push *)"])
@@ -316,6 +319,7 @@ class ClaudeArgsTests(PairOptionsCase):
         # permission rule the user relies on — the spawn must refuse.
         adapter = CL.ClaudeAdapter()
         for options in ({"settings": "not json"}, {"settings": [1]}, {"settings": {"ultracode": True}},
+                        {"settings": {"autoMode": {"hard_deny": []}}}, {"settings": {"env": {"PATH": "x"}}},
                         {"args": ["--model", "x"]}, {"args": "--max-budget-usd 40"}, {"args": ["40"]}):
             with self.subTest(options=options):
                 spec = self.spec(backend_options=options)
@@ -349,13 +353,21 @@ REFUSED_ARGS = [
     # the spawn's own stream protocol
     "--print", "-p", "--resume", "-r", "--continue", "-c", "--session-id", "--fork-session",
     "--input-format", "--output-format", "--replay-user-messages", "--include-partial-messages",
-    "--forward-subagent-text", "--include-hook-events",
-    # would loosen the pair or bypass an opt-in (review of 5f66ff8, P2-2)
+    "--forward-subagent-text", "--include-hook-events", "--sdk-url", "--await-claim",
+    "--await-initialize", "--session-mirror", "--json-schema", "--enable-auth-status",
+    "--prompt-suggestions",
+    # would loosen the pair or bypass an opt-in (review of 5f66ff8, P2-2; second review of
+    # b07509e: --plugin-dir-no-mcp, --managed-settings; then the 2.1.295 root-command sweep)
     "--setting-sources", "--restricted", "--safe-mode", "--bare", "--permission-prompt-tool",
-    "--permission-prompts", "--plugin-dir", "--plugin-url", "--agent", "--agents",
-    # would lose or move the session, or never start it
-    "--no-session-persistence", "--worktree", "-w", "--tmux", "--bg", "--background", "--cloud",
-    "--desktop", "--environment", "--remote-control", "--teleport", "--from-pr", "--ide",
+    "--permission-prompts", "--plugin-dir", "--plugin-url", "--plugin-dir-no-mcp", "--agent",
+    "--agents", "--agent-type", "--agent-id", "--agent-name", "--team-name", "--managed-settings", "--client-data-url", "--project-config-root",
+    "--dangerously-load-development-channels", "--inherit-permission-mode", "--enable-auto-mode",
+    "--tools",
+    # would lose, cut, rewind or move the session, or never start it
+    "--no-session-persistence", "--resume-session-at", "--resume-drops-turn", "--reply-on-resume",
+    "--rewind-files", "--worktree", "-w", "--deep-link-cwd-b64", "--tmux", "--bg", "--background",
+    "--cloud", "--remote", "--desktop", "--environment", "--pool", "--attach-serve",
+    "--remote-control", "--rc", "--teleport", "--from-pr", "--ide", "--init-only",
     "--version", "-v", "--help", "-h", "--", "-",
 ]
 REFUSED_SETTINGS = [
@@ -363,6 +375,23 @@ REFUSED_SETTINGS = [
     {"enableAllProjectMcpServers": True}, {"enabledMcpjsonServers": ["x"]}, {"agent": "reviewer"},
     {"sandbox": {"enabled": True}}, {"permissions": {"allow": ["Bash"]}},
     {"permissions": {"defaultMode": "bypassPermissions"}}, {"permissions": {"additionalDirectories": ["/"]}},
+    # second review of b07509e: the classifier's own rules, command helpers that run outside
+    # the permission system, and a key that deletes all your transcripts
+    {"autoMode": {"hard_deny": [], "soft_deny": [], "allow": ["Any git push"]}},
+    {"apiKeyHelper": "x"}, {"awsAuthRefresh": "x"}, {"awsCredentialExport": "x"},
+    {"otelHeadersHelper": "x"}, {"cleanupPeriodDays": 36500},
+    # a few more from the 2.1.295 schema that the allowlist keeps out
+    {"processWrapper": "x"}, {"statusLine": {"type": "command", "command": "x"}},
+    {"autoMemoryDirectory": "/"}, {"skipWebFetchPreflight": True}, {"fallbackModel": ["x"]},
+    {"effortLevel": "low"}, {"permissions": {"disableBypassPermissionsMode": "disable"}},
+    {"permissions": {"disableAutoMode": "disable"}},
+]
+# settings.env names are an allowlist too. Each of these changes what the pair's commands run,
+# which config it reads, or where its traffic and credentials go.
+REFUSED_ENV = [
+    "CLAUDE_CODE_SHELL_PREFIX", "CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_PROCESS_WRAPPER", "NODE_OPTIONS", "PATH", "BASH_ENV",
+    "GIT_SSH_COMMAND", "HTTPS_PROXY", "bash_default_timeout_ms",
 ]
 
 
@@ -372,16 +401,16 @@ class ValidateBackendOptionsTests(unittest.TestCase):
     def test_accepts_and_normalizes_both_keys(self):
         self.assertEqual(self.validate(None), {})
         self.assertEqual(self.validate({}), {})
-        self.assertEqual(self.validate({"settings": {"a": 1}}), {"settings": {"a": 1}})
-        self.assertEqual(self.validate({"settings": '{"a": 1}'}), {"settings": {"a": 1}})
+        self.assertEqual(self.validate({"settings": {"language": "x"}}), {"settings": {"language": "x"}})
+        self.assertEqual(self.validate({"settings": '{"language": "x"}'}), {"settings": {"language": "x"}})
         self.assertEqual(self.validate({"args": ["--max-budget-usd", "40"]}), {"args": ["--max-budget-usd", "40"]})
         self.assertEqual(self.validate({"args": '["--max-budget-usd", "40"]'}), {"args": ["--max-budget-usd", "40"]})
         self.assertEqual(self.validate({"args": []}), {"args": []})
 
     def test_does_not_mutate_the_input(self):
-        original = {"settings": '{"a": 1}'}
+        original = {"settings": '{"language": "x"}'}
         self.validate(original)
-        self.assertEqual(original, {"settings": '{"a": 1}'})
+        self.assertEqual(original, {"settings": '{"language": "x"}'})
 
     def test_unknown_keys_refused_unless_spawn_mode(self):
         with self.assertRaisesRegex(ValueError, "not Claude options"):
@@ -433,10 +462,45 @@ class ValidateBackendOptionsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "permissions must be a JSON object"):
             self.validate({"settings": {"permissions": ["Bash"]}})
 
+    def test_env_names_are_an_allowlist(self):
+        for name in REFUSED_ENV:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, f"env may not set {re.escape(repr(name))}"):
+                    self.validate({"settings": {"env": {name: "x"}}})
+                with self.assertRaisesRegex(ValueError, "env may not set"):
+                    self.validate({"settings": json.dumps({"env": {name: "x"}})}, allow_unknown=True)
+        with self.assertRaisesRegex(ValueError, "env must be a JSON object"):
+            self.validate({"settings": {"env": ["MCP_TIMEOUT=1"]}})
+
     def test_tightening_and_neutral_settings_pass(self):
-        settings = {"permissions": {"deny": ["WebFetch"], "ask": ["Bash(git push *)"]},
-                    "env": {"A": "1"}, "model": "x", "cleanupPeriodDays": 36500}
+        # Every key and env name the allowlists hold, written out (a name
+        # dropped from them fails here).
+        settings = {"permissions": {"deny": ["WebFetch"], "ask": ["Bash(git push *)"],
+                                    "blockReadsOutsideWorkingDirectories": True},
+                    "env": dict.fromkeys(["BASH_DEFAULT_TIMEOUT_MS", "BASH_MAX_TIMEOUT_MS",
+                                          "BASH_MAX_OUTPUT_LENGTH", "MAX_THINKING_TOKENS",
+                                          "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "MCP_TIMEOUT", "MCP_TOOL_TIMEOUT",
+                                          "MAX_MCP_OUTPUT_TOKENS", "DISABLE_TELEMETRY",
+                                          "DISABLE_ERROR_REPORTING", "DISABLE_AUTOUPDATER",
+                                          "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+                                          "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR"], "1"),
+                    "model": "x", "outputStyle": "Explanatory", "language": "finnish",
+                    "alwaysThinkingEnabled": True, "attribution": {"commit": ""},
+                    "includeCoAuthoredBy": False, "includeGitInstructions": False,
+                    "bashOutputMaxChars": 60000}
         self.assertEqual(self.validate({"settings": settings}), {"settings": settings})
+
+    def test_settings_refusal_names_the_field_or_the_allowlist(self):
+        for settings, pattern in (({"fallbackModel": ["x"]}, "set it with fallback_model instead"),
+                                  ({"effortLevel": "low"}, "set it with effort instead"),
+                                  ({"enabledMcpjsonServers": ["x"]}, "set it with mcp_whitelist instead"),
+                                  ({"permissions": {"allow": ["Bash"]}}, "set it with allowed_tools instead"),
+                                  ({"permissions": {"defaultMode": "auto"}}, "set it with permission_mode"),
+                                  ({"autoMode": {}}, "only permissions, env, model"),
+                                  ({"permissions": {"disableAutoMode": "disable"}}, "only deny / ask")):
+            with self.subTest(settings=settings):
+                with self.assertRaisesRegex(ValueError, pattern):
+                    self.validate({"settings": settings})
 
     def test_refusal_names_the_field_to_use(self):
         with self.assertRaisesRegex(ValueError, "set it with disallowed_tools instead"):
@@ -562,6 +626,55 @@ class ContextAlertTests(PairOptionsCase):
         alert.note_registry(*g["_registry_read"]("p"))
         self.assertEqual(alert.alert_at, 350_000)
 
+    def test_wait_keeps_the_last_good_headroom_when_defaults_fail_to_read(self):
+        # Second review of b07509e: a failed defaults.json read fell back to
+        # the default headroom for one poll; the level rose and fell back,
+        # and the drop rule read the fall as a lowered level — exit 8.
+        # Global headroom 300k on a 1M window: level 670k (default: 820k).
+        R.add_pair(self.spec("p"))
+        g = wait_globals()
+        path = g["_pairs_dir"]() / "defaults.json"
+        good = json.dumps({"context_alert_headroom": 300_000})
+        path.write_text(good, encoding="utf-8")
+        alert = g["Alert"]("default", None)
+        self.assertIsNone(self.poll(g, alert, "p", 700_000))  # already past 670k when we start
+        path.write_text(good[:10], encoding="utf-8")  # torn mid-write
+        self.assertEqual(g["_headroom_read"](), (False, None))
+        self.assertIsNone(self.poll(g, alert, "p", 701_000))
+        self.assertEqual(alert.headroom, 300_000)
+        path.write_text(good, encoding="utf-8")
+        self.assertIsNone(self.poll(g, alert, "p", 702_000))  # fired here before the fix
+        # A crossing during a failed read still fires, at the last good level.
+        alert = g["Alert"]("default", None)
+        self.assertIsNone(self.poll(g, alert, "p", 600_000))
+        path.write_text("{", encoding="utf-8")
+        self.assertEqual(self.poll(g, alert, "p", 680_000), (680_000, WINDOW_1M, 670_000))
+        # No file is a good read: pair_settings_reset deleted it.
+        path.unlink()
+        self.assertEqual(g["_headroom_read"](), (True, None))
+        self.assertIsNone(self.poll(g, alert, "p", 681_000))
+        self.assertIsNone(alert.headroom)
+
+    def test_wait_drop_rule_waits_for_one_good_read_of_each_input(self):
+        # A failed FIRST read leaves the default level standing; the first
+        # good read then lowers it. That is no drop the watcher saw happen.
+        R.add_pair(self.spec("p"))
+        g = wait_globals()
+        path = g["_pairs_dir"]() / "defaults.json"
+        path.write_text("{", encoding="utf-8")
+        alert = g["Alert"]("default", None)
+        self.assertIsNone(self.poll(g, alert, "p", 700_000))  # level 820k: the default
+        path.write_text(json.dumps({"context_alert_headroom": 300_000}), encoding="utf-8")
+        self.assertIsNone(self.poll(g, alert, "p", 702_000))  # level 670k, already behind the fill
+        # The same for the registry: a pair whose first read failed.
+        path.unlink()
+        R.add_pair(self.spec("q", context_alert_at=350_000))
+        alert = g["Alert"]("default", None)
+        alert.note_registry(False, None)
+        self.assertIsNone(alert.check(self.ctx(400_000), None))  # level 820k: no pair value yet
+        self.assertIsNone(self.poll(g, alert, "q", 402_000))  # 350k, already behind the fill
+        self.assertIsNone(self.poll(g, alert, "q", 403_000))
+
     def test_wait_fires_once_when_the_level_drops_behind_the_fill(self):
         # A crossing needs prev < level <= used; lowering context_alert_at
         # below the current fill would otherwise never fire.
@@ -675,12 +788,13 @@ class ServerToolTests(PairOptionsCase):
     def test_create_stores_the_new_fields_normalized(self):
         report, create = self.create(
             model="opus", disallowed_tools=["Artifact", " Bash(git push *) "], context_alert_at="350_000",
-            backend_options={"settings": '{"env": {"A": "1"}}', "args": '["--max-budget-usd", "40"]'})
+            backend_options={"settings": '{"env": {"MCP_TIMEOUT": "1"}}', "args": '["--max-budget-usd", "40"]'})
         stored = R.get_pair("c")
         self.assertEqual(stored.disallowed_tools, ["Artifact", "Bash(git push *)"])
         self.assertEqual(stored.context_alert_at, 350_000)
         # JSON strings are parsed once at create, so the registry holds objects.
-        self.assertEqual(stored.backend_options, {"settings": {"env": {"A": "1"}}, "args": ["--max-budget-usd", "40"]})
+        self.assertEqual(stored.backend_options, {"settings": {"env": {"MCP_TIMEOUT": "1"}},
+                                                  "args": ["--max-budget-usd", "40"]})
         self.assertEqual(create.call_args.args[0].disallowed_tools, stored.disallowed_tools)
         self.assertIn("Created 'c'", report)
 
@@ -693,6 +807,7 @@ class ServerToolTests(PairOptionsCase):
         for options, pattern in (({"config": {"x": 1}}, "not Claude options"),
                                  ({"args": ["--model", "x"]}, "may not contain --model"),
                                  ({"settings": {"ultracode": True}}, "ultracode parameter"),
+                                 ({"settings": {"autoMode": {"allow": ["Any git push"]}}}, "'autoMode'"),
                                  ({"settings": "nope"}, "JSON object")):
             with self.subTest(options=options):
                 with self.assertRaisesRegex(PairError, pattern):
@@ -766,8 +881,8 @@ class ServerToolTests(PairOptionsCase):
         with self.assertRaisesRegex(PairError, "may not contain --resume"):
             tool(S.pair_update)("p", backend_options={"args": ["--resume", "x"]})
         self.runtime.evict.assert_not_called()
-        tool(S.pair_update)("p", backend_options='{"settings": "{\\"env\\": {\\"A\\": \\"1\\"}}"}')
-        self.assertEqual(R.get_pair("p").backend_options, {"settings": {"env": {"A": "1"}}})
+        tool(S.pair_update)("p", backend_options='{"settings": "{\\"env\\": {\\"MCP_TIMEOUT\\": \\"1\\"}}"}')
+        self.assertEqual(R.get_pair("p").backend_options, {"settings": {"env": {"MCP_TIMEOUT": "1"}}})
         self.runtime.evict.assert_called_once()
         R.add_pair(self.spec("cx", backend="codex"))
         with self.assertRaisesRegex(PairError, "settings is Claude-only"):
@@ -778,19 +893,22 @@ class ServerToolTests(PairOptionsCase):
     def test_secrets_in_settings_are_masked_on_display(self):
         # Display only: the registry keeps the values (the docs say to keep
         # secrets out — settings travel on the claude command line).
-        secret = {"settings": {"env": {"API_TOKEN": "s3cret-env"}, "apiKeyHelper": "s3cret-helper",
-                               "model": "x"}}
+        # A secret-looking key can only arrive by a hand edit now (the
+        # allowlist refuses apiKeyHelper); it is masked all the same.
+        given = {"settings": {"env": {"MCP_TIMEOUT": "s3cret-env"}, "model": "x"}}
         R.add_pair(self.spec())
-        update = tool(S.pair_update)("p", backend_options=secret)
+        update = tool(S.pair_update)("p", backend_options=given)
+        stored = {"settings": {**given["settings"], "apiKeyHelper": "s3cret-helper"}}
+        R.update_pair("p", backend_options=stored)
         info = tool(S.pair_info)("p")
         verbose = tool(S.pair_info)("p", verbose=True)
         verbose_update = tool(S.pair_update)("p", purpose="x", verbose=True)
         for shown in (update, info, verbose, verbose_update):
             self.assertNotIn("s3cret", shown)
-        self.assertIn('"env": {"API_TOKEN": "***"}', info)
+        self.assertIn('"env": {"MCP_TIMEOUT": "***"}', info)
         self.assertIn('"apiKeyHelper": "***"', info)
         self.assertIn('"model": "x"', info)
-        self.assertEqual(R.get_pair("p").backend_options, secret)
+        self.assertEqual(R.get_pair("p").backend_options, stored)
 
     def test_pair_info_shows_the_new_fields(self):
         R.add_pair(self.spec(disallowed_tools=["Artifact", "Bash(git push *)"], context_alert_at=350_000,
@@ -834,7 +952,7 @@ class ServerToolTests(PairOptionsCase):
     def test_warm_runtime_is_replaced_when_another_process_changes_options(self):
         # pair_update evicts only its own process's runtime; another process's
         # warm runtime must notice the change at its next get_or_start.
-        for change in ({"disallowed_tools": ["Artifact"]}, {"backend_options": {"settings": {"a": 1}}},
+        for change in ({"disallowed_tools": ["Artifact"]}, {"backend_options": {"settings": {"language": "x"}}},
                        {"ultracode": True}, {"fallback_model": "sonnet"}, {"extra_dirs": ["D:/x"]},
                        {"allowed_tools": ["Read"]}, {"system_prompt_append": "x"}, {"profile_name": "x"}):
             with self.subTest(change=change):
@@ -866,7 +984,7 @@ class ServerToolTests(PairOptionsCase):
         # and kill its background work.
         report, _ = self.create(
             "warm", model="opus", disallowed_tools=["Artifact", "Bash(git push *)"], ultracode=True,
-            backend_options={"settings": '{"permissions": {"deny": ["WebFetch"]}, "env": {"A": "1"}}',
+            backend_options={"settings": '{"permissions": {"deny": ["WebFetch"]}, "env": {"MCP_TIMEOUT": "1"}}',
                              "args": ["--max-budget-usd", "5"]},
             allowed_tools=["Read"], extra_dirs=[str(self.directory / "extra")], fallback_model="sonnet",
             system_prompt_append="Focus.", context_alert_at=350_000)

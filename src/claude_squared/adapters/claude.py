@@ -56,8 +56,9 @@ _MODEL_UNAVAILABLE_HELP = (
 # v0.17.0: flags a raw ``backend_options.args`` entry may not carry. Principle:
 # anything that loosens a pair must stay visible in its permission_mode /
 # allowed_tools / extra_dirs / mcp_whitelist, and nothing may break the spawn.
-# (1) Flags the pair sets from its own fields — a second ``--settings`` would
-# replace the merged JSON, not add to it. Value = the field to use instead.
+# (1) Flags the pair sets from its own fields, or that a field covers — a
+# second ``--settings`` would replace the merged JSON, not add to it; the
+# tool set stays visible in disallowed_tools. Value = the field to use instead.
 _MANAGED_FLAGS: dict[str, str] = {
     "--settings": "backend_options.settings",
     "--disallowed-tools": "disallowed_tools", "--disallowedTools": "disallowed_tools",
@@ -70,63 +71,149 @@ _MANAGED_FLAGS: dict[str, str] = {
     "--append-system-prompt-file": "system_prompt_append / profile_name",
     "--mcp-config": "mcp_whitelist", "--strict-mcp-config": "mcp_whitelist",
     "--add-dir": "extra_dirs",
+    "--inherit-permission-mode": "permission_mode", "--enable-auto-mode": "permission_mode",
+    "--tools": "disallowed_tools",
 }
 # (2) Flags refused outright. Value = why. Flag list read from ``claude
-# --help`` on CLI 2.1.295 (2026-10-09); ``--permission-prompt-tool`` is
-# hidden from it but still referenced by ``--permission-prompts``.
+# --help`` on CLI 2.1.295 (2026-10-09), then every option the root command
+# defines in the 2.1.295 binary, hidden ones included (second review of
+# b07509e found --managed-settings and --plugin-dir-no-mcp there). The
+# hidden flags' reasons come from their own descriptions, not from probes.
 _PROTOCOL = "every spawn path sets the stream protocol the runtime reads itself"
+_STREAM = "it adds to or reshapes the messages the runtime reads"
 _OTHER_SESSION = "it starts or attaches a different kind of session than the pair's own"
+_PLUGINS = "plugins bring MCP servers, hooks and agents past the mcp_whitelist opt-in"
+_AGENT = "an agent definition can carry its own permissionMode and tools"
+_MOVED = "the session would move to another directory, where the pair can't find its transcript"
+_TRUNCATED = "it cuts the resumed session short"
+_TEAMMATE = "it makes the pair a team member whose permission requests go to a team lead"
 _REFUSED_FLAGS: dict[str, str] = {
     "--print": _PROTOCOL, "-p": _PROTOCOL, "--resume": _PROTOCOL, "-r": _PROTOCOL,
     "--continue": _PROTOCOL, "-c": _PROTOCOL, "--session-id": _PROTOCOL,
     "--fork-session": _PROTOCOL, "--input-format": _PROTOCOL, "--output-format": _PROTOCOL,
     "--replay-user-messages": _PROTOCOL, "--include-partial-messages": _PROTOCOL,
     "--forward-subagent-text": _PROTOCOL, "--include-hook-events": _PROTOCOL,
+    "--sdk-url": _PROTOCOL, "--await-claim": "it waits for a host's claim the pair never sends",
+    "--await-initialize": "it waits for an initialize request the pair never sends",
+    "--session-mirror": _STREAM, "--json-schema": _STREAM, "--enable-auth-status": _STREAM,
+    "--prompt-suggestions": _STREAM,
     "--setting-sources": "it would stop loading your settings files, and with them their deny "
                          "rules and hooks",
     "--restricted": "it ignores your settings files, and with them their deny rules and hooks",
     "--safe-mode": "it switches off hooks, CLAUDE.md and other customizations",
     "--bare": "it skips keychain auth (a subscription login can't start) and your hooks",
+    "--managed-settings": "it is a second settings channel (policy tier) that nothing here checks",
+    "--client-data-url": "it loads a remote configuration document that nothing here checks",
+    "--project-config-root": "it reads another directory's project settings, .mcp.json and agents",
     "--permission-prompt-tool": "approvals are the pair's permission_mode (stdio hangs a headless "
                                 "pair; an MCP tool would take approvals over)",
     "--permission-prompts": "approvals are the pair's permission_mode",
-    "--plugin-dir": "plugins bring MCP servers, hooks and agents past the mcp_whitelist opt-in",
-    "--plugin-url": "plugins bring MCP servers, hooks and agents past the mcp_whitelist opt-in",
-    "--agent": "an agent definition can carry its own permissionMode and tools",
-    "--agents": "an agent definition can carry its own permissionMode and tools",
+    "--plugin-dir": _PLUGINS, "--plugin-url": _PLUGINS,
+    "--plugin-dir-no-mcp": "it still loads the plugin's hooks and agents (only its MCP servers "
+                           "stay out)",
+    "--dangerously-load-development-channels": "it loads channel servers that are not on the "
+                                               "approved list",
+    "--agent": _AGENT, "--agents": _AGENT, "--agent-type": _AGENT,
+    # Together they make the session a team member, and the binary routes a
+    # team member's permission requests to the team lead over a mailbox.
+    "--agent-id": _TEAMMATE, "--agent-name": _TEAMMATE, "--team-name": _TEAMMATE,
     "--no-session-persistence": "the session would not be saved, so the next respawn would lose "
                                 "the conversation",
-    "--worktree": "the session would move to a new worktree, where the pair can't find its "
-                  "transcript", "-w": "the session would move to a new worktree, where the pair "
-                                      "can't find its transcript",
+    "--resume-session-at": _TRUNCATED, "--resume-drops-turn": _TRUNCATED,
+    "--reply-on-resume": "it can start a turn on its own when the pair respawns",
+    "--rewind-files": "it restores files to an earlier state and exits",
+    "--worktree": _MOVED, "-w": _MOVED, "--deep-link-cwd-b64": _MOVED,
     "--tmux": "it needs --worktree",
     "--bg": _OTHER_SESSION, "--background": _OTHER_SESSION, "--cloud": _OTHER_SESSION,
-    "--desktop": _OTHER_SESSION, "--environment": _OTHER_SESSION,
-    "--remote-control": _OTHER_SESSION, "--teleport": _OTHER_SESSION,
+    "--remote": _OTHER_SESSION, "--desktop": _OTHER_SESSION, "--environment": _OTHER_SESSION,
+    "--pool": _OTHER_SESSION, "--attach-serve": _OTHER_SESSION,
+    "--remote-control": _OTHER_SESSION, "--rc": _OTHER_SESSION, "--teleport": _OTHER_SESSION,
     "--from-pr": _OTHER_SESSION, "--ide": _OTHER_SESSION,
+    "--init-only": "it runs setup hooks and exits — the pair would never start",
     "--version": "it prints and exits — the pair would never start", "-v": "it prints and exits",
     "--help": "it prints and exits — the pair would never start", "-h": "it prints and exits",
     "--": "it ends option parsing, so everything after it would become the prompt",
     "-": "it ends option parsing, so everything after it would become the prompt",
 }
-# Settings keys refused in ``backend_options.settings`` by the same principle
-# (key names checked against the CLI 2.1.295 binary, 2026-10-09). Tightening
-# keys (permissions.deny / ask, …) and neutral ones (env, model, …) pass.
-_REFUSED_SETTINGS: dict[str, str] = {
-    "hooks": "hooks run commands and can approve tool calls — keep them in your settings files",
-    "disableAllHooks": "it switches off your hooks",
-    "enabledPlugins": "plugins bring MCP servers, hooks and agents past the mcp_whitelist opt-in",
-    "enableAllProjectMcpServers": "use mcp_whitelist",
-    "enabledMcpjsonServers": "use mcp_whitelist",
-    "agent": "an agent definition can carry its own permissionMode and tools",
-    "sandbox": "it changes how Bash is approved (sandboxed commands are auto-allowed by default)",
+# ``backend_options.settings`` is an ALLOWLIST (second review of b07509e,
+# P2). The denylist it replaces missed ``autoMode``, whose allow / soft_deny
+# / hard_deny lists replace the auto-mode classifier's rules (--settings is
+# one of the sources the classifier reads) while pair_info still says
+# ``auto``; the 2.1.295 schema also has command helpers that run outside the
+# permission system (apiKeyHelper, awsAuthRefresh, awsCredentialExport,
+# otelHeadersHelper, processWrapper …), cleanupPeriodDays (the retention of
+# ALL your transcripts), statusLine, claudeMd, autoMemoryDirectory … Each key
+# below was read from that schema (2026-10-09) and can't loosen the pair or
+# change what it loads: model is inert (every spawn passes --model), the rest
+# shape replies, commit text and Bash output size. permissions and env are
+# checked one level down.
+_ALLOWED_SETTINGS = ("permissions", "env", "model", "outputStyle", "language",
+                     "alwaysThinkingEnabled", "attribution", "includeCoAuthoredBy",
+                     "includeGitInstructions", "bashOutputMaxChars")
+# Tightening only: blockReadsOutsideWorkingDirectories refuses file-tool reads
+# outside the working directories. (disableBypassPermissionsMode / disableAutoMode
+# would contradict an unrestricted / auto pair, so they stay out too.)
+_ALLOWED_PERMISSIONS = ("deny", "ask", "blockReadsOutsideWorkingDirectories")
+# settings.env reaches the CLI and every command the pair runs, so the names
+# are an allowlist too: CLAUDE_CODE_SHELL_PREFIX wraps every command,
+# CLAUDE_CODE_PROCESS_WRAPPER / NODE_OPTIONS / PATH / BASH_ENV / GIT_SSH_COMMAND
+# change what an approved command runs, CLAUDE_CONFIG_DIR swaps the whole
+# config, ANTHROPIC_* swap the credentials or the endpoint. What passes:
+# Claude Code's own timeouts, output limits and telemetry switches (each name
+# found in the 2.1.295 binary).
+_ALLOWED_ENV = ("BASH_DEFAULT_TIMEOUT_MS", "BASH_MAX_TIMEOUT_MS", "BASH_MAX_OUTPUT_LENGTH",
+                "MAX_THINKING_TOKENS", "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "MCP_TIMEOUT",
+                "MCP_TOOL_TIMEOUT", "MAX_MCP_OUTPUT_TOKENS", "DISABLE_TELEMETRY",
+                "DISABLE_ERROR_REPORTING", "DISABLE_AUTOUPDATER",
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+                "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR")
+# Refused keys a pair field covers: the refusal names the field.
+_SETTINGS_FIELDS: dict[str, str] = {
+    "fallbackModel": "fallback_model", "effortLevel": "effort",
+    "enableAllProjectMcpServers": "mcp_whitelist", "enabledMcpjsonServers": "mcp_whitelist",
 }
-_REFUSED_PERMISSION_SETTINGS: dict[str, str] = {
-    "defaultMode": "use permission_mode",
-    "allow": "use allowed_tools",
-    "additionalDirectories": "use extra_dirs",
+_PERMISSION_FIELDS: dict[str, str] = {
+    "allow": "allowed_tools", "defaultMode": "permission_mode",
+    "additionalDirectories": "extra_dirs",
 }
 CLAUDE_BACKEND_OPTION_KEYS = ("settings", "args")
+
+
+def _check_settings(settings: dict[str, Any]) -> None:
+    """Raise ValueError unless every key of ``settings`` is on the allowlist."""
+    if "ultracode" in settings:
+        raise ValueError("set Ultracode with the ultracode parameter, not backend_options.settings "
+                         "— both go into the same --settings JSON")
+    for key in settings:
+        if key in _SETTINGS_FIELDS:
+            raise ValueError(f"backend_options.settings may not contain {key!r}: set it with "
+                             f"{_SETTINGS_FIELDS[key]} instead.")
+        if key not in _ALLOWED_SETTINGS:
+            raise ValueError(
+                f"backend_options.settings may not contain {key!r}: only {', '.join(_ALLOWED_SETTINGS)} "
+                f"pass. Other keys can loosen the pair or reach past it (hooks, autoMode, command "
+                f"helpers such as apiKeyHelper, cleanupPeriodDays …); keep those in your own settings files.")
+    perms = settings.get("permissions")
+    if perms is not None and not isinstance(perms, dict):
+        raise ValueError("backend_options.settings.permissions must be a JSON object")
+    for key in perms or {}:
+        if key in _PERMISSION_FIELDS:
+            raise ValueError(f"backend_options.settings may not contain permissions.{key}: set it with "
+                             f"{_PERMISSION_FIELDS[key]} instead. Tightening rules (permissions.deny / "
+                             f"ask) are fine.")
+        if key not in _ALLOWED_PERMISSIONS:
+            raise ValueError(f"backend_options.settings may not contain permissions.{key}: only "
+                             f"{' / '.join(_ALLOWED_PERMISSIONS)} pass.")
+    env = settings.get("env")
+    if env is not None and not isinstance(env, dict):
+        raise ValueError("backend_options.settings.env must be a JSON object")
+    for name in env or {}:
+        if name not in _ALLOWED_ENV:
+            raise ValueError(
+                f"backend_options.settings.env may not set {name!r}: only Claude Code's own timeout, "
+                f"output-limit and telemetry variables pass ({', '.join(_ALLOWED_ENV)}). Others can "
+                f"change what the pair's commands run or where it connects (CLAUDE_CODE_SHELL_PREFIX, "
+                f"CLAUDE_CONFIG_DIR, ANTHROPIC_*, PATH …).")
 
 
 def _refused_arg(token: str) -> str | None:
@@ -263,9 +350,9 @@ class ClaudeAdapter(PairAdapter):
                                  allow_unknown: bool = False) -> dict[str, Any]:
         """Check (and normalize) a Claude pair's ``backend_options``; raises
         ValueError. ``settings``: a JSON object (dict or JSON string), merged
-        with the ultracode key into the one ``--settings`` flag, without the
-        keys in ``_REFUSED_SETTINGS``. ``args``: a list of raw CLI tokens,
-        none of them in ``_MANAGED_FLAGS`` / ``_REFUSED_FLAGS``.
+        with the ultracode key into the one ``--settings`` flag, holding only
+        the keys ``_check_settings`` allows. ``args``: a list of raw CLI
+        tokens, none of them in ``_MANAGED_FLAGS`` / ``_REFUSED_FLAGS``.
 
         ``allow_unknown`` is the spawn-time mode: before v0.17.0 a Claude pair
         accepted any keys and ignored them, so a stored unknown key must not
@@ -287,19 +374,7 @@ class ClaudeAdapter(PairAdapter):
                     raise ValueError(f"backend_options.settings must be a JSON object: {e}") from None
             if not isinstance(settings, dict):
                 raise ValueError("backend_options.settings must be a JSON object (a dict)")
-            if "ultracode" in settings:
-                raise ValueError("set Ultracode with the ultracode parameter, not backend_options.settings "
-                                 "— both go into the same --settings JSON")
-            for key, why in _REFUSED_SETTINGS.items():
-                if key in settings:
-                    raise ValueError(f"backend_options.settings may not contain {key!r}: {why}.")
-            perms = settings.get("permissions")
-            if perms is not None and not isinstance(perms, dict):
-                raise ValueError("backend_options.settings.permissions must be a JSON object")
-            for key, why in _REFUSED_PERMISSION_SETTINGS.items():
-                if key in (perms or {}):
-                    raise ValueError(f"backend_options.settings may not contain permissions.{key}: {why}. "
-                                     f"Tightening rules (permissions.deny / ask) are fine.")
+            _check_settings(settings)
             bo["settings"] = settings
         if "args" in bo:
             raw = bo["args"]

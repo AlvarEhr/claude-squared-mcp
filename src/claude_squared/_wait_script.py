@@ -179,10 +179,21 @@ def _backend(pair: str) -> str:
     return str(spec.get("backend") or "claude") if isinstance(spec, dict) else "claude"
 
 
-def _headroom():
-    d = _read(_pairs_dir() / "defaults.json")
-    v = d.get("context_alert_headroom") if isinstance(d, dict) else None
-    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
+def _headroom_read():
+    """(ok, headroom) from defaults.json, like ``_registry_read``: ok is False
+    when the file exists but could not be read or parsed (a torn or locked
+    read mid-write), so callers keep the last good value. No file is a good
+    read with no headroom set — pair_settings_reset deletes it."""
+    try:
+        d = json.loads((_pairs_dir() / "defaults.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return True, None
+    except (OSError, ValueError):
+        return False, None
+    if not isinstance(d, dict):
+        return False, None
+    v = d.get("context_alert_headroom")
+    return True, (v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None)
 
 
 def _alert_at(entry):
@@ -215,20 +226,29 @@ class Alert:
     def __init__(self, mode, pct):
         self.mode, self.pct, self.prev, self.prev_level = mode, pct, None, None
         self.alert_at = None  # the pair's own level (v0.17), from the last good registry read
+        self.headroom = None  # the global headroom, from the last good defaults.json read
+        self.alert_at_read = self.headroom_read = False  # a good read seen yet?
 
     def note_registry(self, ok, entry):
         """Take the pair's ``context_alert_at`` from this poll's registry read
         (a pair_update applies to a watcher already running). A failed read
         keeps the last good value."""
         if ok:
-            self.alert_at = _alert_at(entry)
+            self.alert_at, self.alert_at_read = _alert_at(entry), True
 
     def level(self, window, backend="claude", auto_compact_token_limit=None):
         if self.mode == "off" or not window:
             return None
         if self.mode == "pct":
             return int(window * self.pct / 100.0)
-        return context_alert_threshold(window, _headroom(), backend, auto_compact_token_limit,
+        # A failed read keeps the last good headroom: falling back to the
+        # default for one poll moved the level and back, and the drop rule in
+        # check() read the move back as a lowered level — a spurious exit 8
+        # (second review of b07509e).
+        ok, headroom = _headroom_read()
+        if ok:
+            self.headroom, self.headroom_read = headroom, True
+        return context_alert_threshold(window, self.headroom, backend, auto_compact_token_limit,
                                        self.alert_at)
 
     def check(self, ctx, reported):
@@ -241,7 +261,10 @@ class Alert:
         self.auto_compact_token_limit = ctx.get("auto_compact_token_limit") or (reported or {}).get("auto_compact_token_limit")
         level = self.level(window, self.backend, self.auto_compact_token_limit)
         prev, self.prev = self.prev, used
-        prev_level, self.prev_level = self.prev_level, level
+        # A level computed before both inputs had one good read stood on the
+        # defaults, not the pair's settings: no base for the drop rule below.
+        known = self.mode == "pct" or (self.alert_at_read and self.headroom_read)
+        prev_level, self.prev_level = self.prev_level, (level if known else None)
         if level is None or prev is None:
             return None
         if prev < level <= used:

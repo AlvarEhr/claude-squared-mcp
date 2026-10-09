@@ -445,10 +445,11 @@ _SECRET_SETTING = re.compile(r"helper|key|token|secret|password|credential|auth"
 
 def _redact_backend_options(bo: Any) -> Any:
     """``backend_options`` for display (v0.17.0): ``settings.env`` values and
-    secret-looking settings keys (``apiKeyHelper``, ``awsAuthRefresh``, …)
-    masked. Display only — the registry keeps them as given and they travel
-    on the claude command line, visible in any process listing, which is why
-    the docs say to keep secrets out of ``settings``."""
+    secret-looking settings keys masked (the allowlist refuses keys such as
+    ``apiKeyHelper``, but a hand-edited registry can still hold one).
+    Display only — the registry keeps them as given and they travel on the
+    claude command line, visible in any process listing, which is why the
+    docs say to keep secrets out of ``settings``."""
     if not isinstance(bo, dict) or "settings" not in bo:
         return bo
     settings = bo["settings"]
@@ -874,11 +875,16 @@ def pair_create(
             approval: none|approve-for-me|bypass). Claude keys: ``settings`` {settings
             JSON}, merged with ``ultracode`` into the one ``--settings`` flag; ``args``
             [raw CLI args], appended at the end of every spawn. Both re-applied at every
-            spawn. Anything that would loosen the pair outside permission_mode /
-            allowed_tools / extra_dirs / mcp_whitelist is refused (``permissions.allow``
-            / ``defaultMode``, ``hooks``, ``--setting-sources``, ``--plugin-dir`` …), as
-            are flags the pair sets itself. No secrets: both travel on the claude
-            command line.
+            spawn. ``settings`` takes only ``permissions`` (``deny`` / ``ask`` /
+            ``blockReadsOutsideWorkingDirectories``), ``env`` (Claude Code's own timeout,
+            output-limit and telemetry variables), ``model``, ``outputStyle``,
+            ``language``, ``alwaysThinkingEnabled``, ``attribution``,
+            ``includeCoAuthoredBy``, ``includeGitInstructions``, ``bashOutputMaxChars``.
+            ``args`` refuses flags that would loosen the pair outside permission_mode /
+            allowed_tools / extra_dirs / mcp_whitelist (``--setting-sources``,
+            ``--managed-settings``, ``--plugin-dir`` …), lose or move its session, or
+            that the pair sets itself. No secrets: both travel on the claude command
+            line.
         disallowed_tools: Claude tools to remove (``--disallowed-tools``, re-applied at
             every spawn; ``pair_update`` changes it without a clear). A bare name
             (``"Artifact"``) removes the tool's schema from the pair's context; a rule

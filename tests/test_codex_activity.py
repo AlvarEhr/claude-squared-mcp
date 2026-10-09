@@ -399,7 +399,7 @@ class CodexActivityTests(unittest.TestCase):
     def test_wait_alert_uses_codex_limit_and_embeds_identical_stdlib_block(self):
         g = {"__name__": "offline_wait"}
         exec(W.WAIT_SCRIPT_SOURCE, g)
-        g["_headroom"] = lambda: 40_000
+        g["_headroom_read"] = lambda: (True, 40_000)
         alert = g["Alert"]("default", None)
         ctx = {"backend": "codex", "used": 100_000, "window": 200_000, "auto_compact_token_limit": 150_000}
         self.assertIsNone(alert.check(ctx, None))

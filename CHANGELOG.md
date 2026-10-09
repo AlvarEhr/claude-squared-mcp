@@ -19,9 +19,9 @@ process that spawns such a pair runs it without the new flags.
   `pair_update`, passed as `--disallowed-tools` at every spawn (warm runtime,
   per-send override, compaction, fork, `/context`, `pair_invoke`) alongside
   the connector flags, so a `pair_update` applies at the next send without
-  `pair_clear`. Per Claude Code's docs a bare tool name (e.g. `Artifact`)
-  removes that tool's schema from the model's context, cutting the fixed
-  context a pair carries; a rule like `Bash(git push *)` only denies matching
+  `pair_clear`. A bare tool name (e.g. `Artifact`) removes that tool's
+  schema from the model's context, cutting the fixed context a pair carries
+  (measured below); a rule like `Bash(git push *)` only denies matching
   calls. Every spawn path sends the same tool list, so compaction and override
   sends keep hitting the prompt cache; changing the list costs one uncached
   turn on the next send. `[]` clears it; like the other spawn-pinned settings,
@@ -33,32 +33,53 @@ process that spawns such a pair runs it without the new flags.
   line, so a flag missing its value can't consume one of the pair's own. Both
   are re-applied at every spawn. Anything that would loosen the pair outside
   `permission_mode` / `allowed_tools` / `extra_dirs` / `mcp_whitelist` is
-  refused — in `settings`: `permissions.allow` / `defaultMode` /
-  `additionalDirectories`, `hooks`, `disableAllHooks`, `enabledPlugins`,
-  `enableAllProjectMcpServers`, `enabledMcpjsonServers`, `agent`, `sandbox`;
-  in `args`: `--setting-sources`, `--restricted`, `--safe-mode`, `--bare`,
-  `--permission-prompt-tool` / `--permission-prompts`, `--plugin-dir` /
-  `--plugin-url`, `--agent` / `--agents`. So are flags that would lose, move
-  or never start the session (`--no-session-persistence`, `--worktree`,
-  `--bg`, `--cloud`, `--version`, `--help`, `--`, `-` …, combined short flags
-  included) and flags the pair sets itself (`--settings`, `--model`,
-  `--permission-mode`, `--disallowed-tools`, `--output-format`, `--resume`,
-  …, with a pointer to the field to use). `settings` may not carry
+  refused. `settings` is an allowlist (keys read from the CLI 2.1.295
+  settings schema): `permissions` with `deny` / `ask` /
+  `blockReadsOutsideWorkingDirectories`; `env` with Claude Code's own
+  timeout, output-limit and telemetry variables (`BASH_*_TIMEOUT_MS`,
+  `MAX_THINKING_TOKENS`, `MCP_TIMEOUT`, `DISABLE_TELEMETRY` … — 13 names);
+  `model` (inert: every spawn passes `--model`), `outputStyle`, `language`,
+  `alwaysThinkingEnabled`, `attribution`, `includeCoAuthoredBy`,
+  `includeGitInstructions`, `bashOutputMaxChars`. Everything else is
+  refused — among them `permissions.allow` / `defaultMode` /
+  `additionalDirectories`, `autoMode` (its allow / soft_deny / hard_deny
+  lists replace the auto-mode classifier's rules while `pair_info` still
+  says `auto`), `hooks`, the command helpers that run outside the
+  permission system (`apiKeyHelper`, `awsAuthRefresh`,
+  `awsCredentialExport`, `otelHeadersHelper`, `processWrapper` …),
+  `enabledPlugins`, `sandbox`, `cleanupPeriodDays` (it governs all your
+  transcripts), and in `env` `CLAUDE_CODE_SHELL_PREFIX`, `CLAUDE_CONFIG_DIR`,
+  `ANTHROPIC_*`, `PATH`, `NODE_OPTIONS` …. `args` refuses `--setting-sources`,
+  `--managed-settings`, `--client-data-url`, `--project-config-root`,
+  `--restricted`, `--safe-mode`, `--bare`, `--permission-prompt-tool` /
+  `--permission-prompts`, `--plugin-dir` / `--plugin-dir-no-mcp` /
+  `--plugin-url`, `--agent` / `--agents` / `--agent-type`, the team-member
+  flags (`--agent-id` / `--agent-name` / `--team-name`: a team member's
+  permission requests go to a team lead) and
+  `--dangerously-load-development-channels`; flags that would lose, cut,
+  rewind, move or never start the session (`--no-session-persistence`,
+  `--resume-session-at`, `--rewind-files`, `--worktree`, `--bg`, `--cloud`,
+  `--init-only`, `--version`, `--help`, `--`, `-` …, combined short flags
+  included) or reshape the stream the runtime reads (`--sdk-url`,
+  `--json-schema`, `--await-initialize` …); and flags the pair sets itself
+  or a field covers (`--settings`, `--model`, `--permission-mode`,
+  `--disallowed-tools`, `--tools`, `--output-format`, `--resume`, …, with a
+  pointer to the field to use). The flag list covers every option of the
+  2.1.295 root command, hidden ones included. `settings` may not carry
   `ultracode` (use the parameter); `settings` is refused on Codex (Codex uses
   `config`). A malformed stored value refuses the spawn rather than silently
   dropping, e.g., a deny rule. Keep secrets out of both — they travel on the
   claude command line and sit in `registry.json`; `pair_info` /
-  `pair_update` results mask `settings.env` values and secret-looking keys
-  (`apiKeyHelper`, …).
+  `pair_update` results mask `settings.env` values.
 - **Per-pair context alert: `context_alert_at`** (tokens) on `pair_create` /
   `pair_update` (`0` clears it). The alert fires at this or the global level
   (`context_alert_headroom`), whichever comes first — so a smaller window
   still alerts before auto-compaction; when a global headroom larger than the
   window leaves no global level, it is capped at the compaction point
   instead. It drives `wait.py`'s exit 8 (a running watcher re-reads it every
-  poll — one registry read per poll, keeping the last good value when a read
-  fails — and exits at once if a lowered level is already behind the
-  context), the send result's context
+  poll — one registry read per poll; a failed read of the registry or of
+  `defaults.json` keeps the last good value — and exits at once if a lowered
+  level is already behind the context), the send result's context
   warning (replacing the 60%/85% bands for that pair only; other pairs are
   unchanged) and `pair_status`. No respawn. Example: `context_alert_at=350000`
   on a 1M-window pair.
@@ -83,6 +104,25 @@ process that spawns such a pair runs it without the new flags.
 - `pair_handoff` lists `disallowed_tools` and Claude `backend_options` as
   omitted (no Codex equivalent) and carries `context_alert_at` over.
 - `pair_info` shows `disallowed_tools` and the pair's context alert.
+
+### Known issues
+
+- **A per-send `override_permission_mode` (or `override_model` /
+  `override_effort`) runs the turn in a one-shot `claude --print --resume`
+  process, outside the warm runtime and its background protection.** A
+  one-shot `claude -p` has no open stdin to resume on (observed 2026-06-15),
+  so background work started in that turn gets no self-woken continuation
+  and nothing tracks it until it ends. Nor does the override path wait, as a
+  normal send does, for a self-woken turn of the pair's warm runtime in this
+  process before it resumes the same session. For coding rounds set the
+  level on the pair with `pair_update(permission_mode=...)` (a respawn,
+  protected like any other) instead of overriding per send. Fix directions,
+  not yet probed: the 2.1.295 binary contains the stream-json
+  `control_request` subtypes `set_permission_mode` and `set_model` (found by
+  string search), so the warm runtime might switch for one turn and switch
+  back; failing that, the override path should wait for
+  pending background work first (as the warm send does), and refuse — or
+  warn — when the turn launches background work it can't keep.
 
 ### Known unknowns
 
