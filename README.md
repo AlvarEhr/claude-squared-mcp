@@ -100,7 +100,7 @@ pair_compact(name="reviewer", steering_prompt="Focus on what was reviewed and an
 
 **Context window for Codex.** The default window is what Codex itself uses (~258k usable tokens). `context_window="1m"` passes `model_context_window=1000000` (what the Codex app writes); the server clamps it to the model's ceiling — 828,400 usable on the 5.6 family — and the auto-compact threshold is set to 90% of that effective window (the documented 900,000 would sit above the clamp and never fire). It costs more tokens per turn. **If the pair will scour large files or whole repos, pick `1m`** — a compaction (manual or automatic) costs a full-context turn and loses detail, so the window is the budget. `pair_create` says so when a Codex pair is created with the default window.
 
-**`backend_options` on Claude (0.17.0).** Two keys, both re-applied at every spawn: `settings`, a settings JSON object merged with the `ultracode` key into the pair's one `--settings` flag (set Ultracode with its parameter, not here), and `args`, raw CLI tokens appended verbatim (the list starts with a flag). `args` may not carry flags the pair manages itself (`--settings`, `--model`, `--permission-mode`, `--disallowed-tools`, `--output-format`, `--resume` …); the refusal names the field to use instead. Other keys are refused on Claude, and `settings` on Codex (Codex takes `config`). A stored value that can't be used refuses the spawn rather than silently dropping, say, a permission rule in `settings`.
+**`backend_options` on Claude (0.17.0).** Two keys, both re-applied at every spawn: `settings`, a settings JSON object merged with the `ultracode` key into the pair's one `--settings` flag (set Ultracode with its parameter, not here), and `args`, raw CLI tokens that end every spawn's command line (the list starts with a flag). Anything that would loosen the pair outside its `permission_mode` / `allowed_tools` / `extra_dirs` / `mcp_whitelist` is refused: in `settings`, `permissions.allow` / `defaultMode` / `additionalDirectories`, `hooks`, `disableAllHooks`, `enabledPlugins`, the project-MCP approvals, `agent` and `sandbox`; in `args`, `--setting-sources`, `--restricted`, `--safe-mode`, `--bare`, `--permission-prompt-tool`, `--plugin-dir`, `--agent(s)` and the flags that would lose, move or never start the session (`--no-session-persistence`, `--worktree`, `--bg`, `--version`, `--` …). Flags the pair sets itself (`--settings`, `--model`, `--permission-mode`, `--disallowed-tools`, `--output-format`, `--resume` …) are refused too, and the refusal names the field to use instead. Tightening settings (`permissions.deny` / `ask`) and neutral ones (`env`, `model` …) pass. Other keys are refused on Claude, and `settings` on Codex (Codex takes `config`). A stored value that can't be used refuses the spawn rather than silently dropping, say, a deny rule in `settings`. **Keep secrets out of both:** they travel on the claude command line (visible in a process listing) and sit in `registry.json`; tool results mask `settings.env` values and secret-looking keys such as `apiKeyHelper`, but that is display only.
 
 ### Permission levels (one vocabulary, translated per backend)
 
@@ -313,8 +313,11 @@ Three ways to consume the handle:
    this or the global level, whichever comes first, so a smaller window than
    expected still alerts before auto-compaction — e.g. `context_alert_at=350000`
    on a 1M-window pair. It also replaces that pair's 60%/85% footer warnings
-   with one at the same level (other pairs keep the bands); no respawn, and a
-   running watcher picks up a change at its next poll. `--context-alert PCT`
+   with one at the same level (other pairs keep the bands). No respawn: a
+   running watcher re-reads it every poll and exits 8 at once if a lowered
+   level is already behind the pair's context. If a large global headroom
+   leaves no global level at all (headroom bigger than the window), the
+   pair's value is capped at the compaction point instead. `--context-alert PCT`
    overrides both. `pair_status` and a running `pair_poll` show the live
    context and whether it is past the alert.
 
@@ -465,7 +468,7 @@ The list is re-applied at every spawn — warm runtime, per-send override, compa
 | Category | Fields | When change takes effect |
 |---|---|---|
 | Per-send | `model`, `effort`, `permission_mode`, `context_window`, `backend_options`, `ultracode`, `fallback_model`, `mcp_whitelist`, `disallowed_tools` | Next `pair_send` (registry write + runtime eviction → respawn with new values; Codex: every send is a fresh process) |
-| Server-side | `allowed_invocations`, `context_alert_at` | No eviction needed (MCP-layer, not pinned to the CLI subprocess). `allowed_invocations`: next `pair_invoke`. `context_alert_at`: next send's result, `pair_status`, and running `wait.py` watchers at their next poll. Mutable freely. |
+| Server-side | `allowed_invocations`, `context_alert_at` | No eviction needed (MCP-layer, not pinned to the CLI subprocess). `allowed_invocations`: next `pair_invoke`. `context_alert_at`: next send's result, `pair_status`, and running `wait.py` watchers at their next poll (exit 8 at once if the new level is already behind the context). Mutable freely. |
 | Pinned-at-create | `allowed_tools`, `system_prompt_append` | **Only after `pair_clear`** — the existing session was started with the OLD values; rotation creates a fresh session with the new pinned config |
 | Pinned-at-spawn | `cwd`, `extra_dirs` | Next spawn after eviction. A Claude `cwd` change ALSO moves the session JSONL across project dirs (rejected with recovery hint if the move fails); Codex threads aren't cwd-keyed |
 

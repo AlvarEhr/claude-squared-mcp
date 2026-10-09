@@ -402,8 +402,10 @@ def context_alert_threshold(window, headroom=None, backend="claude", auto_compac
     ``context_alert_headroom`` overrides it). A pair's own ``alert_at``
     (``PairSpec.context_alert_at``, absolute tokens) wins when it comes
     first — capped at the global level, so a smaller window or a misjudged
-    value still alerts before auto-compaction. None when the window is
-    unknown."""
+    value still alerts before auto-compaction. A global headroom larger than
+    the window leaves a level of 0 (never crossed); the pair's value is then
+    capped at the compaction point instead, so it still works. None when the
+    window is unknown."""
     point = compaction_point(window, backend, auto_compact_token_limit)
     if point is None:
         return None
@@ -411,7 +413,7 @@ def context_alert_threshold(window, headroom=None, backend="claude", auto_compac
         headroom = max(int(window * 0.15), 40000)
     level = max(0, point - headroom)
     if isinstance(alert_at, int) and not isinstance(alert_at, bool) and alert_at > 0:
-        return min(alert_at, level)
+        return min(alert_at, level if level > 0 else point)
     return level
 
 

@@ -13,6 +13,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -120,7 +121,7 @@ class PairOptionsCase(unittest.TestCase):
         """Every v0.17 option at once (plus ultracode), for the cache invariants."""
         data = dict(ultracode=True, disallowed_tools=["Artifact", "Bash(git push *)"],
                     backend_options={"settings": {"permissions": {"deny": ["WebFetch"]}},
-                                     "args": ["--max-turns", "40"]})
+                                     "args": ["--max-budget-usd", "40"]})
         data.update(changes)
         return self.spec("full", **data)
 
@@ -149,6 +150,17 @@ class ClaudeArgsTests(PairOptionsCase):
             adapter._run_stream_json(spec, ["/context"], timeout_seconds=5)
         self.assertEqual(len(captured), 3)
         return dict(zip(("send", "fork", "stream"), captured))
+
+    def capture_create(self, spec):
+        """argv of create() (its one --print spawn)."""
+        captured = []
+
+        def fake_print(args, **kwargs):
+            captured.append(list(args))
+            return {"session_id": spec.session_id, "result": "pair-ready"}
+        with patch.object(CL.ClaudeAdapter, "_run_print", side_effect=fake_print):
+            CL.ClaudeAdapter().create(spec)
+        return captured[0]
 
     def capture_runtime_start(self, spec):
         """argv of the persistent runtime's spawn (no reader threads run)."""
@@ -233,13 +245,37 @@ class ClaudeArgsTests(PairOptionsCase):
         self.assertEqual(args, MCP_MINIMAL + ["--disallowed-tools", "Artifact",
                                               "--disallowed-tools", "Bash(git push *)"])
 
-    def test_raw_args_come_last_in_common_create_args(self):
-        # Both callers (create, runtime.start) append --print right after, so
-        # a variadic raw flag at the tail cannot swallow anything of ours.
-        spec = self.spec(backend_options={"args": ["--betas", "x", "y"]}, allowed_tools=["Read"])
-        args = CL.ClaudeAdapter()._common_create_args(spec)
-        self.assertEqual(args[-3:], ["--betas", "x", "y"])
-        self.assertLess(args.index("--allowed-tools"), args.index("--betas"))
+    def test_raw_args_end_every_argv(self):
+        # A raw flag missing its value (["--system-prompt"]) would consume the
+        # next token — once that was --print / --permission-mode. They now end
+        # every argv (after -p <message>), so they can only fail loudly.
+        for raw in (["--betas", "x", "y"], ["--system-prompt"]):
+            with self.subTest(raw=raw):
+                spec = self.spec(backend_options={"args": raw}, allowed_tools=["Read"])
+                self.assertNotIn(raw[0], CL.ClaudeAdapter()._common_create_args(spec))
+                argvs = {"create": self.capture_create(spec), "runtime": self.capture_runtime_start(spec),
+                         **self.capture_resume_paths(spec)}
+                for name, argv in argvs.items():
+                    with self.subTest(path=name):
+                        self.assertEqual(argv[-len(raw):], raw)
+                        self.assertEqual(argv.count(raw[0]), 1)
+
+    def test_connector_rewrite_keeps_raw_args_last(self):
+        # With connectors, _run_print switches to stream-json and adds
+        # --verbose: inserted after the output format, not appended.
+        captured = []
+
+        def fake_run(args, **kwargs):
+            captured.append(list(args))
+            out = json.dumps({"type": "result", "subtype": "success", "result": "ok"})
+            return SimpleNamespace(returncode=0, stdout=out.encode(), stderr=b"")
+        spec = self.spec(mcp_whitelist=["probe"])
+        with patch.object(subprocess, "run", side_effect=fake_run), \
+                patch.object(CL.connectors, "effective", return_value=True):
+            CL.ClaudeAdapter()._run_print(["--print", "--output-format", "json", "-p", "m", "--betas", "x"],
+                                          timeout_seconds=5, pair_name="p", connector_spec=spec)
+        self.assertEqual(captured[0][1:], ["--print", "--output-format", "stream-json", "--verbose",
+                                           "-p", "m", "--betas", "x"])
 
     def test_every_spawn_path_sends_the_same_tool_scope_and_options(self):
         # Prompt caching: the tool list and settings must be identical on the
@@ -250,24 +286,21 @@ class ClaudeArgsTests(PairOptionsCase):
         adapter = CL.ClaudeAdapter()
         mcp = adapter._mcp_args(spec)
         settings = ["--settings", '{"permissions": {"deny": ["WebFetch"]}, "ultracode": true}']
-        extra = ["--max-turns", "40"]
+        extra = ["--max-budget-usd", "40"]
         self.assertEqual(adapter._option_args(spec), settings + extra)
         self.assertTrue(contains_run(mcp, ["--disallowed-tools", "Artifact",
                                            "--disallowed-tools", "Bash(git push *)"]))
         common = adapter._common_create_args(spec)
         self.assertEqual(common[:len(mcp) + 2], mcp + settings)
-        self.assertEqual(common[-2:], extra)
+        self.assertFalse(contains_run(common, extra))  # raw args end each argv instead
         runtime = self.capture_runtime_start(spec)
         self.assertEqual(runtime[1:1 + len(common)], common)
         paths = self.capture_resume_paths(spec)
-        for name, argv in [("common", common), ("runtime", runtime), *paths.items()]:
+        for name, argv in [("create", self.capture_create(spec)), ("runtime", runtime), *paths.items()]:
             with self.subTest(path=name):
-                self.assertTrue(contains_run(argv, mcp))
-                self.assertTrue(contains_run(argv, settings))
-                self.assertTrue(contains_run(argv, extra))
+                self.assertTrue(contains_run(argv, mcp + settings))
+                self.assertEqual(argv[-len(extra):], extra)
                 self.assertEqual(argv.count("--settings"), 1)
-                if name in paths:
-                    self.assertTrue(contains_run(argv, mcp + settings + extra))
 
     def test_override_permission_does_not_change_the_options(self):
         # A per-call permission override reaches connector rules only; the
@@ -275,14 +308,15 @@ class ClaudeArgsTests(PairOptionsCase):
         spec = self.full_spec()
         paths = self.capture_resume_paths(spec, send_override={"permission_mode": "read-only"})
         adapter = CL.ClaudeAdapter()
-        self.assertTrue(contains_run(paths["send"], adapter._mcp_args(spec) + adapter._option_args(spec)))
+        self.assertTrue(contains_run(paths["send"], adapter._mcp_args(spec) + adapter._settings_args(spec)))
+        self.assertEqual(paths["send"][-2:], adapter._extra_args(spec))
 
     def test_spawn_refuses_malformed_settings_or_args(self):
         # Dropping a malformed settings value silently could drop a
         # permission rule the user relies on — the spawn must refuse.
         adapter = CL.ClaudeAdapter()
         for options in ({"settings": "not json"}, {"settings": [1]}, {"settings": {"ultracode": True}},
-                        {"args": ["--model", "x"]}, {"args": "--max-turns 40"}, {"args": ["40"]}):
+                        {"args": ["--model", "x"]}, {"args": "--max-budget-usd 40"}, {"args": ["40"]}):
             with self.subTest(options=options):
                 spec = self.spec(backend_options=options)
                 with self.assertRaisesRegex(PairError, "unusable backend_options"):
@@ -304,6 +338,34 @@ class ClaudeArgsTests(PairOptionsCase):
 # validate_backend_options
 # ---------------------------------------------------------------------------
 
+# Written out here rather than read from the adapter's tables, so a flag
+# dropped from them fails this test. (Adding more refusals is fine.)
+REFUSED_ARGS = [
+    # set by the pair's own fields
+    "--settings", "--disallowed-tools", "--disallowedTools", "--allowed-tools", "--allowedTools",
+    "--model", "--fallback-model", "--effort", "--permission-mode", "--dangerously-skip-permissions",
+    "--allow-dangerously-skip-permissions", "--append-system-prompt", "--append-system-prompt-file",
+    "--mcp-config", "--strict-mcp-config", "--add-dir",
+    # the spawn's own stream protocol
+    "--print", "-p", "--resume", "-r", "--continue", "-c", "--session-id", "--fork-session",
+    "--input-format", "--output-format", "--replay-user-messages", "--include-partial-messages",
+    "--forward-subagent-text", "--include-hook-events",
+    # would loosen the pair or bypass an opt-in (review of 5f66ff8, P2-2)
+    "--setting-sources", "--restricted", "--safe-mode", "--bare", "--permission-prompt-tool",
+    "--permission-prompts", "--plugin-dir", "--plugin-url", "--agent", "--agents",
+    # would lose or move the session, or never start it
+    "--no-session-persistence", "--worktree", "-w", "--tmux", "--bg", "--background", "--cloud",
+    "--desktop", "--environment", "--remote-control", "--teleport", "--from-pr", "--ide",
+    "--version", "-v", "--help", "-h", "--", "-",
+]
+REFUSED_SETTINGS = [
+    {"hooks": {"PreToolUse": []}}, {"disableAllHooks": True}, {"enabledPlugins": {"x@y": True}},
+    {"enableAllProjectMcpServers": True}, {"enabledMcpjsonServers": ["x"]}, {"agent": "reviewer"},
+    {"sandbox": {"enabled": True}}, {"permissions": {"allow": ["Bash"]}},
+    {"permissions": {"defaultMode": "bypassPermissions"}}, {"permissions": {"additionalDirectories": ["/"]}},
+]
+
+
 class ValidateBackendOptionsTests(unittest.TestCase):
     validate = staticmethod(CL.ClaudeAdapter.validate_backend_options)
 
@@ -312,8 +374,8 @@ class ValidateBackendOptionsTests(unittest.TestCase):
         self.assertEqual(self.validate({}), {})
         self.assertEqual(self.validate({"settings": {"a": 1}}), {"settings": {"a": 1}})
         self.assertEqual(self.validate({"settings": '{"a": 1}'}), {"settings": {"a": 1}})
-        self.assertEqual(self.validate({"args": ["--max-turns", "40"]}), {"args": ["--max-turns", "40"]})
-        self.assertEqual(self.validate({"args": '["--max-turns", "40"]'}), {"args": ["--max-turns", "40"]})
+        self.assertEqual(self.validate({"args": ["--max-budget-usd", "40"]}), {"args": ["--max-budget-usd", "40"]})
+        self.assertEqual(self.validate({"args": '["--max-budget-usd", "40"]'}), {"args": ["--max-budget-usd", "40"]})
         self.assertEqual(self.validate({"args": []}), {"args": []})
 
     def test_does_not_mutate_the_input(self):
@@ -339,23 +401,42 @@ class ValidateBackendOptionsTests(unittest.TestCase):
             self.validate({"settings": '{"ultracode": false}'}, allow_unknown=True)
 
     def test_args_must_be_a_list_of_strings(self):
-        for args in ("--max-turns 40", ["--max-turns", 40], {"a": 1}, '{"a": 1}', None):
+        for args in ("--max-budget-usd 40", ["--max-budget-usd", 40], {"a": 1}, '{"a": 1}', None):
             with self.subTest(args=args):
                 with self.assertRaisesRegex(ValueError, "list of strings"):
                     self.validate({"args": args})
 
     def test_args_must_start_with_a_flag(self):
-        # On some paths the raw args follow a variadic --disallowed-tools,
-        # which would swallow a leading bare value as a tool name.
+        # They end every argv: a leading bare value would become a prompt.
         with self.assertRaisesRegex(ValueError, "must start with a flag"):
-            self.validate({"args": ["40", "--max-turns"]})
+            self.validate({"args": ["40", "--max-budget-usd"]})
 
-    def test_every_managed_flag_is_refused_in_both_spellings(self):
-        for flag in CL._MANAGED_FLAGS:
-            for args in ([flag], [f"{flag}=value"], ["--max-turns", "4", flag]):
+    def test_every_refused_flag_is_refused_in_both_spellings(self):
+        for flag in REFUSED_ARGS:
+            for args in ([flag], [f"{flag}=value"], ["--max-budget-usd", "4", flag]):
                 with self.subTest(args=args):
-                    with self.assertRaisesRegex(ValueError, f"may not contain {flag}"):
+                    with self.assertRaisesRegex(ValueError, f"may not contain {re.escape(flag)}"):
                         self.validate({"args": args})
+
+    def test_combined_short_flags_are_checked_letter_by_letter(self):
+        with self.assertRaisesRegex(ValueError, "-c:"):
+            self.validate({"args": ["-dc"]})
+        self.assertEqual(self.validate({"args": ["-d", "api"]}), {"args": ["-d", "api"]})
+
+    def test_loosening_settings_are_refused(self):
+        for settings in REFUSED_SETTINGS:
+            with self.subTest(settings=settings):
+                with self.assertRaisesRegex(ValueError, "may not contain"):
+                    self.validate({"settings": settings})
+                with self.assertRaisesRegex(ValueError, "may not contain"):
+                    self.validate({"settings": json.dumps(settings)}, allow_unknown=True)
+        with self.assertRaisesRegex(ValueError, "permissions must be a JSON object"):
+            self.validate({"settings": {"permissions": ["Bash"]}})
+
+    def test_tightening_and_neutral_settings_pass(self):
+        settings = {"permissions": {"deny": ["WebFetch"], "ask": ["Bash(git push *)"]},
+                    "env": {"A": "1"}, "model": "x", "cleanupPeriodDays": 36500}
+        self.assertEqual(self.validate({"settings": settings}), {"settings": settings})
 
     def test_refusal_names_the_field_to_use(self):
         with self.assertRaisesRegex(ValueError, "set it with disallowed_tools instead"):
@@ -364,9 +445,11 @@ class ValidateBackendOptionsTests(unittest.TestCase):
             self.validate({"args": ["--settings", "{}"]})
         with self.assertRaisesRegex(ValueError, "stream protocol"):
             self.validate({"args": ["--output-format", "text"]})
+        with self.assertRaisesRegex(ValueError, "deny rules and hooks"):
+            self.validate({"args": ["--setting-sources", "project"]})
 
     def test_unmanaged_flags_pass_verbatim(self):
-        args = ["--max-turns", "40", "--betas", "a", "b", "--debug"]
+        args = ["--max-budget-usd", "40", "--betas", "a", "b", "--debug"]
         self.assertEqual(self.validate({"args": args}), {"args": args})
 
 
@@ -402,10 +485,37 @@ class ContextAlertTests(PairOptionsCase):
         self.assertEqual(A.context_alert_threshold(200_000, 40_000, "codex", 150_000, 50_000), 50_000)
         self.assertIsNone(A.context_alert_threshold(None, alert_at=350_000))
 
+    def test_a_headroom_larger_than_the_window_keeps_the_pair_level(self):
+        # Review of 5f66ff8, P2-1: the global level clamps to 0 there, and
+        # min(alert_at, 0) = 0 is never crossed; the pair's value is capped at
+        # the compaction point instead.
+        self.assertEqual(A.context_alert_threshold(200_000, 300_000), 0)
+        self.assertEqual(A.context_alert_threshold(200_000, 300_000, alert_at=100_000), 100_000)
+        self.assertEqual(A.context_alert_threshold(200_000, 300_000, alert_at=190_000), 170_000)
+        # A default-window Codex pair (estimated point: 90% of the window).
+        self.assertEqual(A.context_alert_threshold(272_000, 300_000, "codex", None, 200_000), 200_000)
+        tool(S.pair_settings_set)(context_alert_headroom=300_000)
+        spec = self.spec(context_alert_at=100_000)
+        below, past = self.result(90_000, 200_000), self.result(150_000, 200_000)
+        S._apply_context_alert(spec, below)
+        S._apply_context_alert(spec, past)
+        self.assertIsNone(below.context.warning)
+        self.assertIn("context alert (100,000)", past.context.warning)
+        R.add_pair(self.spec("small", context_alert_at=100_000))
+        g = wait_globals()
+        alert = g["Alert"]("default", None)
+        self.assertIsNone(self.poll(g, alert, "small", 90_000, 200_000))
+        self.assertEqual(self.poll(g, alert, "small", 120_000, 200_000), (120_000, 200_000, 100_000))
+
     def test_threshold_ignores_non_positive_and_non_int_alert_at(self):
         for bad in (0, -5, True, False, "350000", 350_000.0):
             with self.subTest(alert_at=bad):
                 self.assertEqual(A.context_alert_threshold(WINDOW_1M, alert_at=bad), DEFAULT_LEVEL_1M)
+
+    def poll(self, g, alert, pair, used, window=WINDOW_1M):
+        """One watcher poll as wait_pair runs it: one registry read, then the check."""
+        alert.note_registry(*g["_registry_read"](pair))
+        return alert.check(self.ctx(used, window), None)
 
     def test_wait_alert_fires_at_the_pair_level(self):
         # The acceptance case: a 1M pair with context_alert_at=350000 exits 8
@@ -416,9 +526,9 @@ class ContextAlertTests(PairOptionsCase):
         for pair, expected in (("alerted", (360_000, WINDOW_1M, 350_000)), ("plain", None)):
             with self.subTest(pair=pair):
                 alert = g["Alert"]("default", None)
-                self.assertIsNone(alert.check(self.ctx(300_000), None, pair))  # first sight never fires
-                self.assertEqual(alert.check(self.ctx(360_000), None, pair), expected)
-        # Without a pair name (task mode before the name is known): global level.
+                self.assertIsNone(self.poll(g, alert, pair, 300_000))  # first sight never fires
+                self.assertEqual(self.poll(g, alert, pair, 360_000), expected)
+        # No registry read yet (task mode before the pair is known): global level.
         alert = g["Alert"]("default", None)
         alert.check(self.ctx(300_000), None)
         self.assertIsNone(alert.check(self.ctx(360_000), None))
@@ -428,17 +538,63 @@ class ContextAlertTests(PairOptionsCase):
         R.add_pair(self.spec("p"))
         g = wait_globals()
         alert = g["Alert"]("default", None)
-        self.assertIsNone(alert.check(self.ctx(300_000), None, "p"))
+        self.assertIsNone(self.poll(g, alert, "p", 300_000))
         self.assertIn("context_alert_at", tool(S.pair_update)("p", context_alert_at=350_000))
         self.runtime.evict.assert_not_called()
-        self.assertEqual(alert.check(self.ctx(360_000), None, "p"), (360_000, WINDOW_1M, 350_000))
+        self.assertEqual(self.poll(g, alert, "p", 360_000), (360_000, WINDOW_1M, 350_000))
+
+    def test_wait_keeps_the_last_good_value_when_a_read_fails(self):
+        # On Windows an open handle can fail the writer's os.replace, and a
+        # reader can see a torn or missing file: that proves nothing.
+        R.add_pair(self.spec("p", context_alert_at=350_000))
+        g = wait_globals()
+        alert = g["Alert"]("default", None)
+        self.assertIsNone(self.poll(g, alert, "p", 300_000))
+        path = R.registry_path()
+        good = path.read_text(encoding="utf-8")
+        path.write_text(good[: len(good) // 2], encoding="utf-8")
+        self.assertEqual(g["_registry_read"]("p"), (False, None))
+        self.assertEqual(self.poll(g, alert, "p", 360_000), (360_000, WINDOW_1M, 350_000))
+        path.unlink()
+        self.assertEqual(g["_registry_read"]("p"), (False, None))
+        alert = g["Alert"]("default", None)
+        alert.alert_at = 350_000
+        alert.note_registry(*g["_registry_read"]("p"))
+        self.assertEqual(alert.alert_at, 350_000)
+
+    def test_wait_fires_once_when_the_level_drops_behind_the_fill(self):
+        # A crossing needs prev < level <= used; lowering context_alert_at
+        # below the current fill would otherwise never fire.
+        R.add_pair(self.spec("p"))
+        g = wait_globals()
+        alert = g["Alert"]("default", None)
+        self.assertIsNone(self.poll(g, alert, "p", 400_000))
+        self.assertIsNone(self.poll(g, alert, "p", 410_000))
+        tool(S.pair_update)("p", context_alert_at=350_000)
+        self.assertEqual(self.poll(g, alert, "p", 412_000), (412_000, WINDOW_1M, 350_000))
+        # Already past the old level when it dropped: that is not new.
+        R.add_pair(self.spec("late"))
+        alert = g["Alert"]("default", None)
+        self.assertIsNone(self.poll(g, alert, "late", 150_000, 200_000))  # level 130k: already past
+        tool(S.pair_update)("late", context_alert_at=100_000)
+        self.assertIsNone(self.poll(g, alert, "late", 151_000, 200_000))
+
+    def test_wait_forgotten_check_uses_the_polls_read(self):
+        g = wait_globals()
+        view = {"owners": [{"status": "forgotten"}]}
+        self.assertTrue(g["_forgotten"](view, (True, None)))
+        self.assertFalse(g["_forgotten"](view, (False, None)))  # unreadable registry
+        self.assertFalse(g["_forgotten"](view, (True, {"name": "p"})))
 
     def test_wait_pct_and_off_modes_ignore_the_pair_value(self):
         R.add_pair(self.spec("p", context_alert_at=350_000))
         g = wait_globals()
-        self.assertEqual(g["Alert"]("pct", 90).level(WINDOW_1M, pair="p"), 900_000)
-        self.assertIsNone(g["Alert"]("off", None).level(WINDOW_1M, pair="p"))
-        self.assertEqual(g["Alert"]("default", None).level(WINDOW_1M, pair="p"), 350_000)
+        alerts = {mode: g["Alert"](mode, pct) for mode, pct in (("pct", 90), ("off", None), ("default", None))}
+        for alert in alerts.values():
+            alert.note_registry(*g["_registry_read"]("p"))
+        self.assertEqual(alerts["pct"].level(WINDOW_1M), 900_000)
+        self.assertIsNone(alerts["off"].level(WINDOW_1M))
+        self.assertEqual(alerts["default"].level(WINDOW_1M), 350_000)
 
     def test_wait_reader_rejects_malformed_registry_values(self):
         # wait.py is stdlib-only and reads the raw JSON: a hand-edited value
@@ -451,9 +607,13 @@ class ContextAlertTests(PairOptionsCase):
                 data = json.loads(path.read_text(encoding="utf-8"))
                 data["pairs"]["p"]["context_alert_at"] = bad
                 path.write_text(json.dumps(data), encoding="utf-8")
-                self.assertIsNone(g["_alert_at"]("p"))
-                self.assertEqual(g["Alert"]("default", None).level(WINDOW_1M, pair="p"), DEFAULT_LEVEL_1M)
-        self.assertIsNone(g["_alert_at"]("missing"))
+                ok, entry = g["_registry_read"]("p")
+                self.assertTrue(ok)
+                self.assertIsNone(g["_alert_at"](entry))
+                alert = g["Alert"]("default", None)
+                alert.note_registry(ok, entry)
+                self.assertEqual(alert.level(WINDOW_1M), DEFAULT_LEVEL_1M)
+        self.assertEqual(g["_registry_read"]("missing"), (True, None))
         self.assertIsNone(g["_alert_at"](None))
 
     def test_send_result_warning_follows_the_pair_level(self):
@@ -515,12 +675,12 @@ class ServerToolTests(PairOptionsCase):
     def test_create_stores_the_new_fields_normalized(self):
         report, create = self.create(
             model="opus", disallowed_tools=["Artifact", " Bash(git push *) "], context_alert_at="350_000",
-            backend_options={"settings": '{"env": {"A": "1"}}', "args": '["--max-turns", "40"]'})
+            backend_options={"settings": '{"env": {"A": "1"}}', "args": '["--max-budget-usd", "40"]'})
         stored = R.get_pair("c")
         self.assertEqual(stored.disallowed_tools, ["Artifact", "Bash(git push *)"])
         self.assertEqual(stored.context_alert_at, 350_000)
         # JSON strings are parsed once at create, so the registry holds objects.
-        self.assertEqual(stored.backend_options, {"settings": {"env": {"A": "1"}}, "args": ["--max-turns", "40"]})
+        self.assertEqual(stored.backend_options, {"settings": {"env": {"A": "1"}}, "args": ["--max-budget-usd", "40"]})
         self.assertEqual(create.call_args.args[0].disallowed_tools, stored.disallowed_tools)
         self.assertIn("Created 'c'", report)
 
@@ -612,6 +772,25 @@ class ServerToolTests(PairOptionsCase):
         R.add_pair(self.spec("cx", backend="codex"))
         with self.assertRaisesRegex(PairError, "settings is Claude-only"):
             tool(S.pair_update)("cx", backend_options={"settings": {"a": 1}})
+        with self.assertRaisesRegex(PairError, "permissions.allow"):
+            tool(S.pair_update)("p", backend_options={"settings": {"permissions": {"allow": ["Bash"]}}})
+
+    def test_secrets_in_settings_are_masked_on_display(self):
+        # Display only: the registry keeps the values (the docs say to keep
+        # secrets out — settings travel on the claude command line).
+        secret = {"settings": {"env": {"API_TOKEN": "s3cret-env"}, "apiKeyHelper": "s3cret-helper",
+                               "model": "x"}}
+        R.add_pair(self.spec())
+        update = tool(S.pair_update)("p", backend_options=secret)
+        info = tool(S.pair_info)("p")
+        verbose = tool(S.pair_info)("p", verbose=True)
+        verbose_update = tool(S.pair_update)("p", purpose="x", verbose=True)
+        for shown in (update, info, verbose, verbose_update):
+            self.assertNotIn("s3cret", shown)
+        self.assertIn('"env": {"API_TOKEN": "***"}', info)
+        self.assertIn('"apiKeyHelper": "***"', info)
+        self.assertIn('"model": "x"', info)
+        self.assertEqual(R.get_pair("p").backend_options, secret)
 
     def test_pair_info_shows_the_new_fields(self):
         R.add_pair(self.spec(disallowed_tools=["Artifact", "Bash(git push *)"], context_alert_at=350_000,
@@ -656,7 +835,8 @@ class ServerToolTests(PairOptionsCase):
         # pair_update evicts only its own process's runtime; another process's
         # warm runtime must notice the change at its next get_or_start.
         for change in ({"disallowed_tools": ["Artifact"]}, {"backend_options": {"settings": {"a": 1}}},
-                       {"ultracode": True}):
+                       {"ultracode": True}, {"fallback_model": "sonnet"}, {"extra_dirs": ["D:/x"]},
+                       {"allowed_tools": ["Read"]}, {"system_prompt_append": "x"}, {"profile_name": "x"}):
             with self.subTest(change=change):
                 registry = RuntimeRegistry()
                 old = SimpleNamespace(spec=self.spec(), is_alive=lambda: True, stop=Mock())
@@ -673,6 +853,31 @@ class ServerToolTests(PairOptionsCase):
         self.assertIs(registry.get_or_start(self.spec(context_alert_at=350_000), CL.ClaudeAdapter()), same)
         same.stop.assert_not_called()
 
+    def test_runtime_and_update_share_one_spawn_field_list(self):
+        self.assertIs(S._SPAWN_PINNED_FIELDS, RT.SPAWN_PINNED_FIELDS)
+        for field in ("disallowed_tools", "backend_options", "ultracode", "fallback_model", "extra_dirs",
+                      "allowed_tools", "mcp_whitelist", "system_prompt_append", "profile_name"):
+            self.assertIn(field, RT.SPAWN_PINNED_FIELDS)
+        self.assertNotIn("context_alert_at", RT.SPAWN_PINNED_FIELDS)
+
+    def test_unchanged_options_keep_the_warm_runtime(self):
+        # Both specs are read back from the registry: unchanged, non-empty
+        # values must compare equal, or every send would respawn the runtime
+        # and kill its background work.
+        report, _ = self.create(
+            "warm", model="opus", disallowed_tools=["Artifact", "Bash(git push *)"], ultracode=True,
+            backend_options={"settings": '{"permissions": {"deny": ["WebFetch"]}, "env": {"A": "1"}}',
+                             "args": ["--max-budget-usd", "5"]},
+            allowed_tools=["Read"], extra_dirs=[str(self.directory / "extra")], fallback_model="sonnet",
+            system_prompt_append="Focus.", context_alert_at=350_000)
+        registry = RuntimeRegistry()
+        same = SimpleNamespace(spec=R.get_pair("warm"), is_alive=lambda: True, stop=Mock())
+        registry._runtimes["warm"] = same
+        R.update_pair("warm", turn_count=7, purpose="later", self_woken_pending=[{"task_id": "t"}])
+        tool(S.pair_update)("warm", context_alert_at=300_000)
+        self.assertIs(registry.get_or_start(R.get_pair("warm"), CL.ClaudeAdapter()), same)
+        same.stop.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Registry round-trip
@@ -687,7 +892,7 @@ class RegistryRoundTripTests(PairOptionsCase):
         R.registry_path().write_text(json.dumps({"version": R.REGISTRY_VERSION, "pairs": {"p": {
             "name": "p", "session_id": "s", "model": "opus", "backend": "claude",
             "disallowed_tools": ["Artifact"], "context_alert_at": 350_000,
-            "backend_options": {"settings": {"a": 1}, "args": ["--max-turns", "4"]},
+            "backend_options": {"settings": {"a": 1}, "args": ["--max-budget-usd", "4"]},
             "future_field": {"from": "a newer process"},
         }}}), encoding="utf-8")
         spec = R.get_pair("p")
@@ -697,7 +902,7 @@ class RegistryRoundTripTests(PairOptionsCase):
         raw = self.raw()["p"]
         self.assertEqual(raw["disallowed_tools"], ["Artifact"])
         self.assertEqual(raw["context_alert_at"], 350_000)
-        self.assertEqual(raw["backend_options"], {"settings": {"a": 1}, "args": ["--max-turns", "4"]})
+        self.assertEqual(raw["backend_options"], {"settings": {"a": 1}, "args": ["--max-budget-usd", "4"]})
         self.assertEqual(raw["future_field"], {"from": "a newer process"})
 
     def test_unset_fields_never_reach_the_file(self):

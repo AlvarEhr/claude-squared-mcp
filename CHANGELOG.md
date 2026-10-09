@@ -29,18 +29,36 @@ process that spawns such a pair runs it without the new flags.
   Codex pairs refuse it.
 - **`backend_options` for Claude pairs:** `settings` (a settings JSON object)
   is merged with the `ultracode` key into ONE `--settings` flag; `args` (a
-  list of raw CLI tokens, starting with a flag) is appended verbatim. Both are
-  re-applied at every spawn. Flags the pair manages itself (`--settings`,
-  `--model`, `--permission-mode`, `--disallowed-tools`, `--output-format`,
-  `--resume`, …) are refused in `args` with a pointer to the field to use;
-  `settings` may not carry `ultracode` (use the parameter); `settings` is
-  refused on Codex (Codex uses `config`). A malformed stored value refuses the
-  spawn rather than silently dropping, e.g., a permission rule.
+  list of raw CLI tokens, starting with a flag) ends every spawn's command
+  line, so a flag missing its value can't consume one of the pair's own. Both
+  are re-applied at every spawn. Anything that would loosen the pair outside
+  `permission_mode` / `allowed_tools` / `extra_dirs` / `mcp_whitelist` is
+  refused — in `settings`: `permissions.allow` / `defaultMode` /
+  `additionalDirectories`, `hooks`, `disableAllHooks`, `enabledPlugins`,
+  `enableAllProjectMcpServers`, `enabledMcpjsonServers`, `agent`, `sandbox`;
+  in `args`: `--setting-sources`, `--restricted`, `--safe-mode`, `--bare`,
+  `--permission-prompt-tool` / `--permission-prompts`, `--plugin-dir` /
+  `--plugin-url`, `--agent` / `--agents`. So are flags that would lose, move
+  or never start the session (`--no-session-persistence`, `--worktree`,
+  `--bg`, `--cloud`, `--version`, `--help`, `--`, `-` …, combined short flags
+  included) and flags the pair sets itself (`--settings`, `--model`,
+  `--permission-mode`, `--disallowed-tools`, `--output-format`, `--resume`,
+  …, with a pointer to the field to use). `settings` may not carry
+  `ultracode` (use the parameter); `settings` is refused on Codex (Codex uses
+  `config`). A malformed stored value refuses the spawn rather than silently
+  dropping, e.g., a deny rule. Keep secrets out of both — they travel on the
+  claude command line and sit in `registry.json`; `pair_info` /
+  `pair_update` results mask `settings.env` values and secret-looking keys
+  (`apiKeyHelper`, …).
 - **Per-pair context alert: `context_alert_at`** (tokens) on `pair_create` /
   `pair_update` (`0` clears it). The alert fires at this or the global level
   (`context_alert_headroom`), whichever comes first — so a smaller window
-  still alerts before auto-compaction. It drives `wait.py`'s exit 8 (a running
-  watcher picks up a change at its next poll), the send result's context
+  still alerts before auto-compaction; when a global headroom larger than the
+  window leaves no global level, it is capped at the compaction point
+  instead. It drives `wait.py`'s exit 8 (a running watcher re-reads it every
+  poll — one registry read per poll, keeping the last good value when a read
+  fails — and exits at once if a lowered level is already behind the
+  context), the send result's context
   warning (replacing the 60%/85% bands for that pair only; other pairs are
   unchanged) and `pair_status`. No respawn. Example: `context_alert_at=350000`
   on a 1M-window pair.
@@ -53,15 +71,32 @@ process that spawns such a pair runs it without the new flags.
 - **`backend_options` keys a Claude pair doesn't read are refused** at
   `pair_create` / `pair_update` (they used to be stored and ignored). Keys
   stored by an earlier version are still ignored at spawn.
-- A warm runtime owned by another MCP process now also respawns at its next
-  send when `ultracode`, `backend_options` or `disallowed_tools` changed (it
-  already did for model, effort, window, cwd, connectors and permission level).
+- A warm runtime owned by another MCP process now respawns at its next send
+  when ANY spawn field changed — `ultracode`, `backend_options`,
+  `disallowed_tools`, `fallback_model`, `extra_dirs`, `allowed_tools`,
+  `system_prompt_append`, `profile_name` as well as the model, effort, window,
+  cwd, connectors and permission level it already compared. `pair_update` and
+  the runtime now read one shared list of these fields; they had drifted.
 - `profile_name` and `system_prompt_append` combine: profile text first, then
   the append. This already worked; the docs now say so, and `pair_create`
   notes a `profile_name` with no file (the pair starts without that text).
 - `pair_handoff` lists `disallowed_tools` and Claude `backend_options` as
   omitted (no Codex equivalent) and carries `context_alert_at` over.
 - `pair_info` shows `disallowed_tools` and the pair's context alert.
+
+### Known unknowns
+
+- Whether a `--permission-mode` flag overrides `permissions.defaultMode` from
+  `--settings` is unverified; `defaultMode` is refused in `settings` so the
+  question can't arise.
+- Whether Ultracode (`--settings {"ultracode": true}`, "xhigh effort plus
+  workflows") forces xhigh over a per-send `override_effort` on the one-shot
+  path is unverified. Before 0.17.0 that path didn't pass the setting at all.
+- Verified (live probe, Haiku): a bare built-in tool name in
+  `--disallowed-tools` removes the tool's schema — input tokens fell from
+  35.3k to 31.6k with `Artifact,Workflow,ScheduleWakeup` removed. That a
+  resumed session picks up a CHANGED list was verified for the connector
+  flags (0.15.0) and is inferred for this one.
 
 ## [0.16.2] — 2026-09-27
 

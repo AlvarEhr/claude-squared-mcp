@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -40,6 +41,7 @@ from claude_squared.models import (
     DEFAULT_EFFORT,
     HEADLESS_INCOMPATIBLE_TOOLS,
     PERMISSION_LEVELS,
+    SPAWN_PINNED_FIELDS,
     ActionInfo,
     AsyncTaskState,
     CompactResult,
@@ -438,9 +440,40 @@ def _fmt_compact_result(r: CompactResult) -> str:
     return f"{header}\n{body}"
 
 
+_SECRET_SETTING = re.compile(r"helper|key|token|secret|password|credential|auth", re.IGNORECASE)
+
+
+def _redact_backend_options(bo: Any) -> Any:
+    """``backend_options`` for display (v0.17.0): ``settings.env`` values and
+    secret-looking settings keys (``apiKeyHelper``, ``awsAuthRefresh``, …)
+    masked. Display only — the registry keeps them as given and they travel
+    on the claude command line, visible in any process listing, which is why
+    the docs say to keep secrets out of ``settings``."""
+    if not isinstance(bo, dict) or "settings" not in bo:
+        return bo
+    settings = bo["settings"]
+    if isinstance(settings, str):
+        try:
+            settings = json.loads(settings)
+        except ValueError:
+            return {**bo, "settings": "***"}
+    if not isinstance(settings, dict):
+        return bo
+    shown = {k: ("***" if _SECRET_SETTING.search(k) else v) for k, v in settings.items()}
+    if isinstance(shown.get("env"), dict):
+        shown["env"] = {k: "***" for k in shown["env"]}
+    return {**bo, "settings": shown}
+
+
+def _redacted(model_obj):
+    if getattr(model_obj, "backend_options", None):
+        return model_obj.model_copy(update={"backend_options": _redact_backend_options(model_obj.backend_options)})
+    return model_obj
+
+
 def _verbose_dump(model_obj) -> str:
     """JSON-stringified Pydantic model for verbose=True paths."""
-    return model_obj.model_dump_json(indent=2, exclude_none=True)
+    return _redacted(model_obj).model_dump_json(indent=2, exclude_none=True)
 
 
 def _verbose_dump_with_msgs(model_obj, transparency_msgs: list[str]) -> str:
@@ -451,7 +484,7 @@ def _verbose_dump_with_msgs(model_obj, transparency_msgs: list[str]) -> str:
     used by pair_settings_set.
     """
     payload = {
-        "spec": model_obj.model_dump(exclude_none=True),
+        "spec": _redacted(model_obj).model_dump(exclude_none=True),
         "transparency_msgs": transparency_msgs,
     }
     return json.dumps(payload, indent=2, default=str)
@@ -840,8 +873,12 @@ def pair_create(
             translation (sandbox: read-only|workspace-write|danger-full-access;
             approval: none|approve-for-me|bypass). Claude keys: ``settings`` {settings
             JSON}, merged with ``ultracode`` into the one ``--settings`` flag; ``args``
-            [raw CLI args] (flags the pair manages itself are refused). Both re-applied
-            at every spawn.
+            [raw CLI args], appended at the end of every spawn. Both re-applied at every
+            spawn. Anything that would loosen the pair outside permission_mode /
+            allowed_tools / extra_dirs / mcp_whitelist is refused (``permissions.allow``
+            / ``defaultMode``, ``hooks``, ``--setting-sources``, ``--plugin-dir`` …), as
+            are flags the pair sets itself. No secrets: both travel on the claude
+            command line.
         disallowed_tools: Claude tools to remove (``--disallowed-tools``, re-applied at
             every spawn; ``pair_update`` changes it without a clear). A bare name
             (``"Artifact"``) removes the tool's schema from the pair's context; a rule
@@ -1617,7 +1654,7 @@ def _apply_context_alert(spec: PairSpec, result: SendResult) -> None:
         limit = (activity_mod.reported_window(spec.name) or {}).get("auto_compact_token_limit")
     level = activity_mod.context_alert_threshold(ctx.tokens_max, headroom, spec.backend, limit,
                                                  spec.context_alert_at)
-    if level is None:
+    if level is None or level <= 0:
         return
     if ctx.tokens_used < level:
         ctx.warning = None
@@ -3099,7 +3136,8 @@ def pair_info(name: str, verbose: bool = False) -> str:
         native = f" ({permission_native(spec.permission_mode, spec.backend)})"
     except Exception:
         pass
-    bo = f"\n  backend_options: {json.dumps(spec.backend_options)}" if spec.backend_options else ""
+    bo = (f"\n  backend_options: {json.dumps(_redact_backend_options(spec.backend_options))}"
+          if spec.backend_options else "")
     if spec.disallowed_tools:
         bo += f"\n  disallowed_tools: {', '.join(spec.disallowed_tools)}"
     if spec.context_alert_at:
@@ -3534,7 +3572,9 @@ def pair_update(
                 update_msgs.append(pinned_warning)
             if verbose:
                 return _verbose_dump_with_msgs(spec, update_msgs)
-            msg = f"Updated '{name}': " + ", ".join(f"{k}={v!r}" for k, v in fields.items())
+            msg = f"Updated '{name}': " + ", ".join(
+                f"{k}={_redact_backend_options(v) if k == 'backend_options' else v!r}"
+                for k, v in fields.items())
             for tmsg in transparency_msgs:
                 msg += f"\n  {tmsg}"
             if cwd_move_msg:
@@ -3547,9 +3587,7 @@ def pair_update(
 
 
 # Fields pinned at runtime spawn: changing one evicts the warm runtime.
-_SPAWN_PINNED_FIELDS = ("model", "effort", "permission_mode", "context_window", "backend_options",
-                        "cwd", "extra_dirs", "allowed_tools", "mcp_whitelist", "ultracode",
-                        "fallback_model", "disallowed_tools")
+_SPAWN_PINNED_FIELDS = SPAWN_PINNED_FIELDS
 
 
 def _move_session_jsonl_for_cwd_change(old_spec: PairSpec, new_cwd: str) -> str:

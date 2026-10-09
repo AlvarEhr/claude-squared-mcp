@@ -39,7 +39,7 @@ from claude_squared.cli_paths import encode_cwd_for_project as _encode_cwd_for_p
 from claude_squared.errors import CLIError, CommandTimeout, TaskStopped
 from claude_squared import activity as _activity
 from claude_squared import async_tasks as _async_tasks
-from claude_squared.models import AsyncTaskState, PairSpec
+from claude_squared.models import SPAWN_PINNED_FIELDS, AsyncTaskState, PairSpec
 from claude_squared.registry import claude_home, logs_dir
 from claude_squared.registry import get_pair as _reg_get_pair, update_pair as _reg_update_pair
 
@@ -728,6 +728,8 @@ class PairRuntime:
             "--input-format", "stream-json",
             "--output-format", "stream-json",
         ]
+        # v0.17.0: the pair's raw backend_options.args end the argv.
+        args += self.adapter._extra_args(self.spec)  # noqa: SLF001
         # Spawn in a NEW process group/session so we can send Ctrl+C / SIGINT
         # for the soft-stop path without affecting our own MCP process. Without
         # this flag, GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) would target the
@@ -2095,19 +2097,13 @@ class RuntimeRegistry:
         with self._lock:
             rt = self._runtimes.get(spec.name)
             if rt is not None and rt.is_alive():
-                if (rt.spec.session_id != spec.session_id
-                        or rt.spec.model != spec.model
-                        or rt.spec.context_window != spec.context_window
-                        or rt.spec.effort != spec.effort
-                        or rt.spec.cwd != spec.cwd
-                        or rt.spec.mcp_whitelist != spec.mcp_whitelist
-                        or rt.spec.permission_mode != spec.permission_mode
-                        # v0.17.0: re-applied at every spawn like the connector
-                        # flags. pair_update evicts only its own process's
-                        # runtime; another process's warm one notices here.
-                        or rt.spec.disallowed_tools != spec.disallowed_tools
-                        or rt.spec.backend_options != spec.backend_options
-                        or rt.spec.ultracode != spec.ultracode):
+                # pair_update evicts only its own process's runtime; a warm one
+                # in another process notices a changed spawn field here. Both
+                # specs come from the registry, so an unchanged value compares
+                # equal (a shape mismatch would respawn — and kill background
+                # work — on every send).
+                if any(getattr(rt.spec, f, None) != getattr(spec, f, None)
+                       for f in ("session_id",) + SPAWN_PINNED_FIELDS):
                     old = self._runtimes.pop(spec.name)
                     rt = None
             if rt is None or not rt.is_alive():

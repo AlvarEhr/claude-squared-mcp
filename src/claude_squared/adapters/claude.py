@@ -53,12 +53,12 @@ _MODEL_UNAVAILABLE_HELP = (
 # _encode_cwd_for_project: kept as a local alias for backward compat within this
 # module (multiple call sites). Source of truth: cli_paths.encode_cwd_for_project.
 
-# v0.17.0: flags a raw ``backend_options.args`` entry may not carry — the pair
-# sets them from its own fields (a second ``--settings`` would replace the
-# merged JSON, not add to it), or every spawn path sets them itself and a
-# duplicate would break the stream protocol the runtime reads. Value = the
-# field to use instead (None: not configurable).
-_MANAGED_FLAGS: dict[str, str | None] = {
+# v0.17.0: flags a raw ``backend_options.args`` entry may not carry. Principle:
+# anything that loosens a pair must stay visible in its permission_mode /
+# allowed_tools / extra_dirs / mcp_whitelist, and nothing may break the spawn.
+# (1) Flags the pair sets from its own fields — a second ``--settings`` would
+# replace the merged JSON, not add to it. Value = the field to use instead.
+_MANAGED_FLAGS: dict[str, str] = {
     "--settings": "backend_options.settings",
     "--disallowed-tools": "disallowed_tools", "--disallowedTools": "disallowed_tools",
     "--allowed-tools": "allowed_tools", "--allowedTools": "allowed_tools",
@@ -67,13 +67,81 @@ _MANAGED_FLAGS: dict[str, str | None] = {
     "--dangerously-skip-permissions": "permission_mode",
     "--allow-dangerously-skip-permissions": "permission_mode",
     "--append-system-prompt": "system_prompt_append / profile_name",
+    "--append-system-prompt-file": "system_prompt_append / profile_name",
     "--mcp-config": "mcp_whitelist", "--strict-mcp-config": "mcp_whitelist",
     "--add-dir": "extra_dirs",
-    "--print": None, "-p": None, "--resume": None, "-r": None, "--continue": None, "-c": None,
-    "--session-id": None, "--fork-session": None,
-    "--input-format": None, "--output-format": None,
+}
+# (2) Flags refused outright. Value = why. Flag list read from ``claude
+# --help`` on CLI 2.1.295 (2026-10-09); ``--permission-prompt-tool`` is
+# hidden from it but still referenced by ``--permission-prompts``.
+_PROTOCOL = "every spawn path sets the stream protocol the runtime reads itself"
+_OTHER_SESSION = "it starts or attaches a different kind of session than the pair's own"
+_REFUSED_FLAGS: dict[str, str] = {
+    "--print": _PROTOCOL, "-p": _PROTOCOL, "--resume": _PROTOCOL, "-r": _PROTOCOL,
+    "--continue": _PROTOCOL, "-c": _PROTOCOL, "--session-id": _PROTOCOL,
+    "--fork-session": _PROTOCOL, "--input-format": _PROTOCOL, "--output-format": _PROTOCOL,
+    "--replay-user-messages": _PROTOCOL, "--include-partial-messages": _PROTOCOL,
+    "--forward-subagent-text": _PROTOCOL, "--include-hook-events": _PROTOCOL,
+    "--setting-sources": "it would stop loading your settings files, and with them their deny "
+                         "rules and hooks",
+    "--restricted": "it ignores your settings files, and with them their deny rules and hooks",
+    "--safe-mode": "it switches off hooks, CLAUDE.md and other customizations",
+    "--bare": "it skips keychain auth (a subscription login can't start) and your hooks",
+    "--permission-prompt-tool": "approvals are the pair's permission_mode (stdio hangs a headless "
+                                "pair; an MCP tool would take approvals over)",
+    "--permission-prompts": "approvals are the pair's permission_mode",
+    "--plugin-dir": "plugins bring MCP servers, hooks and agents past the mcp_whitelist opt-in",
+    "--plugin-url": "plugins bring MCP servers, hooks and agents past the mcp_whitelist opt-in",
+    "--agent": "an agent definition can carry its own permissionMode and tools",
+    "--agents": "an agent definition can carry its own permissionMode and tools",
+    "--no-session-persistence": "the session would not be saved, so the next respawn would lose "
+                                "the conversation",
+    "--worktree": "the session would move to a new worktree, where the pair can't find its "
+                  "transcript", "-w": "the session would move to a new worktree, where the pair "
+                                      "can't find its transcript",
+    "--tmux": "it needs --worktree",
+    "--bg": _OTHER_SESSION, "--background": _OTHER_SESSION, "--cloud": _OTHER_SESSION,
+    "--desktop": _OTHER_SESSION, "--environment": _OTHER_SESSION,
+    "--remote-control": _OTHER_SESSION, "--teleport": _OTHER_SESSION,
+    "--from-pr": _OTHER_SESSION, "--ide": _OTHER_SESSION,
+    "--version": "it prints and exits — the pair would never start", "-v": "it prints and exits",
+    "--help": "it prints and exits — the pair would never start", "-h": "it prints and exits",
+    "--": "it ends option parsing, so everything after it would become the prompt",
+    "-": "it ends option parsing, so everything after it would become the prompt",
+}
+# Settings keys refused in ``backend_options.settings`` by the same principle
+# (key names checked against the CLI 2.1.295 binary, 2026-10-09). Tightening
+# keys (permissions.deny / ask, …) and neutral ones (env, model, …) pass.
+_REFUSED_SETTINGS: dict[str, str] = {
+    "hooks": "hooks run commands and can approve tool calls — keep them in your settings files",
+    "disableAllHooks": "it switches off your hooks",
+    "enabledPlugins": "plugins bring MCP servers, hooks and agents past the mcp_whitelist opt-in",
+    "enableAllProjectMcpServers": "use mcp_whitelist",
+    "enabledMcpjsonServers": "use mcp_whitelist",
+    "agent": "an agent definition can carry its own permissionMode and tools",
+    "sandbox": "it changes how Bash is approved (sandboxed commands are auto-allowed by default)",
+}
+_REFUSED_PERMISSION_SETTINGS: dict[str, str] = {
+    "defaultMode": "use permission_mode",
+    "allow": "use allowed_tools",
+    "additionalDirectories": "use extra_dirs",
 }
 CLAUDE_BACKEND_OPTION_KEYS = ("settings", "args")
+
+
+def _refused_arg(token: str) -> str | None:
+    """Why a raw ``args`` token is refused, or None. Checks ``--flag=value``
+    and combined short flags (``-cp`` = ``-c -p``)."""
+    flag = token.split("=", 1)[0]
+    if flag in _MANAGED_FLAGS:
+        return f"set it with {_MANAGED_FLAGS[flag]} instead"
+    if flag in _REFUSED_FLAGS:
+        return _REFUSED_FLAGS[flag]
+    if len(flag) > 2 and flag[0] == "-" and flag[1] != "-":
+        for ch in flag[1:]:
+            if f"-{ch}" in _REFUSED_FLAGS:
+                return f"-{ch}: {_REFUSED_FLAGS['-' + ch]}"
+    return None
 
 
 def _claude_executable() -> str:
@@ -195,8 +263,9 @@ class ClaudeAdapter(PairAdapter):
                                  allow_unknown: bool = False) -> dict[str, Any]:
         """Check (and normalize) a Claude pair's ``backend_options``; raises
         ValueError. ``settings``: a JSON object (dict or JSON string), merged
-        with the ultracode key into the one ``--settings`` flag. ``args``: a
-        list of raw CLI tokens, none of them a managed flag (``_MANAGED_FLAGS``).
+        with the ultracode key into the one ``--settings`` flag, without the
+        keys in ``_REFUSED_SETTINGS``. ``args``: a list of raw CLI tokens,
+        none of them in ``_MANAGED_FLAGS`` / ``_REFUSED_FLAGS``.
 
         ``allow_unknown`` is the spawn-time mode: before v0.17.0 a Claude pair
         accepted any keys and ignored them, so a stored unknown key must not
@@ -221,6 +290,16 @@ class ClaudeAdapter(PairAdapter):
             if "ultracode" in settings:
                 raise ValueError("set Ultracode with the ultracode parameter, not backend_options.settings "
                                  "— both go into the same --settings JSON")
+            for key, why in _REFUSED_SETTINGS.items():
+                if key in settings:
+                    raise ValueError(f"backend_options.settings may not contain {key!r}: {why}.")
+            perms = settings.get("permissions")
+            if perms is not None and not isinstance(perms, dict):
+                raise ValueError("backend_options.settings.permissions must be a JSON object")
+            for key, why in _REFUSED_PERMISSION_SETTINGS.items():
+                if key in (perms or {}):
+                    raise ValueError(f"backend_options.settings may not contain permissions.{key}: {why}. "
+                                     f"Tightening rules (permissions.deny / ask) are fine.")
             bo["settings"] = settings
         if "args" in bo:
             raw = bo["args"]
@@ -233,17 +312,13 @@ class ClaudeAdapter(PairAdapter):
                 raise ValueError("backend_options.args must be a list of strings, one CLI token each "
                                  "(e.g. [\"--max-budget-usd\", \"5\"])")
             if raw and not raw[0].startswith("-"):
-                # It follows a variadic --disallowed-tools on some spawn paths,
-                # which would swallow a leading value as a tool name.
+                # They end every argv: a leading value would become a second
+                # prompt (or the prompt, on the stream-json paths).
                 raise ValueError(f"backend_options.args must start with a flag (got {raw[0]!r})")
             for token in raw:
-                flag = token.split("=", 1)[0]
-                if flag in _MANAGED_FLAGS:
-                    field = _MANAGED_FLAGS[flag]
-                    raise ValueError(
-                        f"backend_options.args may not contain {flag}: "
-                        + (f"set it with {field} instead." if field else
-                           "every spawn path sets it itself (the runtime's stream protocol)."))
+                why = _refused_arg(token)
+                if why:
+                    raise ValueError(f"backend_options.args may not contain {token.split('=', 1)[0]}: {why}.")
             bo["args"] = raw
         return bo
 
@@ -286,6 +361,7 @@ class ClaudeAdapter(PairAdapter):
                  "--model", self.cli_model(spec),
                  "--permission-mode", self.native_permission(spec.permission_mode),
                  "-p", prompt]
+        args += self._extra_args(spec)
 
         result_json = self._run_print(args, timeout_seconds=300, pair_name=spec.name, cwd=spec.cwd,
                                       **({"connector_spec": spec} if connectors.effective(spec.mcp_whitelist) else {}))
@@ -349,13 +425,14 @@ class ClaudeAdapter(PairAdapter):
         ]
         args += self._fallback_args(spec)
         args += self._mcp_args(spec, permission_mode)
-        args += self._option_args(spec)
+        args += self._settings_args(spec)
         if eff is not None:
             args += ["--effort", eff]
         args += [
             "--permission-mode", self.native_permission(permission_mode or spec.permission_mode),
             "-p", message,
         ]
+        args += self._extra_args(spec)
         from claude_squared.async_tasks import mark_task_executing
         mark_task_executing(task_id)
         result_json = self._run_print(args, timeout_seconds=timeout_seconds,
@@ -405,7 +482,7 @@ class ClaudeAdapter(PairAdapter):
             "-p", sentinel,
         ]
         args += self._mcp_args(spec)
-        args += self._option_args(spec)
+        args += self._option_args(spec)  # raw args last
         result_json = self._run_print(
             args, timeout_seconds=timeout_seconds, pair_name=spec.name, cwd=spec.cwd,
             **({"connector_spec": spec} if connectors.effective(spec.mcp_whitelist) else {})
@@ -517,9 +594,9 @@ class ClaudeAdapter(PairAdapter):
         if spec.allowed_tools and not connectors.effective(spec.mcp_whitelist):
             args += ["--allowed-tools", " ".join(spec.allowed_tools)]
 
-        # v0.17.0: raw extra args LAST — both callers follow with --print, so a
-        # variadic flag here can't swallow anything.
-        args += self._extra_args(spec)
+        # v0.17.0: backend_options.args are NOT here — both callers append
+        # more flags, which a raw flag missing its value would swallow
+        # (["--system-prompt"] eating --print). They end every argv instead.
         return args
 
     def _mcp_args(self, spec: PairSpec, permission_mode: str | None = None) -> list[str]:
@@ -570,13 +647,14 @@ class ClaudeAdapter(PairAdapter):
         return ["--settings", json.dumps(merged, sort_keys=True)] if merged else []
 
     def _extra_args(self, spec: PairSpec) -> list[str]:
-        """backend_options.args, verbatim."""
+        """backend_options.args, verbatim. Every spawn path puts them LAST, so
+        a raw flag missing its value can't consume one of the pair's own."""
         return list(self._claude_options(spec).get("args") or [])
 
     def _option_args(self, spec: PairSpec) -> list[str]:
-        """Settings + raw args for the resume paths that don't go through
-        ``_common_create_args`` (override send, fork, stream-json one-shots).
-        v0.17.0: ultracode used to reach only create and the runtime."""
+        """Settings + raw args, for the fork and stream-json paths whose argv
+        ends with the tool scope. v0.17.0: ultracode used to reach only
+        create and the runtime."""
         return self._settings_args(spec) + self._extra_args(spec)
 
     def _resolve_system_prompt(self, spec: PairSpec) -> str | None:
@@ -594,8 +672,9 @@ class ClaudeAdapter(PairAdapter):
         cli = _claude_executable()
         if connector_spec is not None and connectors.effective(connector_spec.mcp_whitelist):
             args = list(args)
-            args[args.index("--output-format") + 1] = "stream-json"
-            args.append("--verbose")
+            i = args.index("--output-format")
+            args[i + 1] = "stream-json"
+            args.insert(i + 2, "--verbose")  # not appended: raw args stay last
         full = [cli] + args
         try:
             proc = subprocess.run(
@@ -665,7 +744,7 @@ class ClaudeAdapter(PairAdapter):
                 "--input-format", "stream-json",
                 "--output-format", "stream-json"]
         args += self._mcp_args(spec)
-        args += self._option_args(spec)
+        args += self._option_args(spec)  # raw args last
 
         stdin_payload = "\n".join(
             json.dumps({"type": "user", "message": {"role": "user", "content": m}})

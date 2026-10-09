@@ -41,6 +41,17 @@ EffortLevel = str
 # to strip there.
 HEADLESS_INCOMPATIBLE_TOOLS = ("AskUserQuestion",)
 
+# Every PairSpec field a Claude runtime is spawned with: a change respawns it.
+# ONE list for both places that decide that — pair_update (evict in its own
+# process) and RuntimeRegistry.get_or_start (a warm runtime in another
+# process notices at its next send). v0.17.0: they had drifted apart.
+# system_prompt_append / profile_name: no tool changes them, and the CLI
+# snapshots the system prompt per conversation anyway, but a hand edit
+# should still reach the next spawn.
+SPAWN_PINNED_FIELDS = ("model", "effort", "permission_mode", "context_window", "backend_options",
+                       "cwd", "extra_dirs", "allowed_tools", "mcp_whitelist", "ultracode",
+                       "fallback_model", "disallowed_tools", "system_prompt_append", "profile_name")
+
 
 # ============================================================================
 # Permission levels — one vocabulary, translated per backend
