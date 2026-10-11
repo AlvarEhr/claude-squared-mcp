@@ -253,7 +253,16 @@ def _refused_arg(token: str) -> str | None:
 # an answer, on the plan); dropping only that variable made the key win
 # ("Invalid API key"). ANTHROPIC_AUTH_TOKEN outranks the key (docs).
 API_KEY_FILE = "api_key"
-API_KEY_PREFIX = "sk-ant-api"
+# Any Console API key: personal (sk-ant-usr…), service-account, legacy
+# workspace (sk-ant-api…). Verified 2026-10-11 by the manager: a personal key
+# in ANTHROPIC_API_KEY answered a direct `claude -p` Haiku turn, covered by
+# the credits. The known NON-API kinds are refused by prefix.
+API_KEY_PREFIX = "sk-ant-"
+_NON_API_KEYS = (
+    ("sk-ant-oat", "an OAuth access token (from a claude.ai login or setup-token)"),
+    ("sk-ant-ort", "an OAuth refresh token"),
+    ("sk-ant-admin", "an Admin API key (it manages the org; it can't run requests)"),
+)
 OFFICIAL_BASE_URL = "https://api.anthropic.com"
 _API_DROP_ENV = ("CLAUDE_CODE_ENTRYPOINT", "ANTHROPIC_AUTH_TOKEN")
 _CLOUD_PROVIDER_ENV = ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
@@ -268,6 +277,10 @@ _CREDIT_RE = re.compile(r"credit balance (is )?too low", re.IGNORECASE)
 # org that was switched off. Same gating as _CREDIT_RE.
 _INVALID_KEY_RE = re.compile(r"invalid api key|api key authentication is disabled"
                              r"|organization has been disabled", re.IGNORECASE)
+# Docs: a personal or service-account key not scoped to one workspace gets a
+# 400 invalid_request_error "anthropic-workspace-id is required when
+# authenticating with an identity-linked API key…". Same gating.
+_WORKSPACE_REQUIRED_RE = re.compile(r"anthropic-workspace-id is required", re.IGNORECASE)
 
 
 def api_key_path() -> Path:
@@ -283,7 +296,7 @@ def read_api_key() -> str:
         key = path.read_text(encoding="utf-8-sig").strip()
     except FileNotFoundError:
         raise BillingError(
-            f"the API key file {path} does not exist. Write the key of the Console org "
+            f"the API key file {path} does not exist. Write an API key of the Console org "
             f"linked to your plan there (one line, starting with {API_KEY_PREFIX}), or move "
             f"the pair back to the plan with pair_update(name, billing=\"plan\").") from None
     except (OSError, UnicodeError) as e:
@@ -292,6 +305,11 @@ def read_api_key() -> str:
     if not key.startswith(API_KEY_PREFIX) or any(ch.isspace() for ch in key):
         raise BillingError(f"the API key file {path} must hold exactly one API key (a single line "
                            f"starting with {API_KEY_PREFIX}).")
+    for prefix, kind in _NON_API_KEYS:
+        if key.startswith(prefix):
+            raise BillingError(f"the API key file {path} holds {kind}, not an API key. Create a "
+                               f"personal or service-account API key in the Console of the org "
+                               f"linked to your plan.")
     return key
 
 
@@ -392,6 +410,13 @@ def key_file_deny_rule() -> str:
     return f"Read(/{posix})"
 
 
+def _workspace_help(name: str) -> str:
+    return (f"the API wants a workspace for this key: a personal or service-account key must be "
+            f"created scoped to a single workspace (Console → API keys). Replace the key in "
+            f"{api_key_path()}, or move '{name}' back to the plan with pair_update('{name}', "
+            f"billing=\"plan\").")
+
+
 def _key_rejected_help(name: str) -> str:
     return (f"the API rejected the key in {api_key_path()} (or its org is switched off). Fix the "
             f"key file (the next spawn reads "
@@ -407,9 +432,32 @@ def _billing_failure(spec: "PairSpec | None", text: str) -> str | None:
         return None
     if _CREDIT_RE.search(text):
         return _credit_help(spec.name)
+    if _WORKSPACE_REQUIRED_RE.search(text):
+        return _workspace_help(spec.name)
     if _INVALID_KEY_RE.search(text):
         return _key_rejected_help(spec.name)
     return None
+
+
+def _failure_text(stdout: str, stderr: str) -> str:
+    """What a failed process said about itself: the LAST result event's text
+    (``--output-format json`` or stream-json), else stderr. Never the rest of
+    stdout — tool results there may quote anything (review: an
+    error_max_turns run that had quoted the key error read as a rejected key)."""
+    try:
+        whole = json.loads(stdout)
+    except ValueError:
+        whole = None
+    if isinstance(whole, dict) and whole.get("type") == "result":
+        return str(whole.get("result") or "")
+    for line in reversed(stdout.splitlines()):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            return str(event.get("result") or "")
+    return stderr
 
 
 def _credit_help(name: str) -> str:
@@ -986,7 +1034,7 @@ class ClaudeAdapter(PairAdapter):
             # api_error_status 404), with stderr EMPTY (verified the day Fable 5
             # was pulled). So check BOTH streams for the marker, not just stderr.
             combined = (stderr_txt + "\n" + stdout_txt).lower()
-            failure = _billing_failure(env_spec, combined)
+            failure = _billing_failure(env_spec, _failure_text(stdout_txt, stderr_txt))
             if failure:
                 raise CLIError(failure, stderr=stderr_txt or stdout_txt[:2000], exit_code=proc.returncode)
             if MODEL_UNAVAILABLE_MARKER in combined:
@@ -1062,7 +1110,7 @@ class ClaudeAdapter(PairAdapter):
             # v0.18.0: compaction / /context / pair_invoke on an API pair whose
             # credits ran out or whose key was rejected say so, as _run_print does.
             failure = _billing_failure(
-                spec, stderr_txt + "\n" + proc.stdout.decode("utf-8", errors="replace"))
+                spec, _failure_text(proc.stdout.decode("utf-8", errors="replace"), stderr_txt))
             raise CLIError(failure or "claude CLI (stream-json) exited non-zero",
                            stderr=stderr_txt, exit_code=proc.returncode)
 
@@ -1231,6 +1279,11 @@ class ClaudeAdapter(PairAdapter):
                              f"{(result_json.get('result') or '').strip()[:160]!r}")
             safety_kind = "credit_exhausted"
         elif (spec.billing == "api" and (result_json.get("is_error") or api_err)
+              and _WORKSPACE_REQUIRED_RE.search(result_json.get("result") or "")):
+            safety_signal = (f"{_workspace_help(spec.name)} The API said: "
+                             f"{(result_json.get('result') or '').strip()[:160]!r}")
+            safety_kind = "api_key_rejected"
+        elif (spec.billing == "api" and (result_json.get("is_error") or api_err)
               and _INVALID_KEY_RE.search(result_json.get("result") or "")):
             # Otherwise it reads as a transient API error ("retry usually
             # resolves it") — a bad key never does.
@@ -1274,6 +1327,12 @@ class ClaudeAdapter(PairAdapter):
             safety_kind = "error"
         # Keep the raw stop_reason for transparency when it's not a normal finish.
         stop_reason_kept = stop_reason if stop_reason not in (None, "end_turn") else None
+        try:
+            api_calls = int(result_json.get("num_turns") or 0)
+        except (TypeError, ValueError):
+            api_calls = 0
+        refused_outright = (safety_kind in ("credit_exhausted", "api_key_rejected")
+                            and api_calls <= 1)
 
         return SendResult(
             name=spec.name,
@@ -1283,8 +1342,9 @@ class ClaudeAdapter(PairAdapter):
             # v0.18.0: a warm runtime's total_cost_usd is a running total for
             # the process; its reader puts this turn's share in _turn_cost_usd.
             # A one-shot process reports its own (single-turn) total.
-            # A request the API refused (no credits, rejected key) costs nothing.
-            cost_usd=(0.0 if safety_kind in ("credit_exhausted", "api_key_rejected")
+            # A turn the API refused outright (no credits, rejected key) costs
+            # nothing; one that ran out partway keeps what it spent before.
+            cost_usd=(0.0 if refused_outright
                       else result_json["_turn_cost_usd"] if result_json.get("_turn_cost_usd") is not None
                       else result_json.get("total_cost_usd", 0.0)),
             duration_ms=result_json.get("duration_ms", 0),

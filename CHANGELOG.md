@@ -19,7 +19,9 @@ that forks one copies `billing: api` into the fork.
 - **API-key billing per Claude pair: `pair_billing(name, billing, force?)`.**
   Max and Team plans now include monthly API credits for one linked Console
   org, covering `claude -p` runs made with that org's API key. `"api"` runs
-  the pair on the key in `~/.claude/pairs/api_key` (read at every spawn; never
+  the pair on the key in `~/.claude/pairs/api_key` (any Console API key —
+  personal `sk-ant-usr…`, service-account or legacy workspace `sk-ant-api…`;
+  OAuth tokens and Admin keys are refused; read at every spawn; never
   stored in the registry, a command line, a log or a tool result; `pair_info`
   shows its last four characters; a rotated key respawns the pair at its
   next send once no background work is pending); `"plan"`
@@ -56,16 +58,20 @@ that forks one copies `billing: api` into the fork.
   the pair's API total, new `api_cost_usd`); `pair_info` shows billing and
   cost for Claude pairs, `pair_list` flags API-billed pairs. Compaction and
   `pair_invoke` spend is booked too, and so is a result that arrives with no
-  turn open; a request the API refused (no credits, rejected key) counts $0.
+  turn open; a request the API refused outright (no credits, rejected key)
+  counts $0, a turn that ran out partway keeps what it spent before.
 - **Credit and key errors.** On an API-billed pair, a "credit balance (is)
   too low" error is rendered like a usage limit (`⏸ API CREDITS EXHAUSTED`:
   the reply is not an answer; move the pair back to the plan or wait for next
   month's credits), and a rejected key — or a key or org that was switched off
-  — as `⛔ API KEY REJECTED` instead of "a transient API error, retry". Only
+  — as `⛔ API KEY REJECTED` instead of "a transient API error, retry"; a
+  personal or service-account key not scoped to one workspace ("anthropic-
+  workspace-id is required…") gets the same banner with that fix. Only
   error results (is_error / api_error_status) count, never an answer quoting
-  the text; self-woken turns, compaction, `/context` and `pair_invoke`
-  included.
-- `tests/test_billing.py` (offline, 49 tests) and
+  the text — and for a failed process only its last result event, never
+  quoted tool output; self-woken turns, compaction, `/context` and
+  `pair_invoke` included.
+- `tests/test_billing.py` (offline, 54 tests) and
   `tests/smoke_live_billing.py` (fake key by default; `--real` for the key
   file).
 

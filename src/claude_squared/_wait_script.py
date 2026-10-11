@@ -56,8 +56,9 @@ Exit codes:
     1  failed (work error — message on stderr)
     2  not found or ambiguous
     3  timeout (the watcher gave up; the pair is still working — re-arm)
-    4  orphaned (owner MCP server died mid-turn — supervision event, NOT a work
-       error; the work may well have completed — check pair_poll / git)
+    4  owner MCP server died — supervision event, NOT a work error. Mid-turn
+       ("orphaned"): the work may well have completed — check pair_poll / git.
+       Still queued ("not delivered"): it never ran — re-send it.
     5  stopped (pair_stop; the runtime is still alive)
     6  crashed (the pair's claude process died mid-turn; pair_send resumes)
     7  finished detached (Codex: the owner died, the turn finished on its own —

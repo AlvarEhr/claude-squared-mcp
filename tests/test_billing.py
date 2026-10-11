@@ -153,6 +153,22 @@ class KeyFileTests(BillingCase):
                 self.assertNotIn(FAKE_KEY[-12:], text)
                 self.assertIn("key file unusable", CL.api_key_status())
 
+    def test_any_console_api_key_passes_and_non_api_kinds_are_refused(self):
+        # A personal key (sk-ant-usr…) answered and was covered (manager,
+        # 2026-10-11); service-account and legacy workspace keys work too.
+        for key in ("sk-ant-usr01-" + "a" * 40, "sk-ant-api03-" + "b" * 40, "sk-ant-svc01-" + "c" * 40):
+            with self.subTest(key=key[:12]):
+                self.write_key(key)
+                self.assertEqual(CL.read_api_key(), key)
+        for key, kind in (("sk-ant-oat01-" + "d" * 40, "OAuth access token"),
+                          ("sk-ant-ort01-" + "e" * 40, "OAuth refresh token"),
+                          ("sk-ant-admin01-" + "f" * 40, "Admin API key")):
+            with self.subTest(key=key[:12]):
+                self.write_key(key)
+                with self.assertRaisesRegex(BillingError, kind) as caught:
+                    CL.read_api_key()
+                self.assertNotIn(key[-12:], str(caught.exception))
+
     def test_status_shows_only_the_last_four_characters(self):
         self.write_key()
         self.assertEqual(CL.api_key_status(), "key …WXYZ")
@@ -507,6 +523,20 @@ class CostTests(BillingCase):
         rt._after_result(ev)
         self.assertEqual(ev["_turn_cost_usd"], 0.0015)
 
+    def test_missing_or_zero_totals_say_nothing(self):
+        # Review: 1.0, none, 0, 1.25 booked $2.25 — the missing / zero totals
+        # re-booked the running total. Only a positive lower total restarts.
+        rt = PairRuntime(self.add(), CL.ClaudeAdapter())
+        shares = []
+        for total in (1.0, None, 0, 1.25):
+            ev = {"type": "result", "subtype": "success"}
+            if total is not None:
+                ev["total_cost_usd"] = total
+            rt._after_result(ev)
+            shares.append(ev["_turn_cost_usd"])
+        self.assertEqual(shares, [1.0, 0.0, 0.0, 0.25])
+        self.assertEqual(R.get_pair("p").total_cost_usd, 1.25)  # no turn was open: all booked as is
+
     def test_a_result_with_no_turn_open_still_books_its_cost(self):
         self.add(billing="api")
         rt = PairRuntime(R.get_pair("p"), CL.ClaudeAdapter())
@@ -628,9 +658,46 @@ class CreditTests(BillingCase):
     def test_failed_requests_cost_nothing(self):
         api = self.add(billing="api")
         for result in ({"result": "Invalid API key · Fix external API key", "api_error_status": 401},
-                       {"result": "Credit balance too low", "is_error": True}):
+                       {"result": "Credit balance too low", "is_error": True, "num_turns": 1}):
             self.assertEqual(self.build(api, total_cost_usd=0.0024, _turn_cost_usd=0.0024,
                                         **result).cost_usd, 0.0)
+
+    def test_a_turn_that_runs_out_partway_keeps_its_cost(self):
+        r = self.build(self.add(billing="api"), result="Credit balance too low", is_error=True,
+                       num_turns=4, total_cost_usd=0.3, _turn_cost_usd=0.3)
+        self.assertEqual((r.safety_kind, r.cost_usd), ("credit_exhausted", 0.3))
+
+    def test_an_unscoped_identity_key_names_the_fix(self):
+        text = ("anthropic-workspace-id is required when authenticating with an identity-linked "
+                "API key that is not scoped to a single workspace")
+        r = self.build(self.add(billing="api"), result=text, is_error=True, api_error_status=400)
+        self.assertEqual(r.safety_kind, "api_key_rejected")
+        self.assertIn("scoped to a single workspace", S._fmt_send_result(r))
+        self.assertIsNone(self.build(self.add("plain_api", billing="api"), result=text).safety_kind)
+
+    def test_only_the_last_result_of_a_failed_process_is_matched(self):
+        # Review: an error_max_turns failure whose tool output had quoted the
+        # key error came back as "the API rejected the key".
+        self.write_key()
+        spec = self.add(billing="api")
+        events = [{"type": "user", "message": {"content": [{"type": "tool_result",
+                                                            "content": "Invalid API key · Fix external API key"}]}},
+                  {"type": "result", "subtype": "error_max_turns", "is_error": True, "result": ""}]
+        out = "\n".join(json.dumps(e) for e in events)
+        with patch.object(subprocess, "run", return_value=SimpleNamespace(
+                returncode=1, stdout=out.encode(), stderr=b"")):
+            with self.assertRaises(CLIError) as caught:
+                CL.ClaudeAdapter()._run_stream_json(spec, ["/compact"], timeout_seconds=5)
+            self.assertNotIn("rejected the key", str(caught.exception))
+            with self.assertRaises(CLIError) as caught:
+                CL.ClaudeAdapter()._run_print(["--print", "-p", "x"], timeout_seconds=5, pair_name="p",
+                                              env_spec=spec)
+            self.assertNotIn("rejected the key", str(caught.exception))
+        last = json.dumps({"type": "result", "is_error": True, "result": "Invalid API key · Fix external API key"})
+        with patch.object(subprocess, "run", return_value=SimpleNamespace(
+                returncode=1, stdout=(out + "\n" + last).encode(), stderr=b"")):
+            with self.assertRaisesRegex(CLIError, "rejected the key"):
+                CL.ClaudeAdapter()._run_stream_json(spec, ["/compact"], timeout_seconds=5)
 
     def test_stream_json_failures_map_like_one_shots(self):
         # Compaction, /context and pair_invoke on an API pair (review round 1).

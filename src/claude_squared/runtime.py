@@ -1625,14 +1625,18 @@ class PairRuntime:
         # v0.18.0: total_cost_usd counts every turn since this process started
         # (Haiku probe: 0.0078 → 0.0105 → 0.0119); usage is per turn. Every
         # result passes here once, in order, so this turn's share is the step.
+        # A missing or non-positive total says nothing (a result 1.0, none, 0,
+        # 1.25 must book 1.25, not 2.25); only a POSITIVE lower total means the
+        # counter restarted, and then all of it is this turn's.
         try:
             total = float(ev.get("total_cost_usd") or 0.0)
         except (TypeError, ValueError):
-            total = self._cost_seen
-        # A lower total means the counter restarted: the whole new total is
-        # this turn's (a clamp to 0 would drop it).
-        ev["_turn_cost_usd"] = total - self._cost_seen if total >= self._cost_seen else total
-        self._cost_seen = total
+            total = 0.0
+        if total <= 0:
+            ev["_turn_cost_usd"] = 0.0
+        else:
+            ev["_turn_cost_usd"] = total - self._cost_seen if total >= self._cost_seen else total
+            self._cost_seen = total
         with self._scope_lock:
             self._wake_at = None  # any result ends what a wake announced
             solicited = self._current_scope
