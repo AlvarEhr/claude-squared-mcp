@@ -4,6 +4,103 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] — Unreleased
+
+API-key billing for Claude pairs, honest per-turn cost, and a shutdown fix.
+
+**Restart every open Claude and Codex session after installing.** The new
+registry fields are additive and written only when used (`billing` only when
+`"api"`), so a 0.17 process that spawns an API-billed pair runs it on the
+plan — the safe direction.
+
+### Added
+
+- **API-key billing per Claude pair: `pair_billing(name, billing, force?)`.**
+  Max and Team plans now include monthly API credits for one linked Console
+  org, covering `claude -p` runs made with that org's API key. `"api"` runs
+  the pair on the key in `~/.claude/pairs/api_key` (read at every spawn; never
+  stored in the registry, a command line, a log or a tool result; `pair_info`
+  shows its last four characters; a rotated key respawns the pair at its
+  next send once no background work is pending); `"plan"`
+  moves it back. The tool's description tells agents to switch to the API
+  only when the user has asked for it in their own message. It refuses while
+  the key file is missing, warns that claude.ai connectors in `mcp_whitelist`
+  don't load on a key, and, like other spawn-pinned changes, refuses while
+  background work is pending unless `force=True`. `pair_update(billing="plan")`
+  is accepted; `pair_update(billing="api")` refuses and points at
+  `pair_billing`. `pair_create` and `pair_settings_set` have no billing
+  parameter: pairs start on the plan, and so do forks (their fork-init turn
+  too) and adopted pairs; `pair_clear` / `pair_rewind` / `pair_stop(hard)`
+  keep the pair's billing; `pair_handoff` lists it as omitted.
+- **One environment builder for every Claude spawn** (warm runtime, one-shot
+  `--print`, stream-json, triage, `claude mcp list`). On API billing it sets
+  the key and drops `CLAUDE_CODE_ENTRYPOINT` — a pair started from a desktop
+  session inherits `claude-desktop`, and with it the CLI ignores the key
+  (measured on 2.1.296) — and `ANTHROPIC_AUTH_TOKEN` (it outranks the key);
+  the official `ANTHROPIC_BASE_URL` is dropped, any other one refuses, and so
+  does a Bedrock / Vertex / Foundry switch. It sets
+  `CLAUDE_CODE_PROMPT_CACHE_TTL=1h` (an API key otherwise gets 5 min) and
+  `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` (credential-looking variables stay out
+  of the pair's Bash, hooks and stdio MCP servers). A missing or malformed key
+  file refuses the send; it never falls back to the plan.
+- **A Read deny rule for the key file on every Claude spawn**
+  (`--disallowed-tools "Read(//c/Users/…/pairs/api_key)"`, plan pairs too). A
+  scoped rule leaves the tool list, and the prompt cache, unchanged. Shell
+  commands (`cat`) are not covered.
+- **API cost in the reply footer** of an API-billed pair (the turn's cost and
+  the pair's API total, new `api_cost_usd`); `pair_info` shows billing and
+  cost for Claude pairs.
+- **Credit and key errors.** On an API-billed pair, a "credit balance" error
+  is rendered like a usage limit (`⏸ API CREDITS EXHAUSTED`: the reply is not
+  an answer; move the pair back to the plan or wait for next month's credits),
+  and a rejected key as `⛔ API KEY REJECTED` instead of "a transient API
+  error, retry". Self-woken turns included.
+- `tests/test_billing.py` (offline, 42 tests) and
+  `tests/smoke_live_billing.py` (fake key by default; `--real` for the key
+  file).
+
+### Changed
+
+- **Every Claude spawn drops an inherited `ANTHROPIC_API_KEY`** unless the
+  pair is on API billing. In `-p` a key in the environment beats the
+  claude.ai login, so a key where the MCP server starts used to bill every
+  pair silently. If you relied on that, use `pair_billing` per pair.
+- **Every Claude pair's command line gains one flag** — the key file's Read
+  deny rule. The tool list is unchanged, so no cache miss is expected.
+- **Haiku 5.x takes effort levels** (`low` … `max`, like Opus), so a Haiku
+  pair now gets the default `high` and passes `--effort`. Haiku 4.5 and
+  older still have none.
+
+### Fixed
+
+- **`total_cost_usd` double-counted on warm runtimes.** The CLI reports a
+  running total for the process (Haiku probe: 0.0078 → 0.0105 → 0.0119 over
+  three turns), and the registry added it whole after every turn. Each
+  result now gets its own step of that total (reset at every spawn); one-shot
+  processes still report their own. Stored totals from before are not
+  rewritten.
+- **A send queued at shutdown was reported as "may have completed".** When
+  the server exits during a self-woken turn, stopping the runtimes released a
+  send queued behind it; it spawned a fresh runtime inside the exiting
+  server, died before its message was written, and the next server reaped
+  it as `ORPHANED: … the work may have completed`. The exit handler now sets
+  a shutting-down flag first, every spawn refuses after it, and a send that
+  hasn't started fails as `NOT DELIVERED — the MCP server shut down before
+  this send ran; re-send it.` Both orphan sweeps say the same for a task that
+  was still queued. (Closing a turn's stdin on shutdown instead of
+  tree-killing it is a separate design, not in this release.)
+
+### Known unknowns
+
+- The exact text of the credits-exhausted error can't be provoked while
+  credits remain; the match is "credit balance" in an error or a short
+  notice on an API-billed pair (doc wording).
+- Whether a run started from a desktop session counts against the monthly
+  credits once it runs as `sdk-cli` is Anthropic's billing decision;
+  `smoke_live_billing.py --real` shows whether a turn is covered.
+- A turn on a rejected key still reports a small `total_cost_usd` (fake-key
+  probe: $0.0024); it is counted as reported.
+
 ## [0.17.0] — 2026-10-09
 
 Per-pair tool removal, raw Claude options, and a per-pair context alert.

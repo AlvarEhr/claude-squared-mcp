@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -14,7 +15,7 @@ from typing import Any
 from claude_squared.adapters.base import PairAdapter
 from claude_squared import connectors
 from claude_squared.cli_paths import encode_cwd_for_project as _encode_cwd_for_project
-from claude_squared.errors import CLIError, CommandTimeout, PairError, SessionMissing
+from claude_squared.errors import BillingError, CLIError, CommandTimeout, PairError, SessionMissing
 from claude_squared.models import (
     CLAUDE_PERMISSION_MAP,
     HEADLESS_INCOMPATIBLE_TOOLS,
@@ -31,7 +32,7 @@ from claude_squared.models import (
     parse_model_id,
     split_model_tier,
 )
-from claude_squared.registry import claude_home, profiles_dir
+from claude_squared.registry import claude_home, pairs_dir, profiles_dir
 
 
 WARNING_THRESHOLD = 0.60
@@ -245,6 +246,143 @@ def _refused_arg(token: str) -> str | None:
     return None
 
 
+# ---- v0.18.0: API-key billing ------------------------------------------------
+# Measured on CLI 2.1.296, Windows, 2026-10-11 (HANDOFF "API-key billing for
+# pairs"): a pair inherits CLAUDE_CODE_ENTRYPOINT=claude-desktop from a desktop
+# session, and with it the CLI IGNORES ANTHROPIC_API_KEY (a fake key still got
+# an answer, on the plan); dropping only that variable made the key win
+# ("Invalid API key"). ANTHROPIC_AUTH_TOKEN outranks the key (docs).
+API_KEY_FILE = "api_key"
+API_KEY_PREFIX = "sk-ant-api"
+OFFICIAL_BASE_URL = "https://api.anthropic.com"
+_API_DROP_ENV = ("CLAUDE_CODE_ENTRYPOINT", "ANTHROPIC_AUTH_TOKEN")
+_CLOUD_PROVIDER_ENV = ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
+# Docs text when credits run out: "Your credit balance is too low to access the
+# Anthropic API…" (API) / "Credit balance too low · Add funds…" (Claude Code).
+# Not reproducible while credits remain, hence the loose match.
+_CREDIT_RE = re.compile(r"credit balance", re.IGNORECASE)
+# What a turn on a rejected key returns as its result (fake-key probe through
+# the warm runtime, 2.1.296, 2026-10-11): "Invalid API key · Fix external API key".
+_INVALID_KEY_RE = re.compile(r"invalid api key", re.IGNORECASE)
+
+
+def api_key_path() -> Path:
+    """``<CLAUDE_HOME>/pairs/api_key``: the one place the key lives."""
+    return pairs_dir() / API_KEY_FILE
+
+
+def read_api_key() -> str:
+    """The key for billing="api" pairs, read fresh at every spawn. Raises
+    BillingError — whose text never includes any of the file's content."""
+    path = api_key_path()
+    try:
+        key = path.read_text(encoding="utf-8-sig").strip()
+    except FileNotFoundError:
+        raise BillingError(
+            f"the API key file {path} does not exist. Write the key of the Console org "
+            f"linked to your plan there (one line, starting with {API_KEY_PREFIX}), or move "
+            f"the pair back to the plan with pair_update(name, billing=\"plan\").") from None
+    except (OSError, UnicodeError) as e:
+        # Only the type: a decode error's text quotes the file's bytes.
+        raise BillingError(f"the API key file {path} could not be read ({type(e).__name__}).") from None
+    if not key.startswith(API_KEY_PREFIX) or any(ch.isspace() for ch in key):
+        raise BillingError(f"the API key file {path} must hold exactly one API key (a single line "
+                           f"starting with {API_KEY_PREFIX}).")
+    return key
+
+
+def api_key_fingerprint(key: str | None) -> str | None:
+    """A short hash to notice a rotated key without keeping the key around."""
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16] if key else None
+
+
+def current_key_fingerprint() -> str | None:
+    try:
+        return api_key_fingerprint(read_api_key())
+    except BillingError:
+        return None
+
+
+def api_key_status() -> str:
+    """For pair_info and pair_billing: ``key …abcd`` (the last four characters
+    only) or why there is no usable key."""
+    try:
+        key = read_api_key()
+    except BillingError:
+        path = api_key_path()
+        return f"key file missing: {path}" if not path.exists() else f"key file unusable: {path}"
+    return f"key …{key[-4:]}"
+
+
+def _truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def claude_env(billing: str = "plan") -> dict[str, str]:
+    """The environment of a claude spawn — the ONE builder every Claude spawn
+    site uses (warm runtime, one-shot --print, stream-json, triage, ``claude
+    mcp list``, ``--help``).
+
+    ``plan``: this process's environment minus ``ANTHROPIC_API_KEY``. In -p a
+    key always beats the claude.ai login (docs), so a key in the server's
+    environment would silently bill every pair; plan is plan by construction.
+
+    ``api``: the key file's key, without ``CLAUDE_CODE_ENTRYPOINT`` (with it
+    the CLI ignores the key) and ``ANTHROPIC_AUTH_TOKEN`` (it outranks the
+    key). Refuses an environment that would send the key elsewhere — a cloud
+    provider switch or a non-official ``ANTHROPIC_BASE_URL`` (the official one,
+    which the desktop app sets, is dropped). Sets
+    ``CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`` (credential-looking variables stay
+    out of the pair's Bash, hooks and stdio MCP servers) and
+    ``CLAUDE_CODE_PROMPT_CACHE_TTL=1h`` (an API key otherwise gets 5 min).
+    The key never enters ``os.environ``."""
+    env = dict(os.environ)
+    env.pop("ANTHROPIC_API_KEY", None)
+    if billing != "api":
+        return env
+    for var in _CLOUD_PROVIDER_ENV:
+        if _truthy(env.get(var)):
+            raise BillingError(f"{var} is set in the MCP server's environment: the pair would run "
+                               f"on that cloud provider, not on the API key.")
+    base_url = (env.get("ANTHROPIC_BASE_URL") or "").strip().rstrip("/")
+    if base_url and base_url.lower() != OFFICIAL_BASE_URL:
+        raise BillingError("ANTHROPIC_BASE_URL in the MCP server's environment points somewhere other "
+                           f"than {OFFICIAL_BASE_URL}; an API-billed pair won't send the key there.")
+    env.pop("ANTHROPIC_BASE_URL", None)
+    for var in _API_DROP_ENV:
+        env.pop(var, None)
+    env["ANTHROPIC_API_KEY"] = read_api_key()
+    env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = "1"
+    env["CLAUDE_CODE_PROMPT_CACHE_TTL"] = "1h"
+    return env
+
+
+def key_file_deny_rule() -> str:
+    """``Read(//c/Users/…/pairs/api_key)``: a scoped deny rule for the key file,
+    passed on every Claude spawn so the key can't land in a transcript through
+    the Read tool. Absolute rule paths are POSIX with the drive letter as the
+    first segment on Windows. Probed 2026-10-11 (2.1.296, Haiku, a canary
+    file): this form, ``~/…``, ``//C/…``, ``C:/…`` and ``C:\\…`` all denied the
+    Read; with no rule the turn read the canary. ``cat`` in Bash is not covered."""
+    path = Path(os.path.abspath(api_key_path()))
+    posix = path.as_posix()
+    if path.drive:
+        posix = "/" + path.drive.rstrip(":").lower() + posix[len(path.drive):]
+    return f"Read(/{posix})"
+
+
+def _key_rejected_help(name: str) -> str:
+    return (f"the API rejected the key in {api_key_path()}. Fix the key file (the next spawn reads "
+            f"it again), or move '{name}' back to the plan with pair_update('{name}', "
+            f"billing=\"plan\").")
+
+
+def _credit_help(name: str) -> str:
+    return (f"the API rejected the turn: the Console org's credits are used up. Move '{name}' back "
+            f"to the plan with pair_update('{name}', billing=\"plan\") and re-send, or wait for "
+            f"next month's credits.")
+
+
 def _claude_executable() -> str:
     """Locate the claude CLI."""
     env = os.environ.get("CLAUDE_PAIR_CLI_PATH")
@@ -276,7 +414,7 @@ def _cli_permission_choices() -> tuple[str, ...]:
     choices: tuple[str, ...] = ()
     try:
         out = subprocess.run([_claude_executable(), "--help"], capture_output=True, text=True,
-                             timeout=20, stdin=subprocess.DEVNULL).stdout
+                             timeout=20, stdin=subprocess.DEVNULL, env=claude_env()).stdout
         i = out.find("--permission-mode")
         seg = out[i:i + 600] if i >= 0 else ""
         m = re.search(r"choices:\s*(.*?)\)", seg, re.S)
@@ -453,6 +591,7 @@ class ClaudeAdapter(PairAdapter):
         args += self._extra_args(spec)
 
         result_json = self._run_print(args, timeout_seconds=300, pair_name=spec.name, cwd=spec.cwd,
+                                      env_spec=spec,
                                       **({"connector_spec": spec} if connectors.effective(spec.mcp_whitelist) else {}))
         return CreateResult(
             name=spec.name,
@@ -522,10 +661,13 @@ class ClaudeAdapter(PairAdapter):
             "-p", message,
         ]
         args += self._extra_args(spec)
+        env = self._spawn_env(spec)  # a missing key refuses before the task starts
         from claude_squared.async_tasks import mark_task_executing
+        from claude_squared.runtime import refuse_if_shutting_down
+        refuse_if_shutting_down()
         mark_task_executing(task_id)
         result_json = self._run_print(args, timeout_seconds=timeout_seconds,
-                                      pair_name=spec.name, cwd=spec.cwd,
+                                      pair_name=spec.name, cwd=spec.cwd, env_spec=spec, env=env,
                                       **({"connector_spec": spec} if connectors.effective(spec.mcp_whitelist) else {}))
         return self._build_send_result(spec, result_json)
 
@@ -573,7 +715,7 @@ class ClaudeAdapter(PairAdapter):
         args += self._mcp_args(spec)
         args += self._option_args(spec)  # raw args last
         result_json = self._run_print(
-            args, timeout_seconds=timeout_seconds, pair_name=spec.name, cwd=spec.cwd,
+            args, timeout_seconds=timeout_seconds, pair_name=spec.name, cwd=spec.cwd, env_spec=spec,
             **({"connector_spec": spec} if connectors.effective(spec.mcp_whitelist) else {})
         )
         new_sid = result_json.get("session_id")
@@ -704,6 +846,10 @@ class ClaudeAdapter(PairAdapter):
         # The flag is in the 2.1.258 and 2.1.280 binaries too.
         if not connectors.chrome_selected(spec.mcp_whitelist):
             args.append("--no-chrome")
+        # v0.18.0: the API key file is never readable through the Read tool,
+        # on any pair. A scoped rule leaves the tool list (and with it the
+        # prompt cache) unchanged.
+        args += ["--disallowed-tools", key_file_deny_rule()]
         # v0.17.0: the pair's own removals ride with the connector flags, so
         # every spawn path (runtime, override send, compact, fork, /context)
         # sends the same tool list — a different list on one path would miss
@@ -765,9 +911,17 @@ class ClaudeAdapter(PairAdapter):
             parts.append(spec.system_prompt_append.strip())
         return "\n\n".join(parts) if parts else None
 
+    @staticmethod
+    def _spawn_env(spec: PairSpec | None) -> dict[str, str]:
+        """claude_env for this pair's billing (plan when there's no spec)."""
+        return claude_env(spec.billing if spec is not None else "plan")
+
     def _run_print(self, args: list[str], *, timeout_seconds: int, pair_name: str,
-                   cwd: str | None = None, connector_spec: PairSpec | None = None) -> dict:
+                   cwd: str | None = None, connector_spec: PairSpec | None = None,
+                   env_spec: PairSpec | None = None, env: dict[str, str] | None = None) -> dict:
         cli = _claude_executable()
+        if env is None:
+            env = self._spawn_env(env_spec)
         if connector_spec is not None and connectors.effective(connector_spec.mcp_whitelist):
             args = list(args)
             i = args.index("--output-format")
@@ -783,6 +937,7 @@ class ClaudeAdapter(PairAdapter):
                 timeout=timeout_seconds,
                 check=False,
                 cwd=cwd,
+                env=env,
             )
         except subprocess.TimeoutExpired as e:
             raise CommandTimeout(pair_name, timeout_seconds) from e
@@ -796,6 +951,12 @@ class ClaudeAdapter(PairAdapter):
             # api_error_status 404), with stderr EMPTY (verified the day Fable 5
             # was pulled). So check BOTH streams for the marker, not just stderr.
             combined = (stderr_txt + "\n" + stdout_txt).lower()
+            if env_spec is not None and env_spec.billing == "api" and _CREDIT_RE.search(combined):
+                raise CLIError(_credit_help(env_spec.name), stderr=stderr_txt or stdout_txt[:2000],
+                               exit_code=proc.returncode)
+            if env_spec is not None and env_spec.billing == "api" and _INVALID_KEY_RE.search(combined):
+                raise CLIError(_key_rejected_help(env_spec.name), stderr=stderr_txt or stdout_txt[:2000],
+                               exit_code=proc.returncode)
             if MODEL_UNAVAILABLE_MARKER in combined:
                 raise CLIError(
                     _MODEL_UNAVAILABLE_HELP,
@@ -849,6 +1010,7 @@ class ClaudeAdapter(PairAdapter):
             for m in messages
         ) + "\n"
 
+        env = self._spawn_env(spec)
         try:
             proc = subprocess.run(
                 args,
@@ -858,6 +1020,7 @@ class ClaudeAdapter(PairAdapter):
                 timeout=timeout_seconds,
                 check=False,
                 cwd=spec.cwd,
+                env=env,
             )
         except subprocess.TimeoutExpired as e:
             raise CommandTimeout(spec.name, timeout_seconds) from e
@@ -1021,6 +1184,21 @@ class ClaudeAdapter(PairAdapter):
                 parts.append(str(expl)[:240])
             safety_signal = " — ".join(parts)
             safety_kind = "refusal"
+        elif (spec.billing == "api" and _CREDIT_RE.search(result_json.get("result") or "")
+              and (result_json.get("is_error") or api_err
+                   or len((result_json.get("result") or "").strip()) <= 400)):
+            # v0.18.0: the Console org's credits ran out. Only on an API-billed
+            # pair, and only an error or a short notice — an API pair's real
+            # answer about "credit balance" code must not read as one.
+            safety_signal = (f"{_credit_help(spec.name)} The API said: "
+                             f"{(result_json.get('result') or '').strip()[:160]!r}")
+            safety_kind = "credit_exhausted"
+        elif spec.billing == "api" and _INVALID_KEY_RE.search(result_json.get("result") or ""):
+            # Otherwise it reads as a transient API error ("retry usually
+            # resolves it") — a bad key never does.
+            safety_signal = (f"{_key_rejected_help(spec.name)} The API said: "
+                             f"{(result_json.get('result') or '').strip()[:160]!r}")
+            safety_kind = "api_key_rejected"
         elif _USAGE_LIMIT_RE.search(result_json.get("result") or ""):
             # v0.12.0: the CLI reports a usage-limit hit as subtype SUCCESS with
             # the limit notice as the result text (observed on par6, 2026-08-22:
@@ -1064,7 +1242,11 @@ class ClaudeAdapter(PairAdapter):
             response=result_json.get("result", ""),
             session_id=result_json.get("session_id", spec.session_id),
             model_used=model_used,
-            cost_usd=result_json.get("total_cost_usd", 0.0),
+            # v0.18.0: a warm runtime's total_cost_usd is a running total for
+            # the process; its reader puts this turn's share in _turn_cost_usd.
+            # A one-shot process reports its own (single-turn) total.
+            cost_usd=(result_json["_turn_cost_usd"] if result_json.get("_turn_cost_usd") is not None
+                      else result_json.get("total_cost_usd", 0.0)),
             duration_ms=result_json.get("duration_ms", 0),
             permission_denials=denials,
             context=ContextStatus(tokens_used=used, tokens_max=ctx_window, percent=pct,
@@ -1083,6 +1265,7 @@ class ClaudeAdapter(PairAdapter):
             self_woken_waited_s=waited_s,
             terminal_reason=result_json.get("terminal_reason"),
             backend="claude",
+            billing=spec.billing,  # v0.18.0: self-woken turns' footers show API cost too
             notes=connectors.claude_init_notes(spec.mcp_whitelist, result_json.get("_mcp_servers")),
         )
 

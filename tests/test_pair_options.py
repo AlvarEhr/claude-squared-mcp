@@ -58,9 +58,13 @@ MCP_V016 = [
     "--disallowed-tools", "mcp__Claude_Squared__*",
     "--disallowed-tools", "AskUserQuestion",
 ]
-# ... plus --no-chrome since the third review of ac6d2c4. Every spawn path
-# sends exactly this block.
-MCP_MINIMAL = MCP_V016 + ["--no-chrome"]
+
+
+def mcp_minimal():
+    """... plus --no-chrome (third review of ac6d2c4) and the API key file's
+    Read deny rule (v0.18.0; its path follows the test's CLAUDE_HOME). Every
+    spawn path sends exactly this block."""
+    return MCP_V016 + ["--no-chrome", "--disallowed-tools", CL.key_file_deny_rule()]
 
 
 def tool(value):
@@ -177,24 +181,24 @@ class ClaudeArgsTests(PairOptionsCase):
 
     def test_minimal_spec_argv_is_v016_plus_no_chrome(self):
         # A pair without the new options must produce byte-for-byte the argv
-        # v0.16.2 produced (hard-coded from HEAD), plus --no-chrome at the end
-        # of the tool-scope block. That flag changes no tool list unless
-        # CLAUDE_CODE_ENABLE_CFC was set; any other drift could miss the
-        # prompt cache of every existing pair after the upgrade.
+        # v0.16.2 produced (hard-coded from HEAD), plus --no-chrome and the key
+        # file's Read deny rule at the end of the tool-scope block. Neither
+        # changes the tool list (unless CLAUDE_CODE_ENABLE_CFC was set); any
+        # other drift could miss the prompt cache of every existing pair.
         cwd = str(self.directory)
         spec = PairSpec(name="p", session_id="sid", model="opus", cwd=cwd)
-        self.assertEqual(CL.ClaudeAdapter()._common_create_args(spec), MCP_MINIMAL + ["--add-dir", cwd])
+        self.assertEqual(CL.ClaudeAdapter()._common_create_args(spec), mcp_minimal() + ["--add-dir", cwd])
         argv = self.capture_resume_paths(spec)
         self.assertEqual(argv["send"], [
             "claude", "--print", "--output-format", "json", "--resume", "sid", "--model", "opus",
-            *MCP_MINIMAL, "--effort", "low", "--permission-mode", "auto", "-p", "hello"])
+            *mcp_minimal(), "--effort", "low", "--permission-mode", "auto", "-p", "hello"])
         self.assertEqual(argv["fork"], [
             "claude", "--print", "--output-format", "json", "--resume", "sid", "--fork-session",
-            "--model", "opus", "--permission-mode", "auto", "-p", "SENTINEL", *MCP_MINIMAL])
+            "--model", "opus", "--permission-mode", "auto", "-p", "SENTINEL", *mcp_minimal()])
         self.assertEqual(argv["stream"], [
             "claude", "--print", "--verbose", "--resume", "sid", "--model", "opus",
             "--permission-mode", "auto", "--input-format", "stream-json", "--output-format", "stream-json",
-            *MCP_MINIMAL])
+            *mcp_minimal()])
         runtime = self.capture_runtime_start(spec)
         for name, got in [("create", self.capture_create(spec)), ("runtime", runtime), *argv.items()]:
             with self.subTest(path=name):
@@ -232,7 +236,7 @@ class ClaudeArgsTests(PairOptionsCase):
         adapter = CL.ClaudeAdapter()
         self.assertEqual(adapter._settings_args(spec), ["--settings", '{"ultracode": true}'])
         self.assertEqual(adapter._common_create_args(spec),
-                         MCP_MINIMAL + ["--settings", '{"ultracode": true}', "--add-dir", cwd])
+                         mcp_minimal() + ["--settings", '{"ultracode": true}', "--add-dir", cwd])
 
     def test_no_settings_and_no_ultracode_means_no_settings_flag(self):
         adapter = CL.ClaudeAdapter()
@@ -278,7 +282,7 @@ class ClaudeArgsTests(PairOptionsCase):
         # after the existing flags, so a pair without them is unchanged.
         spec = self.spec(disallowed_tools=["Artifact", "Bash(git push *)"])
         args = CL.ClaudeAdapter()._mcp_args(spec)
-        self.assertEqual(args, MCP_MINIMAL + ["--disallowed-tools", "Artifact",
+        self.assertEqual(args, mcp_minimal() + ["--disallowed-tools", "Artifact",
                                               "--disallowed-tools", "Bash(git push *)"])
 
     def test_raw_args_end_every_argv(self):
@@ -367,7 +371,7 @@ class ClaudeArgsTests(PairOptionsCase):
         cwd = str(self.directory)
         spec = PairSpec(name="p", session_id="sid", model="opus", cwd=cwd,
                         backend_options={"config": {"x": 1}, "sandbox": "read-only"})
-        self.assertEqual(CL.ClaudeAdapter()._common_create_args(spec), MCP_MINIMAL + ["--add-dir", cwd])
+        self.assertEqual(CL.ClaudeAdapter()._common_create_args(spec), mcp_minimal() + ["--add-dir", cwd])
         self.assertEqual(CL.ClaudeAdapter()._option_args(spec), [])
 
 

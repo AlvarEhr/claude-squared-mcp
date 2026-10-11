@@ -203,6 +203,13 @@ def _save_unlocked(reg: Registry) -> None:
     for name, spec in reg.pairs.items():
         # None deliberately omits the CLI effort flag; preserve it on reload.
         data["pairs"][name]["effort"] = spec.effort
+        # v0.18.0: billing is written only when "api" (an older server then
+        # keeps it as an unknown key and spawns on the plan), the API total
+        # only once there is one.
+        if spec.billing == "plan":
+            data["pairs"][name].pop("billing", None)
+        if not spec.api_cost_usd:
+            data["pairs"][name].pop("api_cost_usd", None)
         for key in spec.model_extra or {}:
             data["pairs"][name][key] = full["pairs"][name][key]
     # Quarantined entries ride along untouched. A live pair under the same

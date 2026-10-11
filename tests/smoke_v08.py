@@ -40,7 +40,8 @@ def test_per_model_effort_defaults():
     assert_eq(default_effort_for_model("claude-opus-4-7"), "high", "full opus name still high")
     assert_eq(default_effort_for_model("sonnet"), "high", "sonnet defaults to high")
     assert_eq(default_effort_for_model("claude-sonnet-4-6"), "high", "full sonnet name still high")
-    assert_eq(default_effort_for_model("haiku"), None, "haiku defaults to None")
+    # v0.18.0: Haiku 5.x takes effort (the bare alias is Haiku 5.5); 4.5 doesn't.
+    assert_eq(default_effort_for_model("haiku"), "high", "haiku (5.5) defaults to high")
     assert_eq(default_effort_for_model("claude-haiku-4-5"), None, "full haiku name still None")
     assert_eq(default_effort_for_model("unknown-model"), "high", "unknown family -> high fallback")
 
@@ -64,14 +65,16 @@ def test_effort_coercion():
         assert msg is not None and "coerced" in msg.lower(), f"sonnet + {eff} has transparency msg"
         print(f"  [PASS] sonnet + {eff} message: {msg[:60]}...")
 
-    # Haiku: any non-None effort -> None with message; None passes through silently
-    coerced, msg = coerce_effort_for_model("haiku", None)
-    assert_eq(coerced, None, "haiku + None passes through")
-    assert_eq(msg, None, "haiku + None no message")
+    # Haiku 4.5: any non-None effort -> None with message; None passes through
+    # silently. (v0.18.0: Haiku 5.x takes every level.)
+    coerced, msg = coerce_effort_for_model("claude-haiku-4-5", None)
+    assert_eq(coerced, None, "haiku 4.5 + None passes through")
+    assert_eq(msg, None, "haiku 4.5 + None no message")
     for eff in ("low", "medium", "high", "xhigh", "max"):
-        coerced, msg = coerce_effort_for_model("haiku", eff)
-        assert_eq(coerced, None, f"haiku + {eff} -> None")
-        assert msg is not None and "doesn't support" in msg, f"haiku + {eff} has transparency msg"
+        coerced, msg = coerce_effort_for_model("claude-haiku-4-5", eff)
+        assert_eq(coerced, None, f"haiku 4.5 + {eff} -> None")
+        assert msg is not None and "doesn't support" in msg, f"haiku 4.5 + {eff} has transparency msg"
+        assert_eq(coerce_effort_for_model("haiku", eff), (eff, None), f"haiku 5.5 + {eff} passes")
 
 
 def test_pairspec_validator_safety_net():
@@ -80,8 +83,8 @@ def test_pairspec_validator_safety_net():
     coercion in pair_create / pair_update is bypassed (registry migration,
     direct PairSpec(...) call, etc.)."""
     print("\n=== PairSpec validator safety net ===")
-    spec = PairSpec(name="test", session_id="abc", model="haiku", effort="xhigh")
-    assert_eq(spec.effort, None, "PairSpec coerces haiku+xhigh -> effort=None")
+    spec = PairSpec(name="test", session_id="abc", model="claude-haiku-4-5", effort="xhigh")
+    assert_eq(spec.effort, None, "PairSpec coerces haiku 4.5+xhigh -> effort=None")
 
     spec2 = PairSpec(name="test", session_id="abc", model="claude-sonnet-4-6", effort="max")
     assert_eq(spec2.effort, "high", "PairSpec coerces sonnet+max -> effort=high")
@@ -158,10 +161,10 @@ def test_settings_model_change_auto_resets_effort():
     assert_eq(new_d.effort, "high", "effort auto-reset to sonnet's default (high)")
     assert any("auto-reset" in m for m in msgs), "auto-reset message surfaced"
 
-    # Switch to haiku — effort should auto-reset to None
-    new_d, msgs = settings_mod.update_defaults(model="haiku")
-    assert_eq(new_d.model, "haiku", "model now haiku")
-    assert_eq(new_d.effort, None, "effort auto-reset to None for haiku")
+    # Switch to Haiku 4.5 — effort should auto-reset to None (no effort knob)
+    new_d, msgs = settings_mod.update_defaults(model="claude-haiku-4-5")
+    assert_eq(new_d.model, "claude-haiku-4-5", "model now haiku 4.5")
+    assert_eq(new_d.effort, None, "effort auto-reset to None for haiku 4.5")
 
 
 def test_settings_explicit_both_fields_no_autoreset():

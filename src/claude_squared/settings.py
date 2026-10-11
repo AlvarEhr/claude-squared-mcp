@@ -12,7 +12,7 @@ Read at the API boundary by ``pair_create`` to fill missing args; written by
 Hardcoded fallbacks (when neither the call nor the defaults file specifies):
     backend = inferred from the model ("claude" unless the model is a Codex id)
     model = "opus" (Claude) / the dynamic current-generation Codex default
-    effort = "high" (model-coerced: haiku → None)
+    effort = "high" (model-coerced: Haiku 4.5 → None)
     permission_mode = "auto"
     context_window = "default"
     persistent = False

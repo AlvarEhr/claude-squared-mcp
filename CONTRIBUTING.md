@@ -72,6 +72,11 @@ your real `codex` auth and delete the threads they create.
 - `python tests/smoke_live_codex_detach.py`,
   `python tests/smoke_live_codex_context.py` — Codex turns surviving their
   MCP server, and the Codex context alert (a few short Luna turns each)
+- `python tests/smoke_live_billing.py [--real]` — API-key billing (0.18.0): a pair
+  switched onto a FAKE key must fail with "Invalid API key" through the warm
+  runtime, then answer back on the plan (three small Haiku turns of plan usage).
+  `--real` uses `~/.claude/pairs/api_key` instead and spends one Haiku turn of
+  API credits.
 - `python tests/smoke_live_codex_update.py` — a running server following a
   Codex app update, including the binary vanishing between lookup and spawn
   (a create probe + three one-line Luna turns)

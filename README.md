@@ -154,7 +154,7 @@ Gates: a busy source is refused; a source with a Claude tool allow-list needs an
 
 ### Inspection
 - `pair_list()` — short list (Codex pairs show as `codex:<model>`, `[1m]` windows flagged)
-- `pair_info(name)` — full details + transcript path
+- `pair_info(name)` — full details + transcript path (Claude: billing and cost too)
 - `pair_transcript(name, last_n=10)` — tail recent turns (Claude JSONL or Codex rollout)
 - `pair_status(name)` — liveness (active / slow / likely-hung; Codex: in-flight process)
 - `pair_actions(name?)` — discoverability: curated commands + (if name) pair-installed skills (Claude)
@@ -162,10 +162,11 @@ Gates: a busy source is refused; a source with a Claude tool allow-list needs an
 
 ### Mutation
 - `pair_stop(name, force?, hard?, drain_queue?)` — cancel the executing turn (Claude: in-band interrupt, the pair stays alive; Codex: tree-kill, the thread resumes). Works across MCP processes (per-task cancel file; foreign self-woken turns must be stopped by their owner). `force` tree-kills a wedged runtime, `hard` also rotates the session (context gone), `drain_queue` cancels queued sends too (default: they still run)
-- `pair_update(name, model?, effort?, permission_mode?, context_window?, backend_options?, disallowed_tools?, context_alert_at?, mcp_whitelist?, allowed_tools?, allowed_invocations?, cwd?, extra_dirs?, ultracode?, fallback_model?, purpose?, force?)` — the backend is fixed; a model from the other backend is refused
+- `pair_update(name, model?, effort?, permission_mode?, context_window?, backend_options?, disallowed_tools?, context_alert_at?, mcp_whitelist?, allowed_tools?, allowed_invocations?, cwd?, extra_dirs?, ultracode?, fallback_model?, purpose?, billing?, force?)` — the backend is fixed; a model from the other backend is refused; `billing` takes only `"plan"`
+- `pair_billing(name, billing, force?)` — move a Claude pair between plan and API-key billing (see [API-key billing](#api-key-billing-claude-0180)); the only way onto the API
 - `pair_clear(name, archive_old=True)` — rotate to a fresh session/thread; pinned config preserved
 - `pair_compact(name, steering_prompt?, timeout_seconds=45, compact_timeout_seconds=600)` — Claude: native /compact via stream-json; Codex: `codex app-server` `thread/compact/start` (steering ignored). Async-wrapped, degrades gracefully to an async handle past the sync cap.
-- `pair_fork(name, new_name?)` — branch a pair into a new independent pair, keeping both (Claude: native `--fork-session`; Codex: native `exec fork`)
+- `pair_fork(name, new_name?)` — branch a pair into a new independent pair, keeping both (Claude: native `--fork-session`; Codex: native `exec fork`). A fork starts on the plan
 - `pair_rewind_points(name, last_n?)` — list user-message boundaries to rewind to, with after-context
 - `pair_rewind(name, to_point, archive?)` — rewind the conversation to before a chosen user message (conversation-only, pre-rewind transcript archived)
 
@@ -461,13 +462,31 @@ Tool definitions are part of the fixed context a pair carries on every turn. `di
 
 The list is re-applied at every spawn — warm runtime, per-send override, compaction, fork, `/context`, `pair_invoke` — so a `pair_update` applies at the next send without a `pair_clear`, and every path sends the same tool list, which keeps compaction and override sends on the prompt cache. Changing the list costs one uncached turn on the next send. `[]` clears it, `pair_fork` keeps it, `pair_handoff` drops it, and Codex pairs refuse it (limit a Codex pair with its permission level).
 
+## API-key billing (Claude, 0.18.0)
+
+Since October 2026 Max and Team plans include monthly API credits for one linked Console org ([support article](https://support.claude.com/en/articles/17154008-monthly-api-credits-for-max-and-team-plans)). They cover `claude -p` runs made with an API key from that org — not runs signed in with your plan. A Claude pair can be moved onto that key, one pair at a time. Every pair starts on the plan.
+
+**Who decides.** Only you. `pair_billing`'s tool description tells agents to switch a pair to the API only when you have asked for it in your own message — never on their own, not to get past a usage limit. Switching back to the plan is always allowed. To be asked yourself every time, add `"ask": ["mcp__pair__pair_billing"]` to `permissions` in your Claude Code settings: the host then prompts before each call (an `ask` rule holds in auto, acceptEdits and bypass modes).
+
+**Setup.** Write the key to `~/.claude/pairs/api_key` — one line, starting with `sk-ant-api`. The MCP reads it at every spawn and keeps it out of the registry, command lines, logs and tool results; `pair_info` shows its last four characters. A rotated key respawns the pair at its next send (once no background work is pending — a respawn would kill it). A missing or malformed file refuses the send (never a silent fall back to the plan), and `pair_billing(name, "api")` refuses while the file is missing.
+
+**Switching.** `pair_billing(name, "api")`, and back with `pair_update(name, billing="plan")` or `pair_billing(name, "plan")`. Either respawns the pair at its next send, costs one uncached turn (prompt caches are per org), and refuses while background work is pending unless `force=True`. `pair_clear`, `pair_rewind` and `pair_stop(hard=True)` keep the billing; `pair_fork` and `pair_adopt` start on the plan; `pair_handoff` to Codex drops it. There is no default for it.
+
+**What an API pair runs with.** `ANTHROPIC_API_KEY` from the file, without `CLAUDE_CODE_ENTRYPOINT` (a pair started from a desktop session inherits `claude-desktop`, and with it the CLI ignores the key — measured) and `ANTHROPIC_AUTH_TOKEN` (it outranks the key). The prompt-cache TTL is set to 1 h (an API key otherwise gets 5 min) and `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` keeps credential-looking environment variables (other API keys, tokens) out of the pair's Bash, hooks and stdio MCP servers. The switch refuses when the MCP server's environment points the CLI at Bedrock, Vertex, Foundry or a non-Anthropic `ANTHROPIC_BASE_URL`. claude.ai connectors don't load on an API key; `pair_billing` warns when the pair's `mcp_whitelist` names one.
+
+**Plan pairs are plan by construction.** In `-p`, an API key in the environment beats your login, so a key set where the MCP server starts would silently bill every pair. Every Claude spawn (pairs, triage, `claude mcp list`) now drops an inherited `ANTHROPIC_API_KEY` unless the pair is on API billing.
+
+**Cost.** An API pair's reply footer shows what the turn cost and the pair's API total; `pair_info` shows the pair's cost at list prices and how much of it went to the key. When the credits run out the turns fail — rendered as `API CREDITS EXHAUSTED` with the way back — and nothing is charged to the plan. A rejected key shows `API KEY REJECTED`.
+
+**The key file and the pair.** Every Claude spawn carries a deny rule for reading the key file with the Read tool (probed on Windows), so the key can't end up in a transcript that way. It does **not** cover shell commands: a pair allowed to run `cat` can still read the file. Keep it readable by your account only.
+
 ## Mid-flight config changes
 
 `pair_update` propagation depends on the field category — three buckets:
 
 | Category | Fields | When change takes effect |
 |---|---|---|
-| Per-send | `model`, `effort`, `permission_mode`, `context_window`, `backend_options`, `ultracode`, `fallback_model`, `mcp_whitelist`, `disallowed_tools` | Next `pair_send` (registry write + runtime eviction → respawn with new values; Codex: every send is a fresh process) |
+| Per-send | `model`, `effort`, `permission_mode`, `context_window`, `backend_options`, `ultracode`, `fallback_model`, `mcp_whitelist`, `disallowed_tools`, `billing` (0.18.0; `pair_billing` for the API) | Next `pair_send` (registry write + runtime eviction → respawn with new values; Codex: every send is a fresh process) |
 | Server-side | `allowed_invocations`, `context_alert_at` | No eviction needed (MCP-layer, not pinned to the CLI subprocess). `allowed_invocations`: next `pair_invoke`. `context_alert_at`: next send's result, `pair_status`, and running `wait.py` watchers at their next poll (exit 8 at once if the new level is already behind the context). Mutable freely. |
 | Pinned-at-create | `allowed_tools`, `system_prompt_append` | **Only after `pair_clear`** — the existing session was started with the OLD values; rotation creates a fresh session with the new pinned config |
 | Pinned-at-spawn | `cwd`, `extra_dirs` | Next spawn after eviction. A Claude `cwd` change ALSO moves the session JSONL across project dirs (rejected with recovery hint if the move fails); Codex threads aren't cwd-keyed |

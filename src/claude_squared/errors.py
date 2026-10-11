@@ -9,6 +9,27 @@ class TaskStopped(PairError):
     """A queued operation was cancelled before backend execution."""
 
 
+# v0.18.0 (Incident 2026-10-04, fix A): a send that had not started when the
+# MCP server began shutting down. Stored bare (async_tasks supervision
+# prefixes) so every reader shows the same words.
+NOT_DELIVERED_PREFIX = "NOT DELIVERED — "
+NOT_DELIVERED_MESSAGE = (NOT_DELIVERED_PREFIX
+                         + "the MCP server shut down before this send ran; re-send it.")
+
+
+class ServerShuttingDown(PairError):
+    """The MCP server is exiting: nothing new may spawn (v0.18.0, fix A)."""
+
+    def __init__(self, message: str = NOT_DELIVERED_MESSAGE):
+        super().__init__(message)
+
+
+class BillingError(PairError):
+    """An API-billed pair can't spawn: key file missing / malformed, or an
+    environment the key must not be mixed with (v0.18.0). Never carries the
+    key itself."""
+
+
 class PairNotFound(PairError):
     def __init__(self, name: str):
         super().__init__(

@@ -50,7 +50,14 @@ HEADLESS_INCOMPATIBLE_TOOLS = ("AskUserQuestion",)
 # should still reach the next spawn.
 SPAWN_PINNED_FIELDS = ("model", "effort", "permission_mode", "context_window", "backend_options",
                        "cwd", "extra_dirs", "allowed_tools", "mcp_whitelist", "ultracode",
-                       "fallback_model", "disallowed_tools", "system_prompt_append", "profile_name")
+                       "fallback_model", "disallowed_tools", "system_prompt_append", "profile_name",
+                       "billing")
+
+# v0.18.0: how a Claude pair's turns are paid for. "plan" = the claude.ai
+# login (an inherited ANTHROPIC_API_KEY is stripped, so plan is plan by
+# construction); "api" = the key in <CLAUDE_HOME>/pairs/api_key, read at
+# every spawn. Only the pair_billing tool sets "api".
+BILLING_MODES = ("plan", "api")
 
 
 # ============================================================================
@@ -257,7 +264,7 @@ def short_model_label(model: str) -> str:
 # multi-agent mode, opt-in, never a default). Per-model capability:
 #   - Claude Opus / Fable / unknown families: all five (CLI is the authority)
 #   - Claude Sonnet: low/medium/high
-#   - Claude Haiku: no effort knob at all
+#   - Claude Haiku 5.x: all five; Haiku 4.5 and older: no effort knob (v0.18.0)
 #   - Codex: whatever ``models_cache.json`` lists for the slug (dynamic), falling
 #     back to the six-level set when the cache is unavailable.
 # Unsupported requests are coerced to the NEAREST supported level with a
@@ -306,7 +313,13 @@ def _allowed_efforts(model: str, backend: str | None = None) -> list[str]:
     if fam == "sonnet":
         return ["low", "medium", "high"]
     if fam == "haiku":
-        return []
+        # v0.18.0: Haiku 5.5 takes low through max (API docs; the CLI accepts
+        # --effort low|max for it, 2026-10-11). Haiku 4.5 and older have no
+        # effort knob. The bare alias follows the current Haiku (5.5).
+        _fam, version = parse_model_id(model)
+        if version and version[:1] < (5,):
+            return []
+        return list(EFFORT_LEVELS_CLAUDE)
     return list(EFFORT_LEVELS_CLAUDE)
 
 
@@ -316,7 +329,7 @@ def coerce_effort_for_model(model: str, effort: str | None,
 
     ``None`` passes through untouched (= let the CLI default). An unsupported
     level is coerced to the nearest supported one by rank (Sonnet+xhigh →
-    high; Codex luna+ultra → max; Haiku anything → None). Unknown effort
+    high; Codex luna+ultra → max; Haiku 4.5 anything → None). Unknown effort
     strings on a model with a known level list are coerced too (with a message)
     rather than rejected, so a typo can't brick a registry entry.
     """
@@ -348,7 +361,7 @@ def coerce_effort_for_model(model: str, effort: str | None,
 
 def default_effort_for_model(model: str, backend: str | None = None) -> str | None:
     """The default effort when none is specified: ``high`` everywhere except
-    models with no effort knob (Haiku → None). Coerced against capability."""
+    models with no effort knob (Haiku 4.5 → None). Coerced against capability."""
     coerced, _ = coerce_effort_for_model(model, DEFAULT_EFFORT, backend)
     return coerced
 
@@ -579,7 +592,7 @@ class PairSpec(BaseModel):
     # Floating aliases (``opus``, ``sol``) follow the backend's current
     # generation; pinned ids (``claude-opus-5``, ``gpt-5.6-sol``) stay put.
     model: str = "opus"
-    # Nullable since haiku has no effort knob. The adapter omits the effort arg
+    # Nullable since Haiku 4.5 has no effort knob. The adapter omits the effort arg
     # when this is None. Default "high" (policy 2026-09-07) on both backends;
     # the validator coerces it against the model's capability.
     effort: str | None = DEFAULT_EFFORT
@@ -627,10 +640,19 @@ class PairSpec(BaseModel):
     context_alert_at: int | None = None
     # v0.11.0: dedup marker for the "newer model available" notice.
     last_drift_notice: str | None = None
+    # v0.18.0 (Claude): "plan" | "api" (BILLING_MODES). Written to the registry
+    # only when "api": an older server keeps the unknown key and spawns the
+    # pair on the plan — the safe direction.
+    billing: Literal["plan", "api"] = "plan"
     created_at: datetime = Field(default_factory=datetime.utcnow)
     last_active_at: datetime = Field(default_factory=datetime.utcnow)
     turn_count: int = 0
+    # Every turn at list prices, plan turns included (v0.18.0: per-turn
+    # deltas — a warm runtime reports a running total).
     total_cost_usd: float = 0.0
+    # v0.18.0: what the API-billed turns cost (accumulated only while billing
+    # is "api"); kept across pair_clear, since it is money spent.
+    api_cost_usd: float = 0.0
 
     @model_validator(mode="before")
     @classmethod
@@ -660,6 +682,10 @@ class PairSpec(BaseModel):
                 values["context_window"] = "default"
         if values.get("backend_options") is None:
             values["backend_options"] = {}
+        if values.get("billing") is None:
+            values.pop("billing", None)
+        elif isinstance(values["billing"], str):
+            values["billing"] = values["billing"].strip().lower()
         if "effort" in values:
             coerced, _msg = coerce_effort_for_model(
                 values.get("model", "opus"), values["effort"], values.get("backend"),
@@ -719,7 +745,8 @@ class SendResult(BaseModel):
     # v0.11.0 model-handling hardening — see ClaudeAdapter._build_send_result.
     model_substitution: str | None = None
     safety_signal: str | None = None
-    # "refusal" | "usage_limit" | "model_unavailable" | "error"
+    # "refusal" | "usage_limit" | "credit_exhausted" | "api_key_rejected" |
+    # "model_unavailable" | "error"
     safety_kind: str | None = None
     stop_reason: str | None = None
     drift_note: str | None = None
@@ -740,6 +767,10 @@ class SendResult(BaseModel):
     # v0.13.0: free-form transparency notes the adapter wants surfaced once
     # (e.g. "sandbox degraded to read-only: windows.sandbox missing").
     notes: list[str] = Field(default_factory=list)
+    # v0.18.0: the billing this turn ran under, and (api) the pair's API
+    # total after it — set by the server's send runner for the footer.
+    billing: str | None = None
+    api_cost_usd: float | None = None
 
 
 class CompactResult(BaseModel):

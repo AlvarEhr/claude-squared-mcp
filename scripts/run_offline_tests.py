@@ -70,6 +70,10 @@ def main() -> int:
         "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
         "-p", "test_pair_options.py", "-v",
     ]))
+    commands.append(("billing", [
+        "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
+        "-p", "test_billing.py", "-v",
+    ]))
     failures = []
     for name, arguments in commands:
         print(f"\n=== {name} ===", flush=True)

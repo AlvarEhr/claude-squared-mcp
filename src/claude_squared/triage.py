@@ -176,7 +176,7 @@ def _claude_cli() -> str:
 def classify_with_haiku(reply: str) -> dict | None:
     """One isolated Haiku call (worker thread only). None on any failure —
     timeout, bad JSON, a usage-limit notice (which also starts the backoff)."""
-    from claude_squared.adapters.claude import _USAGE_LIMIT_RE
+    from claude_squared.adapters.claude import _USAGE_LIMIT_RE, claude_env
     # --no-chrome: CLAUDE_CODE_ENABLE_CFC in the inherited environment would
     # otherwise connect Claude in Chrome even here (v0.17.0, as for pairs).
     argv = [_claude_cli(), "-p", "--model", "haiku", "--no-session-persistence",
@@ -184,8 +184,9 @@ def classify_with_haiku(reply: str) -> dict | None:
             "--setting-sources", "", "--system-prompt", _SYSTEM_PROMPT,
             "--output-format", "json"]
     prompt = "Progress report to triage:\n\n" + (reply or "")[-_REPLY_CHARS:]
+    # v0.18.0: always on the plan (an inherited ANTHROPIC_API_KEY is dropped).
     kwargs: dict = {"stdin": subprocess.PIPE, "stdout": subprocess.PIPE,
-                    "stderr": subprocess.PIPE}
+                    "stderr": subprocess.PIPE, "env": claude_env()}
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     with tempfile.TemporaryDirectory(prefix="cs-triage-", ignore_cleanup_errors=True) as cwd:

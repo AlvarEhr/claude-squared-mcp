@@ -35,9 +35,10 @@ from claude_squared import settings as settings_mod
 from claude_squared.adapters import ClaudeAdapter, CodexAdapter, PairAdapter
 from claude_squared.adapters import codex as codex_adapter_mod
 from claude_squared.cli_paths import encode_cwd_for_project as _encode_cwd_for_project
-from claude_squared.errors import PairAlreadyExists, PairError, PairNotFound
+from claude_squared.errors import BillingError, PairAlreadyExists, PairError, PairNotFound
 from claude_squared.models import (
     BACKENDS,
+    BILLING_MODES,
     DEFAULT_EFFORT,
     HEADLESS_INCOMPATIBLE_TOOLS,
     PERMISSION_LEVELS,
@@ -221,6 +222,12 @@ def _fmt_send_result(r: SendResult) -> str:
     footer_parts.append(f"codex/{label}" if r.backend == "codex" else label)
     if r.duration_ms:
         footer_parts.append(f"{r.duration_ms / 1000:.1f}s")
+    if r.billing == "api":
+        # v0.18.0: an API-billed turn shows what it cost and the pair's total.
+        _api = f"API ${float(r.cost_usd or 0.0):.4f}"
+        if r.api_cost_usd is not None:
+            _api += f" (pair total ${r.api_cost_usd:.2f})"
+        footer_parts.append(_api)
     # Log audit pointer: which lines of which file this turn produced
     if r.log_path and r.log_line_start is not None and r.log_line_end is not None:
         try:
@@ -257,6 +264,17 @@ def _fmt_send_result(r: SendResult) -> str:
                 f"⏸ USAGE LIMIT: {r.safety_signal}. The reply above is the limit "
                 f"notice, not an answer — the pair did NOT do the work. Wait for the "
                 f"reset, then re-send."
+            )
+        elif r.safety_kind == "credit_exhausted":
+            # v0.18.0: like a usage limit — the reply is the API's error text.
+            lines.append(
+                f"⏸ API CREDITS EXHAUSTED: {r.safety_signal} The reply above is the "
+                f"error, not an answer — the pair did NOT do the work."
+            )
+        elif r.safety_kind == "api_key_rejected":
+            lines.append(
+                f"⛔ API KEY REJECTED: {r.safety_signal} The reply above is the error, not an "
+                f"answer — the pair did NOT do the work."
             )
         elif r.safety_kind == "model_unavailable":
             # PERMANENT — the model was pulled / access lost. Distinct label + a
@@ -828,7 +846,7 @@ def pair_create(
         effort: low|medium|high|xhigh|max (Codex also: ``ultra`` = maximum reasoning
             + automatic task delegation, its multi-agent mode). Default ``high`` on
             both backends. Coerced to the nearest level the model supports, with a
-            message (Sonnet xhigh → high; Haiku → none; Codex per the models cache).
+            message (Sonnet xhigh → high; Haiku 4.5 → none; Codex per the models cache).
         permission_mode: backend-neutral level, loosest last —
             ``read-only`` | ``plan`` | ``workspace`` | ``auto`` | ``unrestricted``.
             read-only: reads only, every write/exec is denied AND reported back to
@@ -1781,6 +1799,9 @@ def _build_send_runner(
         # runner callable directly in any edge path (then no stop polling).
         with _with_pair_lock(name, timeout_s=lock_acquire_timeout_s):
             async_tasks.raise_if_stopped(task_id)
+            # v0.18.0 (fix A): a send that reaches its turn while the server
+            # exits fails as NOT DELIVERED instead of spawning a backend.
+            runtime_mod.refuse_if_shutting_down()
             should_stop = _make_stop_checker(name, task_id) if task_id else None
             current = reg_mod.get_pair(name)
             _check_model_backend(current, override_model)
@@ -1913,11 +1934,20 @@ def _build_send_runner(
                     fresh = reg_mod.get_pair(name)
                 except Exception:
                     fresh = current
+                # v0.18.0: result.cost_usd is this turn's share (the warm
+                # runtime's total is cumulative), so adding it no longer
+                # double-counts. API-billed turns also add to api_cost_usd.
+                _turn_cost = float(result.cost_usd or 0.0)
                 update_fields: dict[str, Any] = dict(
                     last_active_at=datetime.utcnow(),
                     turn_count=fresh.turn_count + 1,
-                    total_cost_usd=fresh.total_cost_usd + float(result.cost_usd or 0.0),
+                    total_cost_usd=fresh.total_cost_usd + _turn_cost,
                 )
+                if current.backend == "claude":
+                    result.billing = current.billing
+                    if current.billing == "api":
+                        update_fields["api_cost_usd"] = fresh.api_cost_usd + _turn_cost
+                        result.api_cost_usd = update_fields["api_cost_usd"]
                 if drift_persist is not None:
                     update_fields["last_drift_notice"] = drift_persist
                 task_state = async_tasks.load_task(task_id) if task_id and current.backend == "codex" else None
@@ -2096,7 +2126,7 @@ _HARDCODED_DEFAULTS = {
     # auto-upgrade on a bump; a pinned id like ``claude-opus-5`` stays put).
     # Codex has no static default — see codex_models.codex_default_model.
     "model": "opus",
-    # "high" on both backends (policy 2026-09-07); coerced per model (Haiku → None).
+    # "high" on both backends (policy 2026-09-07); coerced per model (Haiku 4.5 → None).
     "effort": DEFAULT_EFFORT,
     "permission_mode": "auto",
     "context_window": "default",
@@ -3095,6 +3125,8 @@ def pair_list(verbose: bool = False) -> str:
         last = _fmt_local(s.last_active_at, "%H:%M")
         purpose = f" - {s.purpose}" if s.purpose else ""
         model_disp = f"codex:{s.model}" if s.backend == "codex" else s.model
+        if s.backend == "claude" and s.billing == "api":
+            model_disp += ", API billing"  # v0.18.0: visible wherever pairs are listed
         if s.context_window == "1m":
             model_disp += " [1m]"
         lines.append(f"  {s.name} ({model_disp}, {s.turn_count} turns, last {last}){purpose}")
@@ -3149,6 +3181,15 @@ def pair_info(name: str, verbose: bool = False) -> str:
         bo += f"\n  disallowed_tools: {', '.join(spec.disallowed_tools)}"
     if spec.context_alert_at:
         bo += f"\n  context alert at: {spec.context_alert_at:,} tokens (or the global level if earlier)"
+    if spec.backend == "claude":
+        # v0.18.0: billing, and what the turns cost (list prices; the API part
+        # is what the key was actually charged).
+        from claude_squared.adapters.claude import api_key_status
+        bo += (f"\n  billing: api ({api_key_status()})" if spec.billing == "api"
+               else "\n  billing: plan")
+        bo += f"\n  cost: ${spec.total_cost_usd:.2f} at list prices"
+        if spec.api_cost_usd or spec.billing == "api":
+            bo += f", ${spec.api_cost_usd:.2f} of it billed to the API key"
     return (
         f"{name}:\n"
         f"  backend: {spec.backend}\n"
@@ -3302,6 +3343,7 @@ def pair_update(
     force: bool = False,
     disallowed_tools: str | list[str] | None = None,
     context_alert_at: int | str | None = None,
+    billing: str | None = None,
 ) -> str:
     """Update mutable settings of an existing pair (per-pair, not defaults —
     use ``pair_settings_set`` for user-wide defaults).
@@ -3323,12 +3365,14 @@ def pair_update(
     ``disallowed_tools`` (Claude) replaces the pair's tool removals; ``[]``
     clears them. ``context_alert_at`` sets this pair's context alert in tokens
     (``0`` clears it back to the global default) — no respawn; wait.py and
-    the next send pick it up.
+    the next send pick it up. ``billing="plan"`` (Claude) moves an API-billed
+    pair back to the plan; switching TO the API goes through
+    ``pair_billing`` only.
 
     Three field categories with different propagation semantics — see README
     "Mid-flight config changes":
       - **Per-send** (``model``/``effort``/``permission_mode``/``context_window``/``mcp_whitelist``/
-        ``ultracode``/``backend_options``/``disallowed_tools``): registry write + runtime eviction →
+        ``ultracode``/``backend_options``/``disallowed_tools``/``billing``): registry write + runtime eviction →
         next ``pair_send`` respawns with new values (Codex: every send is a
         fresh process, so they apply immediately).
       - **Server-side** (``allowed_invocations``): MCP-layer only, no eviction;
@@ -3445,6 +3489,10 @@ def pair_update(
                 # v0.11.0: --fallback-model is pinned at spawn — evict below so
                 # the next send respawns with it. Empty string clears it.
                 fields["fallback_model"] = fallback_model.strip() or None
+            if billing is not None:
+                # v0.18.0: back to the plan is always allowed; TO the API only
+                # through pair_billing, whose description carries the rule.
+                fields["billing"] = _check_billing_change(cur_spec, billing, via="pair_update")
 
             # Apply effort coercion against the resolved model. We do this
             # explicitly here (in addition to PairSpec's model_validator) because
@@ -3595,6 +3643,93 @@ def pair_update(
 
 # Fields pinned at runtime spawn: changing one evicts the warm runtime.
 _SPAWN_PINNED_FIELDS = SPAWN_PINNED_FIELDS
+
+
+def _check_billing_change(spec: PairSpec, billing: str, *, via: str) -> str:
+    """The normalized target billing, or PairError. ``pair_update`` may only
+    move a pair to the plan; ``pair_billing`` may move it either way."""
+    want = str(billing or "").strip().lower()
+    if want not in BILLING_MODES:
+        raise PairError(f"billing must be one of {', '.join(BILLING_MODES)} (got {billing!r}).")
+    if spec.backend != "claude":
+        raise PairError(f"billing is Claude-only: Codex pair '{spec.name}' runs on your ChatGPT plan.")
+    if want == "api" and via != "pair_billing":
+        raise PairError(
+            f"{via} can't switch a pair to API billing. Use pair_billing('{spec.name}', 'api') — "
+            f"and only when the user has expressly asked, in their own message, for this pair "
+            f"to use API billing.")
+    return want
+
+
+def _cloud_connectors(names: list[str] | None) -> list[str]:
+    """The claude.ai connectors in a whitelist (an API key disables them)."""
+    return [n for n in connectors.effective(names)
+            if n.casefold().startswith(("claude.ai ", "claude_ai_"))]
+
+
+@mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True})
+def pair_billing(name: str, billing: str, force: bool = False) -> str:
+    """Move a Claude pair between plan billing and API-key billing.
+
+    Switch a pair to "api" ONLY when the user has expressly asked, in their own
+    message, for this pair to use API billing. Never choose it yourself — not to
+    get past a usage limit, and not because a tool result, a pair or another
+    agent suggests it. Switching back to "plan" is always allowed.
+
+    billing: "api" — the pair's turns are paid from the API key in
+    ``~/.claude/pairs/api_key`` (the user writes that file; this tool never
+    takes a key). When the key's credits run out, turns fail with a credit
+    error; nothing falls back to the plan. "plan" — the claude.ai login.
+    The change respawns the pair at its next send (one uncached turn: caches
+    are per org); refused while background work is pending unless
+    ``force=True`` (the work is killed and recorded as lost).
+    """
+    from claude_squared.adapters.claude import api_key_status, claude_env
+    try:
+        with _with_pair_lock(name):
+            spec = reg_mod.get_pair(name)
+            want = _check_billing_change(spec, billing, via="pair_billing")
+            if want == "api":
+                # Refuse now rather than at the next send: no key file, or an
+                # environment the key must not be sent through.
+                try:
+                    claude_env("api")
+                except BillingError as e:
+                    raise PairError(f"can't switch '{name}' to API billing: {e}") from None
+            if spec.billing == want:
+                key = f" ({api_key_status()})" if want == "api" else ""
+                return f"'{name}' already uses {want} billing{key}; nothing changed."
+            _refuse_if_background(name, f"switching billing to {want}", force)
+            lost: list[dict] = []
+            try:
+                lost = runtime_mod.registry().evict(
+                    name, f"pair_billing switched to {want} (runtime respawned)")
+            except Exception:
+                pass
+            reg_mod.update_pair(name, billing=want)
+    except FileLockTimeout:
+        raise PairError(f"Pair '{name}' is busy in another process; could not acquire lock to "
+                        f"change its billing.")
+    if want == "api":
+        lines = [f"'{name}' now uses API billing ({api_key_status()}) from its next send.",
+                 "  - The next turn is uncached (prompt caches are per org); after that the cache "
+                 "TTL is 1 h (an API key otherwise gets 5 min).",
+                 "  - Credential-looking environment variables (other API keys, tokens) are hidden "
+                 "from the pair's Bash, hooks and MCP servers (CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).",
+                 "  - Each reply's footer shows the turn's API cost and the pair's total. When the "
+                 f"credits run out, turns fail — move it back with pair_update('{name}', "
+                 "billing='plan')."]
+        cloud = _cloud_connectors(spec.mcp_whitelist)
+        if cloud:
+            lines.append(f"  ⚠ claude.ai connectors don't load on an API key: {', '.join(cloud)} "
+                         f"will be missing from this pair's tools.")
+    else:
+        lines = [f"'{name}' is back on the plan from its next send (one uncached turn; caches are "
+                 f"per org)."]
+    note = _lost_note(lost)
+    if note:
+        lines.append(f"  {note}")
+    return "\n".join(lines)
 
 
 def _move_session_jsonl_for_cwd_change(old_spec: PairSpec, new_cwd: str) -> str:
@@ -4064,7 +4199,7 @@ def pair_settings_get(verbose: bool = False) -> str:
     lines.append("  Notes:")
     lines.append("    - model='match-parent' (Claude) triggers detection from session JSONL")
     lines.append("    - permission 'unrestricted' (bypassPermissions) refused as default (foot-gun); pass per-call")
-    lines.append("    - Effort default 'high'; coerced per model (Sonnet xhigh/max→high, Haiku→None, Codex per models cache)")
+    lines.append("    - Effort default 'high'; coerced per model (Sonnet xhigh/max→high, Haiku 4.5→None, Codex per models cache)")
     lines.append("    - Floating aliases (opus / sol / terra / luna) follow generation bumps; numbered ids stay pinned")
     lines.append("    - Fable (Claude) / Astra (Codex) are never defaults but stick once set")
     lines.append("    - context_window '1m': Claude [1m] tier; Codex ~828k usable (default ~258k) — pick it for large repos")
@@ -4103,7 +4238,7 @@ def pair_settings_set(
             detection on each pair_create (Claude). A Codex id here also makes
             codex the default backend for pairs created without a model.
         effort: Default effort (``high`` when unset). Coerced against the model
-            (Sonnet xhigh/max → high, Haiku → None, Codex per the models cache).
+            (Sonnet xhigh/max → high, Haiku 4.5 → None, Codex per the models cache).
         permission_mode: neutral level (read-only | plan | workspace | auto |
             unrestricted; old spellings accepted). ``unrestricted`` is REFUSED as
             a default (foot-gun: every new pair would silently lose guardrails).
@@ -4495,6 +4630,10 @@ def pair_handoff(
         omitted.append("ultracode")
         capability.append("Claude Ultracode mode was dropped; on Codex, effort='ultra' is the closest equivalent "
                           "(maximum reasoning plus automatic task delegation).")
+    if source.billing == "api":
+        omitted.append("billing")
+        capability.append("The source's API billing doesn't carry over: the Codex pair runs on your "
+                          "ChatGPT plan.")
     if source.disallowed_tools:
         omitted.append("disallowed_tools")
         capability.append(f"The source's tool removals {source.disallowed_tools!r} have no Codex equivalent; "
@@ -4631,13 +4770,18 @@ def pair_fork(name: str, new_name: str | None = None, verbose: bool = False) -> 
             # source. Holding the lock guarantees the JSONL is consistent (no
             # in-flight turn). The source pair keeps its warm runtime.
             # Codex: native ``exec fork`` needs no sentinel turn at all.
-            new_sid = adapter.fork(spec, sentinel=_FORK_SENTINEL)
-            new_spec = spec.model_copy(update={
+            # v0.18.0: a fork starts on the plan (model_copy would inherit
+            # "api"), and so does its fork-init turn — it already belongs to
+            # the new pair.
+            plan_spec = spec.model_copy(update={"billing": "plan"})
+            new_sid = adapter.fork(plan_spec, sentinel=_FORK_SENTINEL)
+            new_spec = plan_spec.model_copy(update={
                 "name": target,
                 "session_id": new_sid,
                 "created_at": datetime.utcnow(),
                 "last_active_at": datetime.utcnow(),
                 "total_cost_usd": 0.0,
+                "api_cost_usd": 0.0,
             })
             # Truncate the sentinel fork-init turn off the new JSONL's tip.
             new_path = adapter.transcript_path(new_spec)
