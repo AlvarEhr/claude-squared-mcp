@@ -90,6 +90,11 @@ def _current_key_fingerprint() -> str | None:
     return current_key_fingerprint()
 
 
+def _book_cost(name: str, cost: float, billing: str) -> None:
+    from claude_squared.adapters.claude import book_cost
+    book_cost(name, cost, billing)
+
+
 # ---------- Event-to-text formatting (shared between main + sub-agent logs) ----------
 
 class ToolCounter:
@@ -1624,8 +1629,10 @@ class PairRuntime:
             total = float(ev.get("total_cost_usd") or 0.0)
         except (TypeError, ValueError):
             total = self._cost_seen
-        ev["_turn_cost_usd"] = max(0.0, total - self._cost_seen)
-        self._cost_seen = max(self._cost_seen, total)
+        # A lower total means the counter restarted: the whole new total is
+        # this turn's (a clamp to 0 would drop it).
+        ev["_turn_cost_usd"] = total - self._cost_seen if total >= self._cost_seen else total
+        self._cost_seen = total
         with self._scope_lock:
             self._wake_at = None  # any result ends what a wake announced
             solicited = self._current_scope
@@ -1691,6 +1698,9 @@ class PairRuntime:
                 result = self.adapter._build_send_result(self.spec, ev)  # noqa: SLF001
             except Exception as e:
                 error = f"{type(e).__name__}: {e}"
+            if result is not None:
+                cost = float(result.cost_usd or 0.0)  # 0 for a refused request
+                record["cost_usd"] = cost
             status = "done"
             if (task is not None and _async_tasks.was_stopped(task.task_id)
                     and subtype == "error_during_execution"):
@@ -1735,6 +1745,8 @@ class PairRuntime:
             # A result with no turn open: resolves a wake its init announced
             # (never "whatever turn is open" — a one-shot send's could be).
             self._activity.clear_wake(gen=self._gen)
+            # Its spend still happened (v0.18.0, review round 1).
+            _book_cost(self.spec.name, cost, self.spec.billing)
         self._record_self_woken(record)
         self._implicit_done.set()
 
@@ -1831,6 +1843,9 @@ class PairRuntime:
                     if self._implicit_scope is not None or self._wake_live_locked():
                         continue  # opened (or announced) in the gap — wait again
                 if not promoted:
+                    # v0.18.0 (fix A): the wait above may have ended because the
+                    # exit handler stopped this runtime's self-woken turn.
+                    refuse_if_shutting_down()
                     _async_tasks.mark_task_executing(task_id)
                     promoted = True
                 # Belt: every queued line was attributed by the reader before
@@ -1998,7 +2013,7 @@ class PairRuntime:
                 try:
                     self.proc.stdin.write(payload.encode("utf-8"))
                     self.proc.stdin.flush()
-                except (BrokenPipeError, OSError) as e:
+                except (BrokenPipeError, OSError, ValueError) as e:  # ValueError: a closed file
                     raise CLIError(
                         f"pair runtime stdin closed: {e}",
                         stderr=self._collect_stderr(),

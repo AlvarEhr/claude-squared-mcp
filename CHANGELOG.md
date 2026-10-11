@@ -8,10 +8,11 @@ All notable changes to this project are documented here. Format follows
 
 API-key billing for Claude pairs, honest per-turn cost, and a shutdown fix.
 
-**Restart every open Claude and Codex session after installing.** The new
-registry fields are additive and written only when used (`billing` only when
-`"api"`), so a 0.17 process that spawns an API-billed pair runs it on the
-plan — the safe direction.
+**Restart every open Claude and Codex session after installing — before the
+first `pair_billing`.** The new registry fields are additive and written only
+when used (`billing` only when `"api"`), so a 0.17 process that spawns an
+API-billed pair runs it on the plan — the safe direction — but a 0.17 process
+that forks one copies `billing: api` into the fork.
 
 ### Added
 
@@ -39,23 +40,32 @@ plan — the safe direction.
   (measured on 2.1.296) — and `ANTHROPIC_AUTH_TOKEN` (it outranks the key);
   the official `ANTHROPIC_BASE_URL` is dropped, any other one refuses, and so
   does a Bedrock / Vertex / Foundry switch. It sets
-  `CLAUDE_CODE_PROMPT_CACHE_TTL=1h` (an API key otherwise gets 5 min) and
-  `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` (credential-looking variables stay out
-  of the pair's Bash, hooks and stdio MCP servers). A missing or malformed key
-  file refuses the send; it never falls back to the plan.
+  `CLAUDE_CODE_PROMPT_CACHE_TTL=1h` (an API key otherwise gets 5 min). A
+  missing or malformed key file refuses the send; it never falls back to the
+  plan. **An API pair's own processes (its Bash, hooks, MCP servers) can see
+  the key in their environment:** `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` would
+  hide it, but on CLI 2.1.296 it forces the permission mode to `default`
+  (measured: a Write denied on an acceptEdits pair), and Bash could read the
+  key file anyway. Bound the spend in the Console — the key's expiry, no
+  payment method on the org, a workspace spend limit.
 - **A Read deny rule for the key file on every Claude spawn**
   (`--disallowed-tools "Read(//c/Users/…/pairs/api_key)"`, plan pairs too). A
   scoped rule leaves the tool list, and the prompt cache, unchanged. Shell
   commands (`cat`) are not covered.
 - **API cost in the reply footer** of an API-billed pair (the turn's cost and
   the pair's API total, new `api_cost_usd`); `pair_info` shows billing and
-  cost for Claude pairs.
-- **Credit and key errors.** On an API-billed pair, a "credit balance" error
-  is rendered like a usage limit (`⏸ API CREDITS EXHAUSTED`: the reply is not
-  an answer; move the pair back to the plan or wait for next month's credits),
-  and a rejected key as `⛔ API KEY REJECTED` instead of "a transient API
-  error, retry". Self-woken turns included.
-- `tests/test_billing.py` (offline, 42 tests) and
+  cost for Claude pairs, `pair_list` flags API-billed pairs. Compaction and
+  `pair_invoke` spend is booked too, and so is a result that arrives with no
+  turn open; a request the API refused (no credits, rejected key) counts $0.
+- **Credit and key errors.** On an API-billed pair, a "credit balance (is)
+  too low" error is rendered like a usage limit (`⏸ API CREDITS EXHAUSTED`:
+  the reply is not an answer; move the pair back to the plan or wait for next
+  month's credits), and a rejected key — or a key or org that was switched off
+  — as `⛔ API KEY REJECTED` instead of "a transient API error, retry". Only
+  error results (is_error / api_error_status) count, never an answer quoting
+  the text; self-woken turns, compaction, `/context` and `pair_invoke`
+  included.
+- `tests/test_billing.py` (offline, 49 tests) and
   `tests/smoke_live_billing.py` (fake key by default; `--real` for the key
   file).
 
@@ -86,20 +96,21 @@ plan — the safe direction.
   it as `ORPHANED: … the work may have completed`. The exit handler now sets
   a shutting-down flag first, every spawn refuses after it, and a send that
   hasn't started fails as `NOT DELIVERED — the MCP server shut down before
-  this send ran; re-send it.` Both orphan sweeps say the same for a task that
-  was still queued. (Closing a turn's stdin on shutdown instead of
+  this send ran; re-send it.` Both orphan sweeps and both watchers (wait.py,
+  `python -m claude_squared wait`) say the same for a task that was still
+  queued. (Closing a turn's stdin on shutdown instead of
   tree-killing it is a separate design, not in this release.)
 
 ### Known unknowns
 
 - The exact text of the credits-exhausted error can't be provoked while
-  credits remain; the match is "credit balance" in an error or a short
-  notice on an API-billed pair (doc wording).
+  credits remain; the match is "credit balance (is) too low" in an error
+  result of an API-billed pair (doc wording).
 - Whether a run started from a desktop session counts against the monthly
   credits once it runs as `sdk-cli` is Anthropic's billing decision;
   `smoke_live_billing.py --real` shows whether a turn is covered.
 - A turn on a rejected key still reports a small `total_cost_usd` (fake-key
-  probe: $0.0024); it is counted as reported.
+  probe: $0.0024, probably a client-side estimate); it is counted as $0.
 
 ## [0.17.0] — 2026-10-09
 

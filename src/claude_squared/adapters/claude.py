@@ -259,11 +259,15 @@ _API_DROP_ENV = ("CLAUDE_CODE_ENTRYPOINT", "ANTHROPIC_AUTH_TOKEN")
 _CLOUD_PROVIDER_ENV = ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
 # Docs text when credits run out: "Your credit balance is too low to access the
 # Anthropic API…" (API) / "Credit balance too low · Add funds…" (Claude Code).
-# Not reproducible while credits remain, hence the loose match.
-_CREDIT_RE = re.compile(r"credit balance", re.IGNORECASE)
-# What a turn on a rejected key returns as its result (fake-key probe through
-# the warm runtime, 2.1.296, 2026-10-11): "Invalid API key · Fix external API key".
-_INVALID_KEY_RE = re.compile(r"invalid api key", re.IGNORECASE)
+# Not reproducible while credits remain. Matched only on an error result
+# (is_error / api_error_status) of an API-billed pair, never on an answer.
+_CREDIT_RE = re.compile(r"credit balance (is )?too low", re.IGNORECASE)
+# A rejected key or org: "Invalid API key · Fix external API key" (fake-key
+# probe through the warm runtime, 2.1.296, 2026-10-11: subtype success,
+# is_error true, api_error_status 401) and the API's 403 texts for a key or
+# org that was switched off. Same gating as _CREDIT_RE.
+_INVALID_KEY_RE = re.compile(r"invalid api key|api key authentication is disabled"
+                             r"|organization has been disabled", re.IGNORECASE)
 
 
 def api_key_path() -> Path:
@@ -314,6 +318,23 @@ def api_key_status() -> str:
     return f"key …{key[-4:]}"
 
 
+def book_cost(name: str, cost: float, billing: str) -> None:
+    """Add spend outside a send (compaction, pair_invoke, a result with no
+    turn open) to the pair's totals — and to api_cost_usd on API billing.
+    Best effort: bookkeeping never fails the operation."""
+    if not cost:
+        return
+    try:
+        from claude_squared.registry import get_pair, update_pair
+        cur = get_pair(name)
+        fields: dict[str, Any] = {"total_cost_usd": cur.total_cost_usd + cost}
+        if billing == "api":
+            fields["api_cost_usd"] = cur.api_cost_usd + cost
+        update_pair(name, **fields)
+    except Exception:
+        pass
+
+
 def _truthy(value: str | None) -> bool:
     return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -332,10 +353,11 @@ def claude_env(billing: str = "plan") -> dict[str, str]:
     key). Refuses an environment that would send the key elsewhere — a cloud
     provider switch or a non-official ``ANTHROPIC_BASE_URL`` (the official one,
     which the desktop app sets, is dropped). Sets
-    ``CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`` (credential-looking variables stay
-    out of the pair's Bash, hooks and stdio MCP servers) and
     ``CLAUDE_CODE_PROMPT_CACHE_TTL=1h`` (an API key otherwise gets 5 min).
-    The key never enters ``os.environ``."""
+    The key never enters ``os.environ`` — but the pair's own processes (its
+    Bash, hooks, MCP servers) inherit it. No CLAUDE_CODE_SUBPROCESS_ENV_SCRUB:
+    on 2.1.296 it forces the permission mode to ``default`` ("allowed_non_write_users
+    hardening"; review round 1, 2026-10-11), and Bash could read the key file anyway."""
     env = dict(os.environ)
     env.pop("ANTHROPIC_API_KEY", None)
     if billing != "api":
@@ -352,7 +374,6 @@ def claude_env(billing: str = "plan") -> dict[str, str]:
     for var in _API_DROP_ENV:
         env.pop(var, None)
     env["ANTHROPIC_API_KEY"] = read_api_key()
-    env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = "1"
     env["CLAUDE_CODE_PROMPT_CACHE_TTL"] = "1h"
     return env
 
@@ -372,9 +393,23 @@ def key_file_deny_rule() -> str:
 
 
 def _key_rejected_help(name: str) -> str:
-    return (f"the API rejected the key in {api_key_path()}. Fix the key file (the next spawn reads "
+    return (f"the API rejected the key in {api_key_path()} (or its org is switched off). Fix the "
+            f"key file (the next spawn reads "
             f"it again), or move '{name}' back to the plan with pair_update('{name}', "
             f"billing=\"plan\").")
+
+
+def _billing_failure(spec: "PairSpec | None", text: str) -> str | None:
+    """The clear message for a failed process of an API-billed pair whose
+    output says the credits ran out or the key was rejected, else None.
+    Only for processes that already failed (non-zero exit)."""
+    if spec is None or spec.billing != "api":
+        return None
+    if _CREDIT_RE.search(text):
+        return _credit_help(spec.name)
+    if _INVALID_KEY_RE.search(text):
+        return _key_rejected_help(spec.name)
+    return None
 
 
 def _credit_help(name: str) -> str:
@@ -951,12 +986,9 @@ class ClaudeAdapter(PairAdapter):
             # api_error_status 404), with stderr EMPTY (verified the day Fable 5
             # was pulled). So check BOTH streams for the marker, not just stderr.
             combined = (stderr_txt + "\n" + stdout_txt).lower()
-            if env_spec is not None and env_spec.billing == "api" and _CREDIT_RE.search(combined):
-                raise CLIError(_credit_help(env_spec.name), stderr=stderr_txt or stdout_txt[:2000],
-                               exit_code=proc.returncode)
-            if env_spec is not None and env_spec.billing == "api" and _INVALID_KEY_RE.search(combined):
-                raise CLIError(_key_rejected_help(env_spec.name), stderr=stderr_txt or stdout_txt[:2000],
-                               exit_code=proc.returncode)
+            failure = _billing_failure(env_spec, combined)
+            if failure:
+                raise CLIError(failure, stderr=stderr_txt or stdout_txt[:2000], exit_code=proc.returncode)
             if MODEL_UNAVAILABLE_MARKER in combined:
                 raise CLIError(
                     _MODEL_UNAVAILABLE_HELP,
@@ -1026,11 +1058,13 @@ class ClaudeAdapter(PairAdapter):
             raise CommandTimeout(spec.name, timeout_seconds) from e
 
         if proc.returncode != 0:
-            raise CLIError(
-                "claude CLI (stream-json) exited non-zero",
-                stderr=proc.stderr.decode("utf-8", errors="replace"),
-                exit_code=proc.returncode,
-            )
+            stderr_txt = proc.stderr.decode("utf-8", errors="replace")
+            # v0.18.0: compaction / /context / pair_invoke on an API pair whose
+            # credits ran out or whose key was rejected say so, as _run_print does.
+            failure = _billing_failure(
+                spec, stderr_txt + "\n" + proc.stdout.decode("utf-8", errors="replace"))
+            raise CLIError(failure or "claude CLI (stream-json) exited non-zero",
+                           stderr=stderr_txt, exit_code=proc.returncode)
 
         events: list[dict] = []
         for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
@@ -1043,6 +1077,11 @@ class ClaudeAdapter(PairAdapter):
                 continue
         if connectors.effective(spec.mcp_whitelist):
             self._attach_mcp_init(events)
+        # v0.18.0: compaction and pair_invoke spend counts too (one process,
+        # so its last result's total is its whole cost).
+        totals = [float(e.get("total_cost_usd") or 0.0) for e in events if e.get("type") == "result"]
+        if totals and max(totals) > 0:
+            book_cost(spec.name, max(totals), spec.billing)
         return events
 
     @staticmethod
@@ -1184,16 +1223,15 @@ class ClaudeAdapter(PairAdapter):
                 parts.append(str(expl)[:240])
             safety_signal = " — ".join(parts)
             safety_kind = "refusal"
-        elif (spec.billing == "api" and _CREDIT_RE.search(result_json.get("result") or "")
-              and (result_json.get("is_error") or api_err
-                   or len((result_json.get("result") or "").strip()) <= 400)):
-            # v0.18.0: the Console org's credits ran out. Only on an API-billed
-            # pair, and only an error or a short notice — an API pair's real
-            # answer about "credit balance" code must not read as one.
+        elif (spec.billing == "api" and (result_json.get("is_error") or api_err)
+              and _CREDIT_RE.search(result_json.get("result") or "")):
+            # v0.18.0: the Console org's credits ran out. Only an ERROR of an
+            # API-billed pair — an answer quoting the text must not read as one.
             safety_signal = (f"{_credit_help(spec.name)} The API said: "
                              f"{(result_json.get('result') or '').strip()[:160]!r}")
             safety_kind = "credit_exhausted"
-        elif spec.billing == "api" and _INVALID_KEY_RE.search(result_json.get("result") or ""):
+        elif (spec.billing == "api" and (result_json.get("is_error") or api_err)
+              and _INVALID_KEY_RE.search(result_json.get("result") or "")):
             # Otherwise it reads as a transient API error ("retry usually
             # resolves it") — a bad key never does.
             safety_signal = (f"{_key_rejected_help(spec.name)} The API said: "
@@ -1245,7 +1283,9 @@ class ClaudeAdapter(PairAdapter):
             # v0.18.0: a warm runtime's total_cost_usd is a running total for
             # the process; its reader puts this turn's share in _turn_cost_usd.
             # A one-shot process reports its own (single-turn) total.
-            cost_usd=(result_json["_turn_cost_usd"] if result_json.get("_turn_cost_usd") is not None
+            # A request the API refused (no credits, rejected key) costs nothing.
+            cost_usd=(0.0 if safety_kind in ("credit_exhausted", "api_key_rejected")
+                      else result_json["_turn_cost_usd"] if result_json.get("_turn_cost_usd") is not None
                       else result_json.get("total_cost_usd", 0.0)),
             duration_ms=result_json.get("duration_ms", 0),
             permission_denials=denials,

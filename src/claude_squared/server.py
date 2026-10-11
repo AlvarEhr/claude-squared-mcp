@@ -1818,6 +1818,7 @@ def _build_send_runner(
             # Claude promotes immediately before opening its solicited scope,
             # after any local self-woken turn. Other adapters start here.
             if not isinstance(adapter, ClaudeAdapter):
+                runtime_mod.refuse_if_shutting_down()
                 async_tasks.mark_task_executing(task_id)
             # v0.13.0: neutral permission override → validated here so a typo
             # fails fast instead of reaching the CLI. (Bound to a NEW name —
@@ -3667,7 +3668,7 @@ def _cloud_connectors(names: list[str] | None) -> list[str]:
             if n.casefold().startswith(("claude.ai ", "claude_ai_"))]
 
 
-@mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True})
+@mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True})
 def pair_billing(name: str, billing: str, force: bool = False) -> str:
     """Move a Claude pair between plan billing and API-key billing.
 
@@ -3714,8 +3715,9 @@ def pair_billing(name: str, billing: str, force: bool = False) -> str:
         lines = [f"'{name}' now uses API billing ({api_key_status()}) from its next send.",
                  "  - The next turn is uncached (prompt caches are per org); after that the cache "
                  "TTL is 1 h (an API key otherwise gets 5 min).",
-                 "  - Credential-looking environment variables (other API keys, tokens) are hidden "
-                 "from the pair's Bash, hooks and MCP servers (CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).",
+                 "  - The pair's own processes (its Bash, hooks, MCP servers) can see the key in "
+                 "their environment. Bound the spend in the Console: the key's expiry, no payment "
+                 "method on the org, or a workspace spend limit.",
                  "  - Each reply's footer shows the turn's API cost and the pair's total. When the "
                  f"credits run out, turns fail — move it back with pair_update('{name}', "
                  "billing='plan')."]

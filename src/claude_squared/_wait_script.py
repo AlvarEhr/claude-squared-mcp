@@ -361,6 +361,11 @@ def _dead_owner_exit(data, now) -> int | None:
               f"process has exited. pair_poll('{tid}') collects the recovered result.",
               file=sys.stderr)
         return 7
+    if data.get("queued"):
+        # v0.18.0 (Incident 2026-10-04): still queued when its server died.
+        print(f"not delivered: owner MCP server (pid {owner}) died before this send ran — it "
+              f"was never delivered. Re-send it.", file=sys.stderr)
+        return 4
     if _backend(str(data.get("pair_name") or "")) == "codex":
         how = ("A codex turn from before v0.16 dies with its MCP server; the thread is intact — "
                "pair_send resumes it.")

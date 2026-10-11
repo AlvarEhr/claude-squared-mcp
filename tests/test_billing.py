@@ -194,7 +194,9 @@ class EnvBuilderTests(BillingCase):
         self.assertEqual(env["ANTHROPIC_API_KEY"], FAKE_KEY)
         for var in ("CLAUDE_CODE_ENTRYPOINT", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
             self.assertNotIn(var, env)
-        self.assertEqual(env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "1")
+        # Review round 1: on 2.1.296 the scrub forces permission mode to
+        # "default" (Write denied on an acceptEdits pair) — never set it.
+        self.assertNotIn("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", env)
         self.assertEqual(env["CLAUDE_CODE_PROMPT_CACHE_TTL"], "1h")
         self.assertEqual(env["MY_VAR"], "kept")
         # The key never enters this process's own environment.
@@ -376,7 +378,8 @@ class ToolTests(BillingCase):
         self.runtime.evict.assert_called_once()
         self.assertIn("key …WXYZ", out)
         self.assertIn("uncached", out)
-        self.assertIn("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", out)
+        self.assertIn("can see the key in their environment", out)
+        self.assertNotIn("SCRUB", out)
         self.assertNotIn(FAKE_KEY, out)
         self.assertIn("already uses api", tool(S.pair_billing)("p", "API"))
         self.assertEqual(self.runtime.evict.call_count, 1)  # no change, no respawn
@@ -499,6 +502,29 @@ class CostTests(BillingCase):
         ev = {"type": "result", "subtype": "success", "total_cost_usd": 0.002}
         rt._after_result(ev)
         self.assertEqual(ev["_turn_cost_usd"], 0.002)
+        # A lower total means the counter restarted: all of it is this turn's.
+        ev = {"type": "result", "subtype": "success", "total_cost_usd": 0.0015}
+        rt._after_result(ev)
+        self.assertEqual(ev["_turn_cost_usd"], 0.0015)
+
+    def test_a_result_with_no_turn_open_still_books_its_cost(self):
+        self.add(billing="api")
+        rt = PairRuntime(R.get_pair("p"), CL.ClaudeAdapter())
+        rt._after_result({"type": "result", "subtype": "success", "total_cost_usd": 0.5})
+        spec = R.get_pair("p")
+        self.assertEqual((spec.total_cost_usd, spec.api_cost_usd), (0.5, 0.5))
+
+    def test_compaction_and_invoke_spend_is_booked(self):
+        self.write_key()
+        spec = self.add(billing="api", total_cost_usd=1.0, api_cost_usd=1.0)
+        events = [{"type": "system", "subtype": "init"},
+                  {"type": "result", "subtype": "success", "total_cost_usd": 0.25}]
+        out = "\n".join(json.dumps(e) for e in events)
+        with patch.object(subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=out.encode(), stderr=b"")):
+            CL.ClaudeAdapter()._run_stream_json(spec, ["/compact"], timeout_seconds=5)
+        spec = R.get_pair("p")
+        self.assertEqual((spec.total_cost_usd, spec.api_cost_usd), (1.25, 1.25))
 
     def test_the_send_result_prefers_the_turns_share(self):
         spec = self.add()
@@ -544,7 +570,8 @@ class CostTests(BillingCase):
             rt._after_result({"type": "result", "subtype": "success", "result": "woke",
                               "session_id": "p-sid", "total_cost_usd": 1.25})
         spec = R.get_pair("p")
-        self.assertEqual((spec.total_cost_usd, spec.api_cost_usd), (0.25, 0.25))
+        # 1.0 from the earlier result (no turn open, booked as is) + this turn's 0.25.
+        self.assertEqual((spec.total_cost_usd, spec.api_cost_usd), (1.25, 1.25))
         self.assertEqual(spec.self_woken_pending[-1]["cost_usd"], 0.25)
 
 
@@ -564,8 +591,7 @@ class CreditTests(BillingCase):
         spec = self.add(billing="api")
         for result in ({"result": "Credit balance too low · Add funds to continue", "is_error": True},
                        {"result": "Your credit balance is too low to access the Anthropic API.",
-                        "api_error_status": 400},
-                       {"result": "Credit balance too low · Add funds"}):
+                        "api_error_status": 400}):
             with self.subTest(result=result["result"][:30]):
                 r = self.build(spec, **result)
                 self.assertEqual(r.safety_kind, "credit_exhausted")
@@ -574,10 +600,49 @@ class CreditTests(BillingCase):
                 self.assertIn("did NOT do the work", text)
                 self.assertIn("pair_update('p', billing=\"plan\")", text)
 
-    def test_plan_pairs_and_real_answers_are_not_credit_errors(self):
-        long_answer = "Fixed the credit balance check in billing.py. " + "Details follow. " * 40
-        self.assertIsNone(self.build(self.add("plan_pair"), result="Credit balance too low").safety_kind)
-        self.assertIsNone(self.build(self.add("api_pair", billing="api"), result=long_answer).safety_kind)
+    def test_plan_pairs_and_real_answers_are_not_credit_or_key_errors(self):
+        # Only an ERROR result (is_error / api_error_status) of an API pair
+        # counts — an answer quoting the texts is an answer (review round 1).
+        api = self.add("api_pair", billing="api")
+        self.assertIsNone(self.build(self.add("plan_pair"), result="Credit balance too low",
+                                     is_error=True).safety_kind)
+        for answer in ("Credit balance too low · Add funds",
+                       "Fixed the credit balance check in billing.py; it now says your credit "
+                       "balance is too low when it is. " + "Details follow. " * 40,
+                       "The CLI prints 'Invalid API key · Fix external API key' when the key "
+                       "is wrong; I added a test for it. " + "More. " * 40):
+            with self.subTest(answer=answer[:30]):
+                r = self.build(api, result=answer)
+                self.assertIsNone(r.safety_kind)
+                self.assertNotIn("EXHAUSTED", S._fmt_send_result(r))
+                self.assertNotIn("REJECTED", S._fmt_send_result(r))
+
+    def test_switched_off_keys_and_orgs_read_as_rejected(self):
+        api = self.add(billing="api")
+        for text in ("API key authentication is disabled for this organization",
+                     "This organization has been disabled."):
+            with self.subTest(text=text):
+                self.assertEqual(self.build(api, result=text, is_error=True,
+                                            api_error_status=403).safety_kind, "api_key_rejected")
+
+    def test_failed_requests_cost_nothing(self):
+        api = self.add(billing="api")
+        for result in ({"result": "Invalid API key · Fix external API key", "api_error_status": 401},
+                       {"result": "Credit balance too low", "is_error": True}):
+            self.assertEqual(self.build(api, total_cost_usd=0.0024, _turn_cost_usd=0.0024,
+                                        **result).cost_usd, 0.0)
+
+    def test_stream_json_failures_map_like_one_shots(self):
+        # Compaction, /context and pair_invoke on an API pair (review round 1).
+        self.write_key()
+        spec = self.add(billing="api")
+        for text, pattern in (("Credit balance too low · Add funds", "credits are used up"),
+                              ("Invalid API key · Fix external API key", "rejected the key")):
+            out = json.dumps({"type": "result", "is_error": True, "result": text})
+            with self.subTest(text=text), patch.object(subprocess, "run", return_value=SimpleNamespace(
+                    returncode=1, stdout=out.encode(), stderr=b"")):
+                with self.assertRaisesRegex(CLIError, pattern):
+                    CL.ClaudeAdapter()._run_stream_json(spec, ["/compact"], timeout_seconds=5)
 
     def test_a_rejected_key_is_not_a_transient_error(self):
         # The fake-key probe's exact result text (2026-10-11).
@@ -692,6 +757,60 @@ class ShutdownTests(BillingCase):
         self.assertTrue(done.queued)
         self.popen.assert_not_called()
         self.assertEqual(AT.load_task(implicit.task_id).status, "stopped")
+
+    def test_a_live_runtime_releasing_a_queued_send_writes_nothing(self):
+        # Review round 1: the process can still be alive when the wait ends
+        # (the exit handler ended the self-woken turn first). The send must
+        # refuse before it is promoted — nothing reaches stdin.
+        spec = self.add("pair")
+        adapter = CL.ClaudeAdapter()
+        rt = PairRuntime(spec, adapter)
+        rt._drift_checked = True
+        stdin = Mock()
+        rt.proc = SimpleNamespace(pid=0, returncode=None, stdin=stdin, poll=lambda: None)
+        rt._open_implicit_turn()
+        waiting = threading.Event()
+        original_wait = rt.wait_for_implicit_idle
+
+        def wait(*args):
+            waiting.set()
+            return original_wait(*args)
+        runner = S._build_send_runner("pair", "next", hard_timeout_seconds=5, override_model=None,
+                                      override_effort=None, override_permission_mode=None)
+        reg = SimpleNamespace(get_or_start=lambda *a: rt, get_or_none=lambda name: rt)
+        with patch.object(RT, "registry", return_value=reg), \
+                patch.object(S, "_adapter_for", return_value=adapter), \
+                patch.object(adapter, "session_exists", return_value=True), \
+                patch.object(rt, "wait_for_implicit_idle", side_effect=wait):
+            task = AT.start_task("pair", "next", runner, queued=True)
+            self.assertTrue(waiting.wait(5))
+            RT._SHUTTING_DOWN.set()  # the exit handler's first step …
+            rt._abort_implicit_turn("the owning MCP process exited")  # … then the turn ends
+            done = AT.wait_for_task(task.task_id, 5)
+        self.assertEqual((done.status, done.error, done.queued), ("failed", NOT_DELIVERED_MESSAGE, True))
+        stdin.write.assert_not_called()
+        self.popen.assert_not_called()
+
+    def test_the_watchers_say_not_delivered_for_a_queued_task(self):
+        import contextlib
+        from claude_squared import _wait_script as W
+        from claude_squared import __main__ as MAIN
+        g = {"__name__": "offline_wait"}
+        exec(compile(W.WAIT_SCRIPT_SOURCE, "wait.py", "exec"), g)
+        g["_av_task_owner_alive"] = lambda *a: False
+        data = {"task_id": "t", "pair_name": "pair", "owner_pid": 4, "queued": True,
+                "started_at": datetime.utcnow().isoformat(), "status": "running"}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(g["_dead_owner_exit"](data, g["_av_now"]()), 4)
+        self.assertIn("not delivered", err.getvalue())
+        self.assertNotIn("completion", err.getvalue())
+        task_id = self.task_file(queued=True, owner_pid=4)
+        err = io.StringIO()
+        with patch.object(AT, "_is_pid_alive", return_value=False), contextlib.redirect_stderr(err):
+            self.assertEqual(MAIN._cmd_wait([task_id]), 4)
+        self.assertIn("not delivered", err.getvalue())
+        self.assertNotIn("may have completed", err.getvalue())
 
     def task_file(self, *, queued: bool, owner_pid: int):
         if "pair" not in R.load().pairs:
