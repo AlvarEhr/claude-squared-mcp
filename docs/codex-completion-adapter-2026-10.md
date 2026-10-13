@@ -84,7 +84,7 @@ The adapter provides an event and result references under the manager's existing
 
 ## Validation and review
 
-Final checks: all **29 maintained offline suites passed** after the v0.18.0 refresh, including **55 completion/regression tests**. The live current manager's extended-path rollout passes caller identity and full-access eligibility. `git diff --check` passed; original main remained clean.
+Final checks: all **29 maintained offline suites passed** after the v0.18.0 refresh, including **55 completion/regression tests**. The live current manager's extended-path rollout passes caller identity and full-access eligibility. After Alvar restarted, the actual clone armed a read-only Luna task, the manager ended its turn, and the completion callback woke it automatically. The command slept 25 seconds and returned `RESTART_WAKE_OK_B72` with exit 0; the notification was acknowledged as delivered, its result was collected once, and the disposable pair was forgotten/thread archived. No terminal watcher or polling loop was used. `git diff --check` passed; original main remained clean.
 
 The offline runner includes the completion suite. It covers disabled behavior, metadata injection/schema hiding, origin/policy/profile/plan checks, coalescing, fast completion/loss/generation races, pending/background work, context publication lag, cwd changes, clear/forget/archive/rewind, concurrent dispatchers, atomic failures, malformed catalogs/frames, handle cleanup, destination acknowledgments, uncertain sends and reconciliation. Real stdio fixtures validate dispatch after the RPC returns and an owned-server restart with no model calls.
 
