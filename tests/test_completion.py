@@ -4,7 +4,7 @@ import asyncio
 from datetime import datetime, timedelta
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import subprocess
 import sys
 import tempfile
@@ -136,6 +136,41 @@ class CompletionTests(unittest.TestCase):
     def test_own_pair_is_not_a_manager(self):
         R.update_pair("child", session_id=self.thread)
         self.assertIn("own thread", N.arm(self.task(), self.ctx))
+
+    @unittest.skipUnless(os.name == "nt", "requires real Windows extended-path I/O")
+    def test_extended_windows_rollout_arms_and_delivers(self):
+        extended = Path("\\\\?\\" + str(self.rollout.resolve()))
+        with patch("claude_squared.adapters.codex.rollout_path_for", return_value=extended):
+            path = self.arm()
+            N.process_one(path)
+        self.assertEqual(N._read(path)["status"], "delivered")
+        self.assertEqual(len(self.sent), 1)
+
+    def test_windows_prefix_comparison_preserves_directory_boundaries(self):
+        root = PureWindowsPath("C:/home/.codex/sessions")
+        for text in ("C:/home/.codex/sessions/2026/rollout.jsonl",
+                     "\\\\?\\C:\\HOME\\.codex\\sessions\\2026\\rollout.jsonl"):
+            self.assertTrue(N.comparison_path(PureWindowsPath(text)).is_relative_to(root))
+        for text in ("\\\\?\\C:\\home\\.codex\\archived_sessions\\rollout.jsonl",
+                     "\\\\?\\C:\\home\\.codex\\sessions-other\\rollout.jsonl",
+                     "\\\\?\\D:\\home\\.codex\\sessions\\rollout.jsonl"):
+            self.assertFalse(N.comparison_path(PureWindowsPath(text)).is_relative_to(root))
+        extended_root = N.comparison_path(PureWindowsPath("\\\\?\\C:\\home\\.codex\\sessions"))
+        self.assertTrue(PureWindowsPath("C:/home/.codex/sessions/rollout.jsonl").is_relative_to(extended_root))
+
+    def test_extended_unc_paths_match_only_the_same_share(self):
+        root = N.comparison_path(PureWindowsPath("\\\\?\\UNC\\server\\share\\.codex\\sessions"))
+        self.assertTrue(N.comparison_path(PureWindowsPath("\\\\SERVER\\share\\.codex\\sessions\\rollout.jsonl")).is_relative_to(root))
+        self.assertFalse(N.comparison_path(PureWindowsPath("\\\\?\\UNC\\server\\other\\.codex\\sessions\\rollout.jsonl")).is_relative_to(root))
+
+    def test_outside_and_archived_rollouts_still_refused(self):
+        for folder in (self.root / "codex/archived_sessions", self.root / "codex/sessions-other"):
+            folder.mkdir(parents=True)
+            other = folder / self.rollout.name
+            other.write_bytes(self.rollout.read_bytes())
+            with patch("claude_squared.adapters.codex.rollout_path_for", return_value=other):
+                self.assertIn("not an active local session", N.arm(self.task(), self.ctx))
+        self.assertFalse(self.sent)
 
     def test_desktop_builtin_full_access_profile_is_supported(self):
         self.events[0]["payload"]["thread_source"] = "agent_created_thread"
@@ -368,7 +403,7 @@ class CompletionTests(unittest.TestCase):
         self.assertFalse(self.sent)
 
     def test_supported_dispatcher_claims_legacy_backoff_without_old_reader_interference(self):
-        for version in (1, 2):
+        for version in (1, 2, 3):
             with self.subTest(version=version):
                 path = self.arm(); r=N._read(path); r.update(version=version,retry_at=time.time()+600,detail="old build refused")
                 N._save(path,r); N.process_one(path)
@@ -376,8 +411,8 @@ class CompletionTests(unittest.TestCase):
                 self.assertEqual(claimed["version"],N.VERSION)
                 self.assertEqual(claimed["status"],"delivered")
                 # Both installed build-gated readers reject new tickets.
-                self.assertNotIn(claimed["version"],(1,2))
-        self.assertEqual(len(self.sent),2)
+                self.assertNotIn(claimed["version"],(1,2,3))
+        self.assertEqual(len(self.sent),3)
 
     def test_unsupported_dispatcher_does_not_mutate_legacy_ticket(self):
         path=self.arm(); r=N._read(path); r["version"]=1; N._save(path,r)
@@ -388,7 +423,7 @@ class CompletionTests(unittest.TestCase):
         self.assertFalse(self.sent)
 
     def test_coalescing_legacy_registration_drops_obsolete_build_backoff(self):
-        for version in (1, 2):
+        for version in (1, 2, 3):
             with self.subTest(version=version):
                 first = self.task(); path = self.arm(first); record = N._read(path)
                 record.update(version=version, retry_at=time.time()+600)
@@ -400,10 +435,10 @@ class CompletionTests(unittest.TestCase):
                 self.assertEqual(set(upgraded["tasks"]), {first.task_id, second.task_id})
                 N.process_one(path)
                 self.assertEqual(N._read(path)["status"], "delivered")
-        self.assertEqual(len(self.sent), 2)
+        self.assertEqual(len(self.sent), 3)
 
     def test_legacy_uncertain_send_is_not_retransmitted_during_claim_upgrade(self):
-        for version in (1, 2):
+        for version in (1, 2, 3):
             with self.subTest(version=version):
                 path=self.arm(); r=N._read(path); r.update(version=version,status="sending"); N._save(path,r)
                 N.process_one(path)

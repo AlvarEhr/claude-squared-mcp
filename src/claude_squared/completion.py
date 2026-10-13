@@ -9,7 +9,7 @@ import hashlib
 import json
 import logging
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import threading
 import time
@@ -22,10 +22,9 @@ from claude_squared import desktop_bridge as bridge
 from claude_squared.registry import claude_home
 
 logger = logging.getLogger(__name__)
-# Version 3 is intentionally unreadable to the older build-gated dispatchers.
-# Otherwise an old, unsupported Desktop bridge can claim a newer sender's
-# ticket and impose shared retry_at backoff indefinitely.
-VERSION = 3
+# Fence older dispatchers whose path/build preflight could reject a valid
+# manager or impose shared retry_at backoff. Existing work remains readable.
+VERSION = 4
 MAX_WAIT = 6 * 3600
 MAX_ROLLOUT = 128 * 1024 * 1024
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -59,7 +58,7 @@ def _read(path):
         if path.stat().st_size > 128 * 1024:
             return None
         data = json.loads(path.read_text(encoding="utf-8"))
-        if (not isinstance(data, dict) or data.get("version") not in (1, 2, VERSION)
+        if (not isinstance(data, dict) or data.get("version") not in (1, 2, 3, VERSION)
                 or not UUID.fullmatch(str(data.get("id", "")))
                 or path.stem != data.get("id")
                 or not UUID.fullmatch(str(data.get("thread", "")))
@@ -139,6 +138,22 @@ def caller_ids(ctx):
     return tuple(result)
 
 
+def comparison_path(path):
+    """Compare resolved Windows paths equally with/without the extended prefix.
+
+    Keep the original path for I/O, including paths longer than MAX_PATH.
+    Callers resolve paths first so junctions cannot hide an outside location.
+    """
+    if isinstance(path, PureWindowsPath):
+        text = str(path)
+        if text[:8].lower() == "\\\\?\\unc\\":
+            text = "\\\\" + text[8:]
+        elif text.startswith("\\\\?\\"):
+            text = text[4:]
+        return PureWindowsPath(text)
+    return path
+
+
 def caller_snapshot(thread, turn, marker=None):
     from claude_squared.adapters.codex import codex_home, rollout_path_for
 
@@ -146,7 +161,7 @@ def caller_snapshot(thread, turn, marker=None):
     if path is None:
         raise Refused("manager rollout is unavailable or archived")
     path = path.resolve()
-    if not path.is_relative_to((codex_home() / "sessions").resolve()):
+    if not comparison_path(path).is_relative_to(comparison_path((codex_home() / "sessions").resolve())):
         raise Refused("manager is not an active local session")
     if path.stat().st_size > MAX_ROLLOUT:
         raise Refused("manager rollout exceeds the verified inspection limit")
