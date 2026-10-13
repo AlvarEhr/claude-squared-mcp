@@ -4,6 +4,270 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] — 2026-10-11
+
+API-key billing for Claude pairs, honest per-turn cost, and a shutdown fix.
+
+**Restart every open Claude and Codex session after installing — before the
+first `pair_billing`.** The new registry fields are additive and written only
+when used (`billing` only when `"api"`), so a 0.17 process that spawns an
+API-billed pair runs it on the plan — the safe direction — but a 0.17 process
+that forks one copies `billing: api` into the fork.
+
+### Added
+
+- **API-key billing per Claude pair: `pair_billing(name, billing, force?)`.**
+  Max and Team plans now include monthly API credits for one linked Console
+  org, covering `claude -p` runs made with that org's API key. `"api"` runs
+  the pair on the key in `~/.claude/pairs/api_key` (any Console API key —
+  personal `sk-ant-usr…`, service-account or legacy workspace `sk-ant-api…`;
+  OAuth tokens and Admin keys are refused; read at every spawn; never
+  stored in the registry, a command line, a log or a tool result; `pair_info`
+  shows its last four characters; a rotated key respawns the pair at its
+  next send once no background work is pending); `"plan"`
+  moves it back. The tool's description tells agents to switch to the API
+  only when the user has asked for it in their own message. It refuses while
+  the key file is missing, warns that claude.ai connectors in `mcp_whitelist`
+  don't load on a key, and, like other spawn-pinned changes, refuses while
+  background work is pending unless `force=True`. `pair_update(billing="plan")`
+  is accepted; `pair_update(billing="api")` refuses and points at
+  `pair_billing`. `pair_create` and `pair_settings_set` have no billing
+  parameter: pairs start on the plan, and so do forks (their fork-init turn
+  too) and adopted pairs; `pair_clear` / `pair_rewind` / `pair_stop(hard)`
+  keep the pair's billing; `pair_handoff` lists it as omitted.
+- **One environment builder for every Claude spawn** (warm runtime, one-shot
+  `--print`, stream-json, triage, `claude mcp list`). On API billing it sets
+  the key and drops `CLAUDE_CODE_ENTRYPOINT` — a pair started from a desktop
+  session inherits `claude-desktop`, and with it the CLI ignores the key
+  (measured on 2.1.296) — and `ANTHROPIC_AUTH_TOKEN` (it outranks the key);
+  the official `ANTHROPIC_BASE_URL` is dropped, any other one refuses, and so
+  does a Bedrock / Vertex / Foundry switch. It sets
+  `CLAUDE_CODE_PROMPT_CACHE_TTL=1h` (an API key otherwise gets 5 min). A
+  missing or malformed key file refuses the send; it never falls back to the
+  plan. **An API pair's own processes (its Bash, hooks, MCP servers) can see
+  the key in their environment:** `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` would
+  hide it, but on CLI 2.1.296 it forces the permission mode to `default`
+  (measured: a Write denied on an acceptEdits pair), and Bash could read the
+  key file anyway. Bound the spend in the Console — the key's expiry, no
+  payment method on the org, a workspace spend limit.
+- **A Read deny rule for the key file on every Claude spawn**
+  (`--disallowed-tools "Read(//c/Users/…/pairs/api_key)"`, plan pairs too). A
+  scoped rule leaves the tool list, and the prompt cache, unchanged. Shell
+  commands (`cat`) are not covered.
+- **API cost in the reply footer** of an API-billed pair (the turn's cost and
+  the pair's API total, new `api_cost_usd`); `pair_info` shows billing and
+  cost for Claude pairs, `pair_list` flags API-billed pairs. Compaction and
+  `pair_invoke` spend is booked too, and so is a result that arrives with no
+  turn open; a request the API refused outright (no credits, rejected key)
+  counts $0, a turn that ran out partway keeps what it spent before.
+- **Credit and key errors.** On an API-billed pair, a "credit balance (is)
+  too low" error is rendered like a usage limit (`⏸ API CREDITS EXHAUSTED`:
+  the reply is not an answer; move the pair back to the plan or wait for next
+  month's credits), and a rejected key — or a key or org that was switched off
+  — as `⛔ API KEY REJECTED` instead of "a transient API error, retry"; a
+  personal or service-account key not scoped to one workspace ("anthropic-
+  workspace-id is required…") gets the same banner with that fix. Only
+  error results (is_error / api_error_status) count, never an answer quoting
+  the text — and for a failed process only its last result event, never
+  quoted tool output; self-woken turns, compaction, `/context` and
+  `pair_invoke` included.
+- `tests/test_billing.py` (offline, 54 tests) and
+  `tests/smoke_live_billing.py` (fake key by default; `--real` for the key
+  file).
+
+### Changed
+
+- **Every Claude spawn drops an inherited `ANTHROPIC_API_KEY`** unless the
+  pair is on API billing. In `-p` a key in the environment beats the
+  claude.ai login, so a key where the MCP server starts used to bill every
+  pair silently. If you relied on that, use `pair_billing` per pair.
+- **Every Claude pair's command line gains one flag** — the key file's Read
+  deny rule. The tool list is unchanged, so no cache miss is expected.
+- **Haiku 5.x takes effort levels** (`low` … `max`, like Opus), so a Haiku
+  pair now gets the default `high` and passes `--effort`. Haiku 4.5 and
+  older still have none.
+
+### Fixed
+
+- **`total_cost_usd` double-counted on warm runtimes.** The CLI reports a
+  running total for the process (Haiku probe: 0.0078 → 0.0105 → 0.0119 over
+  three turns), and the registry added it whole after every turn. Each
+  result now gets its own step of that total (reset at every spawn); one-shot
+  processes still report their own. Stored totals from before are not
+  rewritten.
+- **A send queued at shutdown was reported as "may have completed".** When
+  the server exits during a self-woken turn, stopping the runtimes released a
+  send queued behind it; it spawned a fresh runtime inside the exiting
+  server, died before its message was written, and the next server reaped
+  it as `ORPHANED: … the work may have completed`. The exit handler now sets
+  a shutting-down flag first, every spawn refuses after it, and a send that
+  hasn't started fails as `NOT DELIVERED — the MCP server shut down before
+  this send ran; re-send it.` Both orphan sweeps and both watchers (wait.py,
+  `python -m claude_squared wait`) say the same for a task that was still
+  queued. (Closing a turn's stdin on shutdown instead of
+  tree-killing it is a separate design, not in this release.)
+
+### Known unknowns
+
+- The exact text of the credits-exhausted error can't be provoked while
+  credits remain; the match is "credit balance (is) too low" in an error
+  result of an API-billed pair (doc wording).
+- Whether a run started from a desktop session counts against the monthly
+  credits once it runs as `sdk-cli` is Anthropic's billing decision;
+  `smoke_live_billing.py --real` shows whether a turn is covered.
+- A turn on a rejected key still reports a small `total_cost_usd` (fake-key
+  probe: $0.0024, probably a client-side estimate); it is counted as $0.
+
+## [0.17.0] — 2026-10-09
+
+Per-pair tool removal, raw Claude options, and a per-pair context alert.
+
+**Restart every open Claude and Codex session after installing.** The
+registry version is unchanged — the new fields are additive and omitted unless
+set, and a 0.16 MCP process keeps them when it writes the registry — but a 0.16
+process that spawns such a pair runs it without the new flags.
+
+### Added
+
+- **Per-pair tool removal (Claude): `disallowed_tools`** on `pair_create` /
+  `pair_update`, passed as `--disallowed-tools` at every spawn (warm runtime,
+  per-send override, compaction, fork, `/context`, `pair_invoke`) alongside
+  the connector flags, so a `pair_update` applies at the next send without
+  `pair_clear`. A bare tool name (e.g. `Artifact`) removes that tool's
+  schema from the model's context, cutting the fixed context a pair carries
+  (measured below); a rule like `Bash(git push *)` only denies matching
+  calls. Every spawn path sends the same tool list, so compaction and override
+  sends keep hitting the prompt cache; changing the list costs one uncached
+  turn on the next send. `[]` clears it; like the other spawn-pinned settings,
+  a change refuses while background work is pending unless `force=True`.
+  Codex pairs refuse it.
+- **`backend_options` for Claude pairs:** `settings` (a settings JSON object)
+  is merged with the `ultracode` key into ONE `--settings` flag; `args` (a
+  list of raw CLI tokens, starting with a flag) ends every spawn's command
+  line, so a flag missing its value can't consume one of the pair's own. Both
+  are re-applied at every spawn. Anything that would loosen the pair outside
+  `permission_mode` / `allowed_tools` / `extra_dirs` / `mcp_whitelist` is
+  refused. `settings` is an allowlist (keys read from the CLI 2.1.295
+  settings schema): `permissions` with `deny` / `ask` /
+  `blockReadsOutsideWorkingDirectories` (`true` only); `env` with Claude Code's own
+  timeout, output-limit and telemetry variables (`BASH_*_TIMEOUT_MS`,
+  `MAX_THINKING_TOKENS`, `MCP_TIMEOUT`, `DISABLE_TELEMETRY` … — 13 names);
+  `model` (inert: every spawn passes `--model`), `outputStyle`, `language`,
+  `alwaysThinkingEnabled`, `attribution`, `includeCoAuthoredBy`,
+  `includeGitInstructions`, `bashOutputMaxChars`. Everything else is
+  refused — among them `permissions.allow` / `defaultMode` /
+  `additionalDirectories`, `autoMode` (its allow / soft_deny / hard_deny
+  lists replace the auto-mode classifier's rules while `pair_info` still
+  says `auto`), `hooks`, the command helpers that run outside the
+  permission system (`apiKeyHelper`, `awsAuthRefresh`,
+  `awsCredentialExport`, `otelHeadersHelper`, `processWrapper` …),
+  `enabledPlugins`, `sandbox`, `cleanupPeriodDays` (it governs all your
+  transcripts), and in `env` `CLAUDE_CODE_SHELL_PREFIX`, `CLAUDE_CONFIG_DIR`,
+  `ANTHROPIC_*`, `PATH`, `NODE_OPTIONS` …. `args` refuses `--setting-sources`,
+  `--managed-settings`, `--client-data-url`, `--project-config-root`,
+  `--restricted`, `--safe-mode`, `--bare`, `--permission-prompt-tool` /
+  `--permission-prompts`, `--plugin-dir` / `--plugin-dir-no-mcp` /
+  `--plugin-url`, `--agent` / `--agents` / `--agent-type`, the team-member
+  flags (`--agent-id` / `--agent-name` / `--team-name`: a team member's
+  permission requests go to a team lead),
+  `--dangerously-load-development-channels`, `--chrome` (Claude in Chrome:
+  your real, signed-in browser) and `--disable-slash-commands` (it takes
+  `/compact`, `/context` and `pair_invoke` with it); flags that would lose,
+  cut, rewind, move, hand off or never start the session
+  (`--no-session-persistence`, `--resume-session-at`, `--rewind-files`,
+  `--worktree`, `--bg`, `--routine`, `--cloud`, `--exec` / `-m` /
+  `--handle-uri`, `--init-only`, `--version`, `--help`, `--`, `-` …,
+  combined short flags included) or reshape the stream the runtime reads
+  (`--sdk-url`, `--json-schema`, `--await-initialize` …); and flags the pair
+  sets itself or a field covers (`--settings`, `--model`,
+  `--permission-mode`, `--disallowed-tools`, `--tools`, `--output-format`,
+  `--resume`, …, with a pointer to the field to use). Every option the
+  2.1.295 root command defines (hidden ones included) and the flags it acts
+  on before its option parser were reviewed; those that loosen the pair,
+  break its session or duplicate its own flags are refused, the rest pass.
+  `settings` may not carry
+  `ultracode` (use the parameter); `settings` is refused on Codex (Codex uses
+  `config`). A malformed stored value refuses the spawn rather than silently
+  dropping, e.g., a deny rule. Keep secrets out of both — they travel on the
+  claude command line and sit in `registry.json`; `pair_info` /
+  `pair_update` results mask `settings.env` values.
+- **Per-pair context alert: `context_alert_at`** (tokens) on `pair_create` /
+  `pair_update` (`0` clears it). The alert fires at this or the global level
+  (`context_alert_headroom`), whichever comes first — so a smaller window
+  still alerts before auto-compaction; when a global headroom larger than the
+  window leaves no global level, it is capped at the compaction point
+  instead. It drives `wait.py`'s exit 8 (a running watcher re-reads it every
+  poll — one registry read per poll; a failed read of the registry or of
+  `defaults.json` keeps the last good value — and exits at once if a lowered
+  level is already behind the context), the send result's context
+  warning (replacing the 60%/85% bands for that pair only; other pairs are
+  unchanged) and `pair_status`. No respawn. Example: `context_alert_at=350000`
+  on a 1M-window pair.
+
+### Changed
+
+- **Claude in Chrome stays off in every Claude pair unless its
+  `mcp_whitelist` names `claude-in-chrome`.** Every Claude spawn (and the
+  interim-triage call) now passes `--no-chrome`. `--strict-mcp-config`
+  doesn't cover Claude in Chrome, and `CLAUDE_CODE_ENABLE_CFC=1` in the
+  environment the MCP server started with would connect your real,
+  signed-in Chrome to every pair. This adds one token to every Claude
+  pair's command line; the tool list, and with it the prompt cache, changes
+  only for a pair that had Chrome connected. Naming it in `mcp_whitelist`
+  only drops the flag: the CLI then decides, and in a headless pair only
+  `CLAUDE_CODE_ENABLE_CFC=1` turns it on.
+- **Ultracode's `--settings` now reaches every spawn path** — the per-send
+  override, compaction, fork, `/context` and `pair_invoke` spawns as well as
+  the warm runtime and create, which were the only ones it reached before.
+- **`backend_options` keys a Claude pair doesn't read are refused** at
+  `pair_create` / `pair_update` (they used to be stored and ignored). Keys
+  stored by an earlier version are still ignored at spawn.
+- A warm runtime owned by another MCP process now respawns at its next send
+  when ANY spawn field changed — `ultracode`, `backend_options`,
+  `disallowed_tools`, `fallback_model`, `extra_dirs`, `allowed_tools`,
+  `system_prompt_append`, `profile_name` as well as the model, effort, window,
+  cwd, connectors and permission level it already compared. `pair_update` and
+  the runtime now read one shared list of these fields; they had drifted.
+- `profile_name` and `system_prompt_append` combine: profile text first, then
+  the append. This already worked; the docs now say so, and `pair_create`
+  notes a `profile_name` with no file (the pair starts without that text).
+- `pair_handoff` lists `disallowed_tools` and Claude `backend_options` as
+  omitted (no Codex equivalent) and carries `context_alert_at` over.
+- `pair_info` shows `disallowed_tools` and the pair's context alert.
+
+### Known issues
+
+- **A per-send `override_permission_mode` (or `override_model` /
+  `override_effort`) runs the turn in a one-shot `claude --print --resume`
+  process, outside the warm runtime and its background protection.** A
+  one-shot `claude -p` has no open stdin to resume on (observed 2026-06-15),
+  so background work started in that turn gets no self-woken continuation
+  and nothing tracks it until it ends. Nor does the override path wait, as a
+  normal send does, for a self-woken turn of the pair's warm runtime in this
+  process before it resumes the same session. For coding rounds set the
+  level on the pair with `pair_update(permission_mode=...)` (a respawn,
+  protected like any other) instead of overriding per send. Fix directions,
+  not yet probed: the 2.1.295 binary contains the stream-json
+  `control_request` subtypes `set_permission_mode` and `set_model` (found by
+  string search), so the warm runtime might switch for one turn and switch
+  back; failing that, the override path should wait for
+  pending background work first (as the warm send does), and refuse — or
+  warn — when the turn launches background work it can't keep.
+
+### Known unknowns
+
+- Whether a `--permission-mode` flag overrides `permissions.defaultMode` from
+  `--settings` is unverified; `defaultMode` is refused in `settings` so the
+  question can't arise.
+- Whether Ultracode (`--settings {"ultracode": true}`, "xhigh effort plus
+  workflows") forces xhigh over a per-send `override_effort` on the one-shot
+  path is unverified. Before 0.17.0 that path didn't pass the setting at all.
+- Verified (live probe, Haiku): a bare built-in tool name in
+  `--disallowed-tools` removes the tool's schema — input tokens fell from
+  35.3k to 31.6k with `Artifact,Workflow,ScheduleWakeup` removed. That a
+  resumed session picks up a CHANGED list was verified for the connector
+  flags (0.15.0) and is inferred for this one.
+
 ## [0.16.2] — 2026-09-27
 
 ### Fixed

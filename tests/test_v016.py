@@ -1351,7 +1351,9 @@ class RoundFourFixTests(ReviewHelpers):
         self.feed(rt, task_started("bgX"))
         reg = RT.RuntimeRegistry()
         reg._runtimes[self.pair] = rt
-        with patch.object(RT, "_REGISTRY", reg):
+        # v0.18.0: the handler sets the process-wide shutting-down flag; keep
+        # it out of the later tests in this process.
+        with patch.object(RT, "_REGISTRY", reg), patch.object(RT, "_SHUTTING_DOWN", threading.Event()):
             RT._shutdown_runtimes()
         rec = R.get_pair(self.pair).self_woken_pending[-1]
         self.assertEqual(rec["status"], "background_lost")

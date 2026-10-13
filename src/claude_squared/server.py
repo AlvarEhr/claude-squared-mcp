@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -35,12 +36,14 @@ from claude_squared import settings as settings_mod
 from claude_squared.adapters import ClaudeAdapter, CodexAdapter, PairAdapter
 from claude_squared.adapters import codex as codex_adapter_mod
 from claude_squared.cli_paths import encode_cwd_for_project as _encode_cwd_for_project
-from claude_squared.errors import PairAlreadyExists, PairError, PairNotFound
+from claude_squared.errors import BillingError, PairAlreadyExists, PairError, PairNotFound
 from claude_squared.models import (
     BACKENDS,
+    BILLING_MODES,
     DEFAULT_EFFORT,
     HEADLESS_INCOMPATIBLE_TOOLS,
     PERMISSION_LEVELS,
+    SPAWN_PINNED_FIELDS,
     ActionInfo,
     AsyncTaskState,
     CompactResult,
@@ -220,6 +223,12 @@ def _fmt_send_result(r: SendResult) -> str:
     footer_parts.append(f"codex/{label}" if r.backend == "codex" else label)
     if r.duration_ms:
         footer_parts.append(f"{r.duration_ms / 1000:.1f}s")
+    if r.billing == "api":
+        # v0.18.0: an API-billed turn shows what it cost and the pair's total.
+        _api = f"API ${float(r.cost_usd or 0.0):.4f}"
+        if r.api_cost_usd is not None:
+            _api += f" (pair total ${r.api_cost_usd:.2f})"
+        footer_parts.append(_api)
     # Log audit pointer: which lines of which file this turn produced
     if r.log_path and r.log_line_start is not None and r.log_line_end is not None:
         try:
@@ -256,6 +265,17 @@ def _fmt_send_result(r: SendResult) -> str:
                 f"⏸ USAGE LIMIT: {r.safety_signal}. The reply above is the limit "
                 f"notice, not an answer — the pair did NOT do the work. Wait for the "
                 f"reset, then re-send."
+            )
+        elif r.safety_kind == "credit_exhausted":
+            # v0.18.0: like a usage limit — the reply is the API's error text.
+            lines.append(
+                f"⏸ API CREDITS EXHAUSTED: {r.safety_signal} The reply above is the "
+                f"error, not an answer — the pair did NOT do the work."
+            )
+        elif r.safety_kind == "api_key_rejected":
+            lines.append(
+                f"⛔ API KEY REJECTED: {r.safety_signal} The reply above is the error, not an "
+                f"answer — the pair did NOT do the work."
             )
         elif r.safety_kind == "model_unavailable":
             # PERMANENT — the model was pulled / access lost. Distinct label + a
@@ -439,9 +459,41 @@ def _fmt_compact_result(r: CompactResult) -> str:
     return f"{header}\n{body}"
 
 
+_SECRET_SETTING = re.compile(r"helper|key|token|secret|password|credential|auth", re.IGNORECASE)
+
+
+def _redact_backend_options(bo: Any) -> Any:
+    """``backend_options`` for display (v0.17.0): ``settings.env`` values and
+    secret-looking settings keys masked (the allowlist refuses keys such as
+    ``apiKeyHelper``, but a hand-edited registry can still hold one).
+    Display only — the registry keeps them as given and they travel on the
+    claude command line, visible in any process listing, which is why the
+    docs say to keep secrets out of ``settings``."""
+    if not isinstance(bo, dict) or "settings" not in bo:
+        return bo
+    settings = bo["settings"]
+    if isinstance(settings, str):
+        try:
+            settings = json.loads(settings)
+        except ValueError:
+            return {**bo, "settings": "***"}
+    if not isinstance(settings, dict):
+        return bo
+    shown = {k: ("***" if _SECRET_SETTING.search(k) else v) for k, v in settings.items()}
+    if isinstance(shown.get("env"), dict):
+        shown["env"] = {k: "***" for k in shown["env"]}
+    return {**bo, "settings": shown}
+
+
+def _redacted(model_obj):
+    if getattr(model_obj, "backend_options", None):
+        return model_obj.model_copy(update={"backend_options": _redact_backend_options(model_obj.backend_options)})
+    return model_obj
+
+
 def _verbose_dump(model_obj) -> str:
     """JSON-stringified Pydantic model for verbose=True paths."""
-    return model_obj.model_dump_json(indent=2, exclude_none=True)
+    return _redacted(model_obj).model_dump_json(indent=2, exclude_none=True)
 
 
 def _verbose_dump_with_msgs(model_obj, transparency_msgs: list[str]) -> str:
@@ -452,7 +504,7 @@ def _verbose_dump_with_msgs(model_obj, transparency_msgs: list[str]) -> str:
     used by pair_settings_set.
     """
     payload = {
-        "spec": model_obj.model_dump(exclude_none=True),
+        "spec": _redacted(model_obj).model_dump(exclude_none=True),
         "transparency_msgs": transparency_msgs,
     }
     return json.dumps(payload, indent=2, default=str)
@@ -756,6 +808,8 @@ def pair_create(
     fallback_model: str | None = None,
     allowed_invocations: str | list[str] | None = None,
     backend_options: dict | str | None = None,
+    disallowed_tools: str | list[str] | None = None,
+    context_alert_at: int | str | None = None,
     initial_message: str | None = None,
     session_id: str | None = None,
     parent_model: str | None = None,
@@ -794,7 +848,7 @@ def pair_create(
         effort: low|medium|high|xhigh|max (Codex also: ``ultra`` = maximum reasoning
             + automatic task delegation, its multi-agent mode). Default ``high`` on
             both backends. Coerced to the nearest level the model supports, with a
-            message (Sonnet xhigh → high; Haiku → none; Codex per the models cache).
+            message (Sonnet xhigh → high; Haiku 4.5 → none; Codex per the models cache).
         permission_mode: backend-neutral level, loosest last —
             ``read-only`` | ``plan`` | ``workspace`` | ``auto`` | ``unrestricted``.
             read-only: reads only, every write/exec is denied AND reported back to
@@ -816,12 +870,14 @@ def pair_create(
         system_prompt_append: Text appended to the default system prompt. Pinned at
             create. Codex: delivered as the thread's first user message (exec has no
             system-prompt flag); it persists in the thread history.
-        profile_name: ``~/.claude/pairs/profiles/<name>.md`` used as system_prompt_append.
+        profile_name: ``~/.claude/pairs/profiles/<name>.md``, a shared role prompt. Combines
+            with ``system_prompt_append``: profile text first, then the append.
         allowed_tools: Claude permission patterns like ``["Bash(git *)", "Read"]``.
             Pinned at create. Ignored by Codex. Rules match the literal command
             (``*`` = any text, also mid-rule: ``Bash(git -C * log*)``).
         mcp_whitelist: Deliberate per-pair connector opt-in on either backend.
             None or [] selects none. Unknown names are stored with a warning.
+            Claude pairs run with ``--no-chrome`` unless it names ``claude-in-chrome``.
             MCP calls act with the server's own privileges, outside the pair sandbox.
         cwd: Absolute workspace root (gates file ops OUTSIDE this path on both
             backends). Default: MCP server's cwd. Use ``extra_dirs`` to widen access.
@@ -837,7 +893,27 @@ def pair_create(
             ``config`` {toml key: value} extra ``-c`` overrides; ``args`` [raw exec
             args]; ``sandbox`` / ``approval`` native override of the permission
             translation (sandbox: read-only|workspace-write|danger-full-access;
-            approval: none|approve-for-me|bypass).
+            approval: none|approve-for-me|bypass). Claude keys: ``settings`` {settings
+            JSON}, merged with ``ultracode`` into the one ``--settings`` flag; ``args``
+            [raw CLI args], appended at the end of every spawn. Both re-applied at every
+            spawn. ``settings`` takes only ``permissions`` (``deny`` / ``ask`` /
+            ``blockReadsOutsideWorkingDirectories: true``), ``env`` (Claude Code's own timeout,
+            output-limit and telemetry variables), ``model``, ``outputStyle``,
+            ``language``, ``alwaysThinkingEnabled``, ``attribution``,
+            ``includeCoAuthoredBy``, ``includeGitInstructions``, ``bashOutputMaxChars``.
+            ``args`` refuses flags that would loosen the pair outside permission_mode /
+            allowed_tools / extra_dirs / mcp_whitelist (``--setting-sources``,
+            ``--managed-settings``, ``--plugin-dir`` …), lose or move its session, or
+            that the pair sets itself. No secrets: both travel on the claude command
+            line.
+        disallowed_tools: Claude tools to remove (``--disallowed-tools``, re-applied at
+            every spawn; ``pair_update`` changes it without a clear). A bare name
+            (``"Artifact"``) removes the tool's schema from the pair's context; a rule
+            (``"Bash(git push *)"``) only denies matching calls. Codex: refused.
+        context_alert_at: this pair's context alert, in tokens (e.g. 350000). The
+            alert fires at this or the global level (pair_settings
+            ``context_alert_headroom``), whichever comes first: wait.py exits 8, the
+            send result warns, pair_status flags it. Omit for the global default.
         initial_message: If set, sent as the first turn (as an async task).
         session_id: Claude: caller-supplied UUID (auto-generated if omitted). Codex
             names its own thread — ignored.
@@ -901,12 +977,16 @@ def pair_create(
         context_window=context_window,
     )
     transparency_msgs.extend(connectors.select(mcp_whitelist_norm, be, resolved_cwd)[1])
-    backend_options_norm = _coerce_backend_options(backend_options)
-    if be == "codex" and backend_options_norm:
-        try:
-            CodexAdapter.validate_backend_options(resolved["permission_mode"], backend_options_norm)
-        except ValueError as e:
-            raise PairError(str(e))
+    backend_options_norm = _check_backend_options(
+        be, _coerce_backend_options(backend_options), resolved["permission_mode"])
+    disallowed_tools_norm = _coerce_to_str_list(disallowed_tools)
+    _refuse_codex_disallowed(be, disallowed_tools_norm)
+    context_alert_at_norm = _coerce_alert_at(context_alert_at)
+    if profile_name:
+        _profile = reg_mod.profiles_dir() / f"{profile_name}.md"
+        if not _profile.exists():
+            transparency_msgs.append(f"profile '{profile_name}' has no file at {_profile} — the pair "
+                                     f"starts without that text.")
 
     # v0.12.0 premium-model notice. Fires on the RESOLVED model, so it catches a
     # premium family arriving via defaults.json or match-parent detection, not
@@ -987,6 +1067,7 @@ def pair_create(
         system_prompt_append=system_prompt_append,
         profile_name=profile_name,
         allowed_tools=allowed_tools_norm,
+        disallowed_tools=disallowed_tools_norm,
         mcp_whitelist=mcp_whitelist_norm,
         allowed_invocations=allowed_invocations_norm,
         cwd=resolved_cwd,
@@ -994,6 +1075,7 @@ def pair_create(
         persistent=resolved["persistent"],
         ultracode=resolved["ultracode"],
         fallback_model=resolved["fallback_model"],
+        context_alert_at=context_alert_at_norm,
         last_drift_notice=drift_seed,
     )
     # Register first so concurrent pair_send calls see it
@@ -1581,6 +1663,40 @@ def _lost_note(lost: list[dict]) -> str | None:
             f"{_describe_background(lost)}")
 
 
+def _pair_alert_at(name: str) -> int | None:
+    try:
+        return reg_mod.get_pair(name).context_alert_at
+    except Exception:
+        return None
+
+
+def _apply_context_alert(spec: PairSpec, result: SendResult) -> None:
+    """v0.17.0: a pair with its own ``context_alert_at`` gets its send-result
+    context warning from that level (the one wait.py exits 8 on) instead of
+    the 60%/85% fill bands; pairs without one keep the bands unchanged."""
+    ctx = result.context
+    if ctx is None or not spec.context_alert_at or not ctx.tokens_max:
+        return
+    try:
+        headroom = settings_mod.load_defaults().context_alert_headroom
+    except Exception:
+        headroom = None
+    limit = None
+    if spec.backend == "codex":
+        limit = (activity_mod.reported_window(spec.name) or {}).get("auto_compact_token_limit")
+    level = activity_mod.context_alert_threshold(ctx.tokens_max, headroom, spec.backend, limit,
+                                                 spec.context_alert_at)
+    if level is None or level <= 0:
+        return
+    if ctx.tokens_used < level:
+        ctx.warning = None
+        return
+    compact = (f"pair_compact('{spec.name}')" if spec.backend == "codex"
+               else f"pair_compact('{spec.name}', steering_prompt=...)")
+    ctx.warning = (f"{ctx.tokens_used:,}/{ctx.tokens_max:,} ({ctx.percent:.0f}%) — past this pair's "
+                   f"context alert ({level:,}). Compact at a clean point: {compact}.")
+
+
 def _activity_status_lines(name: str) -> list[str]:
     """v0.16.0: what the activity files add to pair_status / a running
     pair_poll — live context and its alert state, background lost this
@@ -1607,7 +1723,8 @@ def _activity_status_lines(name: str) -> list[str]:
         reported = view.get("reported_window") or {}
         backend = ctx.get("backend") or reported.get("backend") or "claude"
         limit = ctx.get("auto_compact_token_limit") or reported.get("auto_compact_token_limit")
-        threshold = activity_mod.context_alert_threshold(window, headroom, backend, limit)
+        threshold = activity_mod.context_alert_threshold(window, headroom, backend, limit,
+                                                         _pair_alert_at(name))
         if threshold and used >= threshold:
             near = ("estimated Codex auto-compaction point" if backend == "codex"
                     else "auto-compaction fires near")
@@ -1689,6 +1806,9 @@ def _build_send_runner(
         # runner callable directly in any edge path (then no stop polling).
         with _with_pair_lock(name, timeout_s=lock_acquire_timeout_s):
             async_tasks.raise_if_stopped(task_id)
+            # v0.18.0 (fix A): a send that reaches its turn while the server
+            # exits fails as NOT DELIVERED instead of spawning a backend.
+            runtime_mod.refuse_if_shutting_down()
             should_stop = _make_stop_checker(name, task_id) if task_id else None
             current = reg_mod.get_pair(name)
             _check_model_backend(current, override_model)
@@ -1705,6 +1825,7 @@ def _build_send_runner(
             # Claude promotes immediately before opening its solicited scope,
             # after any local self-woken turn. Other adapters start here.
             if not isinstance(adapter, ClaudeAdapter):
+                runtime_mod.refuse_if_shutting_down()
                 async_tasks.mark_task_executing(task_id)
             # v0.13.0: neutral permission override → validated here so a typo
             # fails fast instead of reaching the CLI. (Bound to a NEW name —
@@ -1739,6 +1860,7 @@ def _build_send_runner(
                     writer.turn_closed(task_id, status="failed")
                 raise
             result.notes.extend(wait_notes)
+            _apply_context_alert(current, result)
             if writer is not None:
                 if result.context is not None:
                     writer.note_context(result.context.tokens_used, result.context.tokens_max,
@@ -1820,11 +1942,20 @@ def _build_send_runner(
                     fresh = reg_mod.get_pair(name)
                 except Exception:
                     fresh = current
+                # v0.18.0: result.cost_usd is this turn's share (the warm
+                # runtime's total is cumulative), so adding it no longer
+                # double-counts. API-billed turns also add to api_cost_usd.
+                _turn_cost = float(result.cost_usd or 0.0)
                 update_fields: dict[str, Any] = dict(
                     last_active_at=datetime.utcnow(),
                     turn_count=fresh.turn_count + 1,
-                    total_cost_usd=fresh.total_cost_usd + float(result.cost_usd or 0.0),
+                    total_cost_usd=fresh.total_cost_usd + _turn_cost,
                 )
+                if current.backend == "claude":
+                    result.billing = current.billing
+                    if current.billing == "api":
+                        update_fields["api_cost_usd"] = fresh.api_cost_usd + _turn_cost
+                        result.api_cost_usd = update_fields["api_cost_usd"]
                 if drift_persist is not None:
                     update_fields["last_drift_notice"] = drift_persist
                 task_state = async_tasks.load_task(task_id) if task_id and current.backend == "codex" else None
@@ -2006,7 +2137,7 @@ _HARDCODED_DEFAULTS = {
     # auto-upgrade on a bump; a pinned id like ``claude-opus-5`` stays put).
     # Codex has no static default — see codex_models.codex_default_model.
     "model": "opus",
-    # "high" on both backends (policy 2026-09-07); coerced per model (Haiku → None).
+    # "high" on both backends (policy 2026-09-07); coerced per model (Haiku 4.5 → None).
     "effort": DEFAULT_EFFORT,
     "permission_mode": "auto",
     "context_window": "default",
@@ -2226,6 +2357,47 @@ def _coerce_backend_options(value: Any) -> dict[str, Any]:
             raise PairError("backend_options must be a JSON object")
         return parsed
     raise PairError(f"backend_options must be a dict or JSON string (got {type(value).__name__})")
+
+
+def _check_backend_options(backend: str, bo: dict[str, Any], level: str) -> dict[str, Any]:
+    """Validate a NEW ``backend_options`` value for the pair's backend; returns
+    it normalized (Claude parses a JSON-string ``settings`` / ``args``)."""
+    if not bo:
+        return bo
+    try:
+        if backend == "codex":
+            if "settings" in bo:
+                raise ValueError("backend_options.settings is Claude-only; Codex takes 'config' "
+                                 "({toml key: value} → -c overrides).")
+            CodexAdapter.validate_backend_options(level, bo)
+            return bo
+        return ClaudeAdapter.validate_backend_options(bo)
+    except ValueError as e:
+        raise PairError(str(e))
+
+
+def _coerce_alert_at(value: Any) -> int | None:
+    """``context_alert_at``: a token count (int, or a string like "350000" /
+    "350_000"); 0 clears it (→ None, the global default)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = int(value.strip().replace("_", "").replace(",", ""))
+        except ValueError:
+            raise PairError(f"context_alert_at must be a token count, e.g. 350000 (got {value!r})")
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise PairError(f"context_alert_at must be a token count, e.g. 350000 (got {value!r})")
+    if value < 0:
+        raise PairError("context_alert_at must be >= 0 tokens (0 clears it)")
+    return value or None
+
+
+def _refuse_codex_disallowed(backend: str, tools: list[str] | None) -> None:
+    if backend == "codex" and tools:
+        raise PairError("disallowed_tools is Claude-only (--disallowed-tools removes tools from a Claude "
+                        "pair's context); claude-squared has no Codex equivalent. Limit a Codex pair "
+                        "with its permission_mode instead.")
 
 
 def _resolve_pair_create_args(
@@ -2986,6 +3158,8 @@ def pair_list(verbose: bool = False) -> str:
         last = _fmt_local(s.last_active_at, "%H:%M")
         purpose = f" - {s.purpose}" if s.purpose else ""
         model_disp = f"codex:{s.model}" if s.backend == "codex" else s.model
+        if s.backend == "claude" and s.billing == "api":
+            model_disp += ", API billing"  # v0.18.0: visible wherever pairs are listed
         if s.context_window == "1m":
             model_disp += " [1m]"
         lines.append(f"  {s.name} ({model_disp}, {s.turn_count} turns, last {last}){purpose}")
@@ -3034,7 +3208,21 @@ def pair_info(name: str, verbose: bool = False) -> str:
         native = f" ({permission_native(spec.permission_mode, spec.backend)})"
     except Exception:
         pass
-    bo = f"\n  backend_options: {json.dumps(spec.backend_options)}" if spec.backend_options else ""
+    bo = (f"\n  backend_options: {json.dumps(_redact_backend_options(spec.backend_options))}"
+          if spec.backend_options else "")
+    if spec.disallowed_tools:
+        bo += f"\n  disallowed_tools: {', '.join(spec.disallowed_tools)}"
+    if spec.context_alert_at:
+        bo += f"\n  context alert at: {spec.context_alert_at:,} tokens (or the global level if earlier)"
+    if spec.backend == "claude":
+        # v0.18.0: billing, and what the turns cost (list prices; the API part
+        # is what the key was actually charged).
+        from claude_squared.adapters.claude import api_key_status
+        bo += (f"\n  billing: api ({api_key_status()})" if spec.billing == "api"
+               else "\n  billing: plan")
+        bo += f"\n  cost: ${spec.total_cost_usd:.2f} at list prices"
+        if spec.api_cost_usd or spec.billing == "api":
+            bo += f", ${spec.api_cost_usd:.2f} of it billed to the API key"
     return (
         f"{name}:\n"
         f"  backend: {spec.backend}\n"
@@ -3186,6 +3374,9 @@ def pair_update(
     verbose: bool = False,
     mcp_whitelist: str | list[str] | None = None,
     force: bool = False,
+    disallowed_tools: str | list[str] | None = None,
+    context_alert_at: int | str | None = None,
+    billing: str | None = None,
 ) -> str:
     """Update mutable settings of an existing pair (per-pair, not defaults —
     use ``pair_settings_set`` for user-wide defaults).
@@ -3204,11 +3395,17 @@ def pair_update(
     auto | unrestricted; old spellings accepted). ``context_window`` is
     ``default`` | ``1m``. ``fallback_model`` is pinned at spawn (like ``model``)
     so changing it evicts the runtime; pass ``""`` to clear it.
+    ``disallowed_tools`` (Claude) replaces the pair's tool removals; ``[]``
+    clears them. ``context_alert_at`` sets this pair's context alert in tokens
+    (``0`` clears it back to the global default) — no respawn; wait.py and
+    the next send pick it up. ``billing="plan"`` (Claude) moves an API-billed
+    pair back to the plan; switching TO the API goes through
+    ``pair_billing`` only.
 
     Three field categories with different propagation semantics — see README
     "Mid-flight config changes":
       - **Per-send** (``model``/``effort``/``permission_mode``/``context_window``/``mcp_whitelist``/
-        ``ultracode``/``backend_options``): registry write + runtime eviction →
+        ``ultracode``/``backend_options``/``disallowed_tools``/``billing``): registry write + runtime eviction →
         next ``pair_send`` respawns with new values (Codex: every send is a
         fresh process, so they apply immediately).
       - **Server-side** (``allowed_invocations``): MCP-layer only, no eviction;
@@ -3274,7 +3471,14 @@ def pair_update(
                             f"usable tokens on {cur_spec.model} (applies from the next send)."
                         )
             if backend_options is not None:
-                fields["backend_options"] = _coerce_backend_options(backend_options)
+                fields["backend_options"] = _check_backend_options(
+                    cur_spec.backend, _coerce_backend_options(backend_options),
+                    fields.get("permission_mode", cur_spec.permission_mode))
+            if disallowed_tools is not None:
+                fields["disallowed_tools"] = _coerce_to_str_list(disallowed_tools)
+                _refuse_codex_disallowed(cur_spec.backend, fields["disallowed_tools"])
+            if context_alert_at is not None:
+                fields["context_alert_at"] = _coerce_alert_at(context_alert_at)
             if cur_spec.backend == "codex":
                 _bo = fields.get("backend_options", cur_spec.backend_options)
                 _lvl = fields.get("permission_mode", cur_spec.permission_mode)
@@ -3318,6 +3522,10 @@ def pair_update(
                 # v0.11.0: --fallback-model is pinned at spawn — evict below so
                 # the next send respawns with it. Empty string clears it.
                 fields["fallback_model"] = fallback_model.strip() or None
+            if billing is not None:
+                # v0.18.0: back to the plan is always allowed; TO the API only
+                # through pair_billing, whose description carries the rule.
+                fields["billing"] = _check_billing_change(cur_spec, billing, via="pair_update")
 
             # Apply effort coercion against the resolved model. We do this
             # explicitly here (in addition to PairSpec's model_validator) because
@@ -3452,7 +3660,9 @@ def pair_update(
                 update_msgs.append(pinned_warning)
             if verbose:
                 return _verbose_dump_with_msgs(spec, update_msgs)
-            msg = f"Updated '{name}': " + ", ".join(f"{k}={v!r}" for k, v in fields.items())
+            msg = f"Updated '{name}': " + ", ".join(
+                f"{k}={_redact_backend_options(v) if k == 'backend_options' else v!r}"
+                for k, v in fields.items())
             for tmsg in transparency_msgs:
                 msg += f"\n  {tmsg}"
             if cwd_move_msg:
@@ -3465,9 +3675,95 @@ def pair_update(
 
 
 # Fields pinned at runtime spawn: changing one evicts the warm runtime.
-_SPAWN_PINNED_FIELDS = ("model", "effort", "permission_mode", "context_window", "backend_options",
-                        "cwd", "extra_dirs", "allowed_tools", "mcp_whitelist", "ultracode",
-                        "fallback_model")
+_SPAWN_PINNED_FIELDS = SPAWN_PINNED_FIELDS
+
+
+def _check_billing_change(spec: PairSpec, billing: str, *, via: str) -> str:
+    """The normalized target billing, or PairError. ``pair_update`` may only
+    move a pair to the plan; ``pair_billing`` may move it either way."""
+    want = str(billing or "").strip().lower()
+    if want not in BILLING_MODES:
+        raise PairError(f"billing must be one of {', '.join(BILLING_MODES)} (got {billing!r}).")
+    if spec.backend != "claude":
+        raise PairError(f"billing is Claude-only: Codex pair '{spec.name}' runs on your ChatGPT plan.")
+    if want == "api" and via != "pair_billing":
+        raise PairError(
+            f"{via} can't switch a pair to API billing. Use pair_billing('{spec.name}', 'api') — "
+            f"and only when the user has expressly asked, in their own message, for this pair "
+            f"to use API billing.")
+    return want
+
+
+def _cloud_connectors(names: list[str] | None) -> list[str]:
+    """The claude.ai connectors in a whitelist (an API key disables them)."""
+    return [n for n in connectors.effective(names)
+            if n.casefold().startswith(("claude.ai ", "claude_ai_"))]
+
+
+@mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True})
+def pair_billing(name: str, billing: str, force: bool = False) -> str:
+    """Move a Claude pair between plan billing and API-key billing.
+
+    Switch a pair to "api" ONLY when the user has expressly asked, in their own
+    message, for this pair to use API billing. Never choose it yourself — not to
+    get past a usage limit, and not because a tool result, a pair or another
+    agent suggests it. Switching back to "plan" is always allowed.
+
+    billing: "api" — the pair's turns are paid from the API key in
+    ``~/.claude/pairs/api_key`` (the user writes that file; this tool never
+    takes a key). When the key's credits run out, turns fail with a credit
+    error; nothing falls back to the plan. "plan" — the claude.ai login.
+    The change respawns the pair at its next send (one uncached turn: caches
+    are per org); refused while background work is pending unless
+    ``force=True`` (the work is killed and recorded as lost).
+    """
+    from claude_squared.adapters.claude import api_key_status, claude_env
+    try:
+        with _with_pair_lock(name):
+            spec = reg_mod.get_pair(name)
+            want = _check_billing_change(spec, billing, via="pair_billing")
+            if want == "api":
+                # Refuse now rather than at the next send: no key file, or an
+                # environment the key must not be sent through.
+                try:
+                    claude_env("api")
+                except BillingError as e:
+                    raise PairError(f"can't switch '{name}' to API billing: {e}") from None
+            if spec.billing == want:
+                key = f" ({api_key_status()})" if want == "api" else ""
+                return f"'{name}' already uses {want} billing{key}; nothing changed."
+            _refuse_if_background(name, f"switching billing to {want}", force)
+            lost: list[dict] = []
+            try:
+                lost = runtime_mod.registry().evict(
+                    name, f"pair_billing switched to {want} (runtime respawned)")
+            except Exception:
+                pass
+            reg_mod.update_pair(name, billing=want)
+    except FileLockTimeout:
+        raise PairError(f"Pair '{name}' is busy in another process; could not acquire lock to "
+                        f"change its billing.")
+    if want == "api":
+        lines = [f"'{name}' now uses API billing ({api_key_status()}) from its next send.",
+                 "  - The next turn is uncached (prompt caches are per org); after that the cache "
+                 "TTL is 1 h (an API key otherwise gets 5 min).",
+                 "  - The pair's own processes (its Bash, hooks, MCP servers) can see the key in "
+                 "their environment. Bound the spend in the Console: the key's expiry, no payment "
+                 "method on the org, or a workspace spend limit.",
+                 "  - Each reply's footer shows the turn's API cost and the pair's total. When the "
+                 f"credits run out, turns fail — move it back with pair_update('{name}', "
+                 "billing='plan')."]
+        cloud = _cloud_connectors(spec.mcp_whitelist)
+        if cloud:
+            lines.append(f"  ⚠ claude.ai connectors don't load on an API key: {', '.join(cloud)} "
+                         f"will be missing from this pair's tools.")
+    else:
+        lines = [f"'{name}' is back on the plan from its next send (one uncached turn; caches are "
+                 f"per org)."]
+    note = _lost_note(lost)
+    if note:
+        lines.append(f"  {note}")
+    return "\n".join(lines)
 
 
 def _move_session_jsonl_for_cwd_change(old_spec: PairSpec, new_cwd: str) -> str:
@@ -3937,7 +4233,7 @@ def pair_settings_get(verbose: bool = False) -> str:
     lines.append("  Notes:")
     lines.append("    - model='match-parent' (Claude) triggers detection from session JSONL")
     lines.append("    - permission 'unrestricted' (bypassPermissions) refused as default (foot-gun); pass per-call")
-    lines.append("    - Effort default 'high'; coerced per model (Sonnet xhigh/max→high, Haiku→None, Codex per models cache)")
+    lines.append("    - Effort default 'high'; coerced per model (Sonnet xhigh/max→high, Haiku 4.5→None, Codex per models cache)")
     lines.append("    - Floating aliases (opus / sol / terra / luna) follow generation bumps; numbered ids stay pinned")
     lines.append("    - Fable (Claude) / Astra (Codex) are never defaults but stick once set")
     lines.append("    - context_window '1m': Claude [1m] tier; Codex ~828k usable (default ~258k) — pick it for large repos")
@@ -3976,7 +4272,7 @@ def pair_settings_set(
             detection on each pair_create (Claude). A Codex id here also makes
             codex the default backend for pairs created without a model.
         effort: Default effort (``high`` when unset). Coerced against the model
-            (Sonnet xhigh/max → high, Haiku → None, Codex per the models cache).
+            (Sonnet xhigh/max → high, Haiku 4.5 → None, Codex per the models cache).
         permission_mode: neutral level (read-only | plan | workspace | auto |
             unrestricted; old spellings accepted). ``unrestricted`` is REFUSED as
             a default (foot-gun: every new pair would silently lose guardrails).
@@ -4369,6 +4665,18 @@ def pair_handoff(
         omitted.append("ultracode")
         capability.append("Claude Ultracode mode was dropped; on Codex, effort='ultra' is the closest equivalent "
                           "(maximum reasoning plus automatic task delegation).")
+    if source.billing == "api":
+        omitted.append("billing")
+        capability.append("The source's API billing doesn't carry over: the Codex pair runs on your "
+                          "ChatGPT plan.")
+    if source.disallowed_tools:
+        omitted.append("disallowed_tools")
+        capability.append(f"The source's tool removals {source.disallowed_tools!r} have no Codex equivalent; "
+                          f"the new pair has Codex's full toolset.")
+    if source.backend_options:
+        omitted.append("backend_options")
+        capability.append("The source's Claude backend_options (settings / raw CLI args) don't apply to Codex "
+                          "and were dropped.")
     if source.allowed_invocations is not None:
         omitted.append("allowed_invocations")  # pair_invoke doesn't exist on Codex at all — nothing to warn about
     if instructions:
@@ -4404,7 +4712,7 @@ def pair_handoff(
             model=stored_model, effort=target_effort, permission_mode=level, context_window=window,
             cwd=source.cwd, extra_dirs=source.extra_dirs, persistent=source.persistent,
             system_prompt_append=source.system_prompt_append, profile_name=source.profile_name,
-            mcp_whitelist=carried_names or None,
+            mcp_whitelist=carried_names or None, context_alert_at=source.context_alert_at,
             handoff_from={"name": name, "backend": source.backend, "session_id": source.session_id,
                           "model": source.model, "imported_at": imported["imported_at"],
                           "import_id": imported["import_id"], "omitted": omitted},
@@ -4499,13 +4807,18 @@ def pair_fork(name: str, new_name: str | None = None, verbose: bool = False) -> 
             # source. Holding the lock guarantees the JSONL is consistent (no
             # in-flight turn). The source pair keeps its warm runtime.
             # Codex: native ``exec fork`` needs no sentinel turn at all.
-            new_sid = adapter.fork(spec, sentinel=_FORK_SENTINEL)
-            new_spec = spec.model_copy(update={
+            # v0.18.0: a fork starts on the plan (model_copy would inherit
+            # "api"), and so does its fork-init turn — it already belongs to
+            # the new pair.
+            plan_spec = spec.model_copy(update={"billing": "plan"})
+            new_sid = adapter.fork(plan_spec, sentinel=_FORK_SENTINEL)
+            new_spec = plan_spec.model_copy(update={
                 "name": target,
                 "session_id": new_sid,
                 "created_at": datetime.utcnow(),
                 "last_active_at": datetime.utcnow(),
                 "total_cost_usd": 0.0,
+                "api_cost_usd": 0.0,
             })
             # Truncate the sentinel fork-init turn off the new JSONL's tip.
             new_path = adapter.transcript_path(new_spec)
@@ -5423,6 +5736,7 @@ def pair_invoke(
                 writer.turn_closed(None, status="failed")
                 raise
             writer.turn_closed(None, preview=result.response or "")
+            _apply_context_alert(spec, result)
             if verbose:
                 return _verbose_dump(result)
             return _fmt_send_result(result)

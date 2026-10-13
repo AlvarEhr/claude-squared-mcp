@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -14,7 +15,7 @@ from typing import Any
 from claude_squared.adapters.base import PairAdapter
 from claude_squared import connectors
 from claude_squared.cli_paths import encode_cwd_for_project as _encode_cwd_for_project
-from claude_squared.errors import CLIError, CommandTimeout, SessionMissing
+from claude_squared.errors import BillingError, CLIError, CommandTimeout, PairError, SessionMissing
 from claude_squared.models import (
     CLAUDE_PERMISSION_MAP,
     HEADLESS_INCOMPATIBLE_TOOLS,
@@ -31,7 +32,7 @@ from claude_squared.models import (
     parse_model_id,
     split_model_tier,
 )
-from claude_squared.registry import claude_home, profiles_dir
+from claude_squared.registry import claude_home, pairs_dir, profiles_dir
 
 
 WARNING_THRESHOLD = 0.60
@@ -52,6 +53,417 @@ _MODEL_UNAVAILABLE_HELP = (
 )
 # _encode_cwd_for_project: kept as a local alias for backward compat within this
 # module (multiple call sites). Source of truth: cli_paths.encode_cwd_for_project.
+
+# v0.17.0: flags a raw ``backend_options.args`` entry may not carry. Principle:
+# anything that loosens a pair must stay visible in its permission_mode /
+# allowed_tools / extra_dirs / mcp_whitelist, and nothing may break the spawn.
+# (1) Flags the pair sets from its own fields, or that a field covers — a
+# second ``--settings`` would replace the merged JSON, not add to it; the
+# tool set stays visible in disallowed_tools. Value = the field to use instead.
+_MANAGED_FLAGS: dict[str, str] = {
+    "--settings": "backend_options.settings",
+    "--disallowed-tools": "disallowed_tools", "--disallowedTools": "disallowed_tools",
+    "--allowed-tools": "allowed_tools", "--allowedTools": "allowed_tools",
+    "--model": "model", "--fallback-model": "fallback_model", "--effort": "effort",
+    "--permission-mode": "permission_mode",
+    "--dangerously-skip-permissions": "permission_mode",
+    "--allow-dangerously-skip-permissions": "permission_mode",
+    "--append-system-prompt": "system_prompt_append / profile_name",
+    "--append-system-prompt-file": "system_prompt_append / profile_name",
+    "--mcp-config": "mcp_whitelist", "--strict-mcp-config": "mcp_whitelist",
+    "--add-dir": "extra_dirs",
+    "--inherit-permission-mode": "permission_mode", "--enable-auto-mode": "permission_mode",
+    "--tools": "disallowed_tools",
+}
+# (2) Flags refused outright. Value = why. Flag list read from ``claude
+# --help`` on CLI 2.1.295 (2026-10-09), then every option the root command
+# defines in the 2.1.295 binary, hidden ones included (second review of
+# b07509e found --managed-settings and --plugin-dir-no-mcp there). The
+# hidden flags' reasons come from their own descriptions, not from probes.
+# The third review added --chrome and --disable-slash-commands, plus the
+# flags the CLI acts on BEFORE its option parser (--routine with --bg;
+# --exec, -m, --handle-uri), which a sweep of option definitions can't see.
+_PROTOCOL = "every spawn path sets the stream protocol the runtime reads itself"
+_STREAM = "it adds to or reshapes the messages the runtime reads"
+_OTHER_SESSION = "it starts or attaches a different kind of session than the pair's own"
+_DISPATCH = "it hands the command line to another session instead of starting the pair's"
+_PLUGINS = "plugins bring MCP servers, hooks and agents past the mcp_whitelist opt-in"
+_AGENT = "an agent definition can carry its own permissionMode and tools"
+_MOVED = "the session would move to another directory, where the pair can't find its transcript"
+_TRUNCATED = "it cuts the resumed session short"
+_TEAMMATE = "it makes the pair a team member whose permission requests go to a team lead"
+_REFUSED_FLAGS: dict[str, str] = {
+    "--print": _PROTOCOL, "-p": _PROTOCOL, "--resume": _PROTOCOL, "-r": _PROTOCOL,
+    "--continue": _PROTOCOL, "-c": _PROTOCOL, "--session-id": _PROTOCOL,
+    "--fork-session": _PROTOCOL, "--input-format": _PROTOCOL, "--output-format": _PROTOCOL,
+    "--replay-user-messages": _PROTOCOL, "--include-partial-messages": _PROTOCOL,
+    "--forward-subagent-text": _PROTOCOL, "--include-hook-events": _PROTOCOL,
+    "--sdk-url": _PROTOCOL, "--await-claim": "it waits for a host's claim the pair never sends",
+    "--await-initialize": "it waits for an initialize request the pair never sends",
+    "--session-mirror": _STREAM, "--json-schema": _STREAM, "--enable-auth-status": _STREAM,
+    "--prompt-suggestions": _STREAM,
+    "--setting-sources": "it would stop loading your settings files, and with them their deny "
+                         "rules and hooks",
+    "--restricted": "it ignores your settings files, and with them their deny rules and hooks",
+    "--safe-mode": "it switches off hooks, CLAUDE.md and other customizations",
+    "--bare": "it skips keychain auth (a subscription login can't start) and your hooks",
+    "--managed-settings": "it is a second settings channel (policy tier) that nothing here checks",
+    "--client-data-url": "it loads a remote configuration document that nothing here checks",
+    "--project-config-root": "it reads another directory's project settings, .mcp.json and agents",
+    "--permission-prompt-tool": "approvals are the pair's permission_mode (stdio hangs a headless "
+                                "pair; an MCP tool would take approvals over)",
+    "--permission-prompts": "approvals are the pair's permission_mode",
+    "--plugin-dir": _PLUGINS, "--plugin-url": _PLUGINS,
+    "--plugin-dir-no-mcp": "it still loads the plugin's hooks and agents (only its MCP servers "
+                           "stay out)",
+    "--dangerously-load-development-channels": "it loads channel servers that are not on the "
+                                               "approved list",
+    "--agent": _AGENT, "--agents": _AGENT, "--agent-type": _AGENT,
+    # Together they make the session a team member, and the binary routes a
+    # team member's permission requests to the team lead over a mailbox.
+    "--agent-id": _TEAMMATE, "--agent-name": _TEAMMATE, "--team-name": _TEAMMATE,
+    "--no-session-persistence": "the session would not be saved, so the next respawn would lose "
+                                "the conversation",
+    "--resume-session-at": _TRUNCATED, "--resume-drops-turn": _TRUNCATED,
+    "--reply-on-resume": "it can start a turn on its own when the pair respawns",
+    "--rewind-files": "it restores files to an earlier state and exits",
+    "--worktree": _MOVED, "-w": _MOVED, "--deep-link-cwd-b64": _MOVED,
+    "--tmux": "it needs --worktree",
+    "--bg": _OTHER_SESSION, "--background": _OTHER_SESSION, "--cloud": _OTHER_SESSION,
+    "--remote": _OTHER_SESSION, "--desktop": _OTHER_SESSION, "--environment": _OTHER_SESSION,
+    "--pool": _OTHER_SESSION, "--attach-serve": _OTHER_SESSION,
+    "--remote-control": _OTHER_SESSION, "--rc": _OTHER_SESSION, "--teleport": _OTHER_SESSION,
+    "--from-pr": _OTHER_SESSION, "--ide": _OTHER_SESSION, "--routine": _OTHER_SESSION,
+    "--exec": _DISPATCH, "-m": _DISPATCH, "--handle-uri": _DISPATCH,
+    "--chrome": "it connects Claude in Chrome — your real, signed-in browser, in visible "
+                "windows — past the mcp_whitelist opt-in",
+    "--disable-slash-commands": "it disables skills, and with them /compact, /context and "
+                                "pair_invoke",
+    "--init-only": "it runs setup hooks and exits — the pair would never start",
+    "--version": "it prints and exits — the pair would never start", "-v": "it prints and exits",
+    "--help": "it prints and exits — the pair would never start", "-h": "it prints and exits",
+    "--": "it ends option parsing, so everything after it would become the prompt",
+    "-": "it ends option parsing, so everything after it would become the prompt",
+}
+# ``backend_options.settings`` is an ALLOWLIST (second review of b07509e,
+# P2). The denylist it replaces missed ``autoMode``, whose allow / soft_deny
+# / hard_deny lists replace the auto-mode classifier's rules (--settings is
+# one of the sources the classifier reads) while pair_info still says
+# ``auto``; the 2.1.295 schema also has command helpers that run outside the
+# permission system (apiKeyHelper, awsAuthRefresh, awsCredentialExport,
+# otelHeadersHelper, processWrapper …), cleanupPeriodDays (the retention of
+# ALL your transcripts), statusLine, claudeMd, autoMemoryDirectory … Each key
+# below was read from that schema (2026-10-09) and can't loosen the pair or
+# change what it loads: model is inert (every spawn passes --model), the rest
+# shape replies, commit text and Bash output size. permissions and env are
+# checked one level down.
+_ALLOWED_SETTINGS = ("permissions", "env", "model", "outputStyle", "language",
+                     "alwaysThinkingEnabled", "attribution", "includeCoAuthoredBy",
+                     "includeGitInstructions", "bashOutputMaxChars")
+# Tightening only: blockReadsOutsideWorkingDirectories refuses file-tool reads
+# outside the working directories, and only ``true`` passes — the schema says
+# true in any settings source wins, but a ``false`` has no use here either.
+# (disableBypassPermissionsMode / disableAutoMode would contradict an
+# unrestricted / auto pair, so they stay out too.)
+_ALLOWED_PERMISSIONS = ("deny", "ask", "blockReadsOutsideWorkingDirectories")
+# settings.env reaches the CLI and every command the pair runs, so the names
+# are an allowlist too: CLAUDE_CODE_SHELL_PREFIX wraps every command,
+# CLAUDE_CODE_PROCESS_WRAPPER / NODE_OPTIONS / PATH / BASH_ENV / GIT_SSH_COMMAND
+# change what an approved command runs, CLAUDE_CONFIG_DIR swaps the whole
+# config, ANTHROPIC_* swap the credentials or the endpoint. What passes:
+# Claude Code's own timeouts, output limits and telemetry switches (each name
+# found in the 2.1.295 binary).
+_ALLOWED_ENV = ("BASH_DEFAULT_TIMEOUT_MS", "BASH_MAX_TIMEOUT_MS", "BASH_MAX_OUTPUT_LENGTH",
+                "MAX_THINKING_TOKENS", "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "MCP_TIMEOUT",
+                "MCP_TOOL_TIMEOUT", "MAX_MCP_OUTPUT_TOKENS", "DISABLE_TELEMETRY",
+                "DISABLE_ERROR_REPORTING", "DISABLE_AUTOUPDATER",
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+                "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR")
+# Refused keys a pair field covers: the refusal names the field.
+_SETTINGS_FIELDS: dict[str, str] = {
+    "fallbackModel": "fallback_model", "effortLevel": "effort",
+    "enableAllProjectMcpServers": "mcp_whitelist", "enabledMcpjsonServers": "mcp_whitelist",
+}
+_PERMISSION_FIELDS: dict[str, str] = {
+    "allow": "allowed_tools", "defaultMode": "permission_mode",
+    "additionalDirectories": "extra_dirs",
+}
+CLAUDE_BACKEND_OPTION_KEYS = ("settings", "args")
+
+
+def _check_settings(settings: dict[str, Any]) -> None:
+    """Raise ValueError unless every key of ``settings`` is on the allowlist."""
+    if "ultracode" in settings:
+        raise ValueError("set Ultracode with the ultracode parameter, not backend_options.settings "
+                         "— both go into the same --settings JSON")
+    for key in settings:
+        if key in _SETTINGS_FIELDS:
+            raise ValueError(f"backend_options.settings may not contain {key!r}: set it with "
+                             f"{_SETTINGS_FIELDS[key]} instead.")
+        if key not in _ALLOWED_SETTINGS:
+            raise ValueError(
+                f"backend_options.settings may not contain {key!r}: only {', '.join(_ALLOWED_SETTINGS)} "
+                f"pass. Other keys can loosen the pair or reach past it (hooks, autoMode, command "
+                f"helpers such as apiKeyHelper, cleanupPeriodDays …); keep those in your own settings files.")
+    perms = settings.get("permissions")
+    if perms is not None and not isinstance(perms, dict):
+        raise ValueError("backend_options.settings.permissions must be a JSON object")
+    for key in perms or {}:
+        if key in _PERMISSION_FIELDS:
+            raise ValueError(f"backend_options.settings may not contain permissions.{key}: set it with "
+                             f"{_PERMISSION_FIELDS[key]} instead. Tightening rules (permissions.deny / "
+                             f"ask) are fine.")
+        if key not in _ALLOWED_PERMISSIONS:
+            raise ValueError(f"backend_options.settings may not contain permissions.{key}: only "
+                             f"{' / '.join(_ALLOWED_PERMISSIONS)} pass.")
+        if key == "blockReadsOutsideWorkingDirectories" and perms[key] is not True:
+            raise ValueError(f"backend_options.settings.permissions.{key} may only be true (got "
+                             f"{json.dumps(perms[key])}): it is here to tighten, never to loosen.")
+    env = settings.get("env")
+    if env is not None and not isinstance(env, dict):
+        raise ValueError("backend_options.settings.env must be a JSON object")
+    for name in env or {}:
+        if name not in _ALLOWED_ENV:
+            raise ValueError(
+                f"backend_options.settings.env may not set {name!r}: only Claude Code's own timeout, "
+                f"output-limit and telemetry variables pass ({', '.join(_ALLOWED_ENV)}). Others can "
+                f"change what the pair's commands run or where it connects (CLAUDE_CODE_SHELL_PREFIX, "
+                f"CLAUDE_CONFIG_DIR, ANTHROPIC_*, PATH …).")
+
+
+def _refused_arg(token: str) -> str | None:
+    """Why a raw ``args`` token is refused, or None. Checks ``--flag=value``
+    and combined short flags (``-cp`` = ``-c -p``)."""
+    flag = token.split("=", 1)[0]
+    if flag in _MANAGED_FLAGS:
+        return f"set it with {_MANAGED_FLAGS[flag]} instead"
+    if flag in _REFUSED_FLAGS:
+        return _REFUSED_FLAGS[flag]
+    if len(flag) > 2 and flag[0] == "-" and flag[1] != "-":
+        for ch in flag[1:]:
+            if f"-{ch}" in _REFUSED_FLAGS:
+                return f"-{ch}: {_REFUSED_FLAGS['-' + ch]}"
+    return None
+
+
+# ---- v0.18.0: API-key billing ------------------------------------------------
+# Measured on CLI 2.1.296, Windows, 2026-10-11 (HANDOFF "API-key billing for
+# pairs"): a pair inherits CLAUDE_CODE_ENTRYPOINT=claude-desktop from a desktop
+# session, and with it the CLI IGNORES ANTHROPIC_API_KEY (a fake key still got
+# an answer, on the plan); dropping only that variable made the key win
+# ("Invalid API key"). ANTHROPIC_AUTH_TOKEN outranks the key (docs).
+API_KEY_FILE = "api_key"
+# Any Console API key: personal (sk-ant-usr…), service-account, legacy
+# workspace (sk-ant-api…). Verified 2026-10-11 by the manager: a personal key
+# in ANTHROPIC_API_KEY answered a direct `claude -p` Haiku turn, covered by
+# the credits. The known NON-API kinds are refused by prefix.
+API_KEY_PREFIX = "sk-ant-"
+_NON_API_KEYS = (
+    ("sk-ant-oat", "an OAuth access token (from a claude.ai login or setup-token)"),
+    ("sk-ant-ort", "an OAuth refresh token"),
+    ("sk-ant-admin", "an Admin API key (it manages the org; it can't run requests)"),
+)
+OFFICIAL_BASE_URL = "https://api.anthropic.com"
+_API_DROP_ENV = ("CLAUDE_CODE_ENTRYPOINT", "ANTHROPIC_AUTH_TOKEN")
+_CLOUD_PROVIDER_ENV = ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
+# Docs text when credits run out: "Your credit balance is too low to access the
+# Anthropic API…" (API) / "Credit balance too low · Add funds…" (Claude Code).
+# Not reproducible while credits remain. Matched only on an error result
+# (is_error / api_error_status) of an API-billed pair, never on an answer.
+_CREDIT_RE = re.compile(r"credit balance (is )?too low", re.IGNORECASE)
+# A rejected key or org: "Invalid API key · Fix external API key" (fake-key
+# probe through the warm runtime, 2.1.296, 2026-10-11: subtype success,
+# is_error true, api_error_status 401) and the API's 403 texts for a key or
+# org that was switched off. Same gating as _CREDIT_RE.
+_INVALID_KEY_RE = re.compile(r"invalid api key|api key authentication is disabled"
+                             r"|organization has been disabled", re.IGNORECASE)
+# Docs: a personal or service-account key not scoped to one workspace gets a
+# 400 invalid_request_error "anthropic-workspace-id is required when
+# authenticating with an identity-linked API key…". Same gating.
+_WORKSPACE_REQUIRED_RE = re.compile(r"anthropic-workspace-id is required", re.IGNORECASE)
+
+
+def api_key_path() -> Path:
+    """``<CLAUDE_HOME>/pairs/api_key``: the one place the key lives."""
+    return pairs_dir() / API_KEY_FILE
+
+
+def read_api_key() -> str:
+    """The key for billing="api" pairs, read fresh at every spawn. Raises
+    BillingError — whose text never includes any of the file's content."""
+    path = api_key_path()
+    try:
+        key = path.read_text(encoding="utf-8-sig").strip()
+    except FileNotFoundError:
+        raise BillingError(
+            f"the API key file {path} does not exist. Write an API key of the Console org "
+            f"linked to your plan there (one line, starting with {API_KEY_PREFIX}), or move "
+            f"the pair back to the plan with pair_update(name, billing=\"plan\").") from None
+    except (OSError, UnicodeError) as e:
+        # Only the type: a decode error's text quotes the file's bytes.
+        raise BillingError(f"the API key file {path} could not be read ({type(e).__name__}).") from None
+    if not key.startswith(API_KEY_PREFIX) or any(ch.isspace() for ch in key):
+        raise BillingError(f"the API key file {path} must hold exactly one API key (a single line "
+                           f"starting with {API_KEY_PREFIX}).")
+    for prefix, kind in _NON_API_KEYS:
+        if key.startswith(prefix):
+            raise BillingError(f"the API key file {path} holds {kind}, not an API key. Create a "
+                               f"personal or service-account API key in the Console of the org "
+                               f"linked to your plan.")
+    return key
+
+
+def api_key_fingerprint(key: str | None) -> str | None:
+    """A short hash to notice a rotated key without keeping the key around."""
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16] if key else None
+
+
+def current_key_fingerprint() -> str | None:
+    try:
+        return api_key_fingerprint(read_api_key())
+    except BillingError:
+        return None
+
+
+def api_key_status() -> str:
+    """For pair_info and pair_billing: ``key …abcd`` (the last four characters
+    only) or why there is no usable key."""
+    try:
+        key = read_api_key()
+    except BillingError:
+        path = api_key_path()
+        return f"key file missing: {path}" if not path.exists() else f"key file unusable: {path}"
+    return f"key …{key[-4:]}"
+
+
+def book_cost(name: str, cost: float, billing: str) -> None:
+    """Add spend outside a send (compaction, pair_invoke, a result with no
+    turn open) to the pair's totals — and to api_cost_usd on API billing.
+    Best effort: bookkeeping never fails the operation."""
+    if not cost:
+        return
+    try:
+        from claude_squared.registry import get_pair, update_pair
+        cur = get_pair(name)
+        fields: dict[str, Any] = {"total_cost_usd": cur.total_cost_usd + cost}
+        if billing == "api":
+            fields["api_cost_usd"] = cur.api_cost_usd + cost
+        update_pair(name, **fields)
+    except Exception:
+        pass
+
+
+def _truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def claude_env(billing: str = "plan") -> dict[str, str]:
+    """The environment of a claude spawn — the ONE builder every Claude spawn
+    site uses (warm runtime, one-shot --print, stream-json, triage, ``claude
+    mcp list``, ``--help``).
+
+    ``plan``: this process's environment minus ``ANTHROPIC_API_KEY``. In -p a
+    key always beats the claude.ai login (docs), so a key in the server's
+    environment would silently bill every pair; plan is plan by construction.
+
+    ``api``: the key file's key, without ``CLAUDE_CODE_ENTRYPOINT`` (with it
+    the CLI ignores the key) and ``ANTHROPIC_AUTH_TOKEN`` (it outranks the
+    key). Refuses an environment that would send the key elsewhere — a cloud
+    provider switch or a non-official ``ANTHROPIC_BASE_URL`` (the official one,
+    which the desktop app sets, is dropped). Sets
+    ``CLAUDE_CODE_PROMPT_CACHE_TTL=1h`` (an API key otherwise gets 5 min).
+    The key never enters ``os.environ`` — but the pair's own processes (its
+    Bash, hooks, MCP servers) inherit it. No CLAUDE_CODE_SUBPROCESS_ENV_SCRUB:
+    on 2.1.296 it forces the permission mode to ``default`` ("allowed_non_write_users
+    hardening"; review round 1, 2026-10-11), and Bash could read the key file anyway."""
+    env = dict(os.environ)
+    env.pop("ANTHROPIC_API_KEY", None)
+    if billing != "api":
+        return env
+    for var in _CLOUD_PROVIDER_ENV:
+        if _truthy(env.get(var)):
+            raise BillingError(f"{var} is set in the MCP server's environment: the pair would run "
+                               f"on that cloud provider, not on the API key.")
+    base_url = (env.get("ANTHROPIC_BASE_URL") or "").strip().rstrip("/")
+    if base_url and base_url.lower() != OFFICIAL_BASE_URL:
+        raise BillingError("ANTHROPIC_BASE_URL in the MCP server's environment points somewhere other "
+                           f"than {OFFICIAL_BASE_URL}; an API-billed pair won't send the key there.")
+    env.pop("ANTHROPIC_BASE_URL", None)
+    for var in _API_DROP_ENV:
+        env.pop(var, None)
+    env["ANTHROPIC_API_KEY"] = read_api_key()
+    env["CLAUDE_CODE_PROMPT_CACHE_TTL"] = "1h"
+    return env
+
+
+def key_file_deny_rule() -> str:
+    """``Read(//c/Users/…/pairs/api_key)``: a scoped deny rule for the key file,
+    passed on every Claude spawn so the key can't land in a transcript through
+    the Read tool. Absolute rule paths are POSIX with the drive letter as the
+    first segment on Windows. Probed 2026-10-11 (2.1.296, Haiku, a canary
+    file): this form, ``~/…``, ``//C/…``, ``C:/…`` and ``C:\\…`` all denied the
+    Read; with no rule the turn read the canary. ``cat`` in Bash is not covered."""
+    path = Path(os.path.abspath(api_key_path()))
+    posix = path.as_posix()
+    if path.drive:
+        posix = "/" + path.drive.rstrip(":").lower() + posix[len(path.drive):]
+    return f"Read(/{posix})"
+
+
+def _workspace_help(name: str) -> str:
+    return (f"the API wants a workspace for this key: a personal or service-account key must be "
+            f"created scoped to a single workspace (Console → API keys). Replace the key in "
+            f"{api_key_path()}, or move '{name}' back to the plan with pair_update('{name}', "
+            f"billing=\"plan\").")
+
+
+def _key_rejected_help(name: str) -> str:
+    return (f"the API rejected the key in {api_key_path()} (or its org is switched off). Fix the "
+            f"key file (the next spawn reads "
+            f"it again), or move '{name}' back to the plan with pair_update('{name}', "
+            f"billing=\"plan\").")
+
+
+def _billing_failure(spec: "PairSpec | None", text: str) -> str | None:
+    """The clear message for a failed process of an API-billed pair whose
+    output says the credits ran out or the key was rejected, else None.
+    Only for processes that already failed (non-zero exit)."""
+    if spec is None or spec.billing != "api":
+        return None
+    if _CREDIT_RE.search(text):
+        return _credit_help(spec.name)
+    if _WORKSPACE_REQUIRED_RE.search(text):
+        return _workspace_help(spec.name)
+    if _INVALID_KEY_RE.search(text):
+        return _key_rejected_help(spec.name)
+    return None
+
+
+def _failure_text(stdout: str, stderr: str) -> str:
+    """What a failed process said about itself: the LAST result event's text
+    (``--output-format json`` or stream-json), else stderr. Never the rest of
+    stdout — tool results there may quote anything (review: an
+    error_max_turns run that had quoted the key error read as a rejected key)."""
+    try:
+        whole = json.loads(stdout)
+    except ValueError:
+        whole = None
+    if isinstance(whole, dict) and whole.get("type") == "result":
+        return str(whole.get("result") or "")
+    for line in reversed(stdout.splitlines()):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            return str(event.get("result") or "")
+    return stderr
+
+
+def _credit_help(name: str) -> str:
+    return (f"the API rejected the turn: the Console org's credits are used up. Move '{name}' back "
+            f"to the plan with pair_update('{name}', billing=\"plan\") and re-send, or wait for "
+            f"next month's credits.")
 
 
 def _claude_executable() -> str:
@@ -85,7 +497,7 @@ def _cli_permission_choices() -> tuple[str, ...]:
     choices: tuple[str, ...] = ()
     try:
         out = subprocess.run([_claude_executable(), "--help"], capture_output=True, text=True,
-                             timeout=20, stdin=subprocess.DEVNULL).stdout
+                             timeout=20, stdin=subprocess.DEVNULL, env=claude_env()).stdout
         i = out.find("--permission-mode")
         seg = out[i:i + 600] if i >= 0 else ""
         m = re.search(r"choices:\s*(.*?)\)", seg, re.S)
@@ -169,6 +581,58 @@ class ClaudeAdapter(PairAdapter):
         return bare
 
     @staticmethod
+    def validate_backend_options(backend_options: dict[str, Any] | None, *,
+                                 allow_unknown: bool = False) -> dict[str, Any]:
+        """Check (and normalize) a Claude pair's ``backend_options``; raises
+        ValueError. ``settings``: a JSON object (dict or JSON string), merged
+        with the ultracode key into the one ``--settings`` flag, holding only
+        the keys ``_check_settings`` allows. ``args``: a list of raw CLI
+        tokens, none of them in ``_MANAGED_FLAGS`` / ``_REFUSED_FLAGS``.
+
+        ``allow_unknown`` is the spawn-time mode: before v0.17.0 a Claude pair
+        accepted any keys and ignored them, so a stored unknown key must not
+        stop the pair from starting — only the two keys it reads are checked.
+        """
+        bo = dict(backend_options or {})
+        unknown = sorted(set(bo) - set(CLAUDE_BACKEND_OPTION_KEYS))
+        if unknown and not allow_unknown:
+            raise ValueError(
+                f"backend_options {unknown} are not Claude options. Claude takes 'settings' (a "
+                f"settings JSON object, passed as --settings) and 'args' (a list of raw CLI args); "
+                f"'config' / 'sandbox' / 'approval' are Codex-only.")
+        if "settings" in bo:
+            settings = bo["settings"]
+            if isinstance(settings, str):
+                try:
+                    settings = json.loads(settings)
+                except ValueError as e:
+                    raise ValueError(f"backend_options.settings must be a JSON object: {e}") from None
+            if not isinstance(settings, dict):
+                raise ValueError("backend_options.settings must be a JSON object (a dict)")
+            _check_settings(settings)
+            bo["settings"] = settings
+        if "args" in bo:
+            raw = bo["args"]
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except ValueError:
+                    raw = None
+            if not isinstance(raw, list) or not all(isinstance(a, str) for a in raw):
+                raise ValueError("backend_options.args must be a list of strings, one CLI token each "
+                                 "(e.g. [\"--max-budget-usd\", \"5\"])")
+            if raw and not raw[0].startswith("-"):
+                # They end every argv: a leading value would become a second
+                # prompt (or the prompt, on the stream-json paths).
+                raise ValueError(f"backend_options.args must start with a flag (got {raw[0]!r})")
+            for token in raw:
+                why = _refused_arg(token)
+                if why:
+                    raise ValueError(f"backend_options.args may not contain {token.split('=', 1)[0]}: {why}.")
+            bo["args"] = raw
+        return bo
+
+    @staticmethod
     def native_permission(level: str | None) -> str:
         """Neutral level (or any accepted alias) → ``--permission-mode`` value.
 
@@ -207,8 +671,10 @@ class ClaudeAdapter(PairAdapter):
                  "--model", self.cli_model(spec),
                  "--permission-mode", self.native_permission(spec.permission_mode),
                  "-p", prompt]
+        args += self._extra_args(spec)
 
         result_json = self._run_print(args, timeout_seconds=300, pair_name=spec.name, cwd=spec.cwd,
+                                      env_spec=spec,
                                       **({"connector_spec": spec} if connectors.effective(spec.mcp_whitelist) else {}))
         return CreateResult(
             name=spec.name,
@@ -270,16 +736,21 @@ class ClaudeAdapter(PairAdapter):
         ]
         args += self._fallback_args(spec)
         args += self._mcp_args(spec, permission_mode)
+        args += self._settings_args(spec)
         if eff is not None:
             args += ["--effort", eff]
         args += [
             "--permission-mode", self.native_permission(permission_mode or spec.permission_mode),
             "-p", message,
         ]
+        args += self._extra_args(spec)
+        env = self._spawn_env(spec)  # a missing key refuses before the task starts
         from claude_squared.async_tasks import mark_task_executing
+        from claude_squared.runtime import refuse_if_shutting_down
+        refuse_if_shutting_down()
         mark_task_executing(task_id)
         result_json = self._run_print(args, timeout_seconds=timeout_seconds,
-                                      pair_name=spec.name, cwd=spec.cwd,
+                                      pair_name=spec.name, cwd=spec.cwd, env_spec=spec, env=env,
                                       **({"connector_spec": spec} if connectors.effective(spec.mcp_whitelist) else {}))
         return self._build_send_result(spec, result_json)
 
@@ -325,8 +796,9 @@ class ClaudeAdapter(PairAdapter):
             "-p", sentinel,
         ]
         args += self._mcp_args(spec)
+        args += self._option_args(spec)  # raw args last
         result_json = self._run_print(
-            args, timeout_seconds=timeout_seconds, pair_name=spec.name, cwd=spec.cwd,
+            args, timeout_seconds=timeout_seconds, pair_name=spec.name, cwd=spec.cwd, env_spec=spec,
             **({"connector_spec": spec} if connectors.effective(spec.mcp_whitelist) else {})
         )
         new_sid = result_json.get("session_id")
@@ -409,9 +881,9 @@ class ClaudeAdapter(PairAdapter):
         # orchestration) is active for the session. Set per session via the
         # 'ultracode' settings key"). Pass it alongside any --effort value —
         # ultracode and effort are independent fields in the CLI's data model
-        # (binary: ``effortValue:_,ultracode:f``).
-        if spec.ultracode:
-            args += ["--settings", '{"ultracode": true}']
+        # (binary: ``effortValue:_,ultracode:f``). v0.17.0: merged with
+        # backend_options.settings into ONE --settings JSON (_settings_args).
+        args += self._settings_args(spec)
 
         # v0.11.0: automatic fallback when the primary model is overloaded or
         # unavailable (e.g. a subscription/trial-flagged model loses access).
@@ -436,6 +908,9 @@ class ClaudeAdapter(PairAdapter):
         if spec.allowed_tools and not connectors.effective(spec.mcp_whitelist):
             args += ["--allowed-tools", " ".join(spec.allowed_tools)]
 
+        # v0.17.0: backend_options.args are NOT here — both callers append
+        # more flags, which a raw flag missing its value would swallow
+        # (["--system-prompt"] eating --print). They end every argv instead.
         return args
 
     def _mcp_args(self, spec: PairSpec, permission_mode: str | None = None) -> list[str]:
@@ -445,7 +920,69 @@ class ClaudeAdapter(PairAdapter):
         # Reapplying disallow flags on resume must retain headless exclusions.
         for tool in HEADLESS_INCOMPATIBLE_TOOLS:
             args += ["--disallowed-tools", tool]
+        # Claude in Chrome drives the user's real, signed-in Chrome, and
+        # --strict-mcp-config doesn't stop it. The 2.1.295 binary decides it
+        # from --chrome / --no-chrome first, then CLAUDE_CODE_ENABLE_CFC in the
+        # environment a pair inherits, then (interactive sessions only)
+        # claudeInChromeDefaultEnabled — so --no-chrome settles it for every
+        # pair whose mcp_whitelist doesn't name it (third review of ac6d2c4).
+        # The flag is in the 2.1.258 and 2.1.280 binaries too.
+        if not connectors.chrome_selected(spec.mcp_whitelist):
+            args.append("--no-chrome")
+        # v0.18.0: the API key file is never readable through the Read tool,
+        # on any pair. A scoped rule leaves the tool list (and with it the
+        # prompt cache) unchanged.
+        args += ["--disallowed-tools", key_file_deny_rule()]
+        # v0.17.0: the pair's own removals ride with the connector flags, so
+        # every spawn path (runtime, override send, compact, fork, /context)
+        # sends the same tool list — a different list on one path would miss
+        # the prompt cache for the whole context — and a pair_update applies
+        # at the next spawn without a pair_clear.
+        for tool in self.disallowed_tools(spec):
+            args += ["--disallowed-tools", tool]
         return args
+
+    @staticmethod
+    def disallowed_tools(spec: PairSpec) -> list[str]:
+        """The pair's ``disallowed_tools``: stripped, de-duplicated in order,
+        minus the headless exclusions ``_mcp_args`` already passes."""
+        out: list[str] = []
+        for tool in spec.disallowed_tools or []:
+            tool = str(tool).strip()
+            if tool and tool not in out and tool not in HEADLESS_INCOMPATIBLE_TOOLS:
+                out.append(tool)
+        return out
+
+    @classmethod
+    def _claude_options(cls, spec: PairSpec) -> dict[str, Any]:
+        """The pair's validated ``backend_options`` (spawn-time mode). A
+        malformed ``settings`` / ``args`` refuses the spawn: silently dropping
+        them could drop a permission rule the user put in ``settings``."""
+        try:
+            return cls.validate_backend_options(spec.backend_options, allow_unknown=True)
+        except ValueError as e:
+            raise PairError(f"pair '{spec.name}' has unusable backend_options: {e}. "
+                           f"Fix it with pair_update(name='{spec.name}', backend_options=...).") from None
+
+    def _settings_args(self, spec: PairSpec) -> list[str]:
+        """ONE ``--settings`` JSON: backend_options.settings plus the ultracode
+        key. Keys sorted so the same config always yields the same argument
+        (ultracode alone is still ``{"ultracode": true}``, as before v0.17)."""
+        merged = dict(self._claude_options(spec).get("settings") or {})
+        if spec.ultracode:
+            merged["ultracode"] = True
+        return ["--settings", json.dumps(merged, sort_keys=True)] if merged else []
+
+    def _extra_args(self, spec: PairSpec) -> list[str]:
+        """backend_options.args, verbatim. Every spawn path puts them LAST, so
+        a raw flag missing its value can't consume one of the pair's own."""
+        return list(self._claude_options(spec).get("args") or [])
+
+    def _option_args(self, spec: PairSpec) -> list[str]:
+        """Settings + raw args, for the fork and stream-json paths whose argv
+        ends with the tool scope. v0.17.0: ultracode used to reach only
+        create and the runtime."""
+        return self._settings_args(spec) + self._extra_args(spec)
 
     def _resolve_system_prompt(self, spec: PairSpec) -> str | None:
         parts = []
@@ -457,13 +994,22 @@ class ClaudeAdapter(PairAdapter):
             parts.append(spec.system_prompt_append.strip())
         return "\n\n".join(parts) if parts else None
 
+    @staticmethod
+    def _spawn_env(spec: PairSpec | None) -> dict[str, str]:
+        """claude_env for this pair's billing (plan when there's no spec)."""
+        return claude_env(spec.billing if spec is not None else "plan")
+
     def _run_print(self, args: list[str], *, timeout_seconds: int, pair_name: str,
-                   cwd: str | None = None, connector_spec: PairSpec | None = None) -> dict:
+                   cwd: str | None = None, connector_spec: PairSpec | None = None,
+                   env_spec: PairSpec | None = None, env: dict[str, str] | None = None) -> dict:
         cli = _claude_executable()
+        if env is None:
+            env = self._spawn_env(env_spec)
         if connector_spec is not None and connectors.effective(connector_spec.mcp_whitelist):
             args = list(args)
-            args[args.index("--output-format") + 1] = "stream-json"
-            args.append("--verbose")
+            i = args.index("--output-format")
+            args[i + 1] = "stream-json"
+            args.insert(i + 2, "--verbose")  # not appended: raw args stay last
         full = [cli] + args
         try:
             proc = subprocess.run(
@@ -474,6 +1020,7 @@ class ClaudeAdapter(PairAdapter):
                 timeout=timeout_seconds,
                 check=False,
                 cwd=cwd,
+                env=env,
             )
         except subprocess.TimeoutExpired as e:
             raise CommandTimeout(pair_name, timeout_seconds) from e
@@ -487,6 +1034,9 @@ class ClaudeAdapter(PairAdapter):
             # api_error_status 404), with stderr EMPTY (verified the day Fable 5
             # was pulled). So check BOTH streams for the marker, not just stderr.
             combined = (stderr_txt + "\n" + stdout_txt).lower()
+            failure = _billing_failure(env_spec, _failure_text(stdout_txt, stderr_txt))
+            if failure:
+                raise CLIError(failure, stderr=stderr_txt or stdout_txt[:2000], exit_code=proc.returncode)
             if MODEL_UNAVAILABLE_MARKER in combined:
                 raise CLIError(
                     _MODEL_UNAVAILABLE_HELP,
@@ -533,12 +1083,14 @@ class ClaudeAdapter(PairAdapter):
                 "--input-format", "stream-json",
                 "--output-format", "stream-json"]
         args += self._mcp_args(spec)
+        args += self._option_args(spec)  # raw args last
 
         stdin_payload = "\n".join(
             json.dumps({"type": "user", "message": {"role": "user", "content": m}})
             for m in messages
         ) + "\n"
 
+        env = self._spawn_env(spec)
         try:
             proc = subprocess.run(
                 args,
@@ -548,16 +1100,19 @@ class ClaudeAdapter(PairAdapter):
                 timeout=timeout_seconds,
                 check=False,
                 cwd=spec.cwd,
+                env=env,
             )
         except subprocess.TimeoutExpired as e:
             raise CommandTimeout(spec.name, timeout_seconds) from e
 
         if proc.returncode != 0:
-            raise CLIError(
-                "claude CLI (stream-json) exited non-zero",
-                stderr=proc.stderr.decode("utf-8", errors="replace"),
-                exit_code=proc.returncode,
-            )
+            stderr_txt = proc.stderr.decode("utf-8", errors="replace")
+            # v0.18.0: compaction / /context / pair_invoke on an API pair whose
+            # credits ran out or whose key was rejected say so, as _run_print does.
+            failure = _billing_failure(
+                spec, _failure_text(proc.stdout.decode("utf-8", errors="replace"), stderr_txt))
+            raise CLIError(failure or "claude CLI (stream-json) exited non-zero",
+                           stderr=stderr_txt, exit_code=proc.returncode)
 
         events: list[dict] = []
         for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
@@ -570,6 +1125,11 @@ class ClaudeAdapter(PairAdapter):
                 continue
         if connectors.effective(spec.mcp_whitelist):
             self._attach_mcp_init(events)
+        # v0.18.0: compaction and pair_invoke spend counts too (one process,
+        # so its last result's total is its whole cost).
+        totals = [float(e.get("total_cost_usd") or 0.0) for e in events if e.get("type") == "result"]
+        if totals and max(totals) > 0:
+            book_cost(spec.name, max(totals), spec.billing)
         return events
 
     @staticmethod
@@ -711,6 +1271,25 @@ class ClaudeAdapter(PairAdapter):
                 parts.append(str(expl)[:240])
             safety_signal = " — ".join(parts)
             safety_kind = "refusal"
+        elif (spec.billing == "api" and (result_json.get("is_error") or api_err)
+              and _CREDIT_RE.search(result_json.get("result") or "")):
+            # v0.18.0: the Console org's credits ran out. Only an ERROR of an
+            # API-billed pair — an answer quoting the text must not read as one.
+            safety_signal = (f"{_credit_help(spec.name)} The API said: "
+                             f"{(result_json.get('result') or '').strip()[:160]!r}")
+            safety_kind = "credit_exhausted"
+        elif (spec.billing == "api" and (result_json.get("is_error") or api_err)
+              and _WORKSPACE_REQUIRED_RE.search(result_json.get("result") or "")):
+            safety_signal = (f"{_workspace_help(spec.name)} The API said: "
+                             f"{(result_json.get('result') or '').strip()[:160]!r}")
+            safety_kind = "api_key_rejected"
+        elif (spec.billing == "api" and (result_json.get("is_error") or api_err)
+              and _INVALID_KEY_RE.search(result_json.get("result") or "")):
+            # Otherwise it reads as a transient API error ("retry usually
+            # resolves it") — a bad key never does.
+            safety_signal = (f"{_key_rejected_help(spec.name)} The API said: "
+                             f"{(result_json.get('result') or '').strip()[:160]!r}")
+            safety_kind = "api_key_rejected"
         elif _USAGE_LIMIT_RE.search(result_json.get("result") or ""):
             # v0.12.0: the CLI reports a usage-limit hit as subtype SUCCESS with
             # the limit notice as the result text (observed on par6, 2026-08-22:
@@ -748,13 +1327,26 @@ class ClaudeAdapter(PairAdapter):
             safety_kind = "error"
         # Keep the raw stop_reason for transparency when it's not a normal finish.
         stop_reason_kept = stop_reason if stop_reason not in (None, "end_turn") else None
+        try:
+            api_calls = int(result_json.get("num_turns") or 0)
+        except (TypeError, ValueError):
+            api_calls = 0
+        refused_outright = (safety_kind in ("credit_exhausted", "api_key_rejected")
+                            and api_calls <= 1)
 
         return SendResult(
             name=spec.name,
             response=result_json.get("result", ""),
             session_id=result_json.get("session_id", spec.session_id),
             model_used=model_used,
-            cost_usd=result_json.get("total_cost_usd", 0.0),
+            # v0.18.0: a warm runtime's total_cost_usd is a running total for
+            # the process; its reader puts this turn's share in _turn_cost_usd.
+            # A one-shot process reports its own (single-turn) total.
+            # A turn the API refused outright (no credits, rejected key) costs
+            # nothing; one that ran out partway keeps what it spent before.
+            cost_usd=(0.0 if refused_outright
+                      else result_json["_turn_cost_usd"] if result_json.get("_turn_cost_usd") is not None
+                      else result_json.get("total_cost_usd", 0.0)),
             duration_ms=result_json.get("duration_ms", 0),
             permission_denials=denials,
             context=ContextStatus(tokens_used=used, tokens_max=ctx_window, percent=pct,
@@ -773,6 +1365,7 @@ class ClaudeAdapter(PairAdapter):
             self_woken_waited_s=waited_s,
             terminal_reason=result_json.get("terminal_reason"),
             backend="claude",
+            billing=spec.billing,  # v0.18.0: self-woken turns' footers show API cost too
             notes=connectors.claude_init_notes(spec.mcp_whitelist, result_json.get("_mcp_servers")),
         )
 

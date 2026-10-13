@@ -30,7 +30,7 @@ from typing import Callable
 from filelock import FileLock, Timeout as FileLockTimeout
 
 from claude_squared.models import AsyncTaskState, SendResult
-from claude_squared.errors import TaskStopped
+from claude_squared.errors import NOT_DELIVERED_MESSAGE, NOT_DELIVERED_PREFIX, TaskStopped
 from claude_squared.registry import async_dir
 from claude_squared import process_identity
 
@@ -144,7 +144,9 @@ CRASHED_ERROR_PREFIX = "CRASHED: "
 # Both supervision-class prefixes — used by ``_format_task_error`` to decide
 # whether to pass an error through bare (so the prefix stays at position 0 for
 # wait.py's ``startswith`` dispatch) or wrap it with the exception class name.
-_SUPERVISION_PREFIXES = (ORPHAN_ERROR_PREFIX, CRASHED_ERROR_PREFIX)
+# v0.18.0: NOT DELIVERED (a send that never started because the server was
+# shutting down) is passed through bare as well.
+_SUPERVISION_PREFIXES = (ORPHAN_ERROR_PREFIX, CRASHED_ERROR_PREFIX, NOT_DELIVERED_PREFIX)
 
 
 def _format_task_error(e: BaseException) -> str:
@@ -174,6 +176,10 @@ _ORPHAN_MESSAGE = (
 
 def _orphan_message(state: AsyncTaskState) -> str:
     from claude_squared import registry
+    if state.queued:
+        # v0.18.0 (Incident 2026-10-04): still queued when its server died —
+        # the message was never written, so nothing "may have completed".
+        return NOT_DELIVERED_MESSAGE
     try:
         backend = registry.get_pair(state.pair_name).backend
     except Exception:
@@ -930,7 +936,9 @@ def _sweep_running_tasks(predicate: Callable[[dict], bool], message: str) -> Non
                     except ValueError:
                         pass  # legacy schema: retain the raw-dict cleanup path
                 data["status"] = "failed"
-                data["error"] = message
+                # v0.18.0: a send still queued never ran — say so, never "may
+                # have completed" (Incident 2026-10-04).
+                data["error"] = NOT_DELIVERED_MESSAGE if data.get("queued") else message
                 data["finished_at"] = now_iso
                 tmp = p.with_suffix(".tmp")
                 with open(tmp, "w", encoding="utf-8") as f:

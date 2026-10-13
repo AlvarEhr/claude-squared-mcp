@@ -74,9 +74,11 @@ def _json_file(path: Path) -> dict:
 
 
 def _list_output(backend: str, cwd: str | None) -> str:
+    extra: dict[str, Any] = {}
     if backend == "claude":
-        from claude_squared.adapters.claude import _claude_executable
+        from claude_squared.adapters.claude import _claude_executable, claude_env
         exe, spawn = _claude_executable(), subprocess.run
+        extra["env"] = claude_env()  # v0.18.0: the plan, like every claude spawn
     else:
         from claude_squared.adapters.codex import codex_executable, run_codex
         exe, spawn = codex_executable(), run_codex  # retries once if an update removed the binary
@@ -90,7 +92,7 @@ def _list_output(backend: str, cwd: str | None) -> str:
         args = [exe, "mcp", "list"] + (["--json"] if backend == "codex" else [])
         result = spawn(args, cwd=working_dir, stdin=subprocess.DEVNULL,
                        capture_output=True, text=True, encoding="utf-8",
-                       errors="replace", timeout=20)
+                       errors="replace", timeout=20, **extra)
         output = result.stdout or ""  # Claude can list unhealthy servers with a nonzero exit.
     except (OSError, subprocess.SubprocessError):
         output = ""
@@ -189,6 +191,19 @@ def select(names: list[str] | None, backend: str, cwd: str | None = None,
         elif entry not in selected:
             selected.append(entry)
     return selected, notes
+
+
+# Claude in Chrome is built into the claude CLI, not a configured server; the
+# 2.1.295 binary names it "claude-in-chrome" (also "Claude in Chrome"), tools
+# mcp__claude-in-chrome__*.
+CHROME_CONNECTORS = ("claude-in-chrome", "Claude in Chrome")
+
+
+def chrome_selected(names: list[str] | None) -> bool:
+    """Whether a Claude pair's mcp_whitelist opts in to Claude in Chrome
+    (otherwise every spawn passes --no-chrome)."""
+    chrome = {_key(name) for name in CHROME_CONNECTORS}
+    return any(_key(name) in chrome for name in effective(names))
 
 
 def effective(names: list[str] | None) -> list[str]:

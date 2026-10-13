@@ -139,7 +139,8 @@ def run_unit_checks(fixture_root: Path) -> None:
 
     print("\n=== effort ===")
     check("default effort is high", M.DEFAULT_EFFORT == "high" and M.default_effort_for_model("opus") == "high")
-    check("haiku -> None", M.default_effort_for_model("haiku") is None)
+    check("haiku 4.5 -> None", M.default_effort_for_model("claude-haiku-4-5") is None)
+    check("haiku 5.5 -> high (v0.18.0)", M.default_effort_for_model("haiku") == "high")
     check("sonnet xhigh -> high", M.coerce_effort_for_model("claude-sonnet-5", "xhigh")[0] == "high")
     check("opus max ok", M.coerce_effort_for_model("claude-opus-5", "max") == ("max", None))
     check("unknown effort coerces (no registry poisoning)", M.coerce_effort_for_model("opus", "bogus")[0] == "high")
@@ -173,8 +174,8 @@ def run_unit_checks(fixture_root: Path) -> None:
     check("cli_model re-appends [1m]", ClaudeAdapter.cli_model(s) == "claude-opus-5[1m]")
     s2 = M.PairSpec(name="b", session_id="s", model="gpt-5.6-luna", permission_mode="acceptEdits", effort="high")
     check("codex backend inferred", s2.backend == "codex" and s2.permission_mode == "workspace")
-    s3 = M.PairSpec(name="c", session_id="s", model="haiku", effort="xhigh")
-    check("haiku effort -> None", s3.effort is None)
+    s3 = M.PairSpec(name="c", session_id="s", model="claude-haiku-4-5", effort="xhigh")
+    check("haiku 4.5 effort -> None", s3.effort is None)
     check("default effort on spec", M.PairSpec(name="d", session_id="s").effort == "high")
     check("SendResult cost nullable", M.SendResult(name="x", response="", session_id="s", model_used="m",
                                                     cost_usd=None, duration_ms=1).cost_usd is None)

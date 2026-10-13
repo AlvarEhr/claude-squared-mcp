@@ -730,6 +730,11 @@ def _cmd_wait(argv: list[str]) -> int:
                 and state.owner_pid is not None
                 and state.owner_pid > 0
                 and not async_tasks._is_pid_alive(int(state.owner_pid))):
+            if state.queued:
+                # v0.18.0 (Incident 2026-10-04): it never ran.
+                print(f"not delivered: owner MCP server (pid {state.owner_pid}) died before "
+                      f"this send ran — it was never delivered. Re-send it.", file=sys.stderr)
+                return 4
             print(
                 f"orphaned: owner MCP server (pid {state.owner_pid}) is no longer "
                 f"alive; the task was running but its supervisor died mid-turn. The "

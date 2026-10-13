@@ -46,15 +46,19 @@ Context alert: exits 8 when the pair's context CROSSES the alert level while
 the watcher runs (never at start, so re-arming is safe). Default level: the
 estimated auto-compaction point (window - 30k) minus a headroom of
 max(15% of the window, 40k) tokens — pair_settings_set(context_alert_headroom=N)
-changes it; --context-alert PCT sets a percentage of the window instead.
+changes it for every pair; a pair's own context_alert_at (pair_update) moves
+it earlier for that pair — a running watcher re-reads it every poll and fires
+at once if the new level is already behind the pair's context; --context-alert
+PCT sets a percentage of the window instead.
 
 Exit codes:
     0  done / idle
     1  failed (work error — message on stderr)
     2  not found or ambiguous
     3  timeout (the watcher gave up; the pair is still working — re-arm)
-    4  orphaned (owner MCP server died mid-turn — supervision event, NOT a work
-       error; the work may well have completed — check pair_poll / git)
+    4  owner MCP server died — supervision event, NOT a work error. Mid-turn
+       ("orphaned"): the work may well have completed — check pair_poll / git.
+       Still queued ("not delivered"): it never ran — re-send it.
     5  stopped (pair_stop; the runtime is still alive)
     6  crashed (the pair's claude process died mid-turn; pair_send resumes)
     7  finished detached (Codex: the owner died, the turn finished on its own —
@@ -149,10 +153,20 @@ def _find_tasks_by_prefix(prefix: str) -> list[str]:
     return [p.stem for p in d.glob(f"{prefix}*.json") if p.stem.startswith(prefix)]
 
 
-def _registry_pair(name: str):
+def _registry_read(name: str):
+    """(ok, entry): ok is False when registry.json could not be read — on
+    Windows a reader's open handle can fail the writer's os.replace and the
+    reader then sees no file or a torn one — so callers keep what they knew."""
     reg = _read(_pairs_dir() / "registry.json")
     pairs = reg.get("pairs") if isinstance(reg, dict) else None
-    return pairs.get(name) if isinstance(pairs, dict) else None
+    if not isinstance(pairs, dict):
+        return False, None
+    entry = pairs.get(name)
+    return True, (entry if isinstance(entry, dict) else None)
+
+
+def _registry_pair(name: str):
+    return _registry_read(name)[1]
 
 
 def _is_pair(name: str) -> bool:
@@ -166,10 +180,27 @@ def _backend(pair: str) -> str:
     return str(spec.get("backend") or "claude") if isinstance(spec, dict) else "claude"
 
 
-def _headroom():
-    d = _read(_pairs_dir() / "defaults.json")
-    v = d.get("context_alert_headroom") if isinstance(d, dict) else None
-    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
+def _headroom_read():
+    """(ok, headroom) from defaults.json, like ``_registry_read``: ok is False
+    when the file exists but could not be read or parsed (a torn or locked
+    read mid-write), so callers keep the last good value. No file is a good
+    read with no headroom set — pair_settings_reset deletes it."""
+    try:
+        d = json.loads((_pairs_dir() / "defaults.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return True, None
+    except (OSError, ValueError):
+        return False, None
+    if not isinstance(d, dict):
+        return False, None
+    v = d.get("context_alert_headroom")
+    return True, (v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None)
+
+
+def _alert_at(entry):
+    """A registry entry's own context alert (``context_alert_at``, v0.17), or None."""
+    v = entry.get("context_alert_at") if isinstance(entry, dict) else None
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else None
 
 
 def _hms(iso) -> str:
@@ -194,14 +225,32 @@ class Alert:
     """Context alert on a CROSSING: the level must be passed while we watch."""
 
     def __init__(self, mode, pct):
-        self.mode, self.pct, self.prev = mode, pct, None
+        self.mode, self.pct, self.prev, self.prev_level = mode, pct, None, None
+        self.alert_at = None  # the pair's own level (v0.17), from the last good registry read
+        self.headroom = None  # the global headroom, from the last good defaults.json read
+        self.alert_at_read = self.headroom_read = False  # a good read seen yet?
+
+    def note_registry(self, ok, entry):
+        """Take the pair's ``context_alert_at`` from this poll's registry read
+        (a pair_update applies to a watcher already running). A failed read
+        keeps the last good value."""
+        if ok:
+            self.alert_at, self.alert_at_read = _alert_at(entry), True
 
     def level(self, window, backend="claude", auto_compact_token_limit=None):
         if self.mode == "off" or not window:
             return None
         if self.mode == "pct":
             return int(window * self.pct / 100.0)
-        return context_alert_threshold(window, _headroom(), backend, auto_compact_token_limit)
+        # A failed read keeps the last good headroom: falling back to the
+        # default for one poll moved the level and back, and the drop rule in
+        # check() read the move back as a lowered level — a spurious exit 8
+        # (second review of b07509e).
+        ok, headroom = _headroom_read()
+        if ok:
+            self.headroom, self.headroom_read = headroom, True
+        return context_alert_threshold(window, self.headroom, backend, auto_compact_token_limit,
+                                       self.alert_at)
 
     def check(self, ctx, reported):
         """(used, window, level) when this observation crosses the level."""
@@ -213,9 +262,18 @@ class Alert:
         self.auto_compact_token_limit = ctx.get("auto_compact_token_limit") or (reported or {}).get("auto_compact_token_limit")
         level = self.level(window, self.backend, self.auto_compact_token_limit)
         prev, self.prev = self.prev, used
+        # A level computed before both inputs had one good read stood on the
+        # defaults, not the pair's settings: no base for the drop rule below.
+        known = self.mode == "pct" or (self.alert_at_read and self.headroom_read)
+        prev_level, self.prev_level = self.prev_level, (level if known else None)
         if level is None or prev is None:
             return None
         if prev < level <= used:
+            return used, window, level
+        # The level moved down past the fill while we watched (a lower
+        # context_alert_at, a smaller window): fire once, as the crossing
+        # would have — unless the fill was already past the old level.
+        if prev_level is not None and level < prev_level and prev < prev_level and level <= used:
             return used, window, level
         return None
 
@@ -304,6 +362,11 @@ def _dead_owner_exit(data, now) -> int | None:
               f"process has exited. pair_poll('{tid}') collects the recovered result.",
               file=sys.stderr)
         return 7
+    if data.get("queued"):
+        # v0.18.0 (Incident 2026-10-04): still queued when its server died.
+        print(f"not delivered: owner MCP server (pid {owner}) died before this send ran — it "
+              f"was never delivered. Re-send it.", file=sys.stderr)
+        return 4
     if _backend(str(data.get("pair_name") or "")) == "codex":
         how = ("A codex turn from before v0.16 dies with its MCP server; the thread is intact — "
                "pair_send resumes it.")
@@ -340,6 +403,7 @@ def wait_task(task_id: str, arg: str, timeout_s: float, poll_s: float, alert: Al
         pair = pair or data.get("pair_name")
         if pair:
             view = pair_activity_view(_pairs_dir(), pair, now=now, grace_seconds=0)
+            alert.note_registry(*_registry_read(pair))
             hit = alert.check(view.get("context"), view.get("reported_window"))
             if hit:
                 print(_alert_message(pair, *hit, [arg] + extra, alert.backend, alert.auto_compact_token_limit))
@@ -480,10 +544,12 @@ def _observe(view, seen, observed, started) -> list:
     return new_turns
 
 
-def _forgotten(pair, view) -> bool:
-    """pair_forget left only tombstones: no registry entry, no live owner."""
+def _forgotten(view, registry) -> bool:
+    """pair_forget left only tombstones: no registry entry, no live owner.
+    ``registry`` is this poll's (ok, entry); an unreadable registry proves nothing."""
+    ok, entry = registry
     owners = view.get("owners") or []
-    return (_registry_pair(pair) is None and any(o.get("status") == "forgotten" for o in owners)
+    return (ok and entry is None and any(o.get("status") == "forgotten" for o in owners)
             and not any(o.get("status") == "live" for o in owners))
 
 
@@ -510,6 +576,8 @@ def wait_pair(pair: str, each_turn: bool, timeout_s: float, poll_s: float, alert
         # Turns that ended while we watch (the window list is cleared by a new
         # send, so remember them).
         new_turns = _observe(view, seen, observed, started)
+        registry = _registry_read(pair)  # once per poll: the alert and the forgotten check
+        alert.note_registry(*registry)
         hit = alert.check(view.get("context"), view.get("reported_window"))
         if hit:
             print(_alert_message(pair, *hit, base, alert.backend, alert.auto_compact_token_limit))
@@ -536,7 +604,7 @@ def wait_pair(pair: str, each_turn: bool, timeout_s: float, poll_s: float, alert
                   "re-send if it is still needed.", file=sys.stderr)
             print(_summary(pair, view, observed, t0_wall, started_iso, "lost background work"))
             return 9
-        if _forgotten(pair, view):
+        if _forgotten(view, registry):
             print(f"pair '{pair}' was forgotten (pair_forget) while being watched", file=sys.stderr)
             return 2
         if each_turn and new_turns:

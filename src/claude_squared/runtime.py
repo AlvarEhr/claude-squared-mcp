@@ -36,10 +36,10 @@ from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING
 
 from claude_squared.cli_paths import encode_cwd_for_project as _encode_cwd_for_project
-from claude_squared.errors import CLIError, CommandTimeout, TaskStopped
+from claude_squared.errors import CLIError, CommandTimeout, ServerShuttingDown, TaskStopped
 from claude_squared import activity as _activity
 from claude_squared import async_tasks as _async_tasks
-from claude_squared.models import AsyncTaskState, PairSpec
+from claude_squared.models import SPAWN_PINNED_FIELDS, AsyncTaskState, PairSpec
 from claude_squared.registry import claude_home, logs_dir
 from claude_squared.registry import get_pair as _reg_get_pair, update_pair as _reg_update_pair
 
@@ -78,6 +78,21 @@ def _claude_executable() -> str:
         if c.exists():
             return str(c)
     return "claude"
+
+
+def _api_key_fingerprint(key: str | None) -> str | None:
+    from claude_squared.adapters.claude import api_key_fingerprint
+    return api_key_fingerprint(key)
+
+
+def _current_key_fingerprint() -> str | None:
+    from claude_squared.adapters.claude import current_key_fingerprint
+    return current_key_fingerprint()
+
+
+def _book_cost(name: str, cost: float, billing: str) -> None:
+    from claude_squared.adapters.claude import book_cost
+    book_cost(name, cost, billing)
 
 
 # ---------- Event-to-text formatting (shared between main + sub-agent logs) ----------
@@ -422,6 +437,12 @@ class PairRuntime:
         self.spec = spec
         self.adapter = adapter
         self.proc: subprocess.Popen | None = None
+        # v0.18.0: hash of the API key this process was spawned with (None on
+        # the plan) — get_or_start respawns when the key file changes.
+        self.key_fingerprint: str | None = None
+        # v0.18.0: the CLI's total_cost_usd is a running total for the
+        # process; the reader keeps the last one to hand each turn its share.
+        self._cost_seen = 0.0
         self.last_activity: datetime = datetime.utcnow()
         self.send_lock = threading.Lock()
         self.started_at: datetime | None = None
@@ -709,6 +730,12 @@ class PairRuntime:
     # ---- lifecycle ----
 
     def start(self) -> None:
+        # v0.18.0 (fix A): the exit handler has begun — a runtime spawned now
+        # would die with this process before its message is delivered.
+        refuse_if_shutting_down()
+        # Built first: an API pair with no usable key refuses here, before
+        # anything is spawned (never a silent fall back to the plan).
+        env = self.adapter._spawn_env(self.spec)  # noqa: SLF001
         self._init_event = None
         cli = _claude_executable()
         args = [cli] + self.adapter._common_create_args(self.spec)  # noqa: SLF001
@@ -719,7 +746,7 @@ class PairRuntime:
             # from context_window; permission level → --permission-mode).
             "--model", self.adapter.cli_model(self.spec),
         ]
-        # Skip --effort for haiku (no effort knob) or any spec where effort
+        # Skip --effort for Haiku 4.5 (no effort knob) or any spec where effort
         # was coerced to None for the model's capability.
         if self.spec.effort is not None:
             args += ["--effort", self.spec.effort]
@@ -728,6 +755,8 @@ class PairRuntime:
             "--input-format", "stream-json",
             "--output-format", "stream-json",
         ]
+        # v0.17.0: the pair's raw backend_options.args end the argv.
+        args += self.adapter._extra_args(self.spec)  # noqa: SLF001
         # Spawn in a NEW process group/session so we can send Ctrl+C / SIGINT
         # for the soft-stop path without affecting our own MCP process. Without
         # this flag, GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) would target the
@@ -743,7 +772,11 @@ class PairRuntime:
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             popen_kwargs["start_new_session"] = True
+        popen_kwargs["env"] = env
         self.proc = subprocess.Popen(args, **popen_kwargs)
+        self.key_fingerprint = _api_key_fingerprint(env.get("ANTHROPIC_API_KEY")) \
+            if self.spec.billing == "api" else None
+        self._cost_seen = 0.0
         self.started_at = datetime.utcnow()
         self._reader_gen += 1
         self._reader_thread = threading.Thread(target=self._stdout_reader, args=(self._reader_gen,),
@@ -752,9 +785,10 @@ class PairRuntime:
         self._stderr_thread = threading.Thread(target=self._stderr_reader, daemon=True)
         self._stderr_thread.start()
         # Seed an init banner manually so users tailing know a fresh runtime started
+        billing = ", billing=api" if self.spec.billing == "api" else ""
         self._append_main_log_line(
             f"[{datetime.now().strftime('%H:%M:%S')}] === RUNTIME START "
-            f"(pair={self.spec.name}, model={self.spec.model}, cwd={self.spec.cwd}) ==="
+            f"(pair={self.spec.name}, model={self.spec.model}, cwd={self.spec.cwd}{billing}) ==="
         )
 
     def _stdout_reader(self, gen: int | None = None) -> None:
@@ -1588,11 +1622,27 @@ class PairRuntime:
         self._stale_notice = None
         self._assistant_since_result = False
         self._note_reported_window(ev)
+        # v0.18.0: total_cost_usd counts every turn since this process started
+        # (Haiku probe: 0.0078 → 0.0105 → 0.0119); usage is per turn. Every
+        # result passes here once, in order, so this turn's share is the step.
+        # A missing or non-positive total says nothing (a result 1.0, none, 0,
+        # 1.25 must book 1.25, not 2.25); only a POSITIVE lower total means the
+        # counter restarted, and then all of it is this turn's.
+        try:
+            total = float(ev.get("total_cost_usd") or 0.0)
+        except (TypeError, ValueError):
+            total = 0.0
+        if total <= 0:
+            ev["_turn_cost_usd"] = 0.0
+        else:
+            ev["_turn_cost_usd"] = total - self._cost_seen if total >= self._cost_seen else total
+            self._cost_seen = total
         with self._scope_lock:
             self._wake_at = None  # any result ends what a wake announced
             solicited = self._current_scope
             if solicited is not None:
                 solicited.result_snapshot = {
+                    "turn_cost_usd": ev["_turn_cost_usd"],
                     "end_line": solicited.end_line,
                     "subagent_logs": list(solicited.subagent_logs),
                     "background_launches": list(solicited.background_launches),
@@ -1624,7 +1674,7 @@ class PairRuntime:
         # (server._wait_for_foreign_self_woken). See is_stale().
         self._last_seen_jsonl_mtime = self._current_jsonl_mtime()
         self.last_activity = datetime.utcnow()
-        cost = float(ev.get("total_cost_usd") or 0.0)
+        cost = float(ev.get("_turn_cost_usd") or 0.0)
         subtype = ev.get("subtype") or ""
         record: dict[str, Any] = {
             "task_id": task.task_id if task is not None else None,
@@ -1652,6 +1702,9 @@ class PairRuntime:
                 result = self.adapter._build_send_result(self.spec, ev)  # noqa: SLF001
             except Exception as e:
                 error = f"{type(e).__name__}: {e}"
+            if result is not None:
+                cost = float(result.cost_usd or 0.0)  # 0 for a refused request
+                record["cost_usd"] = cost
             status = "done"
             if (task is not None and _async_tasks.was_stopped(task.task_id)
                     and subtype == "error_during_execution"):
@@ -1681,11 +1734,14 @@ class PairRuntime:
             # queues behind it), so the plain RMW is safe in practice.
             try:
                 cur = _reg_get_pair(self.spec.name)
+                totals: dict[str, Any] = {"total_cost_usd": cur.total_cost_usd + cost}
+                if self.spec.billing == "api":  # the billing this process runs on
+                    totals["api_cost_usd"] = cur.api_cost_usd + cost
                 _reg_update_pair(
                     self.spec.name,
                     turn_count=cur.turn_count + 1,
-                    total_cost_usd=cur.total_cost_usd + cost,
                     last_active_at=datetime.utcnow(),
+                    **totals,
                 )
             except Exception:
                 pass
@@ -1693,6 +1749,8 @@ class PairRuntime:
             # A result with no turn open: resolves a wake its init announced
             # (never "whatever turn is open" — a one-shot send's could be).
             self._activity.clear_wake(gen=self._gen)
+            # Its spend still happened (v0.18.0, review round 1).
+            _book_cost(self.spec.name, cost, self.spec.billing)
         self._record_self_woken(record)
         self._implicit_done.set()
 
@@ -1789,6 +1847,9 @@ class PairRuntime:
                     if self._implicit_scope is not None or self._wake_live_locked():
                         continue  # opened (or announced) in the gap — wait again
                 if not promoted:
+                    # v0.18.0 (fix A): the wait above may have ended because the
+                    # exit handler stopped this runtime's self-woken turn.
+                    refuse_if_shutting_down()
                     _async_tasks.mark_task_executing(task_id)
                     promoted = True
                 # Belt: every queued line was attributed by the reader before
@@ -1956,7 +2017,7 @@ class PairRuntime:
                 try:
                     self.proc.stdin.write(payload.encode("utf-8"))
                     self.proc.stdin.flush()
-                except (BrokenPipeError, OSError) as e:
+                except (BrokenPipeError, OSError, ValueError) as e:  # ValueError: a closed file
                     raise CLIError(
                         f"pair runtime stdin closed: {e}",
                         stderr=self._collect_stderr(),
@@ -2038,6 +2099,7 @@ class PairRuntime:
                             # result was attributed) — by now a self-woken
                             # continuation may already have moved the live fields.
                             snap = scope.result_snapshot or {}
+                            ev["_turn_cost_usd"] = snap.get("turn_cost_usd")
                             ev["_log_scope"] = {
                                 "log_path": str(scope.main_log_path),
                                 "start_line": scope.start_line,
@@ -2091,17 +2153,33 @@ class RuntimeRegistry:
         self._stop_evictor = threading.Event()
 
     def get_or_start(self, spec: PairSpec, adapter: "ClaudeAdapter") -> PairRuntime:
+        refuse_if_shutting_down()
+        # v0.18.0: an API pair's key is re-read at every send: a rotated or
+        # removed key file respawns the runtime, and the respawn reads the
+        # file again (a missing key then refuses the send). Not while work is
+        # pending — a respawn would kill it; the new key applies once idle.
+        # Decided outside the map lock: pending_work() takes _scope_lock, and
+        # _lock is a leaf.
+        rotated: PairRuntime | None = None
+        if spec.billing == "api":
+            with self._lock:
+                candidate = self._runtimes.get(spec.name)
+            if (candidate is not None and candidate.is_alive()
+                    and candidate.key_fingerprint != _current_key_fingerprint()
+                    and not candidate.pending_work()):
+                rotated = candidate
         old: PairRuntime | None = None
         with self._lock:
             rt = self._runtimes.get(spec.name)
             if rt is not None and rt.is_alive():
-                if (rt.spec.session_id != spec.session_id
-                        or rt.spec.model != spec.model
-                        or rt.spec.context_window != spec.context_window
-                        or rt.spec.effort != spec.effort
-                        or rt.spec.cwd != spec.cwd
-                        or rt.spec.mcp_whitelist != spec.mcp_whitelist
-                        or rt.spec.permission_mode != spec.permission_mode):
+                # pair_update evicts only its own process's runtime; a warm one
+                # in another process notices a changed spawn field here. Both
+                # specs come from the registry, so an unchanged value compares
+                # equal (a shape mismatch would respawn — and kill background
+                # work — on every send).
+                if (any(getattr(rt.spec, f, None) != getattr(spec, f, None)
+                        for f in ("session_id",) + SPAWN_PINNED_FIELDS)
+                        or rt is rotated):
                     old = self._runtimes.pop(spec.name)
                     rt = None
             if rt is None or not rt.is_alive():
@@ -2267,11 +2345,29 @@ class RuntimeRegistry:
 
 _REGISTRY: RuntimeRegistry | None = None
 
+# v0.18.0 (Incident 2026-10-04, fix A): set FIRST by the exit handler. Stopping
+# the runtimes releases a send queued behind a self-woken turn; it used to
+# spawn a fresh runtime inside the exiting server (which died before the
+# message was written) and the successor reaped the task as ORPHANED "may have
+# completed". Now every spawn refuses and the send fails as NOT DELIVERED.
+_SHUTTING_DOWN = threading.Event()
+
+
+def shutting_down() -> bool:
+    return _SHUTTING_DOWN.is_set()
+
+
+def refuse_if_shutting_down() -> None:
+    """Raise ServerShuttingDown (NOT DELIVERED) once the exit handler began."""
+    if _SHUTTING_DOWN.is_set():
+        raise ServerShuttingDown()
+
 
 def _shutdown_runtimes() -> None:
     """atexit: tree-kill every runtime (M2, 2026-09-25: closing only stdin
     doesn't let background work finish — the CLI kills it ~5 s after EOF),
     recording what dies, then close this process's activity files."""
+    _SHUTTING_DOWN.set()
     if _REGISTRY is not None:
         _REGISTRY.stop_all("the owning MCP process exited")
     _activity.shutdown()

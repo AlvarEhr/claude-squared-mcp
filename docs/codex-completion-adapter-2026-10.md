@@ -1,6 +1,6 @@
 # Codex Desktop completion adapter — implementation and work record
 
-Status, 2026-10-13: implemented on `codex/desktop-callback-2026-10-06`, originally based on v0.16.2 / `8644cd8`. The branch keeps callbacks disabled by default and is not merged or released. The separate Codex-only `codex_squared` clone is registered with callbacks enabled; its current pinned revision is recorded in the local `installation.json`. App build allowlisting has been removed at Alvar's request; live protocol and identity checks remain. Active-session detection now normalizes Windows extended path prefixes for comparison. Original main and `pair` remain unchanged. This document separates the Codex agent's changes from Claude's earlier work.
+Status, 2026-10-13: implemented on `codex/desktop-callback-2026-10-06`, with original v0.16.2 base refreshed to released v0.18.0 / `e6d1538`. The callback branch keeps callbacks disabled by default and is not merged into main or released. The separate Codex-only `codex_squared` clone is registered with callbacks enabled; its current pinned revision is recorded in the local `installation.json`. App build allowlisting has been removed at Alvar's request; live protocol and identity checks remain. Active-session detection now normalizes Windows extended path prefixes for comparison. Original main and `pair` remain unchanged by this work. This document separates the Codex agent's changes from Claude's earlier work.
 
 ## What changed
 
@@ -84,7 +84,7 @@ The adapter provides an event and result references under the manager's existing
 
 ## Validation and review
 
-Final checks: all **27 maintained offline suites passed** after build-gate removal. The completion suite was rerun after the schema-3 coexistence fix: **51 completion/regression tests passed**, including legacy-registration coalescing and uncertain-send preservation. `git diff --check` passed; original main remained clean.
+Final checks: all **29 maintained offline suites passed** after the v0.18.0 refresh, including **55 completion/regression tests**. The live current manager's extended-path rollout passes caller identity and full-access eligibility. `git diff --check` passed; original main remained clean.
 
 The offline runner includes the completion suite. It covers disabled behavior, metadata injection/schema hiding, origin/policy/profile/plan checks, coalescing, fast completion/loss/generation races, pending/background work, context publication lag, cwd changes, clear/forget/archive/rewind, concurrent dispatchers, atomic failures, malformed catalogs/frames, handle cleanup, destination acknowledgments, uncertain sends and reconciliation. Real stdio fixtures validate dispatch after the RPC returns and an owned-server restart with no model calls.
 
@@ -109,6 +109,16 @@ Three real failures were found:
 The default elevated Windows sandbox also failed to start a command (`helper_unknown_error: setup refresh had errors`). This upstream/environment failure is **not fixed globally**. A documented per-test-pair `windows.sandbox=unelevated` fallback retained read-only/workspace permissions and allowed the I/O checks. No global sandbox setting, full-access pair mode or other pair was changed. Evidence/logs are in this Codex task's `outputs/codex-squared-daylife-2026-10-07/` and `work/daylife-*` artifacts.
 
 Existing MCP processes retain their loaded snapshot. Current-chat direct lifecycle tests used the older loaded clone; updated callback/metric checks used fresh native managers. Start a fresh chat to load the current installed revision; no forced process/app restart was performed. Build-gate removal and read-only discovery evidence are in this task's `work/callback-no-build-gate-2026-10-07.log` and installation receipt.
+
+### October 13 base refresh and sandbox recheck
+
+The original MCP advanced to v0.17.0 and v0.18.0 while the clone remained on v0.16.2. This branch merged the released v0.18.0 commit, preserving callback entry points and compaction metrics. Only the offline-runner additions conflicted: the resolution retains completion, pair-options and billing suites. The clone now exposes 32 tools, including the new billing tool. Installing it does not switch any pair to API billing; that still requires Alvar's explicit request. Upstream changes include Claude tool/options controls, context alerts, per-turn cost accounting and shutdown fix A. They did not modify the Codex adapter or repair its sandbox.
+
+The two reported builder failures were traced to the Windows sandbox setup log at the exact tool-call times: `helper_unknown_error: setup refresh had errors` hid an ACL refresh failing to open the shared `node_repl.exe` for a root-only permissions update, with Windows sharing violation **32**. This was an upstream runtime/setup problem, not a pair-level permission denial. The manager's own full-access shell success does not prove the elevated sandbox is healthy.
+
+On October 13, CLI **0.162.0-alpha.17.2** passed both disposable live checks with the existing elevated implementation: a read-only shell printed `ELEVATED_SHELL_OK_Q6P2`; a separate workspace pair read a fixture containing 17, wrote the result of multiplying it by three, and returned 51. Both command exit codes were 0. No fallback, sandbox setup repair, global configuration change, permissions escalation or existing-pair mutation was used. The disposable pairs were forgotten after collecting their results. This demonstrates current shell/I/O recovery, not an assertion that an intermittent sharing violation can never recur.
+
+If it recurs, inspect the current setup error and dated sandbox log before changing policy. Do not terminate a shared runtime or silently fall back to unelevated mode. OpenAI's [Windows sandbox guide](https://learn.chatgpt.com/docs/windows/windows-sandbox) documents that fallback's weaker network isolation and lack of denied-read support; it requires a separate user decision. No automatic fallback was implemented. Local evidence: `work/callback-path-fix-2026-10-13.log`, `work/callback-base018-2026-10-13.log`, the two disposable task results, and the installation receipt.
 
 ## Files and release handoff
 
