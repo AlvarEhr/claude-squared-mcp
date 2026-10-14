@@ -4,6 +4,19 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Windows CLI launchers request hidden consoles for tool-capable roots, so
+  ordinary console children can inherit them. Version/help queries, the
+  tool-free triage classifier and PID-scoped `taskkill` run without a console.
+  This closes missing hide options in Codex version/app-server launches,
+  Claude launches and cancellation helpers. Pipes, file-backed Codex turns and
+  the detached PID creation-time guard are preserved. Children that explicitly
+  create or show other windows can still display them; the source of previously
+  reported flashes remains unproven.
+
 ## [0.18.0] — 2026-10-11
 
 API-key billing for Claude pairs, honest per-turn cost, and a shutdown fix.

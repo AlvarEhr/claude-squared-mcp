@@ -52,6 +52,7 @@ from claude_squared.models import (
     normalize_permission,
 )
 from claude_squared.registry import logs_dir
+from claude_squared.process_spawn import hidden_process_kwargs
 from claude_squared.runtime import ToolCounter
 from claude_squared.tool_details import save_codex_item
 
@@ -326,7 +327,8 @@ def _tree_kill(proc: subprocess.Popen) -> str:
     try:
         if os.name == "nt":
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           capture_output=True, timeout=10, check=False)
+                           capture_output=True, timeout=10, check=False,
+                           **hidden_process_kwargs(console=False))
         else:
             import signal
             try:
@@ -381,7 +383,7 @@ def stop_detached(state) -> str | None:
             if os.name == "nt":
                 result = subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
                                         capture_output=True, timeout=10, check=False,
-                                        creationflags=subprocess.CREATE_NO_WINDOW)
+                                        **hidden_process_kwargs(console=False))
                 return "tree-killed" if result.returncode == 0 else "kill-failed"
             import signal
             os.killpg(pid, signal.SIGKILL)  # exec starts its own session/process group
@@ -454,7 +456,8 @@ _EXE_CACHE: dict[str, Any] = {}
 def _codex_version(exe: str) -> tuple[int, ...]:
     try:
         out = subprocess.run([exe, "--version"], capture_output=True, text=True,
-                             timeout=15, stdin=subprocess.DEVNULL).stdout
+                             timeout=15, stdin=subprocess.DEVNULL,
+                             **hidden_process_kwargs(console=False)).stdout
         m = re.search(r"(\d+)\.(\d+)\.(\d+)", out or "")
         return tuple(int(x) for x in m.groups()) if m else ()
     except Exception:
@@ -555,12 +558,12 @@ def _with_fresh_codex(spawn: Callable, args: list[str], **kwargs: Any):
 
 def popen_codex(args: list[str], **kwargs: Any) -> subprocess.Popen:
     """``subprocess.Popen`` with :func:`_with_fresh_codex`'s one retry."""
-    return _with_fresh_codex(subprocess.Popen, args, **kwargs)
+    return _with_fresh_codex(subprocess.Popen, args, **hidden_process_kwargs(kwargs))
 
 
 def run_codex(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
     """``subprocess.run`` with :func:`_with_fresh_codex`'s one retry."""
-    return _with_fresh_codex(subprocess.run, args, **kwargs)
+    return _with_fresh_codex(subprocess.run, args, **hidden_process_kwargs(kwargs))
 
 
 def codex_spawn_error(args: list[str], exc: OSError, cwd: str | None, what: str = "codex") -> str:
@@ -1642,9 +1645,7 @@ class CodexAdapter(PairAdapter):
                         log_available = False
 
         popen_kwargs: dict[str, Any] = {"cwd": spec.cwd or None}
-        if os.name == "nt":
-            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
-        else:
+        if os.name != "nt":
             popen_kwargs["start_new_session"] = True
         t0 = time.monotonic()
         if activity_turn is not None:

@@ -40,6 +40,8 @@ import subprocess
 import tempfile
 import threading
 import time
+
+from claude_squared.process_spawn import hidden_process_kwargs
 from typing import Any
 
 MODES = ("auto", "haiku", "off")
@@ -188,7 +190,8 @@ def classify_with_haiku(reply: str) -> dict | None:
     kwargs: dict = {"stdin": subprocess.PIPE, "stdout": subprocess.PIPE,
                     "stderr": subprocess.PIPE, "env": claude_env()}
     if os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        # No tools or connectors: this classifier is a leaf CLI query.
+        kwargs.update(hidden_process_kwargs(console=False))
     with tempfile.TemporaryDirectory(prefix="cs-triage-", ignore_cleanup_errors=True) as cwd:
         try:
             proc = subprocess.Popen(argv, cwd=cwd, **kwargs)
@@ -220,7 +223,8 @@ def _kill_tree(proc: subprocess.Popen) -> None:
     try:
         if os.name == "nt":
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           capture_output=True, timeout=10, check=False)
+                           capture_output=True, timeout=10, check=False,
+                           **hidden_process_kwargs(console=False))
         else:
             proc.kill()
         proc.wait(timeout=5)

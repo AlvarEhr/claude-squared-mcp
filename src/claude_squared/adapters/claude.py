@@ -33,6 +33,7 @@ from claude_squared.models import (
     split_model_tier,
 )
 from claude_squared.registry import claude_home, pairs_dir, profiles_dir
+from claude_squared.process_spawn import hidden_process_kwargs
 
 
 WARNING_THRESHOLD = 0.60
@@ -497,7 +498,8 @@ def _cli_permission_choices() -> tuple[str, ...]:
     choices: tuple[str, ...] = ()
     try:
         out = subprocess.run([_claude_executable(), "--help"], capture_output=True, text=True,
-                             timeout=20, stdin=subprocess.DEVNULL, env=claude_env()).stdout
+                             timeout=20, stdin=subprocess.DEVNULL, env=claude_env(),
+                             **hidden_process_kwargs(console=False)).stdout
         i = out.find("--permission-mode")
         seg = out[i:i + 600] if i >= 0 else ""
         m = re.search(r"choices:\s*(.*?)\)", seg, re.S)
@@ -1021,6 +1023,7 @@ class ClaudeAdapter(PairAdapter):
                 check=False,
                 cwd=cwd,
                 env=env,
+                **hidden_process_kwargs(),
             )
         except subprocess.TimeoutExpired as e:
             raise CommandTimeout(pair_name, timeout_seconds) from e
@@ -1101,6 +1104,7 @@ class ClaudeAdapter(PairAdapter):
                 check=False,
                 cwd=spec.cwd,
                 env=env,
+                **hidden_process_kwargs(),
             )
         except subprocess.TimeoutExpired as e:
             raise CommandTimeout(spec.name, timeout_seconds) from e

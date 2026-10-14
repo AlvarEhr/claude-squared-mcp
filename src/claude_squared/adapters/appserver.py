@@ -36,9 +36,7 @@ class AppServerClient:
     def __enter__(self) -> AppServerClient:
         kwargs = dict(stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                       stderr=subprocess.PIPE, cwd=self.cwd)
-        if os.name == "nt":
-            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-        else:
+        if os.name != "nt":
             kwargs["start_new_session"] = True
         from claude_squared.adapters.codex import codex_spawn_error, popen_codex
 

@@ -41,6 +41,7 @@ from claude_squared import activity as _activity
 from claude_squared import async_tasks as _async_tasks
 from claude_squared.models import SPAWN_PINNED_FIELDS, AsyncTaskState, PairSpec
 from claude_squared.registry import claude_home, logs_dir
+from claude_squared.process_spawn import hidden_process_kwargs
 from claude_squared.registry import get_pair as _reg_get_pair, update_pair as _reg_update_pair
 
 if TYPE_CHECKING:
@@ -757,10 +758,8 @@ class PairRuntime:
         ]
         # v0.17.0: the pair's raw backend_options.args end the argv.
         args += self.adapter._extra_args(self.spec)  # noqa: SLF001
-        # Spawn in a NEW process group/session so we can send Ctrl+C / SIGINT
-        # for the soft-stop path without affecting our own MCP process. Without
-        # this flag, GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) would target the
-        # console group we're in.
+        # POSIX tree-kill uses a separate session. Windows uses exact-PID
+        # taskkill /F /T; a hidden console lets command children inherit it.
         popen_kwargs: dict = {
             "cwd": self.spec.cwd,
             "stdin": subprocess.PIPE,
@@ -768,12 +767,10 @@ class PairRuntime:
             "stderr": subprocess.PIPE,
             "bufsize": 0,
         }
-        if os.name == "nt":
-            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-        else:
+        if os.name != "nt":
             popen_kwargs["start_new_session"] = True
         popen_kwargs["env"] = env
-        self.proc = subprocess.Popen(args, **popen_kwargs)
+        self.proc = subprocess.Popen(args, **hidden_process_kwargs(popen_kwargs))
         self.key_fingerprint = _api_key_fingerprint(env.get("ANTHROPIC_API_KEY")) \
             if self.spec.billing == "api" else None
         self._cost_seen = 0.0
@@ -1026,6 +1023,7 @@ class PairRuntime:
                 subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(pid)],
                     capture_output=True, timeout=10, check=False,
+                    **hidden_process_kwargs(console=False),
                 )
             except Exception:
                 try:

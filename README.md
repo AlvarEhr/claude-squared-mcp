@@ -83,6 +83,12 @@ pair_compact(name="reviewer", steering_prompt="Focus on what was reviewed and an
 
 ## Backends: Claude Code and Codex
 
+On Windows, tool-capable CLI processes start with a hidden console that ordinary
+console children can inherit. Short version/help queries and cancellation
+helpers run without a console. Redirected output and cancellation behavior are
+preserved. A command that explicitly creates or shows another window can still
+display it. See [Windows launch verification](docs/windows-hidden-spawn.md).
+
 | | Claude (`backend="claude"`, default) | Codex (`backend="codex"`) |
 |---|---|---|
 | Session | `claude --print --resume <uuid>`; warm stream-json runtime kept between sends | `codex exec --json … resume <thread-id>`; one process per turn, thread named by Codex |
