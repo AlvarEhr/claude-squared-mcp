@@ -1,6 +1,7 @@
 """Completion delivery regressions. Isolated homes; no live model calls."""
 from contextlib import contextmanager, ExitStack
 import asyncio
+import io
 from datetime import datetime, timedelta
 import json
 import os
@@ -136,6 +137,84 @@ class CompletionTests(unittest.TestCase):
     def test_own_pair_is_not_a_manager(self):
         R.update_pair("child", session_id=self.thread)
         self.assertIn("own thread", N.arm(self.task(), self.ctx))
+
+    def test_rollout_over_128_mib_with_one_giant_tool_output_arms_and_delivers(self):
+        with self.rollout.open("ab") as stream:
+            stream.write(b'{"timestamp":"2026-10-14T00:00:00Z","ordinal":4,"type":"response_item","payload":{"type":"function_call_output","namespace":"functions","name":"exec","output":"')
+            block = b"x" * (1024 * 1024)
+            for _ in range(129):
+                stream.write(block)
+            stream.write(b'"}}\n')
+        self.assertGreater(self.rollout.stat().st_size, 128 * 1024 * 1024)
+        original = json.loads
+        sizes = []
+        def bounded_loads(data, *args, **kwargs):
+            sizes.append(len(data))
+            return original(data, *args, **kwargs)
+        with patch.object(N.json, "loads", side_effect=bounded_loads):
+            path = self.arm(); N.process_one(path)
+        self.assertEqual(N._read(path)["status"], "delivered")
+        self.assertEqual(len(self.sent), 1)
+        self.assertLess(max(sizes), 4096)  # the giant payload never reaches JSON decoding
+
+    def test_big_irrelevant_events_do_not_hide_new_restrictive_policy_or_rollback(self):
+        with self.rollout.open("ab") as stream:
+            stream.write(b'{"type":"event_msg","payload":{"type":"agent_message","message":"')
+            stream.write(b"x" * 16384); stream.write(b'"}}\n')
+            newer = str(uuid.uuid4())
+            rows = [{"type":"event_msg","payload":{"type":"task_started","turn_id":newer}},
+                    {"type":"turn_context","payload":dict(self.events[-1]["payload"],turn_id=newer,sandbox_policy={"type":"read-only"})}]
+            for row in rows:
+                stream.write(json.dumps(row).encode()+b"\n")
+        with patch.object(N,"MAX_CONTROL_RECORD",8192):
+            self.assertIn("not armed",N.arm(self.task(),self.ctx))
+            with self.rollout.open("ab") as stream:
+                stream.write(b'{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}\n')
+            with self.assertRaisesRegex(N.Refused,"rolled back"):
+                N.caller_snapshot(self.thread,self.turn)
+
+    def test_oversized_control_record_is_refused_and_partial_context_defers(self):
+        self.events[-1]["payload"]["extra"] = "x" * 16384
+        self.write_rollout()
+        with patch.object(N,"MAX_CONTROL_RECORD",8192):
+            self.assertIn("control record",N.arm(self.task(),self.ctx))
+        self.events.pop(); self.write_rollout()
+        with self.rollout.open("ab") as stream:
+            stream.write(b'{"type":"turn_context","payload":{"turn_id":"unfinished')
+        with self.assertRaises(N.Deferred):
+            N.caller_snapshot(self.thread,self.turn)
+
+    def test_stream_handles_unknown_small_order_utf8_and_receipt_chunk_boundaries(self):
+        marker = "CLAUDE_PAIR_COMPLETION:" + str(uuid.uuid4())
+        rows = [{"payload":{"type":"task_started","turn_id":self.turn},"type":"event_msg"},
+                {"type":"response_item","payload":{"type":"function_call_output","namespace":"codex_app", "name":"send_message_to_thread", "output":"å" * 2100 + marker}}]
+        data = b"\n".join(json.dumps(row,ensure_ascii=False).encode() for row in rows)+b"\n"
+        self.assertEqual(list(N.manager_records(io.BytesIO(data),marker)),rows)
+        self.assertEqual(list(N.manager_records(io.BytesIO(data))),rows[:1])
+
+    def test_stream_reads_fixed_eof_without_chasing_appends(self):
+        first = json.dumps(self.events[0]).encode()+b"\n"
+        second = json.dumps(self.events[1]).encode()+b"\n"
+        class Appending(io.BytesIO):
+            def readline(self,size=-1):
+                value = super().readline(size)
+                at = self.tell(); self.seek(0,os.SEEK_END); self.write(second); self.seek(at)
+                return value
+        self.assertEqual(list(N.manager_records(Appending(first))),self.events[:1])
+
+    def test_receipt_marker_split_between_reads_still_requires_exact_route(self):
+        marker = "CLAUDE_PAIR_COMPLETION:" + str(uuid.uuid4())
+        def append(namespace):
+            prefix = ('{"type":"response_item","payload":{"type":"function_call_output","namespace":"'
+                      + namespace + '","name":"send_message_to_thread","output":"').encode()
+            record = prefix+b"x"*(4096-len(prefix)-11)+marker.encode()+b'"}}\n'
+            self.assertEqual(record.index(marker.encode()),4096-11)
+            with self.rollout.open("ab") as stream:
+                stream.write(record)
+        append("other")
+        self.assertFalse(N.caller_snapshot(self.thread,self.turn,marker)["receipt"])
+        append("codex_app")
+        self.assertTrue(N.caller_snapshot(self.thread,self.turn,marker)["receipt"])
 
     @unittest.skipUnless(os.name == "nt", "requires real Windows extended-path I/O")
     def test_extended_windows_rollout_arms_and_delivers(self):
@@ -403,7 +482,7 @@ class CompletionTests(unittest.TestCase):
         self.assertFalse(self.sent)
 
     def test_supported_dispatcher_claims_legacy_backoff_without_old_reader_interference(self):
-        for version in (1, 2, 3):
+        for version in (1, 2, 3, 4):
             with self.subTest(version=version):
                 path = self.arm(); r=N._read(path); r.update(version=version,retry_at=time.time()+600,detail="old build refused")
                 N._save(path,r); N.process_one(path)
@@ -411,8 +490,8 @@ class CompletionTests(unittest.TestCase):
                 self.assertEqual(claimed["version"],N.VERSION)
                 self.assertEqual(claimed["status"],"delivered")
                 # Both installed build-gated readers reject new tickets.
-                self.assertNotIn(claimed["version"],(1,2,3))
-        self.assertEqual(len(self.sent),3)
+                self.assertNotIn(claimed["version"],(1,2,3,4))
+        self.assertEqual(len(self.sent),4)
 
     def test_unsupported_dispatcher_does_not_mutate_legacy_ticket(self):
         path=self.arm(); r=N._read(path); r["version"]=1; N._save(path,r)
@@ -423,7 +502,7 @@ class CompletionTests(unittest.TestCase):
         self.assertFalse(self.sent)
 
     def test_coalescing_legacy_registration_drops_obsolete_build_backoff(self):
-        for version in (1, 2, 3):
+        for version in (1, 2, 3, 4):
             with self.subTest(version=version):
                 first = self.task(); path = self.arm(first); record = N._read(path)
                 record.update(version=version, retry_at=time.time()+600)
@@ -435,10 +514,10 @@ class CompletionTests(unittest.TestCase):
                 self.assertEqual(set(upgraded["tasks"]), {first.task_id, second.task_id})
                 N.process_one(path)
                 self.assertEqual(N._read(path)["status"], "delivered")
-        self.assertEqual(len(self.sent), 3)
+        self.assertEqual(len(self.sent), 4)
 
     def test_legacy_uncertain_send_is_not_retransmitted_during_claim_upgrade(self):
-        for version in (1, 2, 3):
+        for version in (1, 2, 3, 4):
             with self.subTest(version=version):
                 path=self.arm(); r=N._read(path); r.update(version=version,status="sending"); N._save(path,r)
                 N.process_one(path)

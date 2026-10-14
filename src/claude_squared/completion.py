@@ -24,9 +24,13 @@ from claude_squared.registry import claude_home
 logger = logging.getLogger(__name__)
 # Fence older dispatchers whose path/build preflight could reject a valid
 # manager or impose shared retry_at backoff. Existing work remains readable.
-VERSION = 4
+VERSION = 5
 MAX_WAIT = 6 * 3600
-MAX_ROLLOUT = 128 * 1024 * 1024
+MAX_CONTROL_RECORD = 8 * 1024 * 1024
+# Codex's canonical JSONL envelope lets us skip huge messages/tool outputs
+# without materializing them. Small noncanonical records still parse normally.
+_ENVELOPE = re.compile(rb'^\s*\{(?:\s*"(?:timestamp|ordinal)"\s*:\s*(?:"[^"\\]*"|[0-9]+)\s*,)*\s*"type"\s*:\s*"([^"]+)"\s*,\s*"payload"\s*:\s*\{')
+_PAYLOAD_TYPE = re.compile(rb'\s*"type"\s*:\s*"([^"]+)"')
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 TERMINAL = {"delivered", "canceled", "blocked"}
 _stop = threading.Event()
@@ -58,7 +62,7 @@ def _read(path):
         if path.stat().st_size > 128 * 1024:
             return None
         data = json.loads(path.read_text(encoding="utf-8"))
-        if (not isinstance(data, dict) or data.get("version") not in (1, 2, 3, VERSION)
+        if (not isinstance(data, dict) or data.get("version") not in (1, 2, 3, 4, VERSION)
                 or not UUID.fullmatch(str(data.get("id", "")))
                 or path.stem != data.get("id")
                 or not UUID.fullmatch(str(data.get("thread", "")))
@@ -154,6 +158,68 @@ def comparison_path(path):
     return path
 
 
+def manager_records(stream, marker=None):
+    """Bound memory per control record, not by the manager's lifetime log size.
+
+    Read only the EOF snapshot taken at entry. Never parse an incomplete final
+    record or chase concurrent appends. Irrelevant canonical rows are drained
+    in chunks; they can be arbitrarily large without allocating a whole line.
+    """
+    stream.seek(0, os.SEEK_END)
+    remaining = stream.tell()
+    stream.seek(0)
+    while remaining:
+        head = stream.readline(min(4096, remaining))
+        if not head:
+            break
+        remaining -= len(head)
+        envelope = _ENVELOPE.match(head)
+        relevant, receipt_row = True, False
+        if envelope:
+            kind = envelope[1]
+            subtype = _PAYLOAD_TYPE.match(head, envelope.end())
+            if kind == b"event_msg":
+                relevant = subtype is None or subtype[1] in (b"task_started", b"thread_rolled_back")
+            elif kind == b"response_item":
+                relevant = bool(marker) and (subtype is None or subtype[1] == b"function_call_output")
+                receipt_row = relevant
+            else:
+                relevant = kind in (b"session_meta", b"turn_context")
+        needle = marker.encode("utf-8") if receipt_row else b""
+        found_marker, overlap = bool(needle and needle in head), head[-len(needle):] if needle else b""
+        chunks, size, complete = ([head] if relevant else []), len(head), head.endswith(b"\n")
+        while not complete and remaining:
+            chunk = stream.readline(min(64 * 1024, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            size += len(chunk)
+            complete = chunk.endswith(b"\n")
+            if needle:
+                found_marker = found_marker or needle in overlap + chunk
+                overlap = chunk[-len(needle):]
+            if relevant:
+                if size > MAX_CONTROL_RECORD:
+                    if not receipt_row:
+                        raise Refused("manager control record exceeds the bounded inspection limit")
+                    chunks.clear()  # a generic giant tool output is not a receipt
+                elif chunks:
+                    chunks.append(chunk)
+        if not relevant or not complete:
+            continue
+        if receipt_row:
+            if not found_marker:
+                continue
+            if size > MAX_CONTROL_RECORD:
+                raise Refused("manager callback receipt exceeds the bounded inspection limit")
+        try:
+            row = json.loads(b"".join(chunks))
+        except (ValueError, UnicodeError):
+            continue
+        if isinstance(row, dict) and isinstance(row.get("payload"), dict):
+            yield row
+
+
 def caller_snapshot(thread, turn, marker=None):
     from claude_squared.adapters.codex import codex_home, rollout_path_for
 
@@ -163,18 +229,10 @@ def caller_snapshot(thread, turn, marker=None):
     path = path.resolve()
     if not comparison_path(path).is_relative_to(comparison_path((codex_home() / "sessions").resolve())):
         raise Refused("manager is not an active local session")
-    if path.stat().st_size > MAX_ROLLOUT:
-        raise Refused("manager rollout exceeds the verified inspection limit")
     meta, context, receipt = None, None, False
     latest_turn, source_present = None, False
-    with path.open(encoding="utf-8") as f:
-        for line in f:
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue  # incomplete concurrent append
-            if not isinstance(row, dict) or not isinstance(row.get("payload"), dict):
-                continue
+    with path.open("rb") as f:
+        for row in manager_records(f, marker):
             payload = row["payload"]
             if row.get("type") == "session_meta":
                 meta = payload
