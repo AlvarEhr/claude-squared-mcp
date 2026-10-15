@@ -320,6 +320,81 @@ class CodexActivityTests(unittest.TestCase):
         turns = self.snapshot()["window_turns"]
         self.assertEqual([t["kind"] for t in turns], ["compact"])
 
+    def usage_event(self, last_input, last_total, cumulative, window=475_000):
+        event = {"type": "event_msg", "payload": {"type": "token_count", "info": {
+            "last_token_usage": {"input_tokens": last_input, "output_tokens": last_total - last_input,
+                                 "total_tokens": last_total},
+            "total_token_usage": {"input_tokens": cumulative - 276_417, "output_tokens": 276_417,
+                                  "total_tokens": cumulative},
+            "model_context_window": window,
+        }}}
+        with self.rollout.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(event) + "\n")
+
+    def test_compact_uses_post_compaction_estimate_not_cumulative_usage(self):
+        # 2026-10-15 regression: the last pre-compaction call (318,367 input)
+        # and Codex's post-compaction token_count (input 0, total_tokens = its
+        # estimate of the new history) — the cumulative 56,802,796 was
+        # reported as the compacted size and tripped the context alert.
+        self.usage_event(318_367, 318_487, 56_802_796)
+        turn = C._CodexActivity(self.spec, "before-compact")
+        turn.poll(force=True)
+        turn.close()
+        self.assertEqual(self.snapshot()["context"]["used"], 318_367)
+        compacted = lambda *a, **k: self.usage_event(0, 27_527, 56_802_796)
+        with patch.object(self.adapter.__class__, "_appserver_compact", side_effect=compacted):
+            result = S._build_compact_runner(self.spec.name, None, compact_timeout_seconds=5)()
+        self.assertEqual((result.pre_tokens, result.post_tokens), (318_367, 27_527))
+        self.assertIn("Codex's estimate", result.summary_preview)
+        context = self.snapshot()["context"]
+        self.assertEqual((context["used"], context["source"]), (27_527, "compaction"))
+        status = tool(S.pair_status)(self.spec.name)
+        self.assertIn("27,527 / 475,000", status)
+        self.assertNotIn("past the context alert", status)
+        log = (R.logs_dir() / self.spec.name / "main.log").read_text(encoding="utf-8")
+        self.assertIn("COMPACTED 318,367 -> 27,527", log)
+        # The next sample before any model call keeps the estimate, not 0.
+        turn = C._CodexActivity(self.spec, "after-compact")
+        turn.poll(force=True)
+        turn.close()
+        self.assertEqual(self.snapshot()["context"]["used"], 27_527)
+        self.assertEqual(self.adapter.context(self.spec).tokens_used, 27_527)
+
+    def test_compact_without_a_new_token_count_never_reports_the_old_one(self):
+        self.usage_event(318_367, 318_487, 56_802_796)
+        with patch.object(self.adapter.__class__, "_appserver_compact", return_value=None):
+            result = self.adapter.compact(self.spec, timeout_seconds=5)
+        self.assertEqual(result.pre_tokens, 318_367)
+        self.assertNotIn(result.post_tokens, (318_367, 318_487, 56_802_796))
+
+    def test_live_context_tokens_ignores_cumulative_usage(self):
+        self.assertEqual(C.live_context_tokens({"last_token_usage": {"input_tokens": 90_000, "total_tokens": 90_050},
+                                                "total_token_usage": {"total_tokens": 9_999_999}}), 90_000)
+        self.assertEqual(C.live_context_tokens({"last_token_usage": {"input_tokens": 0, "total_tokens": 27_527},
+                                                "total_token_usage": {"total_tokens": 56_802_796}}), 27_527)
+        self.assertIsNone(C.live_context_tokens({"total_token_usage": {"total_tokens": 56_802_796}}))
+        self.assertIsNone(C.live_context_tokens(None))
+
+    def test_context_larger_than_window_is_unknown_and_never_alerts(self):
+        # A context file already holding a cumulative figure (written by an
+        # older build) reads as unknown: no status alert, no wait.py exit 8.
+        writer = V.writer(self.spec.name, "codex")
+        writer.note_context(318_367, 475_000, window_source="rollout", source="rollout")
+        writer.note_compaction("manual (app-server)", 318_367, 56_802_796)
+        self.assertIsNone(self.snapshot()["context"]["used"])
+        writer.note_context(56_802_796, 475_000, window_source="rollout", source="compaction")
+        writer.flush()
+        context = V.view(self.spec.name, grace_seconds=0)["context"]
+        self.assertIsNone(context["used"])
+        self.assertEqual(context["implausible_used"], 56_802_796)
+        self.assertNotIn("past the context alert", tool(S.pair_status)(self.spec.name))
+        g = {"__name__": "offline_wait"}
+        exec(W.WAIT_SCRIPT_SOURCE, g)
+        g["_headroom_read"] = lambda: (True, 40_000)
+        alert = g["Alert"]("default", None)
+        self.assertIsNone(alert.check(dict(context, used=318_367), None))
+        self.assertIsNone(alert.check(context, None))
+
     def test_graceful_owner_shutdown_does_not_publish_a_surviving_send_as_aborted(self):
         turn = C._CodexActivity(self.spec, "detaching")
         turn.writer._shutdown("owner exited")

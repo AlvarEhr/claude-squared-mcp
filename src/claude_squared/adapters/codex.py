@@ -166,14 +166,14 @@ class _CodexActivity:
         self.writer.note_reported_window(window, model_key=f"{self.spec.model}|{self.spec.context_window}",
                                           model=self.spec.model, source="rollout",
                                           auto_compact_token_limit=limit)
-        last = info.get("last_token_usage") or {}
         # Match the SendResult footer: current model-call input, never the
         # rollout's cumulative total_token_usage (design revision E). Whether
         # native auto-compaction counts output too is unmeasured; this proxy
         # and the default 90% compaction point are alerting estimates.
-        if last.get("input_tokens") is None:
+        used = live_context_tokens(info)
+        if used is None:
             return
-        self.used = max(0, int(last["input_tokens"]))
+        self.used = used
         self.writer.note_context(self.used, window, window_source="rollout", source="rollout",
                                   auto_compact_token_limit=limit)
 
@@ -773,6 +773,38 @@ def read_last_token_count(rollout: Path | None) -> dict[str, Any] | None:
     return None
 
 
+def live_context_tokens(info: dict[str, Any] | None) -> int | None:
+    """Live context fill from a ``token_count`` payload's ``info``: the last
+    model call's ``input_tokens`` — never ``total_token_usage``, which is the
+    thread's cumulative usage across every call (tens of millions on a long
+    thread). After a compaction Codex writes a token_count whose
+    ``last_token_usage`` has ``input_tokens`` 0 and ``total_tokens`` set to
+    its estimate of the new history (verified 2026-10-15: 0 / 27,527 while
+    the cumulative total stayed 56,802,796); that estimate is the fill until
+    the next model call. None when neither is reported."""
+    last = (info or {}).get("last_token_usage") or {}
+    inp = last.get("input_tokens")
+    if isinstance(inp, int) and inp > 0:
+        return inp
+    est = last.get("total_tokens")
+    if isinstance(est, int) and est > 0:
+        return est
+    return None
+
+
+def _post_compaction_tokens(before: dict[str, Any] | None, after: dict[str, Any] | None) -> int | None:
+    """Codex's own post-compaction estimate, when compaction wrote a NEW
+    token_count with the ``input_tokens`` 0 marker (see
+    ``live_context_tokens``); None otherwise — the last token_count may still
+    be the pre-compaction one, whose figures describe the old context."""
+    if not after or after == before:
+        return None
+    last = (after.get("info") or {}).get("last_token_usage") or {}
+    if last.get("input_tokens"):
+        return None
+    return live_context_tokens(after.get("info"))
+
+
 def _estimate_compacted_tokens(rollout: Path | None) -> int:
     """Rough size of the LAST ``compacted`` record's replacement history
     (chars / 4). 0 when there is none."""
@@ -1318,20 +1350,24 @@ class CodexAdapter(PairAdapter):
             raise SessionMissing(spec.name, spec.session_id)
         rollout = self.transcript_path(spec)
         tc0 = read_last_token_count(rollout) or {}
-        info0 = tc0.get("info") or {}
-        pre = int((info0.get("last_token_usage") or {}).get("input_tokens")
-                  or (info0.get("total_token_usage") or {}).get("total_tokens") or 0)
+        pre = live_context_tokens(tc0.get("info")) or 0
         t0 = time.monotonic()
         outcome = self._appserver_compact(spec, timeout_seconds=timeout_seconds, should_stop=should_stop)
         dur_ms = int((time.monotonic() - t0) * 1000)
         tc1 = read_last_token_count(rollout) or {}
-        info1 = tc1.get("info") or {}
-        post = int((info1.get("total_token_usage") or {}).get("total_tokens") or 0)
+        # Never total_token_usage: it is cumulative thread usage, not the
+        # context (2026-10-15: reported 318,367 -> 56,802,796 and tripped the
+        # context alert). Codex's post-compaction token_count carries its own
+        # estimate of the new history in last_token_usage.total_tokens.
+        post = _post_compaction_tokens(tc0, tc1) or 0
         notes: list[str] = []
-        if not post:
-            # Codex's post-compaction token_count reports zeros (verified on a
-            # 164k thread); estimate from the compaction record's replacement
-            # history instead — the next reply's footer shows the real fill.
+        if post:
+            notes.append("post-compaction size is Codex's estimate of the compacted history; "
+                         "the next reply's footer shows the real context fill")
+        else:
+            # Older Codex wrote all zeros here (verified on a 164k thread);
+            # estimate from the compaction record's replacement history
+            # instead — the next reply's footer shows the real fill.
             est = _estimate_compacted_tokens(rollout)
             if est:
                 post = est
@@ -1431,11 +1467,15 @@ class CodexAdapter(PairAdapter):
         total = info.get("total_token_usage") or {}
         window = int(info.get("model_context_window") or 0)
         used = int(last.get("input_tokens") or 0) + int(last.get("output_tokens") or 0)
+        compacted = not last.get("input_tokens") and bool(live_context_tokens(info))
+        if compacted:
+            used = live_context_tokens(info) or 0
         pct = (used / window * 100) if window else 0.0
         cw = context_windows(spec.model)
         md = [
             f"**Model:** {spec.model}",
-            f"**Tokens:** {_fmt_tokens(used)} / {_fmt_tokens(window)} ({pct:.0f}%)",
+            f"**Tokens:** {_fmt_tokens(used)} / {_fmt_tokens(window)} ({pct:.0f}%)"
+            + (" — Codex's estimate after compaction; the next reply reports the real fill" if compacted else ""),
             f"- last call: input {last.get('input_tokens', 0):,} (cached {last.get('cached_input_tokens', 0):,}), "
             f"output {last.get('output_tokens', 0):,} (reasoning {last.get('reasoning_output_tokens', 0):,})",
             f"- thread total: input {total.get('input_tokens', 0):,}, output {total.get('output_tokens', 0):,}, "
@@ -1974,12 +2014,11 @@ class CodexAdapter(PairAdapter):
         rollout = self.transcript_path(spec)
         tc = read_last_token_count(rollout)
         info = (tc or {}).get("info") or {}
-        last = info.get("last_token_usage") or {}
         window = int(info.get("model_context_window") or 0)
         if not window:
             cw = context_windows(model_used)
             window = (cw[1] if spec.context_window == "1m" else cw[0]) if cw else 258_400
-        used = int(last.get("input_tokens") or usage.get("input_tokens") or 0)
+        used = live_context_tokens(info) or int(usage.get("input_tokens") or 0)
         pct = (used / window * 100) if window else 0.0
         warning = None
         if pct >= STRONG_WARNING_THRESHOLD * 100:

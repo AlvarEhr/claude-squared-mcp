@@ -130,14 +130,13 @@ def _context_fill(spec, *, provenance: dict | None = None) -> "tuple[int, int, f
         if getattr(spec, "backend", "claude") == "codex":
             # Codex: the rollout's last token_count carries the EFFECTIVE
             # window + the last call's prompt size — zero inference as well.
-            from claude_squared.adapters.codex import CodexAdapter, read_last_token_count
+            from claude_squared.adapters.codex import CodexAdapter, live_context_tokens, read_last_token_count
             tc = read_last_token_count(CodexAdapter().transcript_path(spec))
             if not tc:
                 return None
             info = tc.get("info") or {}
-            last = info.get("last_token_usage") or {}
             window = int(info.get("model_context_window") or 0)
-            used = int(last.get("input_tokens") or 0)
+            used = live_context_tokens(info) or 0
             pct = (used / window * 100) if window else 0.0
             return (used, window, pct)
         from claude_squared.adapters.claude import ClaudeAdapter

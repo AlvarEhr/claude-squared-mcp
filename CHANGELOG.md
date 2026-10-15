@@ -16,6 +16,14 @@ All notable changes to this project are documented here. Format follows
   the detached PID creation-time guard are preserved. Children that explicitly
   create or show other windows can still display them; the source of previously
   reported flashes remains unproven.
+- Codex `pair_compact` no longer reports the thread's cumulative token usage
+  as the compacted size (seen: `318,367 → 56,802,796`, which `pair_status`
+  then showed as 11958% and `wait.py` exited 8 on). The post-compaction size
+  is Codex's own estimate from its post-compaction `token_count`
+  (`last_token_usage.total_tokens`), falling back to the summary-size
+  estimate; live context, `pair_context` and the send footer read the same
+  figure until the next model call. A recorded context larger than its window
+  now reads as unknown, so `pair_status` and `wait.py` never alert on one.
 
 ## [0.18.0] — 2026-10-11
 
