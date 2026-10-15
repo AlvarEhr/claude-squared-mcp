@@ -6,6 +6,10 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.18.1] — 2026-10-15
+
+Codex compaction reports the real context size; Windows CLI launches use hidden consoles.
+
 ### Fixed
 
 - Windows CLI launchers request hidden consoles for tool-capable roots, so
