@@ -31,7 +31,9 @@ a compaction during that turn drops them until the next 0.19 compaction.
   After every turn the profile Codex recorded is checked; one that is less
   confined than asked (an unexpected writable root, network on) marks the
   binary in `~/.claude/pairs/codex_profile_unsupported.json` and every later
-  turn runs the plain flags (read-only: `-s read-only`, no scratch folder).
+  turn of every Codex pair runs the plain flags (read-only: `-s read-only`, no
+  scratch folder). Delete that file to clear a false mark; a Codex update
+  starts fresh anyway.
 - **Credential read-denial (Codex, Windows).** On a profile-capable build every
   sandboxed level denies sandboxed commands reads of
   `~/.claude/.credentials.json`, `~/.claude/pairs/api_key`,
@@ -44,7 +46,9 @@ a compaction during that turn drops them until the next 0.19 compaction.
   `codex` CLI started inside a Codex sandbox can no longer log in. You and the
   unsandboxed codex process are unaffected. Undo per file:
   `icacls <file> /remove:d CodexSandboxUsers`. A program that replaces the file
-  atomically drops the entry until the next pair turn re-applies it.
+  atomically drops the entry until the next pair turn re-applies it. Verified
+  with `[windows] sandbox = "elevated"` only; another sandbox mode may run
+  commands as you, where the group deny doesn't apply (the create result says so).
   `CLAUDE_PAIR_CODEX_DENY_READ` replaces the list (empty: none).
 - **`backend_options={"network": true}`** for Codex pairs: network inside the
   `workspace`/`auto` sandbox, with git's HTTPS fixed for the sandbox
@@ -73,10 +77,12 @@ a compaction during that turn drops them until the next 0.19 compaction.
   `TEMP`/`TMP`/`TMPDIR`, whole-table `shell_environment_policy`) and the ones that
   would reshape the sandbox around `permission_mode` (`sandbox_mode`,
   `approval_policy`, `approvals_reviewer`, `sandbox_permissions`, `profile(s)`);
-  `developer_instructions` on every platform. `backend_options.args` refuses
-  `-s`/`--sandbox`, `--approve-for-me`, `--dangerously-bypass-approvals-and-sandbox`,
-  `-p`/`--profile`, `-c`/`--config`, `--add-dir`, `-m` and `-C`, and
-  `backend_options.approval='approve-for-me'` is refused at a read-only level.
+  `developer_instructions` on every platform. `backend_options.args` takes only
+  `--enable`, `--disable`, `-i`/`--image`, `--color` and `--output-schema` (an
+  allowlist: on 0.164 `--yolo` and `--not-so-yolo` are hidden aliases of the
+  bypass and approve-for-me flags), and `backend_options.approval='approve-for-me'`
+  is refused at a read-only level. A read-only spawn never passes
+  `--approve-for-me` (or a stored bypass flag) in any mode.
   Only a NEW value is checked: a stored one keeps working, and in profile mode
   whatever would override the profile is left out of the spawn with a note.
 - A permission profile ignores `sandbox_workspace_write.network_access` /

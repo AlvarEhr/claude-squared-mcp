@@ -685,25 +685,29 @@ _MANAGED_CONFIG = {
 # profile mode anyway, rather than trusted to stay inert in a later build.
 _SANDBOX_SHAPING_CONFIG = ("sandbox_mode", "approval_policy", "approvals_reviewer", "sandbox_permissions",
                            "profile", "profiles")
-# Raw exec flags backend_options.args may not carry (like v0.17 does for
-# Claude): each would bypass permission_mode, a field, or config validation.
-_REFUSED_ARGS = {
+# backend_options.args takes only these exec flags (each with one value) for
+# NEW values: an allowlist, because the exec CLI is an alpha with hidden
+# aliases — on 0.164, --yolo is --dangerously-bypass-approvals-and-sandbox and
+# --not-so-yolo is --approve-for-me (verified 2026-10-26 from clap's
+# "cannot be used multiple times" / "cannot be used with" errors).
+_ALLOWED_ARGS = ("--enable", "--disable", "-i", "--image", "--color", "--output-schema")
+# Where a refused flag's job is done instead (the refusal names it).
+_ARG_FIELDS = {
     "-s": "permission_mode (or backend_options.sandbox)",
     "--sandbox": "permission_mode (or backend_options.sandbox)",
-    "--approve-for-me": "permission_mode='auto'",
+    "--approve-for-me": "permission_mode='auto'", "--not-so-yolo": "permission_mode='auto'",
     "--dangerously-bypass-approvals-and-sandbox": "permission_mode='unrestricted'",
-    "-p": "permission_mode — config profiles can reshape the sandbox",
-    "--profile": "permission_mode — config profiles can reshape the sandbox",
+    "--yolo": "permission_mode='unrestricted'",
     "-c": "backend_options.config", "--config": "backend_options.config",
-    "--add-dir": "extra_dirs",
-    "-m": "model", "--model": "model",
-    "-C": "cwd", "--cd": "cwd",
+    "--add-dir": "extra_dirs", "-m": "model", "--model": "model", "-C": "cwd", "--cd": "cwd",
 }
-_VALUE_FLAGS = {"-s", "--sandbox", "-p", "--profile", "-c", "--config", "--add-dir", "-m", "--model", "-C", "--cd"}
+_VALUE_FLAGS = {"-s", "--sandbox", "-p", "--profile", "-c", "--config", "--add-dir", "-m", "--model", "-C", "--cd",
+                "--enable", "--disable", "-i", "--image", "--color", "--output-schema"}
 # The ones a stored (pre-0.19) value may still carry; dropped at spawn in
-# profile mode, where they would override the profile.
-_SANDBOX_SHAPING_ARGS = {"-s", "--sandbox", "-p", "--profile", "--approve-for-me",
-                         "--dangerously-bypass-approvals-and-sandbox"}
+# profile mode, where they would override the profile, and at read-only in
+# every mode (fail closed).
+_SANDBOX_SHAPING_ARGS = {"-s", "--sandbox", "-p", "--profile", "--approve-for-me", "--not-so-yolo",
+                         "--dangerously-bypass-approvals-and-sandbox", "--yolo"}
 _GIT_HTTPS_ENV = (("GIT_CONFIG_COUNT", "1"), ("GIT_CONFIG_KEY_0", "http.sslBackend"),
                   ("GIT_CONFIG_VALUE_0", "openssl"))
 
@@ -742,16 +746,32 @@ def _arg_flag(token: str) -> str | None:
 
 
 def validate_codex_args(args: Any) -> None:
-    """``backend_options.args`` (create/update): refuse flags that would
-    bypass permission_mode, a field, or ``backend_options.config``'s checks."""
+    """``backend_options.args`` (create/update): only :data:`_ALLOWED_ARGS`,
+    each followed by its value (or ``--flag=value``). Anything else could
+    bypass permission_mode, a field or ``backend_options.config``'s checks —
+    or, as a bare token, become exec's prompt."""
     if args is None:
         return
     if not isinstance(args, list):
         raise ValueError("backend_options.args must be a list of strings")
-    for token in args:
-        flag = _arg_flag(str(token))
-        if flag in _REFUSED_ARGS:
-            raise ValueError(f"backend_options.args may not contain {flag}: use {_REFUSED_ARGS[flag]} instead.")
+    tokens = [str(t) for t in args]
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        flag = _arg_flag(token)
+        # A short flag must stand alone (no attached "-ifile" spellings).
+        if flag not in _ALLOWED_ARGS or (not token.startswith("--") and token != flag):
+            hint = _ARG_FIELDS.get(flag or "")
+            raise ValueError(
+                f"backend_options.args may not contain {token!r}"
+                + (f": use {hint} instead" if hint else "")
+                + f". Allowed: {', '.join(_ALLOWED_ARGS)}, each with its value.")
+        if "=" in token:
+            i += 1
+            continue
+        if i + 1 >= len(tokens):
+            raise ValueError(f"backend_options.args: {token} needs a value")
+        i += 2
 
 
 def _strip_sandbox_args(args: list[Any]) -> tuple[list[str], list[str]]:
@@ -809,6 +829,13 @@ def _windows_sandbox() -> bool:
     """The v0.19 sandbox features apply on Windows only (POSIX workspace-write
     already scopes TMPDIR and /tmp; not probed there)."""
     return os.name == "nt"
+
+
+def _elevated_sandbox() -> bool:
+    """``[windows] sandbox = "elevated"`` in the user's config (re-added for
+    pairs): the mode the credential deny was verified in."""
+    windows = _load_user_config().get("windows")
+    return isinstance(windows, dict) and str(windows.get("sandbox") or "") == "elevated"
 
 
 def _text_argv_ok(exe: str) -> bool:
@@ -1129,17 +1156,31 @@ def sandbox_plan(level: str, backend_options: dict[str, Any] | None = None, *,
     if approval == "bypass":
         return SandboxPlan(["--dangerously-bypass-approvals-and-sandbox"] + add_dirs, "none", "native",
                            config_args=_cfg(raw_config), extra_args=[str(a) for a in raw_args])
+    spawn_notes: list[str] = []
+    if kind == "read-only":
+        # Fail closed in EVERY mode (legacy, POSIX, after a breach mark):
+        # without a profile --approve-for-me implies workspace-write, so a
+        # stored approval='approve-for-me' — or a stored sandbox-shaping arg —
+        # must never reach a read-only spawn.
+        if approval == "approve-for-me":
+            spawn_notes.append("backend_options.approval='approve-for-me' is ignored at read-only; "
+                               "use permission_mode='auto' for reviewed escalations")
+            approval = None
+        raw_args, dropped = _strip_sandbox_args(raw_args)
+        for d in dropped:
+            spawn_notes.append(f"backend_options.args {d!r} was not passed: a read-only pair runs "
+                               f"plain read-only (remove it with pair_update(backend_options=…))")
     flags = ["--approve-for-me"] if approval == "approve-for-me" else (["-s", sandbox] if sandbox else [])
     net_legacy = ["-c", "sandbox_workspace_write.network_access=true"] if network else []
     if pair_name is None or kind == "none" or not _windows_sandbox():
         return SandboxPlan(flags + net_legacy + add_dirs, kind, "native", network=network,
-                           config_args=_cfg(raw_config), extra_args=[str(a) for a in raw_args])
+                           spawn_notes=spawn_notes, config_args=_cfg(raw_config),
+                           extra_args=[str(a) for a in raw_args])
     scratch = scratch_dir(pair_name, create=create)
     exe = exe or (codex_executable() if probe else _known_exe())
     key = _exe_key(exe) if exe else None
     supported = profile_support(exe, probe=probe) if exe else (False if probe else None)
     notes: list[str] = []
-    spawn_notes: list[str] = []
     roots: list[str] = []
     if supported:
         # Settings a profile ignores are carried over, the rest dropped.
@@ -1164,10 +1205,6 @@ def sandbox_plan(level: str, backend_options: dict[str, Any] | None = None, *,
             spawn_notes.append(f"backend_options.args {d!r} was not passed: it would override the sandbox "
                                f"permission profile (remove it with pair_update(backend_options=…))")
         raw_args = kept_args
-        if approval == "approve-for-me" and kind == "read-only":
-            spawn_notes.append("backend_options.approval='approve-for-me' is ignored at read-only; "
-                               "use permission_mode='auto' for reviewed escalations")
-            approval = None
     env: list[str] = []
     for var in _TEMP_VARS:
         env += _q_env(var, str(scratch))
@@ -1198,11 +1235,11 @@ def sandbox_plan(level: str, backend_options: dict[str, Any] | None = None, *,
         return SandboxPlan(args, kind, "profile", scratch, tuple(deny), network, key, git_env, notes,
                            spawn_notes, writes, _cfg(raw_config), [str(a) for a in raw_args])
     if kind == "read-only":
-        return SandboxPlan(flags, kind, "legacy", None, (), False, key, False, notes,
+        return SandboxPlan(flags, kind, "legacy", None, (), False, key, False, notes, spawn_notes,
                            config_args=_cfg(raw_config), extra_args=[str(a) for a in raw_args])
     args = flags + ["--add-dir", str(scratch), "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true"]
     return SandboxPlan(args + env + net_legacy + add_dirs, kind, "legacy", scratch, (), network, key, git_env,
-                       notes, config_args=_cfg(raw_config), extra_args=[str(a) for a in raw_args])
+                       notes, spawn_notes, config_args=_cfg(raw_config), extra_args=[str(a) for a in raw_args])
 
 
 def sandbox_notes(spec: PairSpec, *, python_check: bool = False, detail: bool = False,
@@ -1224,7 +1261,15 @@ def sandbox_notes(spec: PairSpec, *, python_check: bool = False, detail: bool = 
             return notes
         plan = sandbox_plan(spec.permission_mode, bo, pair_name=spec.name, create=False, cwd=spec.cwd,
                             extra_dirs=spec.extra_dirs, probe=probe)
-        if plan.deny and detail:
+        if plan.deny and not _elevated_sandbox():
+            # Verified only with the elevated sandbox (commands run as the
+            # CodexSandboxOffline user, a member of the group the deny entry
+            # names). Another mode may run them as you with a restricted
+            # token, which a group deny doesn't reach — not probed.
+            denied = ("credential read-denial requested, but it was verified only with `[windows] sandbox = "
+                      "\"elevated\"`, which this config doesn't set: with another sandbox mode commands may run "
+                      "as you, and the files stay readable")
+        elif plan.deny and detail:
             denied = (f"{len(plan.deny)} credential file(s) unreadable to sandboxed commands — Codex enforces "
                       f"this with a PERMANENT deny entry on each file for every Codex sandbox on this machine "
                       f"(undo: icacls <file> /remove:d CodexSandboxUsers); a claude or codex CLI run inside the "
@@ -2164,8 +2209,10 @@ class CodexAdapter(PairAdapter):
                             mark_profile_unsupported(plan.exe_key, breach)
                         result.notes.append(
                             f"⚠ SANDBOX: {breach}. claude-squared stops using permission profiles for this "
-                            f"Codex build — pairs now run the plain sandbox flags (read-only: no scratch "
-                            f"folder; no credential read-denial). Check what this turn did (pair_log).")
+                            f"Codex build — every Codex pair now runs the plain sandbox flags (read-only: no "
+                            f"scratch folder; no credential read-denial). Check what this turn did (pair_log). "
+                            f"If this was a false alarm, delete {_unsupported_path()} (a Codex update starts "
+                            f"fresh anyway: the mark is per binary).")
                     if warning:
                         result.notes.append(f"⚠ SANDBOX: {warning}")
                 if not recorded and any(e.get("type") == "turn.completed" for e in events):

@@ -1,5 +1,5 @@
 """Live check: v0.19 Codex sandbox ergonomics on Windows (costs a little
-Codex usage — about twelve short turns plus one compaction on gpt-5.6-luna, low).
+Codex usage — about eighteen short turns plus one compaction on gpt-5.6-luna, low).
 
     python tests/smoke_live_codex_sandbox.py [--root DIR] [--model gpt-5.6-luna]
 
@@ -23,6 +23,8 @@ given):
 - read-only pair: scratch writable, cwd not, PowerShell not in
   ConstrainedLanguage, no post-turn sandbox warning;
 - auto pair and a fork of it: each on the profile with its own scratch;
+- cwd = a git worktree (workspace, auto) and a repo subfolder: no false
+  post-turn breach (a false one would degrade every pair on the machine);
 - the create-time Python check; ``pair_forget`` removes the scratch folder.
 
 Real Codex home with --ignore-user-config; deletes the threads it created and
@@ -101,6 +103,13 @@ def main() -> int:
         "except Exception as e:\n    print('NET FAIL', type(e).__name__, e)\n", encoding="utf-8")
     sibling = root / "sibling"
     sibling.mkdir()
+    repo, worktree = root / "repo", root / "repo-wt"
+    subfolder = repo / "sub"
+    subfolder.mkdir(parents=True)
+    (subfolder / "s.txt").write_text("s\n", encoding="utf-8")
+    for cmd in (["init", "-q"], ["config", "user.email", "probe@example.invalid"], ["config", "user.name", "probe"],
+                ["add", "."], ["commit", "-qm", "init"], ["worktree", "add", "-q", str(worktree), "-b", "wt"]):
+        subprocess.run(["git", "-C", str(repo)] + cmd, check=True, capture_output=True)
     vault = root / "vault"
     vault.mkdir()
     canary_text = f"CANARY-SECRET-{secrets.token_hex(4)}"
@@ -261,9 +270,29 @@ def main() -> int:
             check("fork: canary credential unreadable", "CANARY=DENIED" in out and canary_text not in out, out)
         check("fork: no post-turn sandbox warning", not any("SANDBOX" in n for n in result.notes), str(result.notes))
 
+        print("\n== git worktree and repo subfolder cwds ==", flush=True)
+        # A false breach here would mark the binary and degrade EVERY pair on
+        # the machine, so a real worktree (workspace + auto) and a subfolder
+        # of a repo must read as confined.
+        extra_pairs = []
+        for name, level, where in (("sbx-wt", "workspace", worktree), ("sbx-wt-auto", "auto", worktree),
+                                   ("sbx-sub", "workspace", subfolder)):
+            tool(S.pair_create)(name, backend="codex", model=args.model, effort="low", permission_mode=level,
+                                cwd=str(where))
+            threads.append(R.get_pair(name).session_id)
+            extra_pairs.append((name, CX.scratch_dir(name, create=False)))
+            target = where / f"{name}.txt"
+            tid, result = send(name, exact(f"Set-Content -Path '{target}' -Value x; 'WROTE'"))
+            check(f"{name}: cwd writable", target.exists(), outputs(name, tid))
+            check(f"{name}: no post-turn sandbox warning", not any("SANDBOX" in n for n in result.notes),
+                  str(result.notes))
+        check("no binary marked unsupported", not (R.pairs_dir() / "codex_profile_unsupported.json").exists(),
+              (R.pairs_dir() / "codex_profile_unsupported.json").read_text(encoding="utf-8")
+              if (R.pairs_dir() / "codex_profile_unsupported.json").exists() else "")
+
         print("\n== forget ==", flush=True)
-        for name, path in (("sbx-ws", scratch), ("sbx-ro", ro_scratch), ("sbx-auto", auto_scratch),
-                           ("sbx-fork", fork_scratch)):
+        for name, path in [("sbx-ws", scratch), ("sbx-ro", ro_scratch), ("sbx-auto", auto_scratch),
+                           ("sbx-fork", fork_scratch)] + extra_pairs:
             out = tool(S.pair_forget)(name, archive=False)
             check(f"pair_forget removed {name}'s scratch", not path.exists(), out)
     finally:
@@ -279,7 +308,15 @@ def main() -> int:
             print("\nTrust entries codex added to config.toml (prune by hand if unwanted):\n  "
                   + "\n  ".join(added), flush=True)
         if not args.keep:
-            shutil.rmtree(root, ignore_errors=True)
+            def _writable_then_retry(func, path, _exc):
+                # git marks its object files read-only, which rmtree can't
+                # delete on Windows as they are.
+                try:
+                    os.chmod(path, 0o666)
+                    func(path)
+                except OSError:
+                    pass
+            shutil.rmtree(root, onerror=_writable_then_retry)
             if root.exists():
                 print(f"could not fully remove {root}", flush=True)
     failed = [label for ok, label, _ in RESULTS if not ok]

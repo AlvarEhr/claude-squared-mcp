@@ -265,6 +265,22 @@ class ProfileArgvTests(SandboxCase):
         self.assertTrue(contains_run(argv, ["-c", "model_verbosity=\"low\""]))
         self.assertEqual(len(plans[0].spawn_notes), 3)
 
+    def test_args_are_an_allowlist(self):
+        for args in (["--yolo"], ["--not-so-yolo"], ["--full-auto"], ["--ephemeral"], ["--worktree"],
+                     ["stray prompt"], ["--enable"], ["-ifile.png"]):
+            with self.subTest(args=args), self.assertRaisesRegex(ValueError, "args"):
+                CX.CodexAdapter.validate_backend_options("workspace", {"args": args})
+        for args in (["--enable", "multi_agent_v2", "--disable", "x"], ["--enable=multi_agent_v2"],
+                     ["-i", "a.png"], ["--color", "never"], ["--output-schema", "s.json"]):
+            with self.subTest(args=args):
+                CX.CodexAdapter.validate_backend_options("workspace", {"args": args})
+
+    def test_hidden_aliases_are_stripped_in_profile_mode(self):
+        argv = self.args(self.spec(backend_options={"args": ["--yolo", "--not-so-yolo", "--color", "never"]}))
+        self.assertNotIn("--yolo", argv)
+        self.assertNotIn("--not-so-yolo", argv)
+        self.assertTrue(contains_run(argv, ["--color", "never"]))
+
     def test_approve_for_me_at_read_only_is_refused(self):
         with self.assertRaisesRegex(ValueError, "contradicts a read-only level"):
             CX.CodexAdapter.validate_backend_options("read-only", {"approval": "approve-for-me"})
@@ -329,6 +345,24 @@ class LegacyArgvTests(SandboxCase):
         self.assertTrue(contains_run(argv, ["-s", "read-only"]))
         self.assertFalse(any("default_permissions" in a or "TEMP" in a for a in argv))
 
+    def test_read_only_never_emits_approve_for_me(self):
+        # Without a profile --approve-for-me implies workspace-write: a stored
+        # approval (or arg) must not reach a read-only spawn — directly, after
+        # pair_update(permission_mode='read-only') or via a per-send override.
+        stored = {"approval": "approve-for-me", "args": ["--not-so-yolo", "--yolo", "--color", "never"]}
+        for spec, override in ((self.spec(permission_mode="read-only", backend_options=stored), None),
+                               (self.spec(permission_mode="workspace", backend_options=stored), "read-only")):
+            with self.subTest(override=override):
+                plans = []
+                argv = CX.CodexAdapter()._exec_args(spec, model=None, effort=None, permission_mode=override,
+                                                    plan_out=plans)
+                self.assertTrue(contains_run(argv, ["-s", "read-only"]))
+                for flag in ("--approve-for-me", "--not-so-yolo", "--yolo"):
+                    self.assertNotIn(flag, argv)
+                self.assertTrue(contains_run(argv, ["--color", "never"]))
+                self.assertEqual(plans[0].mode, "legacy")
+                self.assertTrue(any("approve-for-me" in n for n in plans[0].spawn_notes))
+
     def test_workspace_gets_scratch_via_add_dir(self):
         argv = self.args(self.spec(permission_mode="workspace"))
         self.assertTrue(contains_run(argv, ["-s", "workspace-write"]))
@@ -355,6 +389,15 @@ class PosixArgvTests(SandboxCase):
         self.assertFalse(self.scratch().exists())
         self.capability.assert_not_called()
         self.assertIsNone(CX.instructions_text(self.spec()))
+
+    def test_posix_read_only_never_emits_approve_for_me(self):
+        argv = CX.CodexAdapter.permission_args("read-only", {"approval": "approve-for-me"}, pair_name="p")
+        self.assertEqual(argv, ["-s", "read-only"])
+        argv = self.args(self.spec(permission_mode="auto", backend_options={"args": ["--yolo"]}),
+                         permission_mode="read-only")
+        self.assertTrue(contains_run(argv, ["-s", "read-only"]))
+        self.assertNotIn("--yolo", argv)
+        self.assertNotIn("--approve-for-me", argv)
 
     def test_posix_network_is_the_legacy_key_only(self):
         argv = CX.CodexAdapter.permission_args("workspace", {"network": True}, pair_name="p")
@@ -875,6 +918,15 @@ class ServerTests(SandboxCase):
         self.assertIn("permission profile", report)
         self.assertIn("network on", report)
         self.assertIn("PYTHON-NOTE", report)
+
+    def test_credential_claim_depends_on_the_elevated_sandbox(self):
+        spec = self.spec("cx")
+        with patch.object(CX, "_load_user_config", return_value={"windows": {"sandbox": "elevated"}}):
+            elevated = " ".join(CX.sandbox_notes(spec, detail=True))
+        self.assertIn("PERMANENT deny entry", elevated)
+        plain = " ".join(CX.sandbox_notes(spec, detail=True))  # config without windows.sandbox
+        self.assertIn("verified only with", plain)
+        self.assertNotIn("PERMANENT", plain)
 
     def test_clear_moves_a_wrapper_thread_to_developer_mode(self):
         R.add_pair(self.spec("cx", system_prompt_append="A"))
