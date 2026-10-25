@@ -231,8 +231,14 @@ class PersistenceRetryTests(ReviewCase):
             deadline = time.monotonic() + 5
             data = {}
             while time.monotonic() < deadline:
-                data = json.loads(A._task_path(task.task_id).read_text(encoding="utf-8"))
-                if data.get("status") == "done":
+                # The retry thread replaces the file under us: Windows refuses an
+                # open mid-replace, and the file can read "done" a moment before
+                # the thread drops its _unsaved_results entry. Poll for both.
+                try:
+                    data = json.loads(A._task_path(task.task_id).read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    data = {}
+                if data.get("status") == "done" and task.task_id not in A._unsaved_results:
                     break
                 time.sleep(0.05)
         self.assertEqual(data.get("status"), "done")
