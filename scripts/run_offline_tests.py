@@ -82,6 +82,10 @@ def main() -> int:
         "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
         "-p", "test_codex_sandbox.py", "-v",
     ]))
+    commands.append(("codex_zst", [
+        "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
+        "-p", "test_codex_zst.py", "-v",
+    ]))
     failures = []
     for name, arguments in commands:
         print(f"\n=== {name} ===", flush=True)

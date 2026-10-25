@@ -155,6 +155,18 @@ def _context_fill(spec, *, provenance: dict | None = None) -> "tuple[int, int, f
         return None
 
 
+def _compressed_note(spec) -> str | None:
+    """The Codex app compresses idle rollouts (``.jsonl.zst``), which this
+    CLI does not decode; say so instead of "no turns"."""
+    try:
+        if getattr(spec, "backend", "claude") == "codex":
+            from claude_squared.adapters.codex import compressed_rollout_note
+            return compressed_rollout_note(spec)
+    except Exception:
+        pass
+    return None
+
+
 def _transcript_path(spec):
     try:
         if getattr(spec, "backend", "claude") == "codex":
@@ -221,11 +233,14 @@ def _cmd_info(argv: list[str]) -> int:
     print(f"  cwd:         {spec.cwd or '(server cwd)'}")
     provenance: dict = {}
     fill = _context_fill(spec, provenance=provenance)
+    compressed = _compressed_note(spec)
     if fill:
         used, window, pct = fill
         print(f"  context:     {pct:.0f}% ({used:,} / {window:,} tokens)   "
               f"[zero-inference, from JSONL"
               f"{'; estimated window' if provenance.get('estimated_window') else ''}]")
+    elif compressed:
+        print(f"  context:     (unreadable: {compressed})")
     else:
         print("  context:     (no turns yet)")
     if spec.persistent:
@@ -253,7 +268,9 @@ def _cmd_context(argv: list[str]) -> int:
     provenance: dict = {}
     fill = _context_fill(spec, provenance=provenance)
     if not fill:
-        print(f"Pair '{name}': no turns yet (context ~0%).")
+        compressed = _compressed_note(spec)
+        print(f"Pair '{name}': {compressed} (context unreadable until then)." if compressed
+              else f"Pair '{name}': no turns yet (context ~0%).")
         return 0
     used, window, pct = fill
     print(f"Pair '{name}' context: {pct:.0f}% ({used:,} / {window:,} tokens)")
@@ -386,6 +403,10 @@ def _cmd_transcript(argv: list[str]) -> int:
         print(str(e), file=sys.stderr)
         return 2
     tp = _transcript_path(spec)
+    compressed = _compressed_note(spec)
+    if compressed:
+        print(f"Pair '{name}': {compressed}.")
+        return 0
     turns = tail_turns(tp, last_n=n) if isinstance(tp, Path) and tp.exists() else []
     if not turns:
         print(f"Pair '{name}': no conversation turns yet.")

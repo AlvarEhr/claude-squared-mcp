@@ -35,7 +35,7 @@ from claude_squared import settings as settings_mod
 from claude_squared.adapters import ClaudeAdapter, CodexAdapter, PairAdapter
 from claude_squared.adapters import codex as codex_adapter_mod
 from claude_squared.cli_paths import encode_cwd_for_project as _encode_cwd_for_project
-from claude_squared.errors import BillingError, PairAlreadyExists, PairError, PairNotFound
+from claude_squared.errors import BillingError, CLIError, PairAlreadyExists, PairError, PairNotFound
 from claude_squared.models import (
     BACKENDS,
     BILLING_MODES,
@@ -1252,10 +1252,23 @@ def pair_adopt(
     eff_display = coerced_effort if coerced_effort is not None else "none"
     line = (f"Adopted {'codex thread' if be == 'codex' else 'session'} {_short(session_id)} as "
             f"pair '{name}' (model {model}, effort {eff_display}, permission {level})")
-    for m in (coercion_msg, model_note):
+    for m in (coercion_msg, model_note, codex_adapter_mod.compressed_rollout_note(spec)):
         if m:
             line += f"\n  {m}"
     return line
+
+
+def _archive_transcript(src: Path, stem: str) -> str:
+    """Copy a transcript into the archive as ``<stem>.jsonl``; a rollout the
+    Codex app compressed is copied as-is to ``<stem>.jsonl.zst`` (there is no
+    zstd decoder here). Returns the display text for the result line."""
+    if codex_adapter_mod.is_compressed_rollout(src):
+        dst = reg_mod.archive_dir() / f"{stem}.jsonl{codex_adapter_mod.ZST_SUFFIX}"
+        shutil.copy2(src, dst)
+        return f"{dst} (copied as-is: the Codex app had compressed the idle thread, so the copy is zstd)"
+    dst = reg_mod.archive_dir() / f"{stem}.jsonl"
+    shutil.copy2(src, dst)
+    return str(dst)
 
 
 @mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False})
@@ -1303,9 +1316,7 @@ def _forget_pair(name: str, archive: bool) -> str:
         src = adapter.transcript_path(spec)
         if src and src.exists():
             ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-            dst = reg_mod.archive_dir() / f"{name}-{ts}.jsonl"
-            shutil.copy2(src, dst)
-            archived = str(dst)
+            archived = _archive_transcript(src, f"{name}-{ts}")
     try:
         activity_mod.forget(name)
     except Exception:
@@ -3199,6 +3210,12 @@ def pair_list(verbose: bool = False) -> str:
     )
 
 
+def _transcript_state(path: Path | None, exists: bool) -> str:
+    if exists and codex_adapter_mod.is_compressed_rollout(path):
+        return f"ok, compressed — {codex_adapter_mod.COMPRESSED_NOTE}"
+    return "ok" if exists else "MISSING"
+
+
 @mcp.tool(output_schema=None, annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True})
 def pair_info(name: str, verbose: bool = False) -> str:
     """Get full configuration + stats for one pair.
@@ -3255,7 +3272,7 @@ def pair_info(name: str, verbose: bool = False) -> str:
         f"{name}:\n"
         f"  backend: {spec.backend}\n"
         f"  {'thread' if spec.backend == 'codex' else 'session'}: {spec.session_id} "
-        f"(transcript: {'ok' if info.transcript_exists else 'MISSING'})\n"
+        f"(transcript: {_transcript_state(tpath, info.transcript_exists)})\n"
         f"  model: {spec.model}, effort: {spec.effort}, permission: {spec.permission_mode}{native}, "
         f"context_window: {spec.context_window}{bo}\n"
         f"  turns: {spec.turn_count}, last active: {_fmt_local(spec.last_active_at)}\n"
@@ -3300,6 +3317,8 @@ def pair_transcript(
     tpath = adapter.transcript_path(spec)
     if not tpath:
         return "(no transcript found)"
+    if codex_adapter_mod.is_compressed_rollout(tpath):
+        return f"Pair '{name}': {codex_adapter_mod.COMPRESSED_NOTE}."
     turns = transcript_mod.tail_turns(tpath, last_n=last_n)
     if not turns:
         return "(no turns)"
@@ -4477,9 +4496,7 @@ def pair_clear(name: str, archive_old: bool = True, verbose: bool = False, force
             archived: str | None = None
             if archive_old and old_path and old_path.exists():
                 ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-                dst = reg_mod.archive_dir() / f"{name}-{ts}-cleared.jsonl"
-                shutil.copy2(old_path, dst)
-                archived = str(dst)
+                archived = _archive_transcript(old_path, f"{name}-{ts}-cleared")
             if verbose:
                 return json.dumps({"old_session_id": old_sid, "new_session_id": new_sid,
                                    "archived_to": archived}, indent=2)
@@ -4913,6 +4930,17 @@ def pair_rewind_points(name: str, last_n: int = 20, verbose: bool = False) -> st
     spec = reg_mod.get_pair(name)
     adapter = _adapter_for(spec)
     path = adapter.transcript_path(spec)
+    restored: str | None = None
+    if spec.backend == "codex" and codex_adapter_mod.is_compressed_rollout(path):
+        try:
+            with _with_pair_lock(name):
+                _refuse_detached_codex(name)
+                spec = reg_mod.get_pair(name)
+                restored = _restore_compressed_rollout(spec, adapter)
+        except FileLockTimeout:
+            raise PairError(f"Pair '{name}' is busy in another process; could not acquire lock to "
+                            f"restore its compressed rollout.")
+        path = adapter.transcript_path(spec)
     if spec.backend == "codex":
         points = codex_adapter_mod.list_turn_points_codex(path) if path and path.exists() else []
     else:
@@ -4920,7 +4948,7 @@ def pair_rewind_points(name: str, last_n: int = 20, verbose: bool = False) -> st
     if verbose:
         return json.dumps(points, indent=2, default=str)
     if not points:
-        return f"Pair '{name}': no user-message rewind points yet."
+        return f"Pair '{name}': no user-message rewind points yet." + (f"\n  {restored}" if restored else "")
     shown = points[-last_n:] if last_n and last_n > 0 else points
     header = f"Pair '{name}' — {len(points)} rewind point(s)"
     if len(shown) < len(points):
@@ -4928,6 +4956,8 @@ def pair_rewind_points(name: str, last_n: int = 20, verbose: bool = False) -> st
     lines = [header + ":",
              "  → pair_rewind(name, to_point=N) rewinds to BEFORE that user message.",
              "  (conversation only — files the pair wrote to disk are NOT reverted)"]
+    if restored:
+        lines.append(f"  {restored}")
     for p in shown:
         after = f"{p['after_assistant_turns']} asst turn(s), {p['after_tool_calls']} tool call(s)"
         if p["after_files"]:
@@ -4935,6 +4965,19 @@ def pair_rewind_points(name: str, last_n: int = 20, verbose: bool = False) -> st
         lines.append(f"  [{p['point']}] {_fmt_local(p['timestamp'])}  \"{p['preview']}\"")
         lines.append(f"        then: {after}")
     return "\n".join(lines)
+
+
+def _restore_compressed_rollout(spec: PairSpec, adapter) -> str | None:
+    """Rewinding needs the plain rollout: if the Codex app compressed it, have
+    Codex restore it (app-server thread/resume, no model call). Caller holds
+    the pair lock. Returns the note for the result; None if already plain."""
+    if not codex_adapter_mod.is_compressed_rollout(adapter.transcript_path(spec)):
+        return None
+    try:
+        return adapter.restore_rollout(spec)
+    except CLIError as e:
+        raise PairError(f"Pair '{spec.name}': {codex_adapter_mod.COMPRESSED_NOTE}, but restoring it for the "
+                        f"rewind failed ({e})") from e
 
 
 @mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False})
@@ -4972,6 +5015,9 @@ def pair_rewind(name: str, to_point: int, archive: bool = True, verbose: bool = 
             path = adapter.transcript_path(spec)
             if not path or not path.exists():
                 raise PairError(f"Pair '{name}' has no transcript to rewind.")
+            restored = _restore_compressed_rollout(spec, adapter) if spec.backend == "codex" else None
+            if restored:
+                path = adapter.transcript_path(spec)
             if spec.backend == "codex":
                 # Verified 2026-09-07: ``exec resume`` reads the rollout JSONL,
                 # so truncating it at a turn boundary rewinds the thread. The
@@ -5023,9 +5069,11 @@ def pair_rewind(name: str, to_point: int, archive: bool = True, verbose: bool = 
             "name": name, "rewound_to_point": to_point,
             "preview": match["preview"], "archived_to": archived,
             "dropped_events": len(dropped), "files_modified_in_dropped_range": dropped_files,
-            "projection_note": codex_note,
+            "projection_note": codex_note, "restore_note": restored,
         }, indent=2, default=str)
     lines = [f"Rewound '{name}' to before point {to_point}: \"{match['preview']}\""]
+    if restored:
+        lines.append(f"  {restored}")
     lines.append(f"  Dropped {len(dropped)} event(s); the pair now continues from there on next send.")
     if codex_note:
         lines.append(f"  {codex_note}")
@@ -5694,6 +5742,7 @@ def _codex_status(spec: PairSpec, *, last_n_log: int, verbose: bool) -> str:
             recent_lines = [l.rstrip("\n") for l in all_lines[-max(1, int(last_n_log)):]]
         except Exception:
             pass
+    compressed = codex_adapter_mod.compressed_rollout_note(spec)
     if verbose:
         return json.dumps({
             "name": name, "backend": "codex",
@@ -5706,10 +5755,13 @@ def _codex_status(spec: PairSpec, *, last_n_log: int, verbose: bool) -> str:
             "inflight_async_tasks": inflight_tasks,
             "recent_log_lines": recent_lines,
             "persistent": spec.persistent,
+            "rollout_compressed": bool(compressed),
         }, indent=2, default=str)
     lines = [f"Pair '{name}' status (codex):"]
     lines.append(f"  turn process: {'running' if info else 'none'}")
     lines.append(f"  liveness: {heuristic}")
+    if compressed:
+        lines.append(f"  rollout: {compressed}")
     lines.extend(_activity_status_lines(name))
     if inflight_tasks:
         ids_str = ", ".join(inflight_tasks) if len(inflight_tasks) <= 2 else ", ".join(t[:8] for t in inflight_tasks[:3]) + "..."
@@ -5815,6 +5867,9 @@ def pair_context(name: str, timeout_seconds: int = 60, verbose: bool = False) ->
     """
     spec = reg_mod.get_pair(name)
     adapter = _adapter_for(spec)
+    note = codex_adapter_mod.compressed_rollout_note(spec)
+    if note:
+        return f"Pair '{name}': {note} (its context fill is unreadable until then)."
     report = adapter.context(spec, timeout_seconds=timeout_seconds)
     if verbose:
         return _verbose_dump(report)

@@ -503,6 +503,11 @@ class CapabilityTests(SandboxCase):
 
 
 # The read-only profile as Codex recorded it in the 2026-10-25 probe.
+def _now_z():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
 def _turn_context(scratch, *, extra_writes=(), deny=(), network="restricted"):
     entries = [{"path": {"type": "special", "value": {"kind": "root"}}, "access": "read"},
                {"path": {"type": "path", "path": str(scratch)}, "access": "write"}]
@@ -603,6 +608,59 @@ class BeltTests(SandboxCase):
             result = adapter.send(spec, "hi")
         self.assertTrue(any("SANDBOX" in n and "not confined" in n for n in result.notes), result.notes)
         self.assertIn(CX._exe_key(str(self.exe)), CX._unsupported_marks())
+
+    def _compressed_rollout(self, *, record_size=True):
+        """An OLD breaching turn, compressed the way the Codex app leaves it
+        (only ``.jsonl.zst``; one zstd frame of RAW blocks, so a naive read
+        would still see its lines). Returns (plain, zst)."""
+        plain = self.directory / "rollout-x.jsonl"
+        zst = CX.compressed_sibling(plain)
+        if plain.exists():
+            plain.unlink()
+        old = (json.dumps({"timestamp": "2026-10-18T10:00:00.000Z", "type": "turn_context",
+                           "payload": _turn_context(self.directory, extra_writes=[self.directory / "x"])})
+               + "\n").encode("utf-8")
+        fhd = 0xA0 if record_size else 0x00  # single-segment + 4-byte size (what Codex wrote) / no size
+        frame = b"\x28\xb5\x2f\xfd" + bytes([fhd]) + (b"" if record_size else b"\x58")
+        frame += len(old).to_bytes(4, "little") if record_size else b""
+        frame += ((len(old) << 3) | 1).to_bytes(3, "little") + old
+        zst.write_bytes(frame)
+        return plain, zst, old
+
+    def _send_restoring(self, plain, zst, old, *, record=True):
+        """Codex restores the plain rollout byte-identical, then appends this
+        turn's confined record (the 2026-10-25 probe's order) — or, with
+        ``record`` False, the turn fails before writing one."""
+        spec = self.spec(permission_mode="read-only")
+        resolved = lambda _self, _spec: plain if plain.exists() else zst  # noqa: E731
+
+        def fake_run(args, run_spec, **kw):
+            plan = CX.sandbox_plan("read-only", {}, pair_name="p")
+            new = json.dumps({"timestamp": _now_z(), "type": "turn_context",
+                              "payload": _turn_context(plan.scratch, deny=plan.deny)}) + "\n"
+            plain.write_bytes(old + (new.encode("utf-8") if record else b""))
+            zst.unlink()
+            if not record:
+                return [{"type": "turn.failed", "error": {}}], "", 1, 5
+            return [{"type": "turn.completed", "usage": {}}], "", 0, 5
+
+        with patch.object(CX.CodexAdapter, "session_exists", return_value=True), \
+                patch.object(CX.CodexAdapter, "transcript_path", resolved), \
+                patch.object(CX.CodexAdapter, "_run", side_effect=fake_run):
+            return CX.CodexAdapter().send(spec, "hi")
+
+    def test_belt_on_a_compressed_rollout_checks_only_this_turn(self):
+        result = self._send_restoring(*self._compressed_rollout())
+        self.assertFalse(any("SANDBOX" in n for n in result.notes), result.notes)
+        self.assertEqual(CX._unsupported_marks(), {})
+
+    def test_belt_without_a_recorded_size_falls_back_to_turn_start(self):
+        for record in (True, False):  # False: only the OLD breaching record is in the file
+            plain, zst, old = self._compressed_rollout(record_size=False)
+            self.assertIsNone(CX.rollout_size(zst))
+            result = self._send_restoring(plain, zst, old, record=record)
+            self.assertFalse(any("SANDBOX" in n for n in result.notes), (record, result.notes))
+            self.assertEqual(CX._unsupported_marks(), {})
 
     def test_send_ignores_turn_contexts_from_before_the_exec(self):
         spec = self.spec(permission_mode="read-only")
