@@ -6,6 +6,8 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.19.0] — 2026-10-25
+
 Codex sandbox ergonomics, Windows first: a private TEMP per pair, a real
 read-only sandbox, credential files out of the sandbox's reach, network on
 request, and instructions that survive compaction. Measured on codex-cli
