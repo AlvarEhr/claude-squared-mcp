@@ -6,6 +6,74 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+Codex sandbox ergonomics, Windows first: a private TEMP per pair, a real
+read-only sandbox, credential files out of the sandbox's reach, network on
+request, and instructions that survive compaction. Measured on codex-cli
+0.164.0-alpha.11.1.
+
+**Restart every open session after installing.** The new registry data is
+additive (`codex_instructions` on Codex pairs, `network` / `sandbox_note`
+inside `backend_options`) and older processes keep it, but a 0.18 process
+sending to a Codex pair created by 0.19 doesn't re-send its instructions, so
+a compaction during that turn drops them until the next 0.19 compaction.
+
+### Added
+
+- **Per-pair scratch folder as TEMP (Codex, Windows).** `TEMP`/`TMP`/`TMPDIR`
+  point at `~/.claude/pairs/scratch/<pair>`, writable at every sandboxed level;
+  the shared user Temp is no longer writable from a pair (it used to be a
+  writable root at `workspace`/`auto`, and nothing was writable at
+  `read-only`). Kept across `pair_clear`/`pair_rewind`, removed by
+  `pair_forget` (a leftover is reported).
+- **Read-only Codex pairs run on a permission profile** (`:read-only` + the
+  scratch folder) when the binary supports profiles — checked once per
+  binary with `codex exec --strict-config` and no model call. Otherwise, or
+  if a turn's recorded profile turns out less confined than asked, they run
+  plain `-s read-only` (fail closed; the binary is marked in
+  `~/.claude/pairs/codex_profile_unsupported.json`).
+- **Credential read-denial (Codex, Windows).** On a profile-capable build every
+  sandboxed level denies sandboxed commands reads of
+  `~/.claude/.credentials.json`, `~/.claude/pairs/api_key`,
+  `~/.codex/auth.json` and `~/.claude.json`, which the sandbox user could read
+  before. Codex enforces this with a permanent deny entry on each file for
+  the `CodexSandboxUsers` group; `CLAUDE_PAIR_CODEX_DENY_READ` replaces the
+  list.
+- **`backend_options={"network": true}`** for Codex pairs: network inside the
+  `workspace`/`auto` sandbox, with git's HTTPS fixed for the sandbox
+  (`http.sslBackend=openssl` via `GIT_CONFIG_*`, skipped with a note when you
+  already use those). Refused at `read-only` and on Claude pairs.
+- **A sandbox note** in the instructions of every sandboxed Codex pair created
+  on Windows: scratch TEMP, stopping processes, headless Chrome, refused
+  `-Force`/escalations, network, credentials. `backend_options={"sandbox_note": false}`
+  leaves it out.
+- **Create-time Python check (Windows):** `pair_create` runs `python` on PATH
+  inside the sandbox (`codex sandbox`, no model) and names the `icacls` fix
+  when the sandbox user can't run it.
+- **`pair_update(system_prompt_append=…)`** (`""` clears it).
+
+### Changed
+
+- **Codex instructions are developer instructions.** `profile_name` /
+  `system_prompt_append` (and the sandbox note) go in as
+  `developer_instructions`, re-sent on every turn and to `pair_compact`: Codex
+  rebuilds a thread's instructions at each compaction from the current
+  settings and silently dropped them otherwise. Older, adopted and handed-off
+  threads keep the first-message form until `pair_clear`; instructions over
+  ~28K command-line characters fall back to it, with a note.
+- `backend_options.config` refuses the keys the new features manage
+  (`default_permissions`, `permissions.*`, `sandbox_workspace_write.*`,
+  `developer_instructions`, `TEMP`/`TMP`/`TMPDIR`, whole-table
+  `shell_environment_policy`).
+
+### Fixed
+
+- Commands Codex refuses before running them at `workspace`
+  (`Remove-Item -Force` "blocked by policy", escalation requests at approval
+  policy never) were silent; they are reported as denials that say the
+  command never ran, with the remedies.
+- The Codex `pair_invoke` error pointed at `~/.codex/skills`, which pairs
+  don't load; it names the workspace skill folders.
+
 ## [0.18.1] — 2026-10-15
 
 Codex compaction reports the real context size; Windows CLI launches use hidden consoles.

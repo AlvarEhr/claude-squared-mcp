@@ -224,7 +224,9 @@ def run_unit_checks(fixture_root: Path) -> None:
     except ValueError as e:
         check("sandbox override refused at auto (CLI rejects -s with --approve-for-me)", "approve-for-me" in str(e))
     check("auto -> --approve-for-me", "--approve-for-me" in args)
-    check("extra_dirs -> --add-dir", args[args.index("--add-dir") + 1] == extra_dir)
+    # v0.19 (Windows): the pair's scratch folder may be another --add-dir.
+    check("extra_dirs -> --add-dir", any(a == "--add-dir" and args[i + 1] == extra_dir
+                                         for i, a in enumerate(args[:-1])))
     check("backend_options.config + args", "foo.bar=1" in joined and args[-2:] == ["--color", "never"])
     if os.name == "nt" and any("windows.sandbox" in a for a in config_readd_args()):
         check("windows.sandbox re-added under --ignore-user-config", any("windows.sandbox" in a for a in args))

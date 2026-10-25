@@ -45,9 +45,11 @@ HEADLESS_INCOMPATIBLE_TOOLS = ("AskUserQuestion",)
 # ONE list for both places that decide that — pair_update (evict in its own
 # process) and RuntimeRegistry.get_or_start (a warm runtime in another
 # process notices at its next send). v0.17.0: they had drifted apart.
-# system_prompt_append / profile_name: no tool changes them, and the CLI
-# snapshots the system prompt per conversation anyway, but a hand edit
-# should still reach the next spawn.
+# system_prompt_append / profile_name: the CLI snapshots the appended system
+# prompt per conversation (2026-10-25, Haiku: a changed
+# --append-system-prompt on resume was ignored, the first one kept), so a
+# change reaches the model only after pair_clear; listed so pair_update's
+# respawn and background refusal treat them like every other spawn flag.
 SPAWN_PINNED_FIELDS = ("model", "effort", "permission_mode", "context_window", "backend_options",
                        "cwd", "extra_dirs", "allowed_tools", "mcp_whitelist", "ultracode",
                        "fallback_model", "disallowed_tools", "system_prompt_append", "profile_name",
@@ -605,7 +607,9 @@ class PairSpec(BaseModel):
     # overrides), ``args`` (list of raw extra exec args), ``sandbox`` /
     # ``approval`` (native override of the permission translation:
     # sandbox ∈ read-only|workspace-write|danger-full-access, approval ∈
-    # none|approve-for-me|bypass). Claude (v0.17.0): ``settings`` (dict merged
+    # none|approve-for-me|bypass), v0.19: ``network`` (bool — sandboxed
+    # network access) and ``sandbox_note`` (bool, default on — the Windows
+    # sandbox note in the instructions). Claude (v0.17.0): ``settings`` (dict merged
     # with the ultracode key into the one ``--settings`` JSON) and ``args``
     # (list of raw extra CLI args) — both re-applied at every spawn
     # (``ClaudeAdapter.validate_backend_options``).
@@ -644,6 +648,17 @@ class PairSpec(BaseModel):
     # only when "api": an older server keeps the unknown key and spawns the
     # pair on the plan — the safe direction.
     billing: Literal["plan", "api"] = "plan"
+    # v0.19 (Codex): how this THREAD received its instructions (profile +
+    # system_prompt_append + the Windows sandbox note), set when the thread is
+    # created: {"mode": "developer" | "wrapper", "sha256": …, "chars": …}.
+    # "developer" threads get the current text as ``developer_instructions``
+    # on every exec and at pair_compact — Codex rebuilds the initial context
+    # at every compaction from the CURRENT session's config, so passing it
+    # only at creation loses it at the first compaction (verified 2026-10-25,
+    # exec auto-compaction and the app-server path). None (threads created
+    # before 0.19, adopted, handed off) = the first-message wrapper; never
+    # given the key, so a compaction can't add a second copy.
+    codex_instructions: dict[str, Any] | None = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
     last_active_at: datetime = Field(default_factory=datetime.utcnow)
     turn_count: int = 0
@@ -722,6 +737,8 @@ class CreateResult(BaseModel):
     transcript_path: str | None = None
     initial_response: str | None = None
     notes: list[str] = Field(default_factory=list)
+    # v0.19 (Codex): the new thread's PairSpec.codex_instructions record.
+    instructions: dict[str, Any] | None = None
 
 
 class SendResult(BaseModel):

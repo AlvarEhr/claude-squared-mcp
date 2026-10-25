@@ -208,6 +208,11 @@ def _normalize_path_list(paths: list[str] | None) -> list[str] | None:
     return out or None
 
 
+# PermissionDenial.tool_name values CodexAdapter gives refusals at approval
+# policy never (stderr only; the command never ran).
+_CODEX_POLICY_REFUSALS = ("policy-blocked", "escalation-refused")
+
+
 def _fmt_send_result(r: SendResult) -> str:
     # Visual separator so the agent can clearly see where the pair's response
     # starts/ends in the UI (otherwise the response text bleeds into the agent's
@@ -367,7 +372,10 @@ def _fmt_send_result(r: SendResult) -> str:
         # any content the model composed inside the call is gone with it.
         interactive = [t for t in counts if t in HEADLESS_INCOMPATIBLE_TOOLS]
         guardian = [t for t in counts if t == "guardian-review"]
-        permissionish = [t for t in counts if t not in HEADLESS_INCOMPATIBLE_TOOLS and t != "guardian-review"]
+        # v0.19: Codex refused these BEFORE running them (approval never).
+        policy = [t for t in counts if t in _CODEX_POLICY_REFUSALS]
+        permissionish = [t for t in counts if t not in HEADLESS_INCOMPATIBLE_TOOLS and t != "guardian-review"
+                         and t not in _CODEX_POLICY_REFUSALS]
 
         lines.append(
             f"\n⛔ PAIR HANDOFF: pair '{r.name}' (permission level '{mode}'{native}) had "
@@ -395,6 +403,21 @@ def _fmt_send_result(r: SendResult) -> str:
                 f"To allow it, the USER must authorize: then re-send with "
                 f"override_permission_mode=\"unrestricted\", or widen the workspace "
                 f"(pair_update extra_dirs=[...]) so the action no longer needs an escalation."
+            )
+        if policy:
+            _cmds = [str((d.tool_input or {}).get("command")) for d in r.permission_denials
+                     if d.tool_name in _CODEX_POLICY_REFUSALS and (d.tool_input or {}).get("command")]
+            lines.append(
+                f"\n   • {', '.join(policy)}: Codex refused "
+                + (f"`{_cmds[0]}`" + (f" (+{len(_cmds) - 1} more)" if len(_cmds) > 1 else "") if _cmds
+                   else "the command")
+                + f" BEFORE running it — it never ran. At this level the approval policy is "
+                f"\"never\", so Codex can't ask anyone: `Remove-Item -Force` and any request for "
+                f"escalated permissions (a git commit writes the protected .git folder) are refused "
+                f"outright.\n"
+                f"     Remedies: ask the pair to rephrase (plain `Remove-Item` without -Force works); "
+                f"or, with the user's OK, pair_update('{r.name}', permission_mode='auto') so escalations "
+                f"go to Codex's auto-reviewer; or make the commit yourself."
             )
         if permissionish:
             denied_p = ", ".join(permissionish)
@@ -866,8 +889,9 @@ def pair_create(
             tokens per turn. **If the pair will scour large files or whole repos,
             pick ``1m``** — a compaction costs a full-context turn, so the window is the budget.
         system_prompt_append: Text appended to the default system prompt. Pinned at
-            create. Codex: delivered as the thread's first user message (exec has no
-            system-prompt flag); it persists in the thread history.
+            create (``pair_update`` changes it for the next ``pair_clear``). Codex:
+            delivered as developer instructions, re-sent every turn so they survive
+            compaction (over ~28K command-line chars: the thread's first message).
         profile_name: ``~/.claude/pairs/profiles/<name>.md``, a shared role prompt. Combines
             with ``system_prompt_append``: profile text first, then the append.
         allowed_tools: Claude permission patterns like ``["Bash(git *)", "Read"]``.
@@ -891,7 +915,10 @@ def pair_create(
             ``config`` {toml key: value} extra ``-c`` overrides; ``args`` [raw exec
             args]; ``sandbox`` / ``approval`` native override of the permission
             translation (sandbox: read-only|workspace-write|danger-full-access;
-            approval: none|approve-for-me|bypass). Claude keys: ``settings`` {settings
+            approval: none|approve-for-me|bypass); ``network`` true = network inside
+            the workspace/auto sandbox (Windows: HTTPS works from Python and git, not
+            PowerShell/curl; refused at read-only); ``sandbox_note`` false drops the
+            Windows sandbox note from the instructions. Claude keys: ``settings`` {settings
             JSON}, merged with ``ultracode`` into the one ``--settings`` flag; ``args``
             [raw CLI args], appended at the end of every spawn. Both re-applied at every
             spawn. ``settings`` takes only ``permissions`` (``deny`` / ``ask`` /
@@ -1089,7 +1116,10 @@ def pair_create(
             _refuse_detached_codex(name)
             adapter = _adapter_for(spec)
             result = adapter.create(spec, initial_message=None)
-            reg_mod.update_pair(name, session_id=result.session_id, turn_count=0)
+            _created: dict[str, Any] = {"session_id": result.session_id, "turn_count": 0}
+            if result.instructions is not None:
+                _created["codex_instructions"] = result.instructions
+            reg_mod.update_pair(name, **_created)
     except FileLockTimeout:
         try:
             reg_mod.remove_pair(name)
@@ -1104,6 +1134,10 @@ def pair_create(
         raise
 
     transparency_msgs.extend(result.notes)
+    if be == "codex":
+        # v0.19: scratch / profile / network, plus the Python-in-sandbox check
+        # (Windows; advisory, cached per binary + interpreter).
+        transparency_msgs.extend(codex_adapter_mod.sandbox_notes(spec, python_check=True))
     # Echo the RESOLVED values (not what the caller passed) so the agent always
     # sees what got applied — defaults filled in, match-parent expanded, effort
     # coerced. Followed by any transparency messages (one per line of context).
@@ -1276,9 +1310,19 @@ def _forget_pair(name: str, archive: bool) -> str:
         activity_mod.forget(name)
     except Exception:
         pass
+    scratch_left: str | None = None
+    if spec.backend == "codex":
+        # v0.19 (R12): after the turn was stopped above; best-effort, a
+        # leftover is reported and never fails the forget.
+        try:
+            scratch_left = codex_adapter_mod.remove_scratch(name)
+        except Exception as e:
+            scratch_left = f"scratch folder not removed: {e}"
     msg = f"Forgot '{name}' (session {_short(spec.session_id)})"
     if archived:
         msg += f"; archived to {archived}"
+    if scratch_left:
+        msg += f"\n⚠ {scratch_left}"
     note = _lost_note(lost)
     if note:
         msg += f"\n⚠ {note}"
@@ -3191,6 +3235,22 @@ def pair_info(name: str, verbose: bool = False) -> str:
         bo += f"\n  cost: ${spec.total_cost_usd:.2f} at list prices"
         if spec.api_cost_usd or spec.billing == "api":
             bo += f", ${spec.api_cost_usd:.2f} of it billed to the API key"
+    else:
+        # v0.19: the sandbox (scratch / profile / network) and how this
+        # thread got its instructions.
+        for _n in codex_adapter_mod.sandbox_notes(spec):
+            bo += f"\n  {_n}"
+        _rec = spec.codex_instructions or {}
+        if _rec.get("mode") == "developer":
+            _changed = codex_adapter_mod.instructions_changed(spec)
+            if _rec.get("chars") or _changed:
+                bo += f"\n  instructions: developer instructions ({_rec.get('chars', 0):,} chars at thread start)"
+            if _changed:
+                bo += (" — changed since; the new text takes effect at the next compaction or "
+                       "pair_clear")
+        elif spec.system_prompt_append or spec.profile_name:
+            bo += ("\n  instructions: in the thread's first message (thread predates 0.19, adopted "
+                   "or handed off); pair_clear moves it to developer instructions")
     return (
         f"{name}:\n"
         f"  backend: {spec.backend}\n"
@@ -3345,6 +3405,7 @@ def pair_update(
     disallowed_tools: str | list[str] | None = None,
     context_alert_at: int | str | None = None,
     billing: str | None = None,
+    system_prompt_append: str | None = None,
 ) -> str:
     """Update mutable settings of an existing pair (per-pair, not defaults —
     use ``pair_settings_set`` for user-wide defaults).
@@ -3380,7 +3441,10 @@ def pair_update(
         takes effect on next ``pair_invoke``. Pass ``[]`` for lockdown.
       - **Pinned-at-create** (``allowed_tools``/
         ``system_prompt_append``): registry updated but only takes effect after
-        ``pair_clear`` (rotates session). ``cwd``/``extra_dirs`` take effect on
+        ``pair_clear`` (rotates session) — the Claude CLI keeps a session's
+        first appended system prompt. Codex threads created by 0.19+ get their
+        instructions re-sent every turn and pick a change up at the next
+        compaction too. ``""`` clears it. ``cwd``/``extra_dirs`` take effect on
         next spawn after eviction; a Claude ``cwd`` change also moves the session
         JSONL across project dirs (rejected with recovery hint if move fails).
     """
@@ -3461,6 +3525,8 @@ def pair_update(
                     raise PairError("fallback_model is Claude-only (--fallback-model); Codex has no equivalent.")
             if purpose is not None:
                 fields["purpose"] = purpose
+            if system_prompt_append is not None:
+                fields["system_prompt_append"] = system_prompt_append.strip() or None
             if allowed_tools is not None:
                 fields["allowed_tools"] = _coerce_to_str_list(allowed_tools)
             if mcp_whitelist is not None:
@@ -3613,7 +3679,19 @@ def pair_update(
             # it inline so they don't have to dig into the README.
             pinned_at_create = {"allowed_tools", "system_prompt_append"}
             pinned_changed = sorted(pinned_at_create & fields.keys())
-            if pinned_changed:
+            if pinned_changed and spec.backend == "codex" and pinned_changed == ["system_prompt_append"]:
+                # v0.19: a developer-instructions thread is re-sent the text
+                # every turn, but Codex rebuilds it only at a compaction.
+                if (spec.codex_instructions or {}).get("mode") == "developer":
+                    pinned_warning = (
+                        f"Note: system_prompt_append takes effect at this thread's next compaction "
+                        f"(pair_compact('{name}') or Codex's own) or at pair_clear('{name}').")
+                else:
+                    pinned_warning = (
+                        f"Note: this thread carries its instructions in its first message; "
+                        f"pair_clear('{name}') starts a thread with the new value (as developer "
+                        f"instructions).")
+            elif pinned_changed:
                 pinned_warning = (
                     f"Note: {', '.join(pinned_changed)} pinned to existing session. "
                     f"Run pair_clear('{name}') for the new value(s) to take effect "
@@ -3621,6 +3699,8 @@ def pair_update(
                 )
             else:
                 pinned_warning = None
+            if spec.backend == "codex" and {"backend_options", "permission_mode"} & fields.keys():
+                transparency_msgs.extend(codex_adapter_mod.sandbox_notes(spec))
             update_msgs = list(transparency_msgs)
             if cwd_move_msg:
                 update_msgs.append(cwd_move_msg)
@@ -4383,8 +4463,13 @@ def pair_clear(name: str, archive_old: bool = True, verbose: bool = False, force
             # Initialize the new session by sending a minimal probe
             created = adapter.create(new_spec)
             new_sid = created.session_id
+            _cleared: dict[str, Any] = {}
+            if created.instructions is not None:
+                # v0.19: a new Codex thread — a pre-0.19 or handed-off pair moves
+                # to developer instructions here.
+                _cleared["codex_instructions"] = created.instructions
             reg_mod.update_pair(name, session_id=new_sid, turn_count=0, total_cost_usd=0.0,
-                                last_active_at=datetime.utcnow())
+                                last_active_at=datetime.utcnow(), **_cleared)
 
             archived: str | None = None
             if archive_old and old_path and old_path.exists():
@@ -4400,6 +4485,8 @@ def pair_clear(name: str, archive_old: bool = True, verbose: bool = False, force
                 msg += f" (archived to {archived})"
             if _lost_note(lost):
                 msg += f"\n⚠ {_lost_note(lost)}"
+            for _n in created.notes:
+                msg += f"\n  {_n}"
             return msg
     except FileLockTimeout:
         raise PairError(f"Pair '{name}' is busy in another process; could not acquire lock to clear.")

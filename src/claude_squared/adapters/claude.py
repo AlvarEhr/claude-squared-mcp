@@ -601,7 +601,8 @@ class ClaudeAdapter(PairAdapter):
             raise ValueError(
                 f"backend_options {unknown} are not Claude options. Claude takes 'settings' (a "
                 f"settings JSON object, passed as --settings) and 'args' (a list of raw CLI args); "
-                f"'config' / 'sandbox' / 'approval' are Codex-only.")
+                f"'config' / 'sandbox' / 'approval' / 'network' / 'sandbox_note' are Codex-only "
+                f"(a Claude pair already has network access).")
         if "settings" in bo:
             settings = bo["settings"]
             if isinstance(settings, str):
