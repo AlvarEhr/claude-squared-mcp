@@ -45,15 +45,15 @@ HEADLESS_INCOMPATIBLE_TOOLS = ("AskUserQuestion",)
 # ONE list for both places that decide that — pair_update (evict in its own
 # process) and RuntimeRegistry.get_or_start (a warm runtime in another
 # process notices at its next send). v0.17.0: they had drifted apart.
-# system_prompt_append / profile_name: the CLI snapshots the appended system
-# prompt per conversation (2026-10-25, Haiku: a changed
-# --append-system-prompt on resume was ignored, the first one kept), so a
-# change reaches the model only after pair_clear; listed so pair_update's
-# respawn and background refusal treat them like every other spawn flag.
+# system_prompt_append / profile_name are NOT listed: the CLI keeps a
+# session's first appended system prompt (2026-10-26, Haiku with a negative
+# control: a changed --append-system-prompt on resume was ignored, and one
+# added only on resume was too), so respawning a warm runtime for them would
+# change nothing while killing its background work. They take effect at
+# pair_clear, which starts a new session anyway.
 SPAWN_PINNED_FIELDS = ("model", "effort", "permission_mode", "context_window", "backend_options",
                        "cwd", "extra_dirs", "allowed_tools", "mcp_whitelist", "ultracode",
-                       "fallback_model", "disallowed_tools", "system_prompt_append", "profile_name",
-                       "billing")
+                       "fallback_model", "disallowed_tools", "billing")
 
 # v0.18.0: how a Claude pair's turns are paid for. "plan" = the claude.ai
 # login (an inherited ANTHROPIC_API_KEY is stripped, so plan is plan by

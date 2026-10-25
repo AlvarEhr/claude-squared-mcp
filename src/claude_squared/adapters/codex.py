@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import glob
 import json
+import logging
 import os
 import queue
 import re
@@ -62,6 +63,7 @@ STRONG_WARNING_THRESHOLD = 0.85
 THREAD_SOURCE = "claude-squared"   # tags our threads in ~/.codex sqlite + the Desktop UI
 PROBE_PROMPT = "Reply with exactly: pair-ready"
 CONTEXT_POLL_SECONDS = 10.0
+logger = logging.getLogger(__name__)
 
 
 class _NoCodexActivity:
@@ -599,10 +601,12 @@ def _toml_literal(v: Any) -> str:
         return str(v)
     if isinstance(v, str):
         # TOML basic strings share JSON's escapes, except that an astral
-        # character must not become a \\ud83d-style surrogate pair (TOML
-        # rejects those — codex would then take the whole value as a raw
-        # literal, quotes included). ensure_ascii=False keeps it as itself.
-        return json.dumps(v, ensure_ascii=False)
+        # character must not become a surrogate-pair escape (TOML rejects
+        # those — codex would then take the whole value as a raw literal,
+        # quotes included), so ensure_ascii=False keeps it as itself; and
+        # TOML also requires DEL (U+007F) escaped, which JSON leaves raw.
+        # JSON already escapes the C0 controls.
+        return json.dumps(v, ensure_ascii=False).replace("\x7f", "\\u007f")
     if isinstance(v, list):
         return "[" + ", ".join(_toml_literal(x) for x in v) + "]"
     return json.dumps(str(v))
@@ -663,15 +667,45 @@ ARGV_BUDGET = 28_000
 _TEMP_VARS = ("TEMP", "TMP", "TMPDIR")
 # Keys the v0.19 features set on every spawn — refused in
 # backend_options.config (codex -c is last-wins, so a user value would
-# silently lose or, for a whole-table spelling, replace ours).
+# silently lose or, for a whole-table spelling, replace ours). Windows only,
+# where the features exist, except developer_instructions (every platform).
 _MANAGED_CONFIG = {
     "default_permissions": "the sandbox permission profile (Windows, v0.19)",
     "permissions": "the sandbox permission profile (Windows, v0.19)",
-    "sandbox_workspace_write": "the scratch folder and backend_options.network",
+    "sandbox_workspace_write": "the scratch folder, extra_dirs and backend_options.network",
     "developer_instructions": "system_prompt_append / profile_name",
     "shell_environment_policy": "the scratch folder (pass dotted leaves, e.g. shell_environment_policy.set.FOO)",
     "shell_environment_policy.set": "the scratch folder (pass dotted leaves, e.g. shell_environment_policy.set.FOO)",
 }
+# Config keys that shape the sandbox or approvals themselves — permission_mode
+# owns those. Verified 2026-10-26 (0.164): sandbox_mode="danger-full-access"
+# and approval_policy="on-request" next to the read-only profile left the
+# profile in force (the key alone does switch the sandbox — positive
+# control). Refused for new values on Windows and dropped at spawn in
+# profile mode anyway, rather than trusted to stay inert in a later build.
+_SANDBOX_SHAPING_CONFIG = ("sandbox_mode", "approval_policy", "approvals_reviewer", "sandbox_permissions",
+                           "profile", "profiles")
+# Raw exec flags backend_options.args may not carry (like v0.17 does for
+# Claude): each would bypass permission_mode, a field, or config validation.
+_REFUSED_ARGS = {
+    "-s": "permission_mode (or backend_options.sandbox)",
+    "--sandbox": "permission_mode (or backend_options.sandbox)",
+    "--approve-for-me": "permission_mode='auto'",
+    "--dangerously-bypass-approvals-and-sandbox": "permission_mode='unrestricted'",
+    "-p": "permission_mode — config profiles can reshape the sandbox",
+    "--profile": "permission_mode — config profiles can reshape the sandbox",
+    "-c": "backend_options.config", "--config": "backend_options.config",
+    "--add-dir": "extra_dirs",
+    "-m": "model", "--model": "model",
+    "-C": "cwd", "--cd": "cwd",
+}
+_VALUE_FLAGS = {"-s", "--sandbox", "-p", "--profile", "-c", "--config", "--add-dir", "-m", "--model", "-C", "--cd"}
+# The ones a stored (pre-0.19) value may still carry; dropped at spawn in
+# profile mode, where they would override the profile.
+_SANDBOX_SHAPING_ARGS = {"-s", "--sandbox", "-p", "--profile", "--approve-for-me",
+                         "--dangerously-bypass-approvals-and-sandbox"}
+_GIT_HTTPS_ENV = (("GIT_CONFIG_COUNT", "1"), ("GIT_CONFIG_KEY_0", "http.sslBackend"),
+                  ("GIT_CONFIG_VALUE_0", "openssl"))
 
 
 def _managed_config_feature(key: str) -> str | None:
@@ -679,20 +713,78 @@ def _managed_config_feature(key: str) -> str | None:
     Dotted ``shell_environment_policy`` leaves other than TEMP/TMP/TMPDIR
     merge with ours (verified), so they stay allowed."""
     k = key.strip()
+    if k == "developer_instructions" or k.startswith("developer_instructions."):
+        return _MANAGED_CONFIG["developer_instructions"]
+    if not _windows_sandbox():
+        return None
     if k in ("shell_environment_policy", "shell_environment_policy.set"):
         return _MANAGED_CONFIG[k]
     if k.startswith("shell_environment_policy.set."):
         return _MANAGED_CONFIG["shell_environment_policy.set"] if k.rsplit(".", 1)[-1].upper() in _TEMP_VARS else None
     if k.startswith("shell_environment_policy."):
         return None
-    for managed in ("default_permissions", "permissions", "sandbox_workspace_write", "developer_instructions"):
+    for managed in ("default_permissions", "permissions", "sandbox_workspace_write"):
         if k == managed or k.startswith(managed + "."):
             return _MANAGED_CONFIG[managed]
+    for shaping in _SANDBOX_SHAPING_CONFIG:
+        if k == shaping or k.startswith(shaping + "."):
+            return "permission_mode"
     return None
 
 
-_GIT_HTTPS_ENV = (("GIT_CONFIG_COUNT", "1"), ("GIT_CONFIG_KEY_0", "http.sslBackend"),
-                  ("GIT_CONFIG_VALUE_0", "openssl"))
+def _arg_flag(token: str) -> str | None:
+    """The flag a raw token spells (``--x=v`` and ``-cVALUE`` forms too)."""
+    if token.startswith("--"):
+        return token.split("=", 1)[0]
+    if token.startswith("-") and len(token) >= 2:
+        return token[:2]
+    return None
+
+
+def validate_codex_args(args: Any) -> None:
+    """``backend_options.args`` (create/update): refuse flags that would
+    bypass permission_mode, a field, or ``backend_options.config``'s checks."""
+    if args is None:
+        return
+    if not isinstance(args, list):
+        raise ValueError("backend_options.args must be a list of strings")
+    for token in args:
+        flag = _arg_flag(str(token))
+        if flag in _REFUSED_ARGS:
+            raise ValueError(f"backend_options.args may not contain {flag}: use {_REFUSED_ARGS[flag]} instead.")
+
+
+def _strip_sandbox_args(args: list[Any]) -> tuple[list[str], list[str]]:
+    """Spawn time, profile mode: drop stored sandbox-shaping flags (and their
+    values) and ``-c`` assignments of keys the profile owns."""
+    kept: list[str] = []
+    dropped: list[str] = []
+    tokens = [str(t) for t in args]
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        flag = _arg_flag(token)
+        takes_value = flag in _VALUE_FLAGS and token == flag
+        value = tokens[i + 1] if takes_value and i + 1 < len(tokens) else None
+        assignment = None
+        if flag in ("-c", "--config"):
+            if takes_value:
+                assignment = value
+            elif flag == "--config" and "=" in token:
+                assignment = token.split("=", 1)[1]   # --config=key=value
+            elif flag == "-c":
+                assignment = token[2:]                # -ckey=value
+        shaping = flag in _SANDBOX_SHAPING_ARGS or (
+            assignment is not None and (_managed_config_feature(assignment.split("=", 1)[0]) is not None))
+        if shaping:
+            dropped.append(" ".join([token] + ([value] if value is not None else [])))
+        else:
+            kept.append(token)
+            if value is not None:
+                kept.append(value)
+        i += 2 if takes_value else 1
+    return kept, dropped
+
 
 # The fixed note for sandboxed Codex pairs on Windows (point 5). It is part
 # of the thread's instructions, which Codex pins per thread and rebuilds only
@@ -708,7 +800,8 @@ SANDBOX_NOTE = (
     "before they run: use plain Remove-Item. The .git folder is write-protected, so leave git commits to the "
     "manager unless you can request escalation.\n"
     "- If network access is on, HTTPS works from Python and git but not from PowerShell (Invoke-WebRequest) or curl.exe.\n"
-    "- Never read or print credential files (Claude/Codex logins, API keys); the sandbox may block them."
+    "- Never read or print credential files (Claude/Codex logins, API keys); the sandbox may block them, so the "
+    "claude and codex CLIs can't log in from inside it."
 )
 
 
@@ -716,6 +809,14 @@ def _windows_sandbox() -> bool:
     """The v0.19 sandbox features apply on Windows only (POSIX workspace-write
     already scopes TMPDIR and /tmp; not probed there)."""
     return os.name == "nt"
+
+
+def _text_argv_ok(exe: str) -> bool:
+    """Free text (developer instructions) may go on argv only for a real
+    executable. A ``codex.cmd`` (the npm shim on PATH) runs through
+    cmd.exe, which re-parses the command line (``%VAR%``, ``&``, quotes) and
+    caps it at 8191 characters — instructions there go in the first message."""
+    return os.name != "nt" or str(exe).lower().endswith(".exe")
 
 
 def scratch_dir(pair_name: str, *, create: bool = True) -> Path:
@@ -754,8 +855,12 @@ def secret_read_denials() -> list[str]:
     it as a PERMANENT ``CodexSandboxUsers:(DENY)(R)`` ACE on the path, so the
     denial applies to every Codex sandbox on the machine from then on; the
     user (not a member) and the unsandboxed codex process are unaffected.
+    An atomic replace of the file drops the ACE until the next spawn that
+    carries the deny re-applies it, and a process already running in the
+    sandbox can read a file replaced under it (verified 2026-10-26).
     Files only, never a directory: a directory deny is inherited by
     everything below it (scratch folders, a pair working under ~/.claude).
+    Not exhaustive: other secrets readable by the sandbox group stay so.
     Existing files only (a missing path is harmless but noise).
     ``CLAUDE_PAIR_CODEX_DENY_READ`` (os.pathsep-separated; empty = none)
     replaces the list — the live harness points it at canaries."""
@@ -802,36 +907,46 @@ def _unsupported_marks() -> dict[str, str]:
         return {}
 
 
-def mark_profile_unsupported(exe_key: str, reason: str) -> None:
+def mark_profile_unsupported(exe_key: str, reason: str) -> bool:
     """The post-turn check saw a profile run that wasn't confined as asked:
-    every process stops using profiles for this binary (fail closed)."""
+    every process stops using profiles for this binary (fail closed).
+    Read-modify-write under a file lock (two processes can mark at once);
+    a failed write is logged and returned, the in-process answer is set
+    either way."""
+    from filelock import FileLock, Timeout
     _PROFILE_CACHE[exe_key] = False
-    marks = _unsupported_marks()
-    marks[exe_key] = f"{datetime.now().isoformat(timespec='seconds')}: {reason}"[:500]
     path = _unsupported_path()
     tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        tmp.write_text(json.dumps(marks, indent=1), encoding="utf-8")
-        os.replace(tmp, path)
-    except OSError:
+        with FileLock(str(path) + ".lock", timeout=10):
+            marks = _unsupported_marks()
+            marks[exe_key] = f"{datetime.now().isoformat(timespec='seconds')}: {reason}"[:500]
+            tmp.write_text(json.dumps(marks, indent=1), encoding="utf-8")
+            os.replace(tmp, path)
+        return True
+    except (OSError, Timeout) as exc:
         tmp.unlink(missing_ok=True)
+        logger.warning("could not record unsupported Codex permission profiles in %s: %s", path, exc)
+        return False
 
 
-def profile_support(exe: str) -> bool:
+def profile_support(exe: str, *, probe: bool = True) -> bool | None:
     """Does this binary take permission profiles (``default_permissions`` +
-    ``[permissions.<n>]``)? The keys come from an alpha build and the binary
-    is re-resolved per spawn, so it is checked per (exe, mtime, size).
+    ``[permissions.<n>]``) together with the re-added user config? The keys
+    come from an alpha build and the binary is re-resolved per spawn, so it
+    is checked per (exe, mtime, size). ``probe=False`` (pair_info) answers
+    from what is known and returns None instead of spawning.
 
     Fail closed: without ``--strict-config`` an unknown key is silently
     ignored and exec would run its default — workspace-write — at the
     read-only level (verified: an unknown -c key ran normally). With it,
-    exec rejects unknown keys and type errors before any model call; empty
-    stdin then stops it at "No prompt provided via stdin." (0.1 s), which
-    is the only answer that counts as support. A spawn failure or timeout
-    is not cached (the updater may be mid-swap)."""
+    exec rejects unknown top-level keys and type errors before any model
+    call; empty stdin then stops it at "No prompt provided via stdin."
+    (0.1 s), which is the only answer that counts as support. A spawn
+    failure or timeout is not cached (the updater may be mid-swap)."""
     key = _exe_key(exe)
     if key is None:
-        return False
+        return False if probe else None
     # Read on every call: another process's post-turn check may have marked
     # this binary since our own answer was cached.
     if key in _unsupported_marks():
@@ -839,19 +954,21 @@ def profile_support(exe: str) -> bool:
         return False
     if key in _PROFILE_CACHE:
         return _PROFILE_CACHE[key]
+    if not probe:
+        return None
     from claude_squared.registry import pairs_dir
     root = pairs_dir() / "scratch"
     q = _toml_literal
     try:
         root.mkdir(parents=True, exist_ok=True)
-        args = [exe, "exec", "--strict-config", "--ignore-user-config", "--skip-git-repo-check",
-                "-C", str(root),
+        args = ([exe, "exec", "--strict-config", "--ignore-user-config", "--skip-git-repo-check",
+                 "-C", str(root)] + config_readd_args() + [
                 "-c", f"default_permissions={q(PROFILE_NAME)}",
                 "-c", f"permissions.{PROFILE_NAME}.extends={q(':read-only')}",
                 "-c", f"permissions.{PROFILE_NAME}_ws.extends={q(':workspace')}",
                 "-c", f"permissions.{PROFILE_NAME}.filesystem="
                       f"{{{q(str(root))}={q('write')}, {q(str(root / 'deny-check'))}={q('deny')}}}",
-                "-c", f"permissions.{PROFILE_NAME}.network.enabled=false", "-"]
+                "-c", f"permissions.{PROFILE_NAME}.network.enabled=false", "-"])
         r = run_codex(args, stdin=subprocess.DEVNULL, capture_output=True, text=True,
                       encoding="utf-8", errors="replace", timeout=20, cwd=str(root))
     except Exception:
@@ -884,12 +1001,44 @@ def _git_env_conflict(backend_options: dict[str, Any]) -> bool:
     return inherit == "all" and any(k.upper() == "GIT_CONFIG_COUNT" for k in os.environ)
 
 
+def _workspace_write_settings(backend_options: dict[str, Any]) -> tuple[bool, list[str], list[str]]:
+    """``sandbox_workspace_write.network_access`` / ``writable_roots`` from
+    the user's config.toml (re-added) and a stored backend_options.config,
+    the latter winning. A permission profile IGNORES them (verified
+    2026-10-26: network stayed restricted and the root unwritable, while the
+    same keys with ``-s workspace-write`` applied both), so profile mode
+    carries them over itself. Returns (network, roots, where-from)."""
+    table: dict[str, Any] = {}
+    sources: list[str] = []
+    user = _load_user_config().get("sandbox_workspace_write")
+    if isinstance(user, dict) and (user.get("network_access") or user.get("writable_roots")):
+        table.update(user)
+        sources.append("config.toml")
+    stored: dict[str, Any] = {}
+    for k, v in ((backend_options or {}).get("config") or {}).items():
+        key = str(k).strip()
+        if key == "sandbox_workspace_write" and isinstance(v, dict):
+            stored.update(v)
+        elif key.startswith("sandbox_workspace_write."):
+            stored[key.split(".", 1)[1]] = v
+    if stored.get("network_access") is not None or stored.get("writable_roots"):
+        table.update({k: v for k, v in stored.items() if k in ("network_access", "writable_roots")})
+        sources.append("backend_options.config")
+    roots = table.get("writable_roots")
+    roots = [str(r) for r in roots] if isinstance(roots, list) else []
+    return table.get("network_access") is True, roots, sources
+
+
 @dataclass
 class SandboxPlan:
     """What one spawn's sandbox looks like. ``kind``: read-only | workspace |
     none (no sandbox). ``mode``: profile (permission profile) | legacy
     (``-s``/``--approve-for-me`` + scratch) | native (plain flags: POSIX, no
-    pair, or no sandbox)."""
+    pair, or no sandbox) | unchecked (pair_info before any spawn checked the
+    binary). ``config_args`` / ``extra_args`` are backend_options.config /
+    .args as this spawn passes them; ``spawn_notes`` go on the turn's
+    result; ``writes`` are the roots the recorded profile may write besides
+    the scratch folder."""
     args: list[str]
     kind: str
     mode: str
@@ -899,6 +1048,10 @@ class SandboxPlan:
     exe_key: str | None = None
     git_env: bool = False
     notes: list[str] = field(default_factory=list)
+    spawn_notes: list[str] = field(default_factory=list)
+    writes: tuple[str, ...] = ()
+    config_args: list[str] = field(default_factory=list)
+    extra_args: list[str] = field(default_factory=list)
 
 
 def _effective(level: str, backend_options: dict[str, Any] | None) -> tuple[str | None, str | None]:
@@ -920,9 +1073,24 @@ def sandbox_kind(level: str, backend_options: dict[str, Any] | None) -> str:
     return "read-only" if sandbox == "read-only" else "workspace"
 
 
+def _known_exe() -> str | None:
+    """The Codex binary without scanning (pair_info must not spawn)."""
+    env = os.environ.get("CLAUDE_PAIR_CODEX_PATH")
+    if env and Path(env).exists():
+        return env
+    for srv in (_load_user_config().get("mcp_servers") or {}).values():
+        envblk = (srv or {}).get("env") if isinstance(srv, dict) else None
+        cand = (envblk or {}).get("CODEX_CLI_PATH") if isinstance(envblk, dict) else None
+        if cand and os.path.isfile(str(cand)):
+            return str(cand)
+    cached = _EXE_CACHE.get("exe")
+    return cached if cached and os.path.isfile(cached) else None
+
+
 def sandbox_plan(level: str, backend_options: dict[str, Any] | None = None, *,
                  pair_name: str | None = None, exe: str | None = None,
-                 create: bool = True) -> SandboxPlan:
+                 create: bool = True, cwd: str | None = None,
+                 extra_dirs: list[str] | None = None, probe: bool = True) -> SandboxPlan:
     """The ONE place a spawn's sandbox is decided (R5), from the EFFECTIVE
     level — so a per-send override and the native sandbox/approval overrides
     follow automatically.
@@ -937,22 +1105,72 @@ def sandbox_plan(level: str, backend_options: dict[str, Any] | None = None, *,
     stays plain ``-s read-only`` (no scratch — ``--add-dir`` is ignored
     there), workspace adds ``--add-dir <scratch>`` +
     ``exclude_tmpdir_env_var`` (verified: GetTempPath follows TEMP, the
-    shared Temp becomes denied)."""
+    shared Temp becomes denied).
+
+    ``extra_dirs`` become ``--add-dir`` except at read-only, where they
+    were never writable (verified 2026-10-26 under the read-only profile
+    too); under the workspace profile ``--add-dir`` still makes them
+    writable (verified 2026-10-25). ``.git`` / ``.codex`` / ``.agents`` /
+    ``.aws`` inside a root stay write-protected under the profile as in
+    legacy mode (verified 2026-10-26), though the recorded profile no
+    longer lists them."""
     sandbox, approval = _effective(level, backend_options)
     bo = backend_options or {}
     kind = sandbox_kind(level, backend_options)
     network = bool(bo.get("network")) and kind == "workspace"
+    raw_config = dict(bo.get("config") or {})
+    raw_args = list(bo.get("args") or [])
+    extra = [str(d) for d in (extra_dirs or [])] if kind != "read-only" else []
+    add_dirs = [a for d in extra for a in ("--add-dir", d)]
+
+    def _cfg(items: dict[str, Any]) -> list[str]:
+        return [a for k, v in items.items() for a in ("-c", f"{k}={_toml_literal(v)}")]
+
     if approval == "bypass":
-        return SandboxPlan(["--dangerously-bypass-approvals-and-sandbox"], "none", "native")
+        return SandboxPlan(["--dangerously-bypass-approvals-and-sandbox"] + add_dirs, "none", "native",
+                           config_args=_cfg(raw_config), extra_args=[str(a) for a in raw_args])
     flags = ["--approve-for-me"] if approval == "approve-for-me" else (["-s", sandbox] if sandbox else [])
     net_legacy = ["-c", "sandbox_workspace_write.network_access=true"] if network else []
     if pair_name is None or kind == "none" or not _windows_sandbox():
-        return SandboxPlan(flags + net_legacy, kind, "native", network=network)
+        return SandboxPlan(flags + net_legacy + add_dirs, kind, "native", network=network,
+                           config_args=_cfg(raw_config), extra_args=[str(a) for a in raw_args])
     scratch = scratch_dir(pair_name, create=create)
+    exe = exe or (codex_executable() if probe else _known_exe())
+    key = _exe_key(exe) if exe else None
+    supported = profile_support(exe, probe=probe) if exe else (False if probe else None)
+    notes: list[str] = []
+    spawn_notes: list[str] = []
+    roots: list[str] = []
+    if supported:
+        # Settings a profile ignores are carried over, the rest dropped.
+        sww_net, sww_roots, sources = _workspace_write_settings(bo)
+        if kind == "workspace" and (sww_net or sww_roots):
+            network = network or sww_net
+            roots = [r for r in sww_roots if r not in extra]
+            notes.append(f"sandbox_workspace_write settings from {' and '.join(sources)} are applied through "
+                         f"the permission profile (network: {'on' if sww_net else 'unchanged'}"
+                         f"{', writable roots: ' + ', '.join(roots) if roots else ''})")
+        kept: dict[str, Any] = {}
+        for k, v in raw_config.items():
+            key_s = str(k).strip()
+            if key_s.startswith("sandbox_workspace_write") or _managed_config_feature(key_s):
+                spawn_notes.append(f"backend_options.config {key_s!r} was not passed: the sandbox permission "
+                                   f"profile decides it (remove it with pair_update(backend_options=…))")
+            else:
+                kept[k] = v
+        raw_config = kept
+        kept_args, dropped = _strip_sandbox_args(raw_args)
+        for d in dropped:
+            spawn_notes.append(f"backend_options.args {d!r} was not passed: it would override the sandbox "
+                               f"permission profile (remove it with pair_update(backend_options=…))")
+        raw_args = kept_args
+        if approval == "approve-for-me" and kind == "read-only":
+            spawn_notes.append("backend_options.approval='approve-for-me' is ignored at read-only; "
+                               "use permission_mode='auto' for reviewed escalations")
+            approval = None
     env: list[str] = []
     for var in _TEMP_VARS:
         env += _q_env(var, str(scratch))
-    notes: list[str] = []
     git_env = False
     if network:
         if _git_env_conflict(bo):
@@ -962,9 +1180,9 @@ def sandbox_plan(level: str, backend_options: dict[str, Any] | None = None, *,
             git_env = True
             for var, value in _GIT_HTTPS_ENV:
                 env += _q_env(var, value)
-    exe = exe or codex_executable()
-    key = _exe_key(exe)
-    if profile_support(exe):
+    if supported is None:
+        return SandboxPlan([], kind, "unchecked", scratch, (), network, key, git_env, notes)
+    if supported:
         deny = secret_read_denials()
         q = _toml_literal
         entries = ", ".join([f"{q(str(scratch))}={q('write')}"] + [f"{q(d)}={q('deny')}" for d in deny])
@@ -975,16 +1193,23 @@ def sandbox_plan(level: str, backend_options: dict[str, Any] | None = None, *,
         ]
         if network:
             args += ["-c", f"permissions.{PROFILE_NAME}.network.enabled=true"]
-        return SandboxPlan(args + env, kind, "profile", scratch, tuple(deny), network, key, git_env, notes)
+        args += env + add_dirs + [a for r in roots for a in ("--add-dir", r)]
+        writes = tuple(([cwd] if cwd and kind == "workspace" else []) + extra + roots)
+        return SandboxPlan(args, kind, "profile", scratch, tuple(deny), network, key, git_env, notes,
+                           spawn_notes, writes, _cfg(raw_config), [str(a) for a in raw_args])
     if kind == "read-only":
-        return SandboxPlan(flags, kind, "legacy", None, (), False, key, False, notes)
+        return SandboxPlan(flags, kind, "legacy", None, (), False, key, False, notes,
+                           config_args=_cfg(raw_config), extra_args=[str(a) for a in raw_args])
     args = flags + ["--add-dir", str(scratch), "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true"]
-    return SandboxPlan(args + env + net_legacy, kind, "legacy", scratch, (), network, key, git_env, notes)
+    return SandboxPlan(args + env + net_legacy + add_dirs, kind, "legacy", scratch, (), network, key, git_env,
+                       notes, config_args=_cfg(raw_config), extra_args=[str(a) for a in raw_args])
 
 
-def sandbox_notes(spec: PairSpec, *, python_check: bool = False) -> list[str]:
-    """One-line summaries of a Codex pair's sandbox for create / update /
-    info. Advisory: never raises."""
+def sandbox_notes(spec: PairSpec, *, python_check: bool = False, detail: bool = False,
+                  probe: bool = True) -> list[str]:
+    """One-line summaries of a Codex pair's sandbox for create (``detail``:
+    what the credential denial does to the machine) / update / info
+    (``probe=False``: no spawn, no directories). Advisory: never raises."""
     try:
         kind = sandbox_kind(spec.permission_mode, spec.backend_options)
         bo = spec.backend_options or {}
@@ -997,11 +1222,22 @@ def sandbox_notes(spec: PairSpec, *, python_check: bool = False) -> list[str]:
             if bo.get("network"):
                 notes.append("network on (sandbox_workspace_write.network_access)")
             return notes
-        plan = sandbox_plan(spec.permission_mode, bo, pair_name=spec.name, create=False)
-        denied = "credential files unreadable to sandboxed commands" if plan.deny else \
-            "no credential files to protect were found"
+        plan = sandbox_plan(spec.permission_mode, bo, pair_name=spec.name, create=False, cwd=spec.cwd,
+                            extra_dirs=spec.extra_dirs, probe=probe)
+        if plan.deny and detail:
+            denied = (f"{len(plan.deny)} credential file(s) unreadable to sandboxed commands — Codex enforces "
+                      f"this with a PERMANENT deny entry on each file for every Codex sandbox on this machine "
+                      f"(undo: icacls <file> /remove:d CodexSandboxUsers); a claude or codex CLI run inside the "
+                      f"sandbox can't log in")
+        elif plan.deny:
+            denied = "credential files unreadable to sandboxed commands"
+        else:
+            denied = "no credential files to protect were found"
         if plan.mode == "profile":
             notes.append(f"sandbox: {kind} permission profile; TEMP/TMP → {plan.scratch}; {denied}")
+        elif plan.mode == "unchecked":
+            notes.append(f"sandbox: {kind}; TEMP/TMP → {plan.scratch}; whether this Codex build takes "
+                         f"permission profiles is checked at the next spawn")
         elif kind == "read-only":
             notes.append("sandbox: plain read-only (this Codex build has no usable permission profiles): "
                          "nothing is writable, not even TEMP, and credential files stay readable to "
@@ -1013,7 +1249,10 @@ def sandbox_notes(spec: PairSpec, *, python_check: bool = False) -> list[str]:
             notes.append("network on — HTTPS works from Python and git"
                          + (" (http.sslBackend=openssl is set for git)" if plan.git_env else "")
                          + ", not from PowerShell (Invoke-WebRequest) or curl.exe (Schannel fails in the sandbox)")
+        elif bo.get("network") and kind == "read-only":
+            notes.append("network: off at read-only (backend_options.network applies at workspace/auto)")
         notes.extend(plan.notes)
+        notes.extend(plan.spawn_notes)
         if python_check:
             py = python_sandbox_note(spec.name)
             if py:
@@ -1058,18 +1297,24 @@ def python_sandbox_note(pair_name: str) -> str | None:
     except Exception:
         return None  # couldn't check (spawn failure / timeout) — try again next create
     out, err = r.stdout or "", (r.stderr or "").strip()
+    reason = err.splitlines()[-1][:200] if err else f"exit {r.returncode}"
     if r.returncode == 0 and "PYOK" in out:
         note = None
     elif r.returncode == 2 and ("Usage:" in err or "unexpected argument" in err):
         note = None  # this Codex build can't run the check
+    elif "\\windowsapps\\" in os.path.normcase(py):
+        note = (f"`python` on PATH ({py}) is the Microsoft Store app alias, which doesn't run inside the "
+                f"Codex sandbox ({reason}). Install Python from python.org (or put a real interpreter first "
+                f"on PATH) and, if it lives under your user folder, grant the sandbox group read+execute on "
+                f"it: icacls \"<python dir>\" /grant \"CodexSandboxUsers:(OI)(CI)RX\" /T — the user runs it. "
+                f"Only `python` on PATH was checked.")
     else:
         folder = os.path.dirname(os.path.realpath(py))
-        note = (f"`python` on PATH ({py}) does not run inside the Codex sandbox "
-                f"({err.splitlines()[-1][:200] if err else f'exit {r.returncode}'}). Sandboxed commands run as "
-                f"the CodexSandboxUsers group, which needs read+execute on the interpreter's folder. Fix (the "
-                f"user runs it): icacls \"{folder}\" /grant \"CodexSandboxUsers:(OI)(CI)RX\" /T (for a venv, "
-                f"the base install's folder) — or give the pair a Python inside its workspace. Only `python` "
-                f"on PATH was checked.")
+        note = (f"`python` on PATH ({py}) does not run inside the Codex sandbox ({reason}). Sandboxed "
+                f"commands run as the CodexSandboxUsers group, which needs read+execute on the interpreter's "
+                f"folder. Fix (the user runs it): icacls \"{folder}\" /grant \"CodexSandboxUsers:(OI)(CI)RX\" "
+                f"/T (for a venv, the base install's folder) — or give the pair a Python inside its workspace. "
+                f"Only `python` on PATH was checked.")
     _PY_CACHE[cache_key] = note
     return note
 
@@ -1097,24 +1342,39 @@ def _turn_contexts_since(rollout: Path | None, offset: int) -> list[dict[str, An
 
 
 def _norm_path(p: Any) -> str:
+    """Comparable form: ``\\\\?\\`` prefix dropped, junctions/symlinks
+    resolved (a home behind a junction must not read as a breach), case
+    folded on Windows."""
     s = str(p or "")
     if s.startswith("\\\\?\\"):
         s = s[4:]
-    return os.path.normcase(os.path.normpath(s)) if s else ""
+    if not s:
+        return ""
+    try:
+        s = os.path.realpath(s)
+    except (OSError, ValueError):
+        pass
+    return os.path.normcase(os.path.normpath(s))
+
+
+# Special roots the :workspace profile records as writable (verified
+# 2026-10-25: tmpdir resolves to the scratch TEMP; slash_tmp is /tmp).
+_WORKSPACE_SPECIAL_WRITES = (":tmpdir", ":slash_tmp")
 
 
 def profile_breach(turn_context: dict[str, Any], plan: SandboxPlan) -> tuple[str | None, str | None]:
     """Post-turn check of what Codex RECORDED for a profile run (the rollout's
     ``turn_context.permission_profile``, written per turn — verified to match
-    enforcement). Returns (breach, warning): a read-only profile with any
-    write besides the scratch folder, or network not restricted, is a breach
-    (fail closed); missing credential denials are a warning."""
+    enforcement). Returns (breach, warning). A breach (fail closed): any
+    write besides the scratch folder (read-only) or besides cwd, extra_dirs,
+    carried-over writable roots, the scratch folder and the :tmpdir /
+    :slash_tmp specials (workspace/auto); or network on although not asked
+    for. Missing credential denials, or network asked for but off, warn."""
     prof = turn_context.get("permission_profile")
     fs = prof.get("file_system") if isinstance(prof, dict) else None
     entries = fs.get("entries") if isinstance(fs, dict) else None
     if not isinstance(entries, list):
-        return ("no permission profile recorded for the turn" if plan.kind == "read-only" else None,
-                None if plan.kind == "read-only" else "no permission profile recorded for the turn")
+        return "no permission profile recorded for the turn", None
 
     def _path(e: dict) -> str:
         path = e.get("path") if isinstance(e, dict) else None
@@ -1122,19 +1382,25 @@ def profile_breach(turn_context: dict[str, Any], plan: SandboxPlan) -> tuple[str
             return _norm_path(path.get("path"))
         return f":{(path or {}).get('value', {}).get('kind', '?')}" if isinstance(path, dict) else "?"
 
+    allowed = {_norm_path(plan.scratch)}
+    if plan.kind == "workspace":
+        allowed |= {_norm_path(w) for w in plan.writes} | set(_WORKSPACE_SPECIAL_WRITES)
+    writes = [_path(e) for e in entries if isinstance(e, dict) and e.get("access") == "write"]
+    bad = [w for w in writes if w not in allowed]
+    network = prof.get("network")
     breach = None
-    if plan.kind == "read-only":
-        scratch = _norm_path(plan.scratch)
-        writes = [_path(e) for e in entries if isinstance(e, dict) and e.get("access") == "write"]
-        bad = [w for w in writes if w != scratch]
-        if bad or prof.get("network") != "restricted":
-            breach = (f"read-only profile not confined as asked (writable: {', '.join(bad) or 'none'}; "
-                      f"network: {prof.get('network')})")
+    if bad or (network != "restricted" and not plan.network):
+        breach = (f"{plan.kind} profile not confined as asked (unexpected writable: {', '.join(bad) or 'none'}; "
+                  f"network: {network})")
+    warnings = []
     denied = {_path(e) for e in entries if isinstance(e, dict) and e.get("access") == "deny"}
     missing = [d for d in plan.deny if _norm_path(d) not in denied]
-    warning = (f"credential read-denial was not in effect this turn ({len(missing)} file(s) missing from "
-               f"the recorded profile)") if missing else None
-    return breach, warning
+    if missing:
+        warnings.append(f"credential read-denial was not in effect this turn ({len(missing)} file(s) missing "
+                        f"from the recorded profile)")
+    if plan.network and network == "restricted":
+        warnings.append("network was asked for but Codex recorded it as off this turn")
+    return breach, "; ".join(warnings) or None
 
 
 def instructions_text(spec: PairSpec) -> str | None:
@@ -1770,7 +2036,13 @@ class CodexAdapter(PairAdapter):
         notes: list[str] = []
         if sys_text:
             extra = ["-c", f"developer_instructions={_toml_literal(sys_text)}"]
-            if _argv_chars(args + extra + ["-"]) <= ARGV_BUDGET:
+            if not _text_argv_ok(args[0]):
+                mode = "wrapper"
+                notes.append(f"the Codex binary is a script ({os.path.basename(args[0])}), which runs through "
+                             f"cmd.exe, so the instructions were delivered as the thread's first message "
+                             f"instead of on its command line (point CLAUDE_PAIR_CODEX_PATH at codex.exe to "
+                             f"get developer instructions)")
+            elif _argv_chars(args + extra + ["-"]) <= ARGV_BUDGET:
                 args += extra
             else:
                 mode = "wrapper"
@@ -1778,6 +2050,7 @@ class CodexAdapter(PairAdapter):
                              f"command line, so they were delivered as the thread's first message instead "
                              f"(a compaction may summarise them away; shorten the profile or "
                              f"system_prompt_append to get developer instructions)")
+            if mode == "wrapper":
                 prompt = (
                     "<operating instructions for this thread — follow them in every turn>\n"
                     f"{sys_text}\n</operating instructions>\n\n{prompt}"
@@ -1841,7 +2114,12 @@ class CodexAdapter(PairAdapter):
                 text = instructions_text(spec)
                 if text:
                     extra = ["-c", f"developer_instructions={_toml_literal(text)}"]
-                    if _argv_chars(args + extra + ["resume", spec.session_id, "-"]) <= ARGV_BUDGET:
+                    if not _text_argv_ok(args[0]):
+                        notes.append(f"the Codex binary is a script ({os.path.basename(args[0])}) that runs "
+                                     f"through cmd.exe, so the instructions were not re-sent on its command "
+                                     f"line; Codex drops them at the next compaction — point "
+                                     f"CLAUDE_PAIR_CODEX_PATH at codex.exe")
+                    elif _argv_chars(args + extra + ["resume", spec.session_id, "-"]) <= ARGV_BUDGET:
                         args += extra
                     else:
                         notes.append(f"the pair's instructions ({len(text):,} chars) no longer fit the Codex "
@@ -1872,21 +2150,28 @@ class CodexAdapter(PairAdapter):
             )
             result.notes.extend(notes)
             plan = plans[-1] if plans else None
+            if plan is not None:
+                result.notes.extend(plan.spawn_notes)
             if plan is not None and plan.mode == "profile":
                 # R1 belt: check what Codex RECORDED for this turn. Only this
                 # exec's turn_context lines count (an early failure leaves
                 # none, and an older turn's record proves nothing).
-                for tc in _turn_contexts_since(rollout, rollout_offset)[-1:]:
+                recorded = _turn_contexts_since(rollout, rollout_offset)[-1:]
+                for tc in recorded:
                     breach, warning = profile_breach(tc, plan)
                     if breach:
                         if plan.exe_key:
                             mark_profile_unsupported(plan.exe_key, breach)
                         result.notes.append(
                             f"⚠ SANDBOX: {breach}. claude-squared stops using permission profiles for this "
-                            f"Codex build — read-only pairs now run plain `-s read-only` (no scratch folder). "
-                            f"Check what this turn did (pair_log).")
+                            f"Codex build — pairs now run the plain sandbox flags (read-only: no scratch "
+                            f"folder; no credential read-denial). Check what this turn did (pair_log).")
                     if warning:
                         result.notes.append(f"⚠ SANDBOX: {warning}")
+                if not recorded and any(e.get("type") == "turn.completed" for e in events):
+                    result.notes.append("⚠ SANDBOX: Codex recorded no permission profile for this turn, so its "
+                                        "sandbox could not be verified")
+                    self._log_line(spec, "=== SANDBOX UNVERIFIED: no turn_context recorded for this turn ===")
             completed = any(e.get("type") == "turn.completed" for e in events)
             failed = any(e.get("type") == "turn.failed" for e in events)
             turn.status = "failed" if failed or (code not in (0, None) and not completed) else "done"
@@ -2179,6 +2464,12 @@ class CodexAdapter(PairAdapter):
             raise ValueError(
                 "backend_options.network needs a sandbox with network access: use "
                 "permission_mode='workspace' (or 'auto') with network, not a read-only level.")
+        if approval == "approve-for-me" and sandbox_kind(lvl, bo) == "read-only":
+            # Without a profile --approve-for-me implies workspace-write, so
+            # this spelling would quietly make a read-only pair writable.
+            raise ValueError(
+                "backend_options.approval='approve-for-me' contradicts a read-only level: use "
+                "permission_mode='auto' for reviewed escalations.")
         config = bo.get("config") or {}
         if not isinstance(config, dict):
             raise ValueError("backend_options.config must be an object of {toml key: value}")
@@ -2187,6 +2478,7 @@ class CodexAdapter(PairAdapter):
             if feature:
                 raise ValueError(f"backend_options.config can't set {str(raw).strip()!r}: claude-squared "
                                  f"manages it for {feature}.")
+        validate_codex_args(bo.get("args"))
 
     @staticmethod
     def permission_args(level: str, backend_options: dict[str, Any] | None = None, *,
@@ -2229,20 +2521,18 @@ class CodexAdapter(PairAdapter):
             limit = int(cw[1] * 0.9) if cw and cw[1] else CODEX_1M_CONFIG["model_auto_compact_token_limit"]
             args += ["-c", f"model_auto_compact_token_limit={limit}"]
         bo = spec.backend_options or {}
-        for k, v in (bo.get("config") or {}).items():
-            args += ["-c", f"{k}={_toml_literal(v)}"]
         level = permission_mode or spec.permission_mode
         CodexAdapter.validate_backend_options(level, bo, spawn=True)
-        # After backend_options.config: codex -c is last-wins, so the managed
-        # sandbox keys can't be overridden by a stored value.
-        plan = sandbox_plan(level, bo, pair_name=spec.name, exe=exe)
+        # The plan also filters backend_options.config / .args (profile mode
+        # drops what would override the profile) and places extra_dirs.
+        plan = sandbox_plan(level, bo, pair_name=spec.name, exe=exe, cwd=cwd, extra_dirs=spec.extra_dirs)
         if plan_out is not None:
             plan_out.append(plan)
+        # After backend_options.config: codex -c is last-wins, so the managed
+        # sandbox keys can't be overridden by a stored value.
+        args += plan.config_args
         args += plan.args
-        for d in spec.extra_dirs or []:
-            args += ["--add-dir", d]
-        for extra in bo.get("args") or []:
-            args.append(str(extra))
+        args += plan.extra_args
         return args
 
     # ---- subprocess + logging --------------------------------------------
@@ -2524,6 +2814,17 @@ class CodexAdapter(PairAdapter):
             codex_turns.append_log(events_path, receipt, output, offset)
 
     @staticmethod
+    def _log_line(spec: PairSpec, text: str) -> None:
+        """One line in the pair's main.log outside a turn's own logging."""
+        try:
+            log_dir = logs_dir() / spec.name
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with open(log_dir / "main.log", "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {text}\n")
+        except OSError:
+            pass
+
+    @staticmethod
     def _count_lines(p: Path) -> int:
         if not p.exists():
             return 0
@@ -2674,6 +2975,25 @@ class CodexAdapter(PairAdapter):
             tool = "apply_patch" if "patch" in line.lower() else "exec"
             denials.append(PermissionDenial(tool_name=tool,
                                             tool_input={"detail": line.strip()[:300]}))
+        # A policy refusal the pair recovered from in the same turn (plain
+        # Remove-Item after -Force was refused) is a note, not a handoff: a
+        # later successful command carries every non-flag word of the
+        # refused one.
+        succeeded = [self._item_preview(e["item"]) for e in events
+                     if e.get("type") == "item.completed"
+                     and (e.get("item") or {}).get("type") == "command_execution"
+                     and e["item"].get("exit_code") == 0 and e["item"].get("status") == "completed"]
+        kept: list[PermissionDenial] = []
+        for d in denials:
+            cmd = (d.tool_input or {}).get("command") if d.tool_name == "policy-blocked" else None
+            words = [w.strip("'\"").lower() for w in str(cmd or "").split() if not w.startswith("-")]
+            ran = next((c for c in succeeded if words and all(w in c.lower() for w in words)), None)
+            if ran:
+                notes.append(f"Codex refused `{cmd}` before running it (approval policy never); the pair then "
+                             f"ran `{ran}` instead")
+            else:
+                kept.append(d)
+        denials = kept
         # A shell command that the SANDBOX blocked fails with an OS
         # permission error in its own output (no router-level "rejected"
         # line): "Access to the path '…' is denied" (PowerShell), "Permission

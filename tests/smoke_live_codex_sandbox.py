@@ -1,5 +1,5 @@
 """Live check: v0.19 Codex sandbox ergonomics on Windows (costs a little
-Codex usage — about ten short turns plus one compaction on gpt-5.6-luna, low).
+Codex usage — about twelve short turns plus one compaction on gpt-5.6-luna, low).
 
     python tests/smoke_live_codex_sandbox.py [--root DIR] [--model gpt-5.6-luna]
 
@@ -18,8 +18,11 @@ given):
   over https;
 - developer instructions: a code word survives resume, ``pair_compact`` and
   ``pair_clear``;
+- extra_dirs writable at workspace, not at read-only; network off at
+  workspace without ``backend_options.network``;
 - read-only pair: scratch writable, cwd not, PowerShell not in
   ConstrainedLanguage, no post-turn sandbox warning;
+- auto pair and a fork of it: each on the profile with its own scratch;
 - the create-time Python check; ``pair_forget`` removes the scratch folder.
 
 Real Codex home with --ignore-user-config; deletes the threads it created and
@@ -59,7 +62,10 @@ FS_COMMAND = (
     "try { Set-Content -Path '__SHARED__' -Value x -ErrorAction Stop; 'SHARED_TEMP_WRITE=OK' } "
     "catch { \"SHARED_TEMP_WRITE=FAIL $($_.Exception.Message)\" }; "
     "try { 'CANARY=' + (Get-Content '__CANARY__' -ErrorAction Stop) } catch { 'CANARY=DENIED' }; "
-    "try { 'PLAIN=' + (Get-Content '__PLAIN__' -ErrorAction Stop) } catch { 'PLAIN=DENIED' }"
+    "try { 'PLAIN=' + (Get-Content '__PLAIN__' -ErrorAction Stop) } catch { 'PLAIN=DENIED' }; "
+    "try { Set-Content -Path '__EXTRA__' -Value x -ErrorAction Stop; 'EXTRA_WRITE=OK' } "
+    "catch { \"EXTRA_WRITE=FAIL $($_.Exception.Message)\" }; "
+    "python net_probe.py"
 )
 
 
@@ -93,6 +99,8 @@ def main() -> int:
         "import urllib.request\n"
         "try:\n    print('HTTP', urllib.request.urlopen('https://example.com', timeout=20).status)\n"
         "except Exception as e:\n    print('NET FAIL', type(e).__name__, e)\n", encoding="utf-8")
+    sibling = root / "sibling"
+    sibling.mkdir()
     vault = root / "vault"
     vault.mkdir()
     canary_text = f"CANARY-SECRET-{secrets.token_hex(4)}"
@@ -140,7 +148,8 @@ def main() -> int:
     try:
         print("\n== workspace pair ==", flush=True)
         report = tool(S.pair_create)("sbx-ws", backend="codex", model=args.model, effort="low",
-                                     permission_mode="workspace", cwd=str(ws), system_prompt_append=append)
+                                     permission_mode="workspace", cwd=str(ws), system_prompt_append=append,
+                                     extra_dirs=[str(sibling)])
         print(report, flush=True)
         spec = R.get_pair("sbx-ws")
         threads.append(spec.session_id)
@@ -154,7 +163,7 @@ def main() -> int:
         check("scratch folder created under CLAUDE_HOME", scratch.is_dir(), str(scratch))
 
         cmd = (FS_COMMAND.replace("__SHARED__", str(shared)).replace("__CANARY__", str(vault / "auth.json"))
-               .replace("__PLAIN__", str(vault / "plain.txt")))
+               .replace("__PLAIN__", str(vault / "plain.txt")).replace("__EXTRA__", str(sibling / "x.txt")))
         tid, result = send("sbx-ws", exact(cmd))
         out = outputs("sbx-ws", tid)
         print(out, flush=True)
@@ -165,6 +174,9 @@ def main() -> int:
         if profile:
             check("workspace: canary credential unreadable", "CANARY=DENIED" in out and canary_text not in out, out)
         check("workspace: plain file readable", "PLAIN=PLAIN-OK" in out, out)
+        check("workspace: extra_dirs writable", "EXTRA_WRITE=OK" in out, out)
+        check("workspace: network off without backend_options.network", "NET FAIL" in out and "HTTP 200" not in out,
+              out)
         check("workspace: no post-turn sandbox warning", not any("SANDBOX" in n for n in result.notes),
               str(result.notes))
 
@@ -202,7 +214,7 @@ def main() -> int:
 
         print("\n== read-only pair ==", flush=True)
         report = tool(S.pair_create)("sbx-ro", backend="codex", model=args.model, effort="low",
-                                     permission_mode="read-only", cwd=str(ws))
+                                     permission_mode="read-only", cwd=str(ws), extra_dirs=[str(sibling)])
         print(report, flush=True)
         threads.append(R.get_pair("sbx-ro").session_id)
         ro_scratch = CX.scratch_dir("sbx-ro", create=False)
@@ -215,11 +227,43 @@ def main() -> int:
             check("read-only: FullLanguage PowerShell", "LANG=FullLanguage" in out, out)
             check("read-only: canary credential unreadable", "CANARY=DENIED" in out and canary_text not in out, out)
         check("read-only: cwd not writable", "CWD_WRITE=FAIL" in out, out)
+        check("read-only: extra_dirs not writable", "EXTRA_WRITE=FAIL" in out, out)
         check("read-only: no post-turn sandbox warning", not any("SANDBOX" in n for n in result.notes),
               str(result.notes))
 
+        print("\n== auto pair + fork ==", flush=True)
+        report = tool(S.pair_create)("sbx-auto", backend="codex", model=args.model, effort="low",
+                                     permission_mode="auto", cwd=str(ws))
+        print(report, flush=True)
+        threads.append(R.get_pair("sbx-auto").session_id)
+        auto_scratch = CX.scratch_dir("sbx-auto", create=False)
+        tid, result = send("sbx-auto", exact(cmd))
+        out = outputs("sbx-auto", tid)
+        print(out, flush=True)
+        check("auto: TEMP is the scratch folder", f"TEMP={auto_scratch}" in out, out)
+        check("auto: cwd writable, shared Temp not",
+              "CWD_WRITE=OK" in out and "SHARED_TEMP_WRITE=FAIL" in out, out)
+        if profile:
+            check("auto: canary credential unreadable", "CANARY=DENIED" in out and canary_text not in out, out)
+        check("auto: no post-turn sandbox warning", not any("SANDBOX" in n for n in result.notes), str(result.notes))
+        forked = tool(S.pair_fork)("sbx-auto", new_name="sbx-fork")
+        print(forked, flush=True)
+        fork = R.get_pair("sbx-fork")
+        threads.append(fork.session_id)
+        check("fork keeps developer-instructions mode", (fork.codex_instructions or {}).get("mode") == "developer",
+              str(fork.codex_instructions))
+        fork_scratch = CX.scratch_dir("sbx-fork", create=False)
+        tid, result = send("sbx-fork", exact(cmd))
+        out = outputs("sbx-fork", tid)
+        print(out, flush=True)
+        check("fork: TEMP is the fork's own scratch folder", f"TEMP={fork_scratch}" in out, out)
+        if profile:
+            check("fork: canary credential unreadable", "CANARY=DENIED" in out and canary_text not in out, out)
+        check("fork: no post-turn sandbox warning", not any("SANDBOX" in n for n in result.notes), str(result.notes))
+
         print("\n== forget ==", flush=True)
-        for name, path in (("sbx-ws", scratch), ("sbx-ro", ro_scratch)):
+        for name, path in (("sbx-ws", scratch), ("sbx-ro", ro_scratch), ("sbx-auto", auto_scratch),
+                           ("sbx-fork", fork_scratch)):
             out = tool(S.pair_forget)(name, archive=False)
             check(f"pair_forget removed {name}'s scratch", not path.exists(), out)
     finally:

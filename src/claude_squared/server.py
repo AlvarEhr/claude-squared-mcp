@@ -1137,7 +1137,7 @@ def pair_create(
     if be == "codex":
         # v0.19: scratch / profile / network, plus the Python-in-sandbox check
         # (Windows; advisory, cached per binary + interpreter).
-        transparency_msgs.extend(codex_adapter_mod.sandbox_notes(spec, python_check=True))
+        transparency_msgs.extend(codex_adapter_mod.sandbox_notes(spec, python_check=True, detail=True))
     # Echo the RESOLVED values (not what the caller passed) so the agent always
     # sees what got applied — defaults filled in, match-parent expanded, effort
     # coerced. Followed by any transparency messages (one per line of context).
@@ -3238,7 +3238,7 @@ def pair_info(name: str, verbose: bool = False) -> str:
     else:
         # v0.19: the sandbox (scratch / profile / network) and how this
         # thread got its instructions.
-        for _n in codex_adapter_mod.sandbox_notes(spec):
+        for _n in codex_adapter_mod.sandbox_notes(spec, probe=False):
             bo += f"\n  {_n}"
         _rec = spec.codex_instructions or {}
         if _rec.get("mode") == "developer":
@@ -3515,8 +3515,11 @@ def pair_update(
                 _bo = fields.get("backend_options", cur_spec.backend_options)
                 _lvl = fields.get("permission_mode", cur_spec.permission_mode)
                 if _bo:
+                    # v0.19: only an INCOMING value gets the full check — a
+                    # stored pre-0.19 value must not stop, say, an effort
+                    # change; the stored one is held to what the CLI refuses.
                     try:
-                        CodexAdapter.validate_backend_options(_lvl, _bo)
+                        CodexAdapter.validate_backend_options(_lvl, _bo, spawn="backend_options" not in fields)
                     except ValueError as e:
                         raise PairError(str(e))
                 if ultracode:
@@ -5344,10 +5347,15 @@ def pair_stop(
                 # v0.13.0 (historian F1): use the id the backend reports.
                 new_sid = str(uuid.uuid4()) if cur_spec.backend == "claude" else "pending-hard-stop"
                 new_spec = cur_spec.model_copy(update={"session_id": new_sid, "turn_count": 0})
-                new_sid = adapter.create(new_spec).session_id
+                created = adapter.create(new_spec)
+                new_sid = created.session_id
+                # v0.19: a new Codex thread records its instructions mode,
+                # exactly like pair_clear.
+                _rotated = ({"codex_instructions": created.instructions}
+                            if created.instructions is not None else {})
                 reg_mod.update_pair(
                     name, session_id=new_sid, turn_count=0, total_cost_usd=0.0,
-                    last_active_at=datetime.utcnow(),
+                    last_active_at=datetime.utcnow(), **_rotated,
                 )
                 actions.append(f"rotated session: {_short(cur_spec.session_id)} → {_short(new_sid)} (hard reset)")
         except FileLockTimeout:

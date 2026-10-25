@@ -25,19 +25,27 @@ a compaction during that turn drops them until the next 0.19 compaction.
   writable root at `workspace`/`auto`, and nothing was writable at
   `read-only`). Kept across `pair_clear`/`pair_rewind`, removed by
   `pair_forget` (a leftover is reported).
-- **Read-only Codex pairs run on a permission profile** (`:read-only` + the
-  scratch folder) when the binary supports profiles — checked once per
-  binary with `codex exec --strict-config` and no model call. Otherwise, or
-  if a turn's recorded profile turns out less confined than asked, they run
-  plain `-s read-only` (fail closed; the binary is marked in
-  `~/.claude/pairs/codex_profile_unsupported.json`).
+- **Codex pairs run on a permission profile (Windows)** — `:read-only` or
+  `:workspace` plus the scratch folder — when the binary supports profiles,
+  checked once per binary with `codex exec --strict-config` and no model call.
+  After every turn the profile Codex recorded is checked; one that is less
+  confined than asked (an unexpected writable root, network on) marks the
+  binary in `~/.claude/pairs/codex_profile_unsupported.json` and every later
+  turn runs the plain flags (read-only: `-s read-only`, no scratch folder).
 - **Credential read-denial (Codex, Windows).** On a profile-capable build every
   sandboxed level denies sandboxed commands reads of
   `~/.claude/.credentials.json`, `~/.claude/pairs/api_key`,
   `~/.codex/auth.json` and `~/.claude.json`, which the sandbox user could read
-  before. Codex enforces this with a permanent deny entry on each file for
-  the `CodexSandboxUsers` group; `CLAUDE_PAIR_CODEX_DENY_READ` replaces the
-  list.
+  before (a partial list: other secrets the sandbox group can read stay
+  readable). **This changes ACLs on those files, existing pairs included,
+  without asking:** Codex enforces the denial with a permanent
+  `CodexSandboxUsers:(DENY)(R)` entry on each file, which stays after the pair
+  is gone and applies to every Codex sandbox on the machine — so a `claude` or
+  `codex` CLI started inside a Codex sandbox can no longer log in. You and the
+  unsandboxed codex process are unaffected. Undo per file:
+  `icacls <file> /remove:d CodexSandboxUsers`. A program that replaces the file
+  atomically drops the entry until the next pair turn re-applies it.
+  `CLAUDE_PAIR_CODEX_DENY_READ` replaces the list (empty: none).
 - **`backend_options={"network": true}`** for Codex pairs: network inside the
   `workspace`/`auto` sandbox, with git's HTTPS fixed for the sandbox
   (`http.sslBackend=openssl` via `GIT_CONFIG_*`, skipped with a note when you
@@ -60,10 +68,28 @@ a compaction during that turn drops them until the next 0.19 compaction.
   settings and silently dropped them otherwise. Older, adopted and handed-off
   threads keep the first-message form until `pair_clear`; instructions over
   ~28K command-line characters fall back to it, with a note.
-- `backend_options.config` refuses the keys the new features manage
-  (`default_permissions`, `permissions.*`, `sandbox_workspace_write.*`,
-  `developer_instructions`, `TEMP`/`TMP`/`TMPDIR`, whole-table
-  `shell_environment_policy`).
+- `backend_options.config` refuses, on Windows, the keys the new features
+  manage (`default_permissions`, `permissions.*`, `sandbox_workspace_write.*`,
+  `TEMP`/`TMP`/`TMPDIR`, whole-table `shell_environment_policy`) and the ones that
+  would reshape the sandbox around `permission_mode` (`sandbox_mode`,
+  `approval_policy`, `approvals_reviewer`, `sandbox_permissions`, `profile(s)`);
+  `developer_instructions` on every platform. `backend_options.args` refuses
+  `-s`/`--sandbox`, `--approve-for-me`, `--dangerously-bypass-approvals-and-sandbox`,
+  `-p`/`--profile`, `-c`/`--config`, `--add-dir`, `-m` and `-C`, and
+  `backend_options.approval='approve-for-me'` is refused at a read-only level.
+  Only a NEW value is checked: a stored one keeps working, and in profile mode
+  whatever would override the profile is left out of the spawn with a note.
+- A permission profile ignores `sandbox_workspace_write.network_access` /
+  `writable_roots` (from config.toml or a stored value); profile mode carries
+  them over itself.
+- `extra_dirs` are no longer passed at read-only (they were never writable
+  there).
+- A Codex binary that is a script (`codex.cmd`) never gets the instructions on
+  its command line (cmd.exe would re-parse them); they go in the first message.
+- **Claude:** changing `system_prompt_append` / `profile_name` no longer
+  restarts a warm runtime (or refuses while background work runs): the CLI keeps
+  a session's first appended system prompt, so the change applies at
+  `pair_clear` either way.
 
 ### Fixed
 

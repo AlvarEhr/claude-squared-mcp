@@ -224,6 +224,79 @@ class ProfileArgvTests(SandboxCase):
         if os.name == "nt":
             self.assertIn("\\U", scratch)
 
+    def test_extra_dirs_are_writable_roots_except_at_read_only(self):
+        extra = str(self.directory / "sibling")
+        ro = self.args(self.spec(permission_mode="read-only", extra_dirs=[extra]))
+        self.assertNotIn("--add-dir", ro)  # never writable there (verified under the profile too)
+        for level in ("workspace", "auto"):
+            argv = self.args(self.spec(permission_mode=level, extra_dirs=[extra]))
+            self.assertTrue(contains_run(argv, ["--add-dir", extra]), level)
+
+    def test_stored_sandbox_shaping_config_is_dropped_in_profile_mode(self):
+        spec = self.spec(permission_mode="read-only", backend_options={"config": {
+            "sandbox_mode": "danger-full-access", "approval_policy": "on-request", "model_verbosity": "low"}})
+        plans = []
+        argv = CX.CodexAdapter()._exec_args(spec, model=None, effort=None, permission_mode=None, plan_out=plans)
+        cfg = config_values(argv)
+        self.assertNotIn("sandbox_mode", cfg)
+        self.assertNotIn("approval_policy", cfg)
+        self.assertEqual(cfg["model_verbosity"], "low")
+        self.assertEqual(len(plans[0].spawn_notes), 2)
+        for key in ("sandbox_mode", "approval_policy", "sandbox_permissions", "profile", "profiles.x.model"):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "permission_mode"):
+                CX.CodexAdapter.validate_backend_options("workspace", {"config": {key: "x"}})
+
+    def test_args_that_bypass_the_sandbox_are_refused_and_stripped(self):
+        for args in (["-s", "workspace-write"], ["--sandbox=danger-full-access"], ["--approve-for-me"],
+                     ["--dangerously-bypass-approvals-and-sandbox"], ["-p", "x"], ["--profile", "x"],
+                     ["-c", "model_verbosity=low"], ["-cmodel_verbosity=low"], ["--config=a=b"],
+                     ["--add-dir", "x"], ["-m", "x"], ["-C", "x"]):
+            with self.subTest(args=args), self.assertRaisesRegex(ValueError, "may not contain"):
+                CX.CodexAdapter.validate_backend_options("workspace", {"args": args})
+        CX.CodexAdapter.validate_backend_options("workspace", {"args": ["--enable", "multi_agent_v2"]})
+        stored = ["-s", "danger-full-access", "--enable", "x", "-c", "sandbox_mode=\"danger-full-access\"",
+                  "-c", "model_verbosity=\"low\"", "--profile", "p"]
+        plans = []
+        argv = CX.CodexAdapter()._exec_args(self.spec(backend_options={"args": stored}), model=None, effort=None,
+                                            permission_mode=None, plan_out=plans)
+        self.assertNotIn("danger-full-access", argv)
+        self.assertNotIn("--profile", argv)
+        self.assertTrue(contains_run(argv, ["--enable", "x"]))
+        self.assertTrue(contains_run(argv, ["-c", "model_verbosity=\"low\""]))
+        self.assertEqual(len(plans[0].spawn_notes), 3)
+
+    def test_approve_for_me_at_read_only_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "contradicts a read-only level"):
+            CX.CodexAdapter.validate_backend_options("read-only", {"approval": "approve-for-me"})
+        plans = []
+        argv = CX.CodexAdapter()._exec_args(self.spec(permission_mode="read-only",
+                                                      backend_options={"approval": "approve-for-me"}),
+                                            model=None, effort=None, permission_mode=None, plan_out=plans)
+        self.assertNotIn("--approve-for-me", argv)  # a stored one is dropped in profile mode
+        self.assertTrue(plans[0].spawn_notes)
+
+    def test_workspace_write_settings_are_carried_into_the_profile(self):
+        root = str(self.directory / "user-root")
+        user = {"sandbox_workspace_write": {"network_access": True, "writable_roots": [root]}}
+        with patch.object(CX, "_load_user_config", return_value=user):
+            plan = CX.sandbox_plan("workspace", {}, pair_name="p", cwd=str(self.directory))
+            ro = CX.sandbox_plan("read-only", {}, pair_name="p")
+        self.assertTrue(plan.network)
+        self.assertIs(config_values(plan.args)[f"permissions.{CX.PROFILE_NAME}.network.enabled"], True)
+        self.assertTrue(contains_run(plan.args, ["--add-dir", root]))
+        self.assertIn(root, plan.writes)
+        self.assertTrue(any("config.toml" in n for n in plan.notes))
+        self.assertFalse(ro.network)
+        self.assertNotIn("--add-dir", ro.args)
+        stored = {"config": {"sandbox_workspace_write.network_access": True}}
+        self.assertTrue(CX.sandbox_plan("workspace", stored, pair_name="p").network)
+
+    def test_del_and_c0_controls_are_escaped(self):
+        text = "bell\x07 del\x7f end"
+        literal = CX._toml_literal(text)
+        self.assertNotIn("\x7f", literal)
+        self.assertEqual(tomllib.loads(f"v = {literal}")["v"], text)
+
     def test_astral_characters_stay_valid_toml(self):
         # json.dumps' default \\ud83d\\ude00 surrogates are invalid TOML.
         text = "Ship it 🚀 — naïve café"
@@ -331,6 +404,20 @@ class CapabilityTests(SandboxCase):
         run.assert_not_called()
         self.assertIn(key, json.loads(CX._unsupported_path().read_text(encoding="utf-8")))
 
+    def test_the_check_includes_the_re_added_user_config(self):
+        with patch.object(CX, "config_readd_args", return_value=["-c", 'web_search="live"']), \
+                patch.object(CX, "run_codex", return_value=self.completed("No prompt provided via stdin.")) as run:
+            CX.profile_support(str(self.exe))
+        self.assertTrue(contains_run(run.call_args.args[0], ["-c", 'web_search="live"']))
+
+    def test_a_failed_marker_write_is_logged_not_swallowed(self):
+        key = CX._exe_key(str(self.exe))
+        with patch.object(CX.os, "replace", side_effect=OSError("disk full")), \
+                self.assertLogs(CX.logger, level="WARNING") as logs:
+            self.assertFalse(CX.mark_profile_unsupported(key, "breach"))
+        self.assertIn("disk full", "\n".join(logs.output))
+        self.assertIs(CX._PROFILE_CACHE[key], False)  # this process still fails closed
+
     def test_a_mark_from_another_process_beats_a_cached_yes(self):
         with patch.object(CX, "run_codex", return_value=self.completed("No prompt provided via stdin.")):
             self.assertTrue(CX.profile_support(str(self.exe)))
@@ -369,10 +456,56 @@ class BeltTests(SandboxCase):
         self.assertIn("no permission profile", breach)
 
     def test_missing_denials_only_warn(self):
-        plan = self.plan("workspace")
+        plan = CX.sandbox_plan("workspace", {}, pair_name="p", cwd=str(self.directory))
         breach, warning = CX.profile_breach(_turn_context(plan.scratch, extra_writes=[self.directory]), plan)
         self.assertIsNone(breach)
         self.assertIn("read-denial", warning)
+
+    def test_workspace_writes_are_checked_too(self):
+        extra = self.directory / "extra"
+        plan = CX.sandbox_plan("workspace", {}, pair_name="p", cwd=str(self.directory), extra_dirs=[str(extra)])
+        ok = _turn_context(plan.scratch, extra_writes=[self.directory, extra], deny=plan.deny)
+        ok["permission_profile"]["file_system"]["entries"] += [
+            {"path": {"type": "special", "value": {"kind": k}}, "access": "write"} for k in ("tmpdir", "slash_tmp")]
+        self.assertEqual(CX.profile_breach(ok, plan), (None, None))
+        breach, _ = CX.profile_breach(_turn_context(plan.scratch, extra_writes=[self.directory, self.secret.parent],
+                                                    deny=plan.deny), plan)
+        self.assertIn("not confined", breach)
+        breach, _ = CX.profile_breach(_turn_context(plan.scratch, extra_writes=[self.directory], deny=plan.deny,
+                                                    network="enabled"), plan)
+        self.assertIn("network", breach)
+        net = CX.sandbox_plan("workspace", {"network": True}, pair_name="p", cwd=str(self.directory))
+        self.assertIsNone(CX.profile_breach(_turn_context(net.scratch, extra_writes=[self.directory],
+                                                          deny=net.deny, network="enabled"), net)[0])
+        _, warning = CX.profile_breach(_turn_context(net.scratch, extra_writes=[self.directory], deny=net.deny), net)
+        self.assertIn("network was asked for", warning)
+
+    def test_a_junctioned_path_is_not_a_breach(self):
+        real = self.directory / "real-home"
+        real.mkdir()
+        link = self.directory / "linked-home"
+        if os.name == "nt":
+            import _winapi
+            _winapi.CreateJunction(str(real), str(link))
+        else:
+            os.symlink(real, link, target_is_directory=True)
+        self.addCleanup(lambda: os.rmdir(link) if os.name == "nt" else os.unlink(link))
+        with patch.dict(os.environ, {"CLAUDE_HOME": str(link)}):
+            plan = CX.sandbox_plan("read-only", {}, pair_name="p")
+        recorded = _turn_context(real / "pairs" / "scratch" / "p", deny=plan.deny)
+        self.assertEqual(CX.profile_breach(recorded, plan), (None, None))
+
+    def test_a_completed_turn_without_a_record_is_flagged(self):
+        spec = self.spec(permission_mode="read-only")
+        rollout = self.directory / "rollout.jsonl"
+        rollout.write_text("", encoding="utf-8")
+        with patch.object(CX.CodexAdapter, "session_exists", return_value=True), \
+                patch.object(CX.CodexAdapter, "transcript_path", return_value=rollout), \
+                patch.object(CX.CodexAdapter, "_run", return_value=([{"type": "turn.completed", "usage": {}}], "", 0, 5)):
+            result = CX.CodexAdapter().send(spec, "hi")
+        self.assertTrue(any("could not be verified" in n for n in result.notes), result.notes)
+        self.assertIn("SANDBOX UNVERIFIED", (R.logs_dir() / "p" / "main.log").read_text(encoding="utf-8"))
+        self.assertEqual(CX._unsupported_marks(), {})
 
     def test_send_marks_the_binary_after_a_breach(self):
         spec = self.spec(permission_mode="read-only")
@@ -511,6 +644,28 @@ class InstructionTests(SandboxCase):
         self.assertEqual(result.instructions, CX.instructions_record("developer", CX.instructions_text(
             self.spec(system_prompt_append="Be terse."))))
 
+    def test_a_script_binary_never_gets_text_on_its_command_line(self):
+        # codex.cmd runs through cmd.exe: no free text on argv.
+        cmd = self.directory / "bin" / "codex.cmd"
+        cmd.write_text("@echo off", encoding="utf-8")
+        with patch.object(CX.os, "name", "nt"):
+            self.assertFalse(CX._text_argv_ok(str(cmd)))
+            self.assertTrue(CX._text_argv_ok(str(self.exe)))
+        # os.name itself stays untouched for the spawn path below.
+        calls, run = self.capture_run()
+        with patch.object(CX, "codex_executable", return_value=str(cmd)), \
+                patch.object(CX, "_text_argv_ok", side_effect=lambda exe: not str(exe).endswith(".cmd")), run:
+            result = CX.CodexAdapter().create(self.spec(system_prompt_append="Be terse."))
+            argv, stdin = calls[0]
+            self.assertFalse(any(a.startswith("developer_instructions=") for a in argv))
+            self.assertIn("Be terse.", stdin)
+            self.assertEqual(result.instructions["mode"], "wrapper")
+            self.assertTrue(any("cmd.exe" in n for n in result.notes))
+            argv, result = self.send_args(self.spec(system_prompt_append="Be terse.",
+                                                    codex_instructions=CX.instructions_record("developer", "x")))
+            self.assertFalse(any(a.startswith("developer_instructions=") for a in argv))
+            self.assertTrue(any("cmd.exe" in n for n in result.notes))
+
     def test_over_budget_falls_back_to_the_wrapper(self):
         calls, run = self.capture_run()
         long = "x" * (CX.ARGV_BUDGET + 10)
@@ -612,6 +767,23 @@ class PolicyRefusalTests(SandboxCase):
         self.assertEqual(result.permission_denials[0].tool_input["command"], "Remove-Item -Force victim.txt")
         self.assertIsNone(result.safety_signal)  # the turn itself did not fail
 
+    def test_a_refusal_the_pair_recovered_from_is_a_note(self):
+        recovered = {"type": "item.completed", "item": {
+            "id": "i1", "type": "command_execution", "command": "Remove-Item victim.txt",
+            "exit_code": 0, "status": "completed", "aggregated_output": ""}}
+        result = CX.CodexAdapter()._build_send_result(
+            self.spec(), [recovered, {"type": "turn.completed", "usage": {}}], BLOCKED_LINE, 0, 5, 0.0,
+            model_used="gpt-5.6-sol", permission_level="workspace")
+        self.assertEqual(result.permission_denials, [])
+        self.assertTrue(any("then ran `Remove-Item victim.txt`" in n for n in result.notes), result.notes)
+        unrelated = {"type": "item.completed", "item": {
+            "id": "i2", "type": "command_execution", "command": "Get-ChildItem", "exit_code": 0,
+            "status": "completed"}}
+        result = CX.CodexAdapter()._build_send_result(
+            self.spec(), [unrelated, {"type": "turn.completed", "usage": {}}], BLOCKED_LINE, 0, 5, 0.0,
+            model_used="gpt-5.6-sol", permission_level="workspace")
+        self.assertEqual([d.tool_name for d in result.permission_denials], ["policy-blocked"])
+
     def test_handoff_text_says_it_never_ran(self):
         R.add_pair(self.spec())
         result = CX.CodexAdapter()._build_send_result(
@@ -663,6 +835,18 @@ class PythonCheckTests(SandboxCase):
         self.assertEqual(CX._PY_CACHE, {})
 
 
+class StoreAliasPythonTests(SandboxCase):
+
+    def test_store_alias_gets_its_own_fix(self):
+        alias = "C:\\Users\\x\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe"
+        denied = subprocess.CompletedProcess([], 1, stdout="", stderr="CreateProcessAsUserW failed: 5")
+        with patch.object(CX.shutil, "which", return_value=alias), \
+                patch.object(CX, "run_codex", return_value=denied):
+            note = CX.python_sandbox_note("p")
+        self.assertIn("Microsoft Store app alias", note)
+        self.assertIn("python.org", note)
+
+
 class PosixPythonCheckTests(SandboxCase):
     windows = False
 
@@ -711,10 +895,40 @@ class ServerTests(SandboxCase):
         tool(S.pair_update)("cl", system_prompt_append="")
         self.assertIsNone(R.get_pair("cl").system_prompt_append)
 
-    def test_update_refuses_network_at_read_only(self):
+    def test_update_moves_a_network_pair_to_read_only_with_a_note(self):
+        # Only an incoming backend_options gets the full check; the stored
+        # network flag simply doesn't apply at read-only.
         R.add_pair(self.spec("cx", backend_options={"network": True}))
+        report = tool(S.pair_update)("cx", permission_mode="read-only")
+        self.assertIn("network: off at read-only", report)
+        self.assertFalse(any("network" in a for a in self.args(R.get_pair("cx"))))
         with self.assertRaisesRegex(PairError, "network"):
-            tool(S.pair_update)("cx", permission_mode="read-only")
+            tool(S.pair_update)("cx", backend_options={"network": True})
+
+    def test_update_with_a_stored_managed_key_still_changes_other_fields(self):
+        R.add_pair(self.spec("cx", backend_options={"config": {"sandbox_workspace_write.network_access": True}}))
+        tool(S.pair_update)("cx", effort="low")
+        self.assertEqual(R.get_pair("cx").effort, "low")
+        with self.assertRaisesRegex(PairError, "manages"):
+            tool(S.pair_update)("cx", backend_options={"config": {"sandbox_workspace_write.network_access": True}})
+
+    def test_hard_stop_records_the_new_threads_instructions(self):
+        R.add_pair(self.spec("cx", system_prompt_append="A"))
+        with self.fake_create():
+            out = tool(S.pair_stop)("cx", hard=True)
+        self.assertIn("rotated session", out)
+        self.assertEqual(R.get_pair("cx").codex_instructions["mode"], "developer")
+
+    def test_info_never_spawns_or_creates_directories(self):
+        R.add_pair(self.spec("cx"))
+        with patch.object(CX, "profile_support", wraps=lambda exe, probe=True: None if not probe else True) as cap, \
+                patch.object(CX, "codex_executable", side_effect=AssertionError("pair_info scanned for codex")), \
+                patch.dict(os.environ, {"CLAUDE_PAIR_CODEX_PATH": str(self.exe)}):
+            info = tool(S.pair_info)("cx")
+        self.assertTrue(cap.call_args_list)
+        self.assertTrue(all(call.kwargs.get("probe") is False for call in cap.call_args_list))
+        self.assertIn("checked at the next spawn", info)
+        self.assertFalse(self.scratch("cx").exists())
 
     def test_info_shows_sandbox_and_changed_instructions(self):
         spec = self.spec("cx", system_prompt_append="A")
