@@ -6,6 +6,11 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.19.1] — 2026-10-25
+
+Codex threads the Codex app compressed after a week idle (`.jsonl.zst`) work
+again, with no new dependency.
+
 ### Fixed
 
 - **Codex pairs idle for about a week failed with `SessionMissing`.** The
