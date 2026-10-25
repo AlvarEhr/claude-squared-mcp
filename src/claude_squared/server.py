@@ -1258,17 +1258,29 @@ def pair_adopt(
     return line
 
 
-def _archive_transcript(src: Path, stem: str) -> str:
-    """Copy a transcript into the archive as ``<stem>.jsonl``; a rollout the
-    Codex app compressed is copied as-is to ``<stem>.jsonl.zst`` (there is no
-    zstd decoder here). Returns the display text for the result line."""
-    if codex_adapter_mod.is_compressed_rollout(src):
-        dst = reg_mod.archive_dir() / f"{stem}.jsonl{codex_adapter_mod.ZST_SUFFIX}"
-        shutil.copy2(src, dst)
-        return f"{dst} (copied as-is: the Codex app had compressed the idle thread, so the copy is zstd)"
-    dst = reg_mod.archive_dir() / f"{stem}.jsonl"
-    shutil.copy2(src, dst)
-    return str(dst)
+def _archive_transcript(adapter: PairAdapter, spec: PairSpec, stem: str) -> tuple[str | None, str | None]:
+    """Copy the pair's transcript into the archive as ``<stem>.jsonl``; a
+    rollout the Codex app compressed is copied as-is to ``<stem>.jsonl.zst``
+    (there is no zstd decoder here). Returns ``(path, note)`` — (None, None)
+    when there is no transcript. The path is looked up again and the copy
+    retried once on OSError: Codex can restore (or the app compress) the
+    rollout between the lookup and the copy. A second failure raises."""
+    for attempt in (1, 2):
+        src = adapter.transcript_path(spec)
+        if not src or not src.exists():
+            return None, None
+        compressed = codex_adapter_mod.is_compressed_rollout(src)
+        dst = reg_mod.archive_dir() / (f"{stem}.jsonl{codex_adapter_mod.ZST_SUFFIX}" if compressed
+                                       else f"{stem}.jsonl")
+        try:
+            shutil.copy2(src, dst)
+        except OSError:
+            if attempt == 2:
+                raise
+            continue
+        return str(dst), ("copied as-is: the Codex app had compressed the idle thread, so the copy is zstd"
+                          if compressed else None)
+    return None, None
 
 
 @mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False})
@@ -1311,12 +1323,16 @@ def _forget_pair(name: str, archive: bool) -> str:
             pass
     spec = reg_mod.remove_pair(name)
     archived: str | None = None
+    archive_note: str | None = None
+    archive_failed: str | None = None
     if archive:
-        adapter = _adapter_for(spec)
-        src = adapter.transcript_path(spec)
-        if src and src.exists():
-            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-            archived = _archive_transcript(src, f"{name}-{ts}")
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        try:
+            archived, archive_note = _archive_transcript(_adapter_for(spec), spec, f"{name}-{ts}")
+        except OSError as e:
+            # The pair is already out of the registry: finish the cleanup
+            # below and report the copy instead of failing half-way.
+            archive_failed = f"transcript not archived: {e}"
     try:
         activity_mod.forget(name)
     except Exception:
@@ -1331,7 +1347,9 @@ def _forget_pair(name: str, archive: bool) -> str:
             scratch_left = f"scratch folder not removed: {e}"
     msg = f"Forgot '{name}' (session {_short(spec.session_id)})"
     if archived:
-        msg += f"; archived to {archived}"
+        msg += f"; archived to {archived}" + (f" ({archive_note})" if archive_note else "")
+    if archive_failed:
+        msg += f"\n⚠ {archive_failed}"
     if scratch_left:
         msg += f"\n⚠ {scratch_left}"
     note = _lost_note(lost)
@@ -4468,7 +4486,6 @@ def pair_clear(name: str, archive_old: bool = True, verbose: bool = False, force
             spec = reg_mod.get_pair(name)
             adapter = _adapter_for(spec)
             old_sid = spec.session_id
-            old_path = adapter.transcript_path(spec)
             _refuse_if_background(name, "clearing", force)
 
             # Tear down any live runtime — it's pinned to the old session_id
@@ -4494,15 +4511,25 @@ def pair_clear(name: str, archive_old: bool = True, verbose: bool = False, force
                                 last_active_at=datetime.utcnow(), **_cleared)
 
             archived: str | None = None
-            if archive_old and old_path and old_path.exists():
+            archive_note: str | None = None
+            archive_failed: str | None = None
+            if archive_old:
                 ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-                archived = _archive_transcript(old_path, f"{name}-{ts}-cleared")
+                try:
+                    # ``spec`` still names the OLD session here.
+                    archived, archive_note = _archive_transcript(adapter, spec, f"{name}-{ts}-cleared")
+                except OSError as e:
+                    # The pair already runs on its new session: report, don't fail.
+                    archive_failed = f"old transcript not archived: {e}"
             if verbose:
                 return json.dumps({"old_session_id": old_sid, "new_session_id": new_sid,
-                                   "archived_to": archived}, indent=2)
+                                   "archived_to": archived, "archive_note": archive_note or archive_failed},
+                                  indent=2)
             msg = f"Cleared '{name}': {_short(old_sid)} → {_short(new_sid)}"
             if archived:
-                msg += f" (archived to {archived})"
+                msg += f" (archived to {archived}" + (f"; {archive_note})" if archive_note else ")")
+            if archive_failed:
+                msg += f"\n⚠ {archive_failed}"
             if _lost_note(lost):
                 msg += f"\n⚠ {_lost_note(lost)}"
             for _n in created.notes:
@@ -4914,17 +4941,23 @@ def pair_fork(name: str, new_name: str | None = None, verbose: bool = False) -> 
     return msg
 
 
-@mcp.tool(output_schema=None, annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True})
+@mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False})
 def pair_rewind_points(name: str, last_n: int = 20, verbose: bool = False) -> str:
     """List the points a pair can be rewound to (genuine user-message boundaries).
 
-    Read-only. Each point is a "back to when you said X" boundary, enriched with
+    Changes nothing, except on a Codex thread the Codex app compressed (idle
+    about a week): Codex restores it first, without a model call, appending
+    one settings record — the result says so. Each point is a "back to when
+    you said X" boundary, enriched with
     what the pair DID afterward (assistant turns / tool calls / files written
     before the next user message) so you can choose WITHOUT reading the
     transcript. Pass the chosen point number to ``pair_rewind(name, to_point=N)``.
 
     Cutting only at user-message boundaries guarantees no dangling tool_use is
     left (which would make the next turn invalid).
+
+    verbose=True returns the JSON list of points — or, when a compressed
+    thread was restored, ``{"restore_note": ..., "points": [...]}``.
     """
     from claude_squared.transcript import list_user_turn_points
     spec = reg_mod.get_pair(name)
@@ -4946,7 +4979,8 @@ def pair_rewind_points(name: str, last_n: int = 20, verbose: bool = False) -> st
     else:
         points = list_user_turn_points(path) if path and path.exists() else []
     if verbose:
-        return json.dumps(points, indent=2, default=str)
+        return json.dumps({"restore_note": restored, "points": points} if restored else points,
+                          indent=2, default=str)
     if not points:
         return f"Pair '{name}': no user-message rewind points yet." + (f"\n  {restored}" if restored else "")
     shown = points[-last_n:] if last_n and last_n > 0 else points
@@ -5015,8 +5049,17 @@ def pair_rewind(name: str, to_point: int, archive: bool = True, verbose: bool = 
             path = adapter.transcript_path(spec)
             if not path or not path.exists():
                 raise PairError(f"Pair '{name}' has no transcript to rewind.")
-            restored = _restore_compressed_rollout(spec, adapter) if spec.backend == "codex" else None
-            if restored:
+            restored: str | None = None
+            refused_checked = False
+            if spec.backend == "codex" and codex_adapter_mod.is_compressed_rollout(path):
+                # Refuse what can be refused before Codex rewrites the file
+                # (temper, 2026-10-25); the exact point is only known after.
+                if to_point < 1:
+                    raise PairError(f"No rewind point {to_point} for '{name}' (points start at 1). "
+                                    f"Use pair_rewind_points('{name}') to list them.")
+                _refuse_if_background(name, "rewinding", force)
+                refused_checked = True
+                restored = _restore_compressed_rollout(spec, adapter)
                 path = adapter.transcript_path(spec)
             if spec.backend == "codex":
                 # Verified 2026-09-07: ``exec resume`` reads the rollout JSONL,
@@ -5032,11 +5075,13 @@ def pair_rewind(name: str, to_point: int, archive: bool = True, verbose: bool = 
                 raise PairError(
                     f"No rewind point {to_point} for '{name}' (valid: {valid}). "
                     f"Use pair_rewind_points('{name}') to list them."
+                    + (f" Nothing was rewound; {restored}." if restored else "")
                 )
             # The session JSONL is about to be truncated — a warm runtime pinned
             # to it holds stale in-memory state, so evict it (next send respawns
             # from the rewound file).
-            _refuse_if_background(name, "rewinding", force)
+            if not refused_checked:
+                _refuse_if_background(name, "rewinding", force)
             rewind_lost: list[dict] = []
             try:
                 rewind_lost = runtime_mod.registry().evict(

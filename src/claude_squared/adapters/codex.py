@@ -1429,10 +1429,11 @@ def _iso_epoch(stamp: Any) -> float | None:
 
 def _turn_contexts_since(rollout: Path | None, offset: int | None, *,
                          not_before: float | None = None) -> list[dict[str, Any]]:
-    """``turn_context`` payloads appended to a rollout after ``offset``. With
-    ``offset`` None (a compressed rollout whose frame did not record its size)
-    the whole file is read and only records stamped at or after
-    ``not_before`` count."""
+    """``turn_context`` payloads appended to a rollout after ``offset`` (None:
+    from the start). With ``not_before`` only records stamped at or after it
+    count — send passes it whenever the rollout was compressed before the
+    turn: the offset is then the frame's recorded size (or unknown), which is
+    only right while Codex keeps restoring byte-identically."""
     if rollout is None or is_compressed_rollout(rollout):
         return []
     out: list[dict[str, Any]] = []
@@ -1448,7 +1449,7 @@ def _turn_contexts_since(rollout: Path | None, offset: int | None, *,
                     continue
                 if not (isinstance(d, dict) and d.get("type") == "turn_context" and isinstance(d.get("payload"), dict)):
                     continue
-                if offset is None and not_before is not None:
+                if not_before is not None:
                     ts = _iso_epoch(d.get("timestamp"))
                     if ts is None or ts < not_before:
                         continue
@@ -1586,7 +1587,7 @@ def rollout_path_for(thread_id: str) -> Path | None:
             if row and row[0]:
                 p = Path(row[0])
                 # Plain again last: Codex may restore the file between the
-                # first two checks (it writes the .jsonl, then drops the .zst).
+                # first two checks (writing the .jsonl and dropping the .zst).
                 for cand in (p, compressed_sibling(p), p):
                     if cand.exists():
                         return cand
@@ -1854,17 +1855,24 @@ def _estimate_compacted_tokens(rollout: Path | None) -> int:
     return max(0, len(text) // 4)
 
 
-def _token_count_before_last_compaction(rollout: Path | None) -> dict[str, Any] | None:
-    """The last ``token_count`` payload written before the LAST ``compacted``
-    record — the pre-compaction fill, for a compaction whose rollout could not
-    be read beforehand (it was compressed). None when there is none."""
+def _pre_compaction_token_count(rollout: Path | None, limit: int | None) -> dict[str, Any] | None:
+    """The pre-compaction ``token_count`` payload for a compaction whose
+    rollout was compressed beforehand (unreadable then): the last one within
+    the first ``limit`` bytes — Codex restored the file byte-identical first,
+    so that is what the plain file said, even if the compaction wrote no
+    record. With ``limit`` None (the frame did not record its size): the last
+    one before the LAST ``compacted`` record. None when there is none."""
     if rollout is None or is_compressed_rollout(rollout):
         return None
     last: dict[str, Any] | None = None
     before: dict[str, Any] | None = None
+    pos = 0
     try:
         with open(rollout, "rb") as f:
             for raw in f:
+                start, pos = pos, pos + len(raw)
+                if limit is not None and start >= limit:
+                    break
                 is_tc = b'"token_count"' in raw
                 if not is_tc and b'"compacted"' not in raw:
                     continue
@@ -1881,7 +1889,7 @@ def _token_count_before_last_compaction(rollout: Path | None) -> dict[str, Any] 
                     last = pl
     except OSError:
         return None
-    return before
+    return last if limit is not None else before
 
 
 def plan_usage_text(rate_limits: dict[str, Any] | None) -> str | None:
@@ -2386,7 +2394,9 @@ class CodexAdapter(PairAdapter):
             args += ["resume", spec.session_id, "-"]
             # A compressed rollout's offset is its recorded plain size: Codex
             # restores it byte-identical before appending this turn.
-            rollout_offset = rollout_size(self.transcript_path(spec))
+            pre_rollout = self.transcript_path(spec)
+            rollout_offset = rollout_size(pre_rollout)
+            stamp_filter = rollout_offset is None or is_compressed_rollout(pre_rollout)
             run_spec = spec.model_copy(update={
                 "model": self._model_for(spec, model),
                 "effort": effort if effort is not None else spec.effort,
@@ -2412,9 +2422,11 @@ class CodexAdapter(PairAdapter):
                 # R1 belt: check what Codex RECORDED for this turn. Only this
                 # exec's turn_context lines count (an early failure leaves
                 # none, and an older turn's record proves nothing). Resolved
-                # again: a compressed rollout is plain by now.
+                # again: a compressed rollout is plain by now; its offset is
+                # backed by the turn-start stamp in case a restore ever
+                # stops being byte-identical (temper, 2026-10-25).
                 recorded = _turn_contexts_since(self.transcript_path(spec), rollout_offset,
-                                                not_before=started - 2)[-1:]
+                                                not_before=started - 2 if stamp_filter else None)[-1:]
                 for tc in recorded:
                     breach, warning = profile_breach(tc, plan)
                     if breach:
@@ -2490,16 +2502,17 @@ class CodexAdapter(PairAdapter):
                                  where=str(codex_home() / "sessions"))
         rollout = self.transcript_path(spec)
         was_compressed = is_compressed_rollout(rollout)
+        restored_size = rollout_size(rollout) if was_compressed else None
         tc0 = read_last_token_count(rollout) or {}
         t0 = time.monotonic()
         outcome = self._appserver_compact(spec, timeout_seconds=timeout_seconds, should_stop=should_stop)
         dur_ms = int((time.monotonic() - t0) * 1000)
         # Resolved again: the app-server restores a compressed rollout to its
         # plain path first (verified 2026-10-25); the pre-compaction figures
-        # are then the last token_count before the new compacted record.
+        # then come from the restored prefix.
         rollout = self.transcript_path(spec)
         if was_compressed:
-            tc0 = _token_count_before_last_compaction(rollout) or {}
+            tc0 = _pre_compaction_token_count(rollout, restored_size) or {}
         pre = live_context_tokens(tc0.get("info")) or 0
         tc1 = read_last_token_count(rollout) or {}
         # Never total_token_usage: it is cumulative thread usage, not the
@@ -2560,7 +2573,8 @@ class CodexAdapter(PairAdapter):
         alone. Verified 2026-10-25 on 0.164: the plain .jsonl is back in ~1 s,
         byte-identical, and Codex appends one ``thread_settings_applied``
         record (the same one compaction's resume writes). Returns a one-line
-        note; raises CLIError if the plain file did not come back."""
+        note; raises CLIError unless the plain file is back AND the .zst is
+        gone (a half-finished restore must not be truncated by a rewind)."""
         client = AppServerClient(
             [codex_executable(), "app-server"] + config_readd_args(),
             cwd=spec.cwd or None, timeout_seconds=timeout_seconds, kill=_tree_kill,
@@ -2583,15 +2597,21 @@ class CodexAdapter(PairAdapter):
                 if _INFLIGHT.get(spec.name, {}).get("proc") is client.proc:
                     _INFLIGHT.pop(spec.name, None)
         if not self._rollout_plain(spec):
-            raise CLIError(f"codex app-server thread/resume did not restore the compressed rollout of "
-                           f"'{spec.name}' (thread {spec.session_id}); a pair_send restores it too")
+            p = self.transcript_path(spec)
+            state = ("the plain rollout is back but the .zst is still there"
+                     if p is not None and p.exists() and not is_compressed_rollout(p) else "no plain rollout")
+            raise CLIError(f"codex app-server thread/resume did not finish restoring the compressed rollout of "
+                           f"'{spec.name}' (thread {spec.session_id}: {state}); a pair_send restores it too")
         self._log_line(spec, "=== ROLLOUT RESTORED from the Codex app's .zst (app-server thread/resume) ===")
         return ("the Codex app had compressed this idle thread; restored it with codex app-server "
                 "thread/resume (no model call; Codex appended one thread_settings_applied record)")
 
     def _rollout_plain(self, spec: PairSpec) -> bool:
+        """Restored: the plain rollout exists and its .zst is gone (only the
+        end state was observed, not the order of Codex's write and delete)."""
         p = self.transcript_path(spec)
-        return p is not None and not is_compressed_rollout(p) and p.exists()
+        return (p is not None and not is_compressed_rollout(p) and p.exists()
+                and not compressed_sibling(p).exists())
 
     def _appserver_compact(self, spec: PairSpec, *, timeout_seconds: int,
                            should_stop: Callable[[], bool] | None = None) -> str | None:

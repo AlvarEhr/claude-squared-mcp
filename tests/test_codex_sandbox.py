@@ -609,15 +609,15 @@ class BeltTests(SandboxCase):
         self.assertTrue(any("SANDBOX" in n and "not confined" in n for n in result.notes), result.notes)
         self.assertIn(CX._exe_key(str(self.exe)), CX._unsupported_marks())
 
-    def _compressed_rollout(self, *, record_size=True):
+    def _compressed_rollout(self, *, record_size=True, old_stamp="2026-10-18T10:00:00.000Z"):
         """An OLD breaching turn, compressed the way the Codex app leaves it
         (only ``.jsonl.zst``; one zstd frame of RAW blocks, so a naive read
-        would still see its lines). Returns (plain, zst)."""
+        would still see its lines). Returns (plain, zst, old bytes)."""
         plain = self.directory / "rollout-x.jsonl"
         zst = CX.compressed_sibling(plain)
         if plain.exists():
             plain.unlink()
-        old = (json.dumps({"timestamp": "2026-10-18T10:00:00.000Z", "type": "turn_context",
+        old = (json.dumps({"timestamp": old_stamp, "type": "turn_context",
                            "payload": _turn_context(self.directory, extra_writes=[self.directory / "x"])})
                + "\n").encode("utf-8")
         fhd = 0xA0 if record_size else 0x00  # single-segment + 4-byte size (what Codex wrote) / no size
@@ -627,10 +627,11 @@ class BeltTests(SandboxCase):
         zst.write_bytes(frame)
         return plain, zst, old
 
-    def _send_restoring(self, plain, zst, old, *, record=True):
-        """Codex restores the plain rollout byte-identical, then appends this
-        turn's confined record (the 2026-10-25 probe's order) — or, with
-        ``record`` False, the turn fails before writing one."""
+    def _send_restoring(self, plain, zst, old, *, record=True, restored=None):
+        """Codex restores the plain rollout byte-identical (or as
+        ``restored``), then appends this turn's confined record (the
+        2026-10-25 probe's order) — or, with ``record`` False, the turn fails
+        before writing one."""
         spec = self.spec(permission_mode="read-only")
         resolved = lambda _self, _spec: plain if plain.exists() else zst  # noqa: E731
 
@@ -638,7 +639,7 @@ class BeltTests(SandboxCase):
             plan = CX.sandbox_plan("read-only", {}, pair_name="p")
             new = json.dumps({"timestamp": _now_z(), "type": "turn_context",
                               "payload": _turn_context(plan.scratch, deny=plan.deny)}) + "\n"
-            plain.write_bytes(old + (new.encode("utf-8") if record else b""))
+            plain.write_bytes((old if restored is None else restored) + (new.encode("utf-8") if record else b""))
             zst.unlink()
             if not record:
                 return [{"type": "turn.failed", "error": {}}], "", 1, 5
@@ -651,6 +652,25 @@ class BeltTests(SandboxCase):
 
     def test_belt_on_a_compressed_rollout_checks_only_this_turn(self):
         result = self._send_restoring(*self._compressed_rollout())
+        self.assertFalse(any("SANDBOX" in n for n in result.notes), result.notes)
+        self.assertEqual(CX._unsupported_marks(), {})
+
+    def test_belt_offset_from_the_frame_size_is_exact(self):
+        # The old breaching record is stamped NOW, so the turn-start filter
+        # can't drop it: only the frame's recorded size keeps it out. The
+        # turn fails before writing a record of its own.
+        plain, zst, old = self._compressed_rollout(old_stamp=_now_z())
+        self.assertEqual(CX.rollout_size(zst), len(old))
+        result = self._send_restoring(plain, zst, old, record=False)
+        self.assertFalse(any("SANDBOX" in n for n in result.notes), result.notes)
+        self.assertEqual(CX._unsupported_marks(), {})
+
+    def test_belt_stamp_backs_the_frame_size(self):
+        # A restore that is NOT byte-identical (hypothetical future Codex):
+        # a stale breaching record lands past the recorded size; only the
+        # turn-start stamp keeps it out.
+        plain, zst, old = self._compressed_rollout()
+        result = self._send_restoring(plain, zst, old, record=False, restored=old + old)
         self.assertFalse(any("SANDBOX" in n for n in result.notes), result.notes)
         self.assertEqual(CX._unsupported_marks(), {})
 

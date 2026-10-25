@@ -265,7 +265,8 @@ class ReaderTests(ZstCase):
         self.assertEqual(CX.tail_turns_codex(self.zst), [])
         self.assertEqual(CX.list_turn_points_codex(self.zst), [])
         self.assertEqual(CX._estimate_compacted_tokens(self.zst), 0)
-        self.assertIsNone(CX._token_count_before_last_compaction(self.zst))
+        self.assertIsNone(CX._pre_compaction_token_count(self.zst, None))
+        self.assertIsNone(CX._pre_compaction_token_count(self.zst, 10))
         self.assertEqual(T.tail_turns(self.zst), [])  # no Claude-parser garbage either
         with self.assertRaises(CLIError):
             CX.truncate_rollout_before_line(self.zst, 1)
@@ -274,28 +275,44 @@ class ReaderTests(ZstCase):
             CX.CodexAdapter().context(self.spec())
         self.assertIn(CX.COMPRESSED_NOTE, str(cm.exception))
 
-    def test_turn_contexts_without_an_offset_filter_by_time(self):
-        write(self.plain, "\n".join([
+    def test_turn_contexts_filter_by_time(self):
+        lines = [
             rec("turn_context", {"n": "old"}, ts="2026-10-18T10:00:00.000Z"),
             rec("turn_context", {"n": "new"}, ts="2026-10-25T17:55:02.569Z"),
             rec("turn_context", {"n": "odd-fraction"}, ts="2026-10-25T17:55:03.5Z"),
             rec("turn_context", {"n": "no-stamp"}, ts=""),
-        ]) + "\n")
+        ]
+        write(self.plain, "\n".join(lines) + "\n")
         cut = CX._iso_epoch("2026-10-25T17:55:00.000Z")
         got = [d["n"] for d in CX._turn_contexts_since(self.plain, None, not_before=cut)]
         self.assertEqual(got, ["new", "odd-fraction"])
-        self.assertEqual(len(CX._turn_contexts_since(self.plain, 0, not_before=cut)), 4)  # offset wins
+        self.assertEqual(len(CX._turn_contexts_since(self.plain, 0)), 4)  # no filter asked
+        # Offset AND stamp (a compressed rollout's frame-size offset): both apply.
+        skip_old = len(lines[0]) + 1
+        got = [d["n"] for d in CX._turn_contexts_since(self.plain, skip_old, not_before=cut + 2.6)]
+        self.assertEqual(got, ["odd-fraction"])
 
     def test_pre_compaction_token_count(self):
-        write(self.plain, "\n".join([
-            token_count(10_000), token_count(90_000), rec("compacted", {"replacement_history": []}),
-            token_count(0, total=12_000), token_count(15_000),
-            token_count(30_000), rec("compacted", {"replacement_history": []}), token_count(0, total=9_000),
-        ]) + "\n")
-        before = CX._token_count_before_last_compaction(self.plain)
-        self.assertEqual(before["info"]["last_token_usage"]["input_tokens"], 30_000)
+        head = "\n".join([token_count(10_000), token_count(90_000), rec("compacted", {"replacement_history": []}),
+                          token_count(0, total=12_000), token_count(15_000), token_count(30_000)]) + "\n"
+        tail = rec("compacted", {"replacement_history": []}) + "\n" + token_count(0, total=9_000) + "\n"
+        write(self.plain, head + tail)
+        size = len(head.encode("utf-8"))
+        # Frame size known: the last token_count in the restored prefix.
+        self.assertEqual(CX._pre_compaction_token_count(self.plain, size)["info"]["last_token_usage"]
+                         ["input_tokens"], 30_000)
+        # Size unknown: the last one before the LAST compacted record.
+        self.assertEqual(CX._pre_compaction_token_count(self.plain, None)["info"]["last_token_usage"]
+                         ["input_tokens"], 30_000)
+        # A compaction that wrote no record: the prefix still answers; the
+        # size-less fallback would name the OLDER compaction's figure.
+        write(self.plain, head + token_count(0, total=9_000) + "\n")
+        self.assertEqual(CX._pre_compaction_token_count(self.plain, size)["info"]["last_token_usage"]
+                         ["input_tokens"], 30_000)
+        self.assertEqual(CX._pre_compaction_token_count(self.plain, None)["info"]["last_token_usage"]
+                         ["input_tokens"], 90_000)
         write(self.plain, token_count(1) + "\n")
-        self.assertIsNone(CX._token_count_before_last_compaction(self.plain))
+        self.assertIsNone(CX._pre_compaction_token_count(self.plain, None))
 
 
 # ---------------------------------------------------------------------------
@@ -419,9 +436,19 @@ class RestoreTests(ZstCase):
 
     def test_no_plain_file_is_an_error(self):
         with patch.object(CX, "_RESTORE_WAIT_SECONDS", 0.3):
-            with self.assertRaises(CLIError):
+            with self.assertRaises(CLIError) as cm:
                 CX.CodexAdapter().restore_rollout(self.spec())
+        self.assertIn("no plain rollout", str(cm.exception))
         self.assertNotIn("z", CX._INFLIGHT)
+
+    def test_plain_file_with_the_zst_still_there_is_not_restored(self):
+        FakeClient.on_resume = lambda: write(self.plain, ROLLOUT)  # .zst left in place
+        with patch.object(CX, "_RESTORE_WAIT_SECONDS", 0.3):
+            with self.assertRaises(CLIError) as cm:
+                CX.CodexAdapter().restore_rollout(self.spec())
+        self.assertIn(".zst is still there", str(cm.exception))
+        self.assertNotIn("ROLLOUT RESTORED", (R.logs_dir() / "z" / "main.log").read_text(encoding="utf-8")
+                         if (R.logs_dir() / "z" / "main.log").exists() else "")
 
 
 # ---------------------------------------------------------------------------
@@ -470,9 +497,50 @@ class ToolTests(ZstCase):
         self.assertEqual(list(R.archive_dir().glob("z-*.jsonl")), [])
 
     def test_archive_helper_plain_and_compressed(self):
-        self.assertTrue(S._archive_transcript(self.zst, "a").endswith("so the copy is zstd)"))
+        adapter, spec = CX.CodexAdapter(), self.spec()
+        path, note = S._archive_transcript(adapter, spec, "a")
+        self.assertEqual(path, str(R.archive_dir() / "a.jsonl.zst"))
+        self.assertIn("so the copy is zstd", note)
         self.restore()
-        self.assertEqual(S._archive_transcript(self.plain, "b"), str(R.archive_dir() / "b.jsonl"))
+        self.assertEqual(S._archive_transcript(adapter, spec, "b"), (str(R.archive_dir() / "b.jsonl"), None))
+        self.plain.unlink()
+        self.assertEqual(S._archive_transcript(adapter, spec, "c"), (None, None))
+
+    def test_archive_looks_again_when_codex_restores_mid_copy(self):
+        real_copy = S.shutil.copy2
+        calls = []
+
+        def racing_copy(src, dst):
+            calls.append(Path(src).name)
+            if len(calls) == 1:
+                self.restore()  # the .zst vanished under us
+                raise FileNotFoundError(src)
+            return real_copy(src, dst)
+
+        with patch.object(S.shutil, "copy2", side_effect=racing_copy):
+            path, note = S._archive_transcript(CX.CodexAdapter(), self.spec(), "r")
+        self.assertEqual(calls, [self.zst.name, self.plain.name])
+        self.assertEqual((path, note), (str(R.archive_dir() / "r.jsonl"), None))
+
+    def test_forget_still_cleans_up_when_the_archive_copy_fails(self):
+        with patch.object(S.shutil, "copy2", side_effect=PermissionError("locked")) as copy, \
+                patch.object(S.activity_mod, "forget") as forget, \
+                patch.object(CX, "remove_scratch", return_value=None) as scratch:
+            out = tool(S.pair_forget)("z")
+        self.assertEqual(copy.call_count, 2)  # retried once
+        self.assertIn("⚠ transcript not archived: locked", out)
+        forget.assert_called_once_with("z")
+        scratch.assert_called_once_with("z")
+        self.assertNotIn("z", R.load().pairs)
+
+    def test_clear_archives_the_zst_and_keeps_archived_to_a_path(self):
+        from claude_squared.models import CreateResult
+        created = CreateResult(name="z", session_id="new-thread")
+        with patch.object(CX.CodexAdapter, "create", return_value=created):
+            out = json.loads(tool(S.pair_clear)("z", verbose=True))
+        self.assertEqual(out["archived_to"], str(next(R.archive_dir().glob("z-*-cleared.jsonl.zst"))))
+        self.assertIn("so the copy is zstd", out["archive_note"])
+        self.assertEqual(R.get_pair("z").session_id, "new-thread")
 
     def test_adopt_accepts_a_compressed_thread(self):
         tool(S.pair_forget)("z", archive=False)
@@ -494,10 +562,16 @@ class ToolTests(ZstCase):
             self.assertIn("2 rewind point(s)", points)
             self.assertIn("restored-note", points)
             self.assertEqual(calls, ["z"])
+            self.assertIsInstance(json.loads(tool(S.pair_rewind_points)("z", verbose=True)), list)  # plain now
+            self.compress(self.plain.read_text(encoding="utf-8"))
+            verbose = json.loads(tool(S.pair_rewind_points)("z", verbose=True))
+            self.assertEqual(verbose["restore_note"], "restored-note")
+            self.assertEqual(len(verbose["points"]), 2)
+            self.assertEqual(calls, ["z", "z"])
             # Compressed again (another idle week): rewind restores, then cuts.
             self.compress(self.plain.read_text(encoding="utf-8"))
             out = tool(S.pair_rewind)("z", to_point=2)
-        self.assertEqual(calls, ["z", "z"])
+        self.assertEqual(calls, ["z", "z", "z"])
         self.assertIn("restored-note", out)
         self.assertFalse(self.zst.exists())
         kept = self.plain.read_text(encoding="utf-8")
@@ -509,6 +583,30 @@ class ToolTests(ZstCase):
         self.restore()
         with patch.object(CX.CodexAdapter, "restore_rollout", side_effect=AssertionError("restored")):
             self.assertIn("2 rewind point(s)", tool(S.pair_rewind_points)("z"))
+
+    def test_rewind_refuses_before_restoring(self):
+        with patch.object(CX.CodexAdapter, "restore_rollout", side_effect=AssertionError("restored")):
+            with self.assertRaises(PairError) as cm:
+                tool(S.pair_rewind)("z", to_point=0)
+            self.assertIn("points start at 1", str(cm.exception))
+            with patch.object(S, "_pending_work_split", return_value=([{"kind": "bg"}], [])), \
+                    patch.object(S, "_describe_background", return_value="1 background task"):
+                with self.assertRaises(PairError) as cm:
+                    tool(S.pair_rewind)("z", to_point=1)
+            self.assertNotIn("restored", str(cm.exception))
+        self.assertTrue(self.zst.exists())
+
+    def test_a_bad_point_after_restoring_says_nothing_was_rewound(self):
+        def fake_restore(adapter_self, spec, timeout_seconds=120):
+            self.restore()
+            return "restored-note"
+
+        with patch.object(CX.CodexAdapter, "restore_rollout", fake_restore):
+            with self.assertRaises(PairError) as cm:
+                tool(S.pair_rewind)("z", to_point=9)
+        self.assertIn("valid: 1..2", str(cm.exception))
+        self.assertIn("Nothing was rewound; restored-note", str(cm.exception))
+        self.assertEqual(self.plain.read_text(encoding="utf-8"), ROLLOUT)
 
     def test_a_failed_restore_refuses_the_rewind_untouched(self):
         with patch.object(CX.CodexAdapter, "restore_rollout", side_effect=CLIError("boom")):

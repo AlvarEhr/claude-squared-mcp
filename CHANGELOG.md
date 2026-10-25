@@ -11,10 +11,10 @@ All notable changes to this project are documented here. Format follows
 - **Codex pairs idle for about a week failed with `SessionMissing`.** The
   Codex app compresses idle rollouts to `rollout-….jsonl.zst` while its
   state database still names the `.jsonl`, and claude-squared looked only for
-  the `.jsonl`. A compressed thread now resolves. `pair_send`, `pair_compact`,
-  `pair_fork` and `pair_adopt` work as before, because Codex restores the plain
-  rollout first (measured on codex-cli 0.164.0-alpha.11.1: byte-identical, the
-  `.zst` removed). The post-turn sandbox check, the context sampler and the
+  the `.jsonl`. A compressed thread now resolves, so `pair_adopt` accepts it,
+  and `pair_send`, `pair_compact` and `pair_fork` work as before: Codex
+  restores the plain rollout first (measured on codex-cli 0.164.0-alpha.11.1:
+  byte-identical, the `.zst` removed). The post-turn sandbox check, the context sampler and the
   compaction sizes read the restored file. No new dependency: claude-squared
   does not decompress rollouts itself.
 - `pair_rewind_points` and `pair_rewind` on a compressed thread have Codex
