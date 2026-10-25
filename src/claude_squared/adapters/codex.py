@@ -1390,7 +1390,8 @@ def python_sandbox_note(pair_name: str) -> str | None:
         note = None
     elif r.returncode == 2 and ("Usage:" in err or "unexpected argument" in err):
         note = None  # this Codex build can't run the check
-    elif "\\windowsapps\\" in os.path.normcase(py):
+    elif "\\windowsapps\\" in py.lower().replace("/", "\\"):
+        # Not os.path.normcase: it's a no-op off Windows, and this is a Windows path.
         note = (f"`python` on PATH ({py}) is the Microsoft Store app alias, which doesn't run inside the "
                 f"Codex sandbox ({reason}). Install Python from python.org (or put a real interpreter first "
                 f"on PATH) and, if it lives under your user folder, grant the sandbox group read+execute on "
