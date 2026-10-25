@@ -267,13 +267,39 @@ class ProfileArgvTests(SandboxCase):
 
     def test_args_are_an_allowlist(self):
         for args in (["--yolo"], ["--not-so-yolo"], ["--full-auto"], ["--ephemeral"], ["--worktree"],
-                     ["stray prompt"], ["--enable"], ["-ifile.png"]):
+                     ["stray prompt"], ["--enable"], ["-i", "a.png"], ["--image", "a.png"],
+                     ["--enable", "guardian_approval"], ["--disable", "shell_tool"], ["--enable=hooks"],
+                     ["--enable", "windows_sandbox_service"], ["--disable", "unified_exec"]):
             with self.subTest(args=args), self.assertRaisesRegex(ValueError, "args"):
                 CX.CodexAdapter.validate_backend_options("workspace", {"args": args})
-        for args in (["--enable", "multi_agent_v2", "--disable", "x"], ["--enable=multi_agent_v2"],
-                     ["-i", "a.png"], ["--color", "never"], ["--output-schema", "s.json"]):
+        for args in (["--enable", "multi_agent_v2", "--disable", "memories"], ["--enable=multi_agent_v2"],
+                     ["--color", "never"], ["--output-schema", "s.json"]):
             with self.subTest(args=args):
                 CX.CodexAdapter.validate_backend_options("workspace", {"args": args})
+
+    def test_risky_feature_config_is_refused(self):
+        for key in ("features.hooks", "features.guardian_approval", "features.network_proxy",
+                    "features.use_legacy_landlock", "features"):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "touches"):
+                CX.CodexAdapter.validate_backend_options("workspace", {"config": {key: True}})
+        CX.CodexAdapter.validate_backend_options("workspace", {"config": {"features.multi_agent_v2": True}})
+
+    def test_stored_risky_features_and_full_auto_are_stripped(self):
+        stored = {"args": ["--full-auto", "--enable", "unified_exec", "--enable", "multi_agent_v2",
+                           "-c", "features.hooks=true"],
+                  "config": {"features.guardian_approval": False, "features.memories": True}}
+        for level in ("workspace", "read-only"):
+            with self.subTest(level=level):
+                plans = []
+                argv = CX.CodexAdapter()._exec_args(self.spec(permission_mode=level, backend_options=stored),
+                                                    model=None, effort=None, permission_mode=None,
+                                                    plan_out=plans)
+                for gone in ("--full-auto", "unified_exec", "features.hooks=true"):
+                    self.assertNotIn(gone, argv)
+                self.assertFalse(any(a.startswith("features.guardian_approval") for a in argv))
+                self.assertTrue(contains_run(argv, ["--enable", "multi_agent_v2"]))
+                self.assertTrue(any(a.startswith("features.memories") for a in argv))
+                self.assertEqual(len(plans[0].spawn_notes), 4)
 
     def test_hidden_aliases_are_stripped_in_profile_mode(self):
         argv = self.args(self.spec(backend_options={"args": ["--yolo", "--not-so-yolo", "--color", "never"]}))
@@ -398,6 +424,13 @@ class PosixArgvTests(SandboxCase):
         self.assertTrue(contains_run(argv, ["-s", "read-only"]))
         self.assertNotIn("--yolo", argv)
         self.assertNotIn("--approve-for-me", argv)
+
+    def test_posix_read_only_strips_risky_features(self):
+        argv = self.args(self.spec(permission_mode="read-only", backend_options={
+            "args": ["--full-auto", "--disable", "shell_tool"], "config": {"features.hooks": True}}))
+        self.assertTrue(contains_run(argv, ["-s", "read-only"]))
+        for gone in ("--full-auto", "shell_tool", "features.hooks=true"):
+            self.assertNotIn(gone, argv)
 
     def test_posix_network_is_the_legacy_key_only(self):
         argv = CX.CodexAdapter.permission_args("workspace", {"network": True}, pair_name="p")

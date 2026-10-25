@@ -78,11 +78,13 @@ a compaction during that turn drops them until the next 0.19 compaction.
   would reshape the sandbox around `permission_mode` (`sandbox_mode`,
   `approval_policy`, `approvals_reviewer`, `sandbox_permissions`, `profile(s)`);
   `developer_instructions` on every platform. `backend_options.args` takes only
-  `--enable`, `--disable`, `-i`/`--image`, `--color` and `--output-schema` (an
-  allowlist: on 0.164 `--yolo` and `--not-so-yolo` are hidden aliases of the
-  bypass and approve-for-me flags), and `backend_options.approval='approve-for-me'`
-  is refused at a read-only level. A read-only spawn never passes
-  `--approve-for-me` (or a stored bypass flag) in any mode.
+  `--enable`, `--disable`, `--color` and `--output-schema` (an allowlist: on 0.164
+  `--yolo` and `--not-so-yolo` are hidden aliases of the bypass and approve-for-me
+  flags; older CLIs have `--full-auto`); features that touch the sandbox,
+  approvals or command execution can't be switched through `--enable`/`--disable`
+  or `features.*`; and `backend_options.approval='approve-for-me'` is refused at a
+  read-only level. A read-only spawn never passes `--approve-for-me`, a stored
+  bypass flag or such a feature switch, in any mode.
   Only a NEW value is checked: a stored one keeps working, and in profile mode
   whatever would override the profile is left out of the spawn with a note.
 - A permission profile ignores `sandbox_workspace_write.network_access` /

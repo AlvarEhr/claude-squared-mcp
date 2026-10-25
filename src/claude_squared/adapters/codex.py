@@ -690,12 +690,28 @@ _SANDBOX_SHAPING_CONFIG = ("sandbox_mode", "approval_policy", "approvals_reviewe
 # aliases — on 0.164, --yolo is --dangerously-bypass-approvals-and-sandbox and
 # --not-so-yolo is --approve-for-me (verified 2026-10-26 from clap's
 # "cannot be used multiple times" / "cannot be used with" errors).
-_ALLOWED_ARGS = ("--enable", "--disable", "-i", "--image", "--color", "--output-schema")
+# -i/--image is left out: it takes several values and could swallow the
+# trailing "-" / "resume <sid> -" (temper, round 3).
+_ALLOWED_ARGS = ("--enable", "--disable", "--color", "--output-schema")
+# Features (``--enable``/``--disable`` X, ``features.X`` in config) that touch
+# the sandbox, approvals or how commands execute, matched by name against
+# ``codex features list`` on 0.164 (2026-10-26): *sandbox*,
+# use_legacy_landlock / use_linux_sandbox_bwrap, network_proxy /
+# respect_system_proxy / system_proxy_fallback, guardian*,
+# exec_permission_approvals, request_permissions_tool, request_rule,
+# write_stdin_approval, unified_exec*, shell_* , executor_*, hooks /
+# plugin_hooks, code_mode*, js_repl*, browser_use*, computer_use,
+# in_app_browser, prefer_mxc. Either direction is refused for new values and
+# stripped from stored ones where the sandbox must hold.
+_RISKY_FEATURE_WORDS = ("sandbox", "landlock", "bwrap", "proxy", "approval", "guardian", "permission", "rule",
+                        "exec", "shell", "hook", "code_mode", "repl", "browser_use", "computer_use",
+                        "in_app_browser", "mxc")
 # Where a refused flag's job is done instead (the refusal names it).
 _ARG_FIELDS = {
     "-s": "permission_mode (or backend_options.sandbox)",
     "--sandbox": "permission_mode (or backend_options.sandbox)",
     "--approve-for-me": "permission_mode='auto'", "--not-so-yolo": "permission_mode='auto'",
+    "--full-auto": "permission_mode",
     "--dangerously-bypass-approvals-and-sandbox": "permission_mode='unrestricted'",
     "--yolo": "permission_mode='unrestricted'",
     "-c": "backend_options.config", "--config": "backend_options.config",
@@ -706,8 +722,21 @@ _VALUE_FLAGS = {"-s", "--sandbox", "-p", "--profile", "-c", "--config", "--add-d
 # The ones a stored (pre-0.19) value may still carry; dropped at spawn in
 # profile mode, where they would override the profile, and at read-only in
 # every mode (fail closed).
+# --full-auto: gone from 0.164's exec, but older CLIs accept it and it beats -s.
 _SANDBOX_SHAPING_ARGS = {"-s", "--sandbox", "-p", "--profile", "--approve-for-me", "--not-so-yolo",
-                         "--dangerously-bypass-approvals-and-sandbox", "--yolo"}
+                         "--dangerously-bypass-approvals-and-sandbox", "--yolo", "--full-auto"}
+
+
+def _risky_feature(name: Any) -> bool:
+    n = str(name or "").strip().lower()
+    return any(word in n for word in _RISKY_FEATURE_WORDS)
+
+
+def _risky_feature_key(key: str) -> bool:
+    """A ``backend_options.config`` key that sets a risky feature (or the
+    whole ``features`` table, which could hold one)."""
+    k = key.strip()
+    return k == "features" or (k.startswith("features.") and _risky_feature(k.split(".", 1)[1]))
 _GIT_HTTPS_ENV = (("GIT_CONFIG_COUNT", "1"), ("GIT_CONFIG_KEY_0", "http.sslBackend"),
                   ("GIT_CONFIG_VALUE_0", "openssl"))
 
@@ -767,11 +796,15 @@ def validate_codex_args(args: Any) -> None:
                 + (f": use {hint} instead" if hint else "")
                 + f". Allowed: {', '.join(_ALLOWED_ARGS)}, each with its value.")
         if "=" in token:
-            i += 1
-            continue
-        if i + 1 >= len(tokens):
+            value, step = token.split("=", 1)[1], 1
+        elif i + 1 < len(tokens):
+            value, step = tokens[i + 1], 2
+        else:
             raise ValueError(f"backend_options.args: {token} needs a value")
-        i += 2
+        if flag in ("--enable", "--disable") and _risky_feature(value):
+            raise ValueError(f"backend_options.args can't {flag[2:]} the {value!r} feature: it touches the "
+                             f"sandbox, approvals or how commands run (permission_mode decides those).")
+        i += step
 
 
 def _strip_sandbox_args(args: list[Any]) -> tuple[list[str], list[str]]:
@@ -794,8 +827,13 @@ def _strip_sandbox_args(args: list[Any]) -> tuple[list[str], list[str]]:
                 assignment = token.split("=", 1)[1]   # --config=key=value
             elif flag == "-c":
                 assignment = token[2:]                # -ckey=value
-        shaping = flag in _SANDBOX_SHAPING_ARGS or (
-            assignment is not None and (_managed_config_feature(assignment.split("=", 1)[0]) is not None))
+        feature = None
+        if flag in ("--enable", "--disable"):
+            feature = value if takes_value else (token.split("=", 1)[1] if "=" in token else None)
+        shaping = flag in _SANDBOX_SHAPING_ARGS or (feature is not None and _risky_feature(feature))
+        if assignment is not None:
+            key = assignment.split("=", 1)[0]
+            shaping = shaping or _managed_config_feature(key) is not None or _risky_feature_key(key)
         if shaping:
             dropped.append(" ".join([token] + ([value] if value is not None else [])))
         else:
@@ -1170,6 +1208,10 @@ def sandbox_plan(level: str, backend_options: dict[str, Any] | None = None, *,
         for d in dropped:
             spawn_notes.append(f"backend_options.args {d!r} was not passed: a read-only pair runs "
                                f"plain read-only (remove it with pair_update(backend_options=…))")
+        for k in [k for k in raw_config if _risky_feature_key(str(k))]:
+            raw_config.pop(k)
+            spawn_notes.append(f"backend_options.config {str(k).strip()!r} was not passed: a read-only pair "
+                               f"runs with Codex's default features (remove it with pair_update(backend_options=…))")
     flags = ["--approve-for-me"] if approval == "approve-for-me" else (["-s", sandbox] if sandbox else [])
     net_legacy = ["-c", "sandbox_workspace_write.network_access=true"] if network else []
     if pair_name is None or kind == "none" or not _windows_sandbox():
@@ -1194,7 +1236,8 @@ def sandbox_plan(level: str, backend_options: dict[str, Any] | None = None, *,
         kept: dict[str, Any] = {}
         for k, v in raw_config.items():
             key_s = str(k).strip()
-            if key_s.startswith("sandbox_workspace_write") or _managed_config_feature(key_s):
+            if key_s.startswith("sandbox_workspace_write") or _managed_config_feature(key_s) \
+                    or _risky_feature_key(key_s):
                 spawn_notes.append(f"backend_options.config {key_s!r} was not passed: the sandbox permission "
                                    f"profile decides it (remove it with pair_update(backend_options=…))")
             else:
@@ -2525,6 +2568,10 @@ class CodexAdapter(PairAdapter):
             if feature:
                 raise ValueError(f"backend_options.config can't set {str(raw).strip()!r}: claude-squared "
                                  f"manages it for {feature}.")
+            if _risky_feature_key(str(raw)):
+                raise ValueError(f"backend_options.config can't set {str(raw).strip()!r}: that feature touches "
+                                 f"the sandbox, approvals or how commands run (permission_mode decides those; "
+                                 f"set other features as features.<name>).")
         validate_codex_args(bo.get("args"))
 
     @staticmethod
