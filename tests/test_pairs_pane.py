@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRATCH = ROOT / ".test-homes"
@@ -65,7 +66,7 @@ class SnapshotTests(unittest.TestCase):
         log.parent.mkdir(parents=True)
         log.write_text("old\n" * 10000 + "\x1b[31m[T-9] Running tests ✓\x1b[0m\n", encoding="utf-8")
         before = {str(p): p.read_bytes() for p in self.pairs.rglob("*") if p.is_file()}
-        data = P.snapshot(self.home)
+        data = P.snapshot(self.home, expanded=["scout"])
         self.assertEqual(len(data["rows"]), 1)
         row = data["rows"][0]
         self.assertEqual((row["name"], row["backend"], row["model"], row["status"]), ("scout", "codex", "luna", "busy"))
@@ -173,6 +174,75 @@ class SnapshotTests(unittest.TestCase):
             self.assertFalse(fill["above_alert"])
         self.activity(turn=None, context={"used": 0, "window": 200_000, "at": self.now.isoformat()})
         self.assertEqual(P.snapshot(self.home)["rows"][0]["context"]["percent"], 0)
+
+    def test_large_history_is_skipped_before_opening_and_recent_files_are_capped(self):
+        folder = self.pairs / "async"
+        folder.mkdir()
+        large = json.dumps({"pair_name": "scout", "status": "done", "result": {"response": "x" * (8 * 1024 * 1024)}})
+        for i in range(10):
+            path = folder / f"old-{i}.json"
+            path.write_text(large, encoding="utf-8")
+            os.utime(path, (1, 1))
+        (folder / "recent-large.json").write_text(large, encoding="utf-8")
+        original = Path.open
+        opened = []
+        def track(path, *args, **kwargs):
+            opened.append(path)
+            return original(path, *args, **kwargs)
+        with patch.object(Path, "open", track):
+            data = P.snapshot(self.home)
+        self.assertFalse(any(path.parent == folder for path in opened))
+        self.assertLess(data["io"]["bytes"], 10000)
+        self.assertIn("Partial snapshot", data["notice"])
+        self.assertEqual(data["rows"][0]["status"], "unknown")
+
+    def test_task_count_budget_and_warm_summary_cache(self):
+        for i in range(P.TASK_BUDGET + 20):
+            self.write(f"async/task-{i}.json", {"task_id": f"task-{i}", "pair_name": "scout",
+                "status": "running", "owner_pid": os.getpid(), "started_at": self.now.isoformat()})
+        cold = P.snapshot(self.home)
+        self.assertLessEqual(cold["io"]["bytes"], P.BYTE_BUDGET)
+        self.assertLessEqual(cold["io"]["files"], P.FILE_BUDGET)
+        self.assertLessEqual(len(cold["cache"]["tasks"]), P.TASK_BUDGET)
+        self.assertTrue(all(isinstance(item["mtime"], str) for item in cold["cache"]["tasks"].values()))
+        warm = P.snapshot(self.home, cache=cold["cache"])
+        self.assertLess(warm["io"]["bytes"], cold["io"]["bytes"])
+        self.assertIn("Partial snapshot", warm["notice"])
+
+    def test_filter_precedes_activity_reads_and_detail_requires_expansion(self):
+        self.activity()
+        self.watch()
+        self.write("registry.json", {"pairs": {"scout": {}, "hidden": {}}})
+        self.write(f"activity/hidden/{os.getpid()}.json", {"version": 1})
+        original = P.Reads.json
+        read_paths = []
+        def track(reader, path, *args, **kwargs):
+            read_paths.append(Path(path))
+            return original(reader, path, *args, **kwargs)
+        with patch.object(P.Reads, "json", track), patch.object(P, "tail", return_value="detail") as detail:
+            collapsed = P.snapshot(self.home, session="manager", show_all=False)
+            detail.assert_not_called()
+            self.assertEqual([r["name"] for r in collapsed["rows"]], ["scout"])
+            self.assertEqual(collapsed["rows"][0]["last_line"], "")
+            self.assertFalse(any("hidden" in path.parts for path in read_paths))
+            P.snapshot(self.home, session="manager", show_all=False, expanded=["hidden", "scout"])
+            detail.assert_called_once_with(self.pairs / "logs/scout/main.log")
+
+    def test_activity_reference_keeps_an_old_running_task_eligible(self):
+        self.activity()
+        path = self.write("async/task.json", {"task_id": "task", "pair_name": "scout",
+            "status": "running", "owner_pid": os.getpid(), "started_at": self.now.isoformat()})
+        os.utime(path, (1, 1))
+        data = P.snapshot(self.home)
+        self.assertEqual(data["cache"]["tasks"]["task.json"]["summary"]["status"], "running")
+        self.assertEqual(data["rows"][0]["status"], "busy")
+
+    def test_completed_receipt_hides_watch_even_while_pid_is_alive(self):
+        path = self.watch()
+        record = json.loads(path.read_text(encoding="utf-8"))
+        path.with_suffix(".done").write_text(json.dumps({"state": "done", "hook_pid": record["hook_pid"],
+            "started_at": record["started_at"]}), encoding="utf-8")
+        self.assertEqual(P.snapshot(self.home, session="manager", show_all=False)["rows"], [])
 
 
 if __name__ == "__main__":

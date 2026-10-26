@@ -11,10 +11,10 @@ export type PairRow = {
   } | null;
   watches: PairWatch[];
 }
-export type PairsView = { rows: PairRow[]; error: string | null; session: string; home: string }
+export type PairsView = { rows: PairRow[]; error: string | null; notice: string | null; session: string; home: string }
 
 declare module 'claude-code' {
   interface PluginState {
-    'pairs-pane': { view: PairsView; all: boolean }
+    'pairs-pane': { view: PairsView; all: boolean; expanded: string[] }
   }
 }

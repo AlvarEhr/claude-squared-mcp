@@ -14,9 +14,10 @@ All notable changes to this project are documented here. Format follows
   times and last activity. Every row shows used/window context with a compact
   bar, an explicit unknown state, and the shared context-alert threshold
   (including per-pair overrides). A read-only Python helper reuses `wait.py`'s activity and
-  PID checks; no model calls. Polling stops when the pane closes.
+  PID checks; no model calls. Reads run only while the pane is placed and visible;
+  log detail is loaded only for expanded rows, after session filtering.
 - Auto-watch publishes a small record while it owns a watch, including the
-  manager session/cwd, start time and hook PID. Records are removed after reporting an outcome;
+  manager session/cwd, start time and hook PID. Completion is recorded before cleanup;
   stale PIDs are hidden by the pane. Display-record failures do not prevent
   completion notifications.
 - Opt-in SessionStart recovery for interrupted watches belonging to the
@@ -24,7 +25,18 @@ All notable changes to this project are documented here. Format follows
   are watched concurrently until the first outcome. Reading it with `pair_poll`
   re-arms remaining recovery records. Existing live watchers are deduplicated
   across startup/resume/clear/compact/fork. Includes an opt-in stream-json
-  SessionStart wake probe; live delivery is not yet verified.
+  SessionStart wake probe. The main session verified on 2026-10-26 with Desktop's
+  CLI 2.1.308 that resume preserves the session ID and SessionStart asyncRewake
+  wakes an idle stream-json manager.
+
+### Fixed
+
+- Pane refreshes no longer parse unbounded historical task payloads. Recent
+  and known-running metadata has byte/count limits and a compact summary cache;
+  omitted data is explicitly partial/unknown.
+- A completed watch whose record cannot be unlinked on Windows no longer
+  looks interrupted and wakes again on a later poll/restart. A separate terminal
+  receipt identifies that watch generation and is honored by recovery and the pane.
 
 ## [0.20.0] — 2026-10-26
 

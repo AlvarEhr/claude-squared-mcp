@@ -232,13 +232,14 @@ def _publish_watch(pairs, key, session, name, payload):
     tmp = target.with_name(key + "." + uuid.uuid4().hex + ".tmp")
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps({
+        data = {
             "version": 1, "pair": name, "session_id": session,
             "cwd": payload.get("cwd") if isinstance(payload.get("cwd"), str) else None,
             "started_at": datetime.now(timezone.utc).isoformat(), "hook_pid": os.getpid(),
-        }), encoding="utf-8")
+        }
+        tmp.write_text(json.dumps(data), encoding="utf-8")
         tmp.replace(target)
-        return target
+        return target, data
     except OSError:
         return None  # a display failure must not lose the completion wake
     finally:
@@ -252,8 +253,52 @@ def _watch_key(session, name):
     return hashlib.sha256(json.dumps([session, name]).encode("utf-8")).hexdigest()
 
 
-def _dead_record(record, reader):
+def _completed_record(path, record):
+    """A separate receipt survives a Windows handle that denies watch-file deletion."""
+    done = _read(path.with_suffix(".done"))
+    return (isinstance(done, dict) and done.get("state") == "done"
+            and done.get("hook_pid") == record.get("hook_pid")
+            and done.get("started_at") == record.get("started_at"))
+
+
+def _retire_watch(path, record):
+    # Write completion BEFORE attempting unlink. Replacing the watch itself
+    # also fails when a Windows reader denies delete sharing (quench, 2026-10-26).
+    receipt = path.with_suffix(".done")
+    tmp = receipt.with_name(receipt.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as stream:
+            json.dump({"state": "done", "hook_pid": record.get("hook_pid"),
+                       "started_at": record.get("started_at")}, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        for attempt in range(4):
+            try:
+                tmp.replace(receipt)
+                break
+            except PermissionError:
+                if attempt == 3:
+                    raise
+                time.sleep(.02 * (attempt + 1))
+        try:
+            path.unlink()
+        except OSError:
+            return  # the receipt prevents recovery even after this PID exits
+        try:
+            receipt.unlink()
+        except OSError:
+            pass
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _dead_record(record, reader, path):
     if not isinstance(record, dict) or record.get("version") != 1:
+        return False
+    if record.get("state") == "done" or _completed_record(path, record):
         return False
     started = reader["_av_parse"](record.get("started_at"))
     pid = record.get("hook_pid")
@@ -305,6 +350,7 @@ def watch(payload, pairs, timeout=WAIT_TIMEOUT_SECONDS, *, recover=None, reader=
     name = "(unresolved)"
     gate = owner = None
     record = None
+    record_data = None
     finished = False
     output = output if output is not None else sys.stderr
     try:
@@ -324,7 +370,7 @@ def watch(payload, pairs, timeout=WAIT_TIMEOUT_SECONDS, *, recover=None, reader=
             # or send may already have taken ownership since the initial scan.
             previous = pairs / "watches" / (key + ".json")
             current = _read(previous)
-            if current != recover or not _dead_record(current, reader):
+            if current != recover or not _dead_record(current, reader, previous):
                 return 0
         if not owner.acquire():
             if not recover:
@@ -339,11 +385,16 @@ def watch(payload, pairs, timeout=WAIT_TIMEOUT_SECONDS, *, recover=None, reader=
                 raise OSError("registry unavailable; recovery record retained for retry")
             if name not in entries:
                 record = previous
+                record_data = recover
                 finished = True
                 print(f"claude-squared auto-watch recovery: pair '{name}' is gone from the registry "
                       "(possibly forgotten while the session was down); clearing its stale watch record.", file=output)
                 return 2
-        record = _publish_watch(pairs, key, session, name, payload) or (previous if recover else None)
+        published = _publish_watch(pairs, key, session, name, payload)
+        if published:
+            record, record_data = published
+        elif recover:
+            record, record_data = previous, recover
         gate.release()
         while True:
             code, message = (_recovery_wait(pairs, name, deadline - time.monotonic(), cancel)
@@ -373,13 +424,12 @@ def watch(payload, pairs, timeout=WAIT_TIMEOUT_SECONDS, *, recover=None, reader=
         finished = True
         return 2
     finally:
-        # Remove before releasing ownership: a new watcher may reuse the path
-        # immediately after unlock. A failed unlink is harmless once this PID exits.
+        # Retire before releasing ownership: another watcher may reuse the path.
         if record is not None and finished:
             try:
-                record.unlink()
-            except OSError:
-                pass
+                _retire_watch(record, record_data)
+            except OSError as exc:
+                print(f"Could not persist watch completion: {exc}; a later restart may repeat this outcome.", file=output)
         # Ownership is released BEFORE the gate, so a racing new request either
         # reaches the existing owner above or starts its own watcher.
         if owner is not None:
@@ -421,7 +471,7 @@ def resume_watches(payload, pairs, timeout=WAIT_TIMEOUT_SECONDS):
                 continue
             if reader is None:
                 reader = runpy.run_path(str(pairs / "wait.py"))
-            if _dead_record(record, reader):
+            if _dead_record(record, reader, path):
                 candidates.append(record)
     except Exception as exc:
         print(f"claude-squared auto-watch recovery could not read its state: {exc}. "

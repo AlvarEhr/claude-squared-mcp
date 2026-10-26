@@ -579,6 +579,56 @@ class HookTests(unittest.TestCase):
         self.assertIn("registry unavailable", err)
         self.assertTrue(record.exists())
 
+    def test_failed_unlink_has_a_terminal_receipt_not_a_recoverable_watch(self):
+        W.install_wait_script(self.pairs / "wait.py")
+        path = self.recovery_record()
+        data = json.loads(path.read_text(encoding="utf-8"))
+        original = Path.unlink
+        def held(target, *args, **kwargs):
+            if target == path:
+                raise PermissionError("watch file held open")
+            return original(target, *args, **kwargs)
+        with patch.object(Path, "unlink", held):
+            H._retire_watch(path, data)
+        self.assertTrue(path.exists())
+        self.assertTrue(path.with_suffix(".done").exists())
+        self.assertEqual(self.finish(self.start_recovery()), (0, "", ""))
+        self.assertEqual(self.finish(self.start(event("pair_poll", "done"))), (0, "", ""))
+        # A later watch of this pair has its own identity, so an old receipt
+        # must not suppress that new work's eventual notification.
+        self.recovery_record(started_at=datetime.now(timezone.utc).isoformat())
+        self.recovery_task(status="done")
+        self.assertEqual(self.finish(self.start_recovery())[0], 2)
+
+    @unittest.skipUnless(os.name == "nt", "Windows delete-sharing regression")
+    def test_windows_open_handle_does_not_rewake_completed_recovery(self):
+        import ctypes
+        from ctypes import wintypes
+        W.install_wait_script(self.pairs / "wait.py")
+        path = self.recovery_record()
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.recovery_task(status="done")
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                       ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        # Share read/write, but NOT delete. Both unlink and atomic replacement
+        # of this watch file fail while the handle is held.
+        handle = kernel.CreateFileW(str(path), 0x80000000, 3, None, 3, 0x80, None)
+        self.assertNotEqual(handle, ctypes.c_void_p(-1).value)
+        try:
+            code = H.watch({"cwd": "/manager"}, self.pairs, recover=data,
+                           reader=runpy.run_path(str(self.pairs / "wait.py")),
+                           cancel=H.threading.Event(), output=io.StringIO())
+            self.assertEqual(code, 2)
+            self.assertTrue(path.exists())
+            self.assertTrue(H._completed_record(path, data))
+            self.assertEqual(self.finish(self.start_recovery()), (0, "", ""))
+            self.assertEqual(self.finish(self.start(event("pair_poll", "done"))), (0, "", ""))
+        finally:
+            kernel.CloseHandle(handle)
+
 
 if __name__ == "__main__":
     unittest.main()

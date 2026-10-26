@@ -6,6 +6,7 @@ const PANE = {
   props: { title: 'Pairs', isFocused: false, bodyColumns: 60, placement: 'dock',
     scroll: { offset: 0, bodyRows: 30 }, view: {} },
 } as const
+const VISIBLE = { id: 'pairs', title: 'Pairs', isPlaced: true, isShown: true, isFocused: false }
 
 function row(name: string, session: string | null = null) {
   return { name, backend: 'codex', model: 'luna', status: 'busy', elapsed_s: 125,
@@ -21,6 +22,7 @@ function base(on: On) {
   on('command.register', () => ({ value: { command: 'pairs' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.close', () => ({ value: undefined }))
+  on('ui.panes', () => ({ value: [VISIBLE] }))
   on('session.id', () => ({ value: 'manager-session' }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   return clock
@@ -100,6 +102,7 @@ test('/pairs opens on demand and resolves the default home', async ($, on) => {
   mock.env(on, { HOME: '/home/user' })
   let opened = 0
   on('ui.open', () => { opened++; return { value: { isPlaced: true } } })
+  on('ui.panes', () => ({ value: [VISIBLE] }))
   on('session.id', () => ({ value: 'manager-session' }))
   on('process.run', (_, e) => {
     expect(e.argv.slice(-2)).toEqual(['--home', '/home/user/.claude'])
@@ -164,4 +167,59 @@ test('context bar and alert are visible in each row, including unknown idle cont
     await ui.press({ key: 'scope' })
     await ui.unmount()
   }
+})
+
+test('scope and expansion reach the reader; collapsed rows show no log detail', async ($, on) => {
+  base(on)
+  const requests: { all: boolean; session: string; expanded: string[]; cache: unknown }[] = []
+  on('process.run', (_, e) => {
+    const request = JSON.parse(e.init?.stdin || '{}')
+    requests.push(request)
+    return { value: { exitCode: 0, stdout: JSON.stringify({ rows: [row('scout', 'manager-session')],
+      cache: { tasks: { example: { summary: { status: 'running' } } } } }),
+      stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: false })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(requests[0]?.all).toBe(false)
+  expect(requests[0]?.session).toBe('manager-session')
+  expect(requests[0]?.expanded).toEqual([])
+  expect(await ui.find({ type: 'Text', text: /Running the tests/ })).toBeUndefined()
+  await ui.press({ key: 'detail-scout' })
+  expect(requests.at(-1)?.expanded).toEqual(['scout'])
+  expect(requests.at(-1)?.cache).toEqual({ tasks: { example: { summary: { status: 'running' } } } })
+  expect((await ui.find({ type: 'Text', text: /Running the tests/ }))?.text).toBe('Running the tests')
+  await ui.press({ key: 'scope' })
+  expect(requests.at(-1)?.all).toBe(true)
+  await ui.unmount()
+})
+
+test('hidden or unplaced panes do not start a filesystem refresh', async ($, on) => {
+  mock.env(on, { HOME: '/home/user' })
+  const clock = mock.clock(on)
+  on('command.register', () => ({ value: { command: 'pairs' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: 'manager-session' }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  let shown = true
+  let placed = true
+  on('ui.panes', () => ({ value: [{ ...VISIBLE, isShown: shown, isPlaced: placed }] }))
+  let calls = 0
+  on('process.run', () => {
+    calls++
+    return { value: { exitCode: 0, stdout: '{"rows":[]}', stderr: '',
+      isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: false })
+  expect(calls).toBe(1)
+  shown = false
+  await clock.advance(4000)
+  expect(calls).toBe(1)
+  shown = true
+  placed = false
+  await clock.advance(4000)
+  expect(calls).toBe(1)
+  placed = true
+  await clock.advance(2000)
+  expect(calls).toBe(2)
 })

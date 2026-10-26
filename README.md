@@ -521,10 +521,10 @@ and the copied 2.1.308 type declarations list `startup`, `resume`, `clear`,
 `compact`, and `fork`; recovery handles all five but always requires an exact
 session-ID match.
 
-The local restart tests are offline. **SessionStart asyncRewake delivery in the
-Desktop transport still needs the live check.** The opt-in probe costs three
-short Haiku turns, verifies the hook's `source` and resumed `session_id`, and
-checks that the hook wakes an idle stream-json manager:
+The main session verified this on **2026-10-26 with Desktop's CLI 2.1.308**:
+`--resume` retained the session ID and SessionStart `asyncRewake` woke the idle
+stream-json manager. The opt-in probe costs three short Haiku turns and records
+the hook's `source`, resumed `session_id`, and wake timing:
 
 ```bash
 python tests/smoke_live_sessionstart.py --live
@@ -545,9 +545,9 @@ is waiting on**. Toggle **This session / All pairs** to see every registered
 pair, including idle pairs, other managers' waits and work with no auto-watch attached.
 
 Each row prominently shows a compact context bar and **used / window** directly
-below its name, plus backend/model, work elapsed time, last log line,
-and each watcher's elapsed time and manager
-session/project (your own is marked **this session**). Queued work,
+below its name, plus backend/model, work elapsed time, and each watcher's
+elapsed time and manager session/project (your own is marked **this session**).
+**Show detail** loads the last log line and activity reasons for that row. Queued work,
 background tasks and pending self-wakes count as active. Unresolved activity
 is labelled `unknown`; orphaned tasks needing recovery stay visible as
 `needs attention`. The pane is read-only: filtering, refreshing and closing
@@ -583,16 +583,32 @@ use `/reload-plugins`. The mod never changes user settings itself.
 After upgrading the server, start a fresh pair MCP server so it installs the
 updated hook script. **New** hook invocations publish small records under
 `<CLAUDE_HOME>/pairs/watches/`; watchers already running from an older script
-will not appear as waits. Records are removed on completion; dead watcher
-PIDs and detected PID reuse are hidden even if cleanup failed.
+will not appear as waits. Completion is recorded in a separate `.done` receipt
+before cleanup. A held Windows file cannot cause the completed watch to recover
+and wake again; a new watch of that pair has a different PID/start identity.
+Dead watcher PIDs and detected PID reuse are also hidden.
 
-The pane refreshes about every two seconds while open. A bundled stdlib Python
-reader calls the installed `wait.py`'s merged activity reader and PID checks,
-so it uses the same rules as the watcher across multiple MCP processes. It
-reads task/activity/watch files and at most 8 KiB from each displayed pair's
-log; it makes no model calls and writes no pair state. Closing it cancels
-refreshes. A failed read clears the display and shows an error instead of
-presenting an old wait as live.
+The pane checks visibility every two seconds and starts a reader only while
+placed and shown. A bundled stdlib Python reader reuses `wait.py`'s activity
+rules and PID checks with a bounded input set. Session/all filtering happens
+before activity reads. Collapsed and filtered-out rows never read log detail;
+expanded rows read at most 8 KiB each. No transcript or separate reply-detail
+read is performed; task files are byte-capped and used only as metadata.
+
+Each refresh scans at most 2,048 task-directory entries and considers at most
+128 tasks: files modified in the last 15 minutes, plus task IDs referenced by
+selected activity or known-running cached summaries. Task JSON is capped at
+64 KiB per file; metadata at 128 KiB (registry: 2 MiB), with a combined 4 MiB /
+128-file JSON-read budget. At most 64 rows are displayed. Compact task summaries
+are cached in the mod across refreshes; prompt/reply bodies are not cached.
+Omissions are labelled **Partial snapshot**, and an otherwise idle result is
+marked **unknown**: old unreferenced queued work cannot be ruled out. This pane
+is an overview, not an exhaustive substitute for `pair_status`/`pair_poll`.
+
+The reader makes no model calls and writes no pair state. Closing the pane
+cancels future refreshes. A failed read clears the display and shows an error
+instead of presenting an old wait as live. Implementation and validation notes
+for maintainers are in [docs/pairs-pane-notes.md](docs/pairs-pane-notes.md).
 
 Python 3.7+ must be available to the host. In `/config`, the plugin exposes
 `pairs-pane.python` (an executable path, no shell arguments),

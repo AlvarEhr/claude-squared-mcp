@@ -4,8 +4,9 @@ import type { PairRow, PairsView } from '../types'
 
 const PANE = 'pairs'
 const view = atom({ plugin: 'pairs-pane', key: 'view' } as const,
-  { rows: [], error: null, session: '', home: '' } as PairsView)
+  { rows: [], error: null, notice: null, session: '', home: '' } as PairsView)
 const all = atom({ plugin: 'pairs-pane', key: 'all' } as const, false)
+const expanded = atom({ plugin: 'pairs-pane', key: 'expanded' } as const, [] as string[])
 
 function duration(seconds: number | null): string {
   if (seconds === null) return 'unknown'
@@ -31,6 +32,8 @@ let refreshing = false
 let cancel: (() => void) | undefined
 let active = true
 let generation = 0
+let readerCache: unknown = {}
+let cacheHome = ''
 
 function stopPolling() {
   active = false
@@ -46,23 +49,31 @@ async function refresh($: EngineInterface) {
   let home = ''
   let session = ''
   try {
+    const panes = await $.ui.panes()
+    if (!panes.some(pane => pane.id === PANE && pane.isPlaced && pane.isShown)) return
     session = await $.session.id()
     const configured = String(options.claudeHome || '') || await $.env.get('CLAUDE_HOME')
     const user = await $.env.get('USERPROFILE') || await $.env.get('HOME')
     home = configured || (user ? `${user}/.claude` : '')
     if (!home) throw new Error('Cannot locate Claude home. Set pairs-pane.claudeHome in /config.')
+    if (home !== cacheHome) { readerCache = {}; cacheHome = home }
+    const showAll = await read($, all)
+    const details = await read($, expanded)
     const result = await $.process.run([
       String(options.python || 'python'), '-B', `${$.plugin.root}/read_pairs.py`, '--home', home,
-    ], { timeoutMs: 5000 })
+    ], { timeoutMs: 5000, stdin: JSON.stringify({ session, all: showAll, expanded: details, cache: readerCache }) })
     if (result.exitCode !== 0 || result.isStdoutTruncated) {
       throw new Error('The pair reader failed. Check pairs-pane.python in /config.')
     }
     const data = JSON.parse(result.stdout)
     if (!Array.isArray(data.rows)) throw new Error('The pair reader returned an invalid snapshot.')
-    if (active && generation === currentGeneration) await update($, view, () => ({ rows: data.rows as PairRow[], error: data.error || null, session, home }))
+    if (active && generation === currentGeneration) {
+      readerCache = data.cache || {}
+      await update($, view, () => ({ rows: data.rows as PairRow[], error: data.error || null, notice: data.notice || null, session, home }))
+    }
   } catch (error) {
     // Do not leave old waits looking live after a reader/permission failure.
-    if (active && generation === currentGeneration) await update($, view, () => ({ rows: [], error: String(error), session, home }))
+    if (active && generation === currentGeneration) await update($, view, () => ({ rows: [], error: String(error), notice: null, session, home }))
   } finally {
     refreshing = false
   }
@@ -82,8 +93,18 @@ async function open($: EngineInterface) {
   if (placed.isPlaced) {
     start($)
     await refresh($)
-  }
+  } else stopPolling()
   return placed.isPlaced
+}
+
+async function changeScope($: EngineInterface) {
+  await update($, all, value => !value)
+  await refresh($)
+}
+
+async function toggleDetail($: EngineInterface, name: string) {
+  await update($, expanded, value => value.includes(name) ? value.filter(item => item !== name) : [...value, name])
+  await refresh($)
 }
 
 export const register: Register = (on, configured) => {
@@ -104,7 +125,9 @@ export const register: Register = (on, configured) => {
   })
   on('session.end', async ($, e, next) => {
     stopPolling()
-    await update($, view, () => ({ rows: [], error: null, session: '', home: '' }))
+    readerCache = {}
+    await update($, expanded, () => [])
+    await update($, view, () => ({ rows: [], error: null, notice: null, session: '', home: '' }))
     return next(e)
   })
 
@@ -112,25 +135,29 @@ export const register: Register = (on, configured) => {
     const { Box, Text, Button } = $.ui.resolve(e)
     const current = await read($, view)
     const showAll = await read($, all)
+    const details = await read($, expanded)
     const rows = current.rows.filter(row => showAll || row.watches.some(w => w.session_id === current.session))
     return (
       <Box flexDirection="column">
         <Box>
           <Button key="scope" label={showAll ? 'All pairs' : 'This session'}
-            onPress={() => { void update($, all, value => !value) }} />
+            onPress={() => { void changeScope($) }} />
           <Button key="refresh" label="Refresh" onPress={() => { void refresh($) }} />
           <Button key="close" label="Close" onPress={() => { stopPolling(); void $.ui.close({ id: PANE }) }} />
         </Box>
         <Text dimColor>{showAll ? 'All pairs · last reported context' : 'Pairs this session is waiting on'}</Text>
         {current.error && <Text>{current.error}</Text>}
+        {current.notice && <Text dimColor>{current.notice}</Text>}
         {!current.error && rows.length === 0 && <Text dimColor>{showAll ? 'No pairs found.' : 'No auto-watch waits for this session.'}</Text>}
         {rows.map(row => (
           <Box flexDirection="column" marginTop={1}>
             <Text bold>{row.name} · {row.backend}/{row.model}</Text>
             <Text bold color={row.context?.above_alert ? 'red' : undefined}>{contextLabel(row)}</Text>
             <Text>{row.status}{row.elapsed_s !== null && row.status !== 'idle' ? ` · ${row.status === 'busy' ? 'running for' : 'work started'} ${duration(row.elapsed_s)}${row.status === 'busy' ? '' : ' ago'}` : ''}</Text>
-            {row.last_line && <Text>{row.last_line}</Text>}
-            {row.reason && <Text dimColor>{row.reason}</Text>}
+            <Button key={`detail-${row.name}`} label={details.includes(row.name) ? 'Hide detail' : 'Show detail'}
+              onPress={() => { void toggleDetail($, row.name) }} />
+            {details.includes(row.name) && row.last_line && <Text>{row.last_line}</Text>}
+            {details.includes(row.name) && row.reason && <Text dimColor>{row.reason}</Text>}
             {row.watches.length === 0 && <Text dimColor>No auto-watch</Text>}
             {row.watches.map(w => (
               <Text dimColor>Watching for {duration(w.elapsed_s)} · {w.session_id === current.session ? 'this session' : `session ${w.session_id}`}{w.cwd ? ` · ${w.cwd}` : ''}{w.verified ? '' : ' · PID unverified'}</Text>
