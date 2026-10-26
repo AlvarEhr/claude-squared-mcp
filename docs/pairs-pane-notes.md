@@ -36,12 +36,17 @@ a bounded task set and bounded JSON reads. Limits live beside the reader:
 | Combined JSON I/O | 4 MiB and 128 file reads per refresh |
 | Selected pairs | 64; at most 16 activity-directory entries per pair |
 | Cross-refresh task cache | 256 KiB of metadata; no prompt/result bodies |
-| Log detail | 8 KiB only for an expanded, selected row |
+| Log detail | 8 KiB only for an expanded, selected row; initial display 15 lines |
+| Reply detail | Latest selected task's full response within its 64 KiB file cap; initial display 12 lines |
+| Combined detail output | 1 MiB per snapshot |
+| Transcript | Explicit open/page only; 64 KiB per page, user/assistant text; no restore/decompression |
 
 Only matching session watches select pairs in the default view. All-pairs mode
 also selects registered/activity pairs. Filtering precedes activity and log
-reads. No separate reply-detail/transcript fetch is performed. Budget/age omissions set a partial
-notice, and idle becomes unknown rather than claiming all work was observed.
+reads. Expanded rows read latest finished/current task payloads within the same
+byte/file budget. Activity-referenced previous completed tasks remain eligible
+even beyond the two-hour scan window. Old-history omissions alone do not alter
+idle status. A dim footnote is gated on known affected working/recent rows.
 An old queued task without an activity reference or cached running summary may
 be omitted; use pair_status/pair_poll when completeness matters.
 
@@ -65,9 +70,34 @@ SendResult.model_used, newest report first. This is last-observed resolution,
 not a query of the provider's current alias mapping. Explicit versioned registry
 IDs stay authoritative; a different family's old turn cannot resolve an alias.
 
-The two-second timer asks `$.ui.panes()` about placement and visibility before
-launching a Python reader. Hidden tabs and unplaced panes perform no filesystem
-refresh. Close/clear cancels polling and invalidates any in-flight result.
+The five-second timer asks `$.ui.panes()` about placement and visibility before
+launching a Python reader. Clicks update cached view/expansion state, then enqueue
+a background refresh; More controls only reveal cached lines. One reader at a
+time covers both snapshots and explicit transcript pages. Per-scope snapshots
+preserve the last view when toggling; expanded detail is retained separately from
+the task-summary cache. Hidden tabs and unplaced panes perform no filesystem
+refresh. Close/clear cancels pending timers and invalidates in-flight results.
+
+`ProcessSpawnRequest.input` in the copied 2.1.308 API is a single string followed
+by closed stdin. There is no stdin writer, so a long-lived request/response
+reader cannot be implemented with that API. One-shot `process.run` remains;
+refresh is never awaited by an input handler. A deferred-reader mod regression
+holds the process result indefinitely while switching views and expanding/
+collapsing rows, and asserts no overlapping launches.
+
+2026-10-26 local timing (`.venv/Scripts/python-direct.exe -B
+scripts/benchmark_pairs_pane.py`, isolated 45-pair fixture, seven subprocess
+samples): median 153.03 ms before, 126.83 ms after; warm I/O unchanged at 11,285
+bytes / 46 files. Treat the small per-call difference as measurement noise.
+The interval cuts scheduled launches from 30 to 12/minute (60%); clicks do not
+await those reads. These are offline reader timings, not Desktop frame timings.
+
+Transcript lookup is explicit only: Claude's home/projects/cwd/session path,
+or Codex's indexed thread path from a read-only SQLite connection. No recursive
+rollout search or model call. Missing/compressed files and oversized JSONL
+records have visible explanations. Pages cover user/assistant text; tool and
+metadata records are skipped. Log timestamps are already local (runtime.py's
+datetime.now); ISO reply/transcript times are formatted locally in the mod.
 
 ## Watch retirement
 

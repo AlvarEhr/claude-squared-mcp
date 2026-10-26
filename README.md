@@ -547,14 +547,21 @@ first), then a collapsed **Idle (N)** group with compact rows. Other managers'
 waits and work with no auto-watch attached are included.
 
 Rows show a short model label, work elapsed time or completion time, and
-**used / window** context. Desktop uses a coloured bar; terminal uses a text
-bar. Watch badges appear only when a watch exists, with elapsed time and the
+**used / window** context, abbreviated (for example, **121k / 828k · 15%**).
+Desktop uses a short inline coloured bar; terminal uses a text bar.
+Watch badges appear only when a watch exists, with elapsed time and the
 manager session (your own is marked **this session**).
 Model labels retain versions, such as **Opus 5.5** and **6.1 Sol**. Floating
 aliases use the latest matching resolved ID in available activity/turn metadata;
 without that evidence, the alias stays unversioned (for example, **Sol**).
-**Show detail** loads the last meaningful log line, skipping TURN bookkeeping,
-and activity reasons for that row. Queued work,
+**Show detail** loads the latest finished reply (the **Previous reply** while
+working), the current message's first line, and the latest 15 meaningful log
+lines, skipping TURN bookkeeping. Reply/log text wraps; **More reply** and
+**More activity** reveal the rest of the bounded content already loaded.
+Replies initially show 12 lines. Timestamps use local time. **Open transcript**
+shows user/assistant messages in the pane, with **Next page** for bounded
+64 KiB pages. Compressed/unavailable transcripts are reported, never restored.
+Queued work,
 background tasks and pending self-wakes count as active. Unresolved activity
 is labelled `unknown`; orphaned tasks needing recovery stay visible as
 `needs attention`. The pane is read-only: filtering, refreshing and closing
@@ -602,22 +609,27 @@ before cleanup. A held Windows file cannot cause the completed watch to recover
 and wake again; a new watch of that pair has a different PID/start identity.
 Dead watcher PIDs and detected PID reuse are also hidden.
 
-The pane checks visibility every two seconds and starts a reader only while
+The pane checks visibility every five seconds and starts a reader only while
 placed and shown. A bundled stdlib Python reader reuses `wait.py`'s activity
 rules and PID checks with a bounded input set. Session/all filtering happens
 before activity reads. Collapsed and filtered-out rows never read log detail;
-expanded rows read at most 8 KiB each. No transcript or separate reply-detail
-read is performed; task files are byte-capped and used only as metadata.
+expanded rows read at most 8 KiB each and reply payloads within the task-file
+cap. View switches and expand/collapse redraw cached content immediately;
+reads run in the background, with at most one reader at a time. More controls
+do no I/O. Transcripts are read only on explicit open/page requests.
 
 Each refresh scans at most 2,048 task-directory entries and considers at most
 128 tasks: files modified in the last two hours, plus task IDs referenced by
 selected activity or known-running cached summaries. Task JSON is capped at
 64 KiB per file; metadata at 128 KiB (registry: 2 MiB), with a combined 4 MiB /
 128-file JSON-read budget. At most 64 rows are displayed. Compact task summaries
-are cached in the mod across refreshes; prompt/reply bodies are not cached.
-Omissions are labelled **Partial snapshot**, and an otherwise idle result is
-marked **unknown**: old unreferenced queued work cannot be ruled out. This pane
+are cached in the mod across refreshes; this metadata cache contains no
+prompt/reply bodies. Expanded detail is cached separately for instant redraw,
+with a combined 1 MiB detail-output cap per snapshot. Oversized/unavailable
+replies show an explanation. Old-history omissions alone do not change idle
+status; a dim footnote appears only for affected working/recent rows. This pane
 is an overview, not an exhaustive substitute for `pair_status`/`pair_poll`.
+Old unreferenced queued work may be omitted by the bounded task scan.
 
 The reader makes no model calls and writes no pair state. Closing the pane
 cancels future refreshes. A failed read clears the display and shows an error
@@ -637,6 +649,9 @@ The API has no direct PID-liveness query, so the pane uses the read-only
 Python helper through `$.process.run`. A host that refuses that call cannot
 provide the pane's live view. Without an attached surface, `/pairs` reports
 that no pane is available and does not start polling.
+The current `$.process.spawn` API closes stdin after one input string, so a
+long-lived request/response reader is not supported; the pane uses serial,
+background one-shot reads instead.
 
 Maintainer checks (local, no model calls):
 

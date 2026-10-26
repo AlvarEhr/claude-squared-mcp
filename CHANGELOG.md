@@ -6,6 +6,15 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Pairs pane controls redraw cached content immediately, with serial background
+  refreshes every five seconds. Expanded rows show the latest/previous reply,
+  current message and wrapped log lines, with local More controls and an explicit
+  paged transcript viewer. Context is a short inline bar with abbreviated counts.
+- Skipping old task history no longer labels finished pairs unknown. Read-limit
+  notices appear as a dim footnote only for affected working/recent rows.
+
 ## [0.21.0] — 2026-10-26
 
 A Pairs pane for the Claude desktop app, and auto-watch waits that survive a restart.

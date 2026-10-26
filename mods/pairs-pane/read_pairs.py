@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import runpy
 import sys
+import sqlite3
 
 JSON_LIMIT = 128 * 1024
 TASK_LIMIT = 64 * 1024
@@ -32,6 +33,7 @@ class Reads:
         self.files = 0
         self.partial = False
         self.memo = {}
+        self.issues = set()
 
     def json(self, path, limit=JSON_LIMIT):
         path = Path(path)
@@ -42,6 +44,7 @@ class Reads:
             size = path.stat().st_size
             if size > limit or size > BYTE_BUDGET - self.bytes or self.files >= FILE_BUDGET:
                 self.partial = True
+                self.issues.add(str(path))
                 self.memo[path] = None
                 return None
             self.files += 1
@@ -53,6 +56,7 @@ class Reads:
             pass
         except (OSError, ValueError):
             self.partial = True
+            self.issues.add(str(path))
         self.memo[path] = value
         return value
 
@@ -62,12 +66,14 @@ class Reads:
                 for index, entry in enumerate(entries):
                     if index >= limit:
                         self.partial = True
+                        self.issues.add(str(directory))
                         break
                     yield entry
         except FileNotFoundError:
             pass
         except OSError:
             self.partial = True
+            self.issues.add(str(directory))
 
 
 def task_summaries(pairs, names, references, reader, reads, now, cache, show_all):
@@ -106,7 +112,6 @@ def task_summaries(pairs, names, references, reader, reads, now, cache, show_all
         if entry.name in candidates:
             continue
         if stat.st_mtime < now.timestamp() - RECENT_SECONDS:
-            reads.partial = True  # old unreferenced queued work cannot be ruled out
             continue
         recent.append((stat, Path(entry.path)))
     room = max(0, TASK_BUDGET - len(candidates))
@@ -126,6 +131,7 @@ def task_summaries(pairs, names, references, reader, reads, now, cache, show_all
             if not isinstance(data, dict):
                 continue
             summary = reader["_av_task_summary"](data)
+            summary["filename"] = filename
             # Retain only the last reported context, never the model reply.
             result = data.get("result")
             if isinstance(result, dict) and isinstance(result.get("model_used"), str):
@@ -164,12 +170,33 @@ def tail(path):
         lines = data.decode("utf-8", "replace").splitlines()
         if offset:
             lines = lines[1:]
-        lines = [re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line).strip() for line in lines]
-        line = next((line for line in reversed(lines) if line and not re.search(
-            r"(?:^|\]\s*)===|\bTURN (?:COMPLETED|STARTED|FAILED|STOPPED)\b", line)), "")
-        return "".join(c if c.isprintable() else " " for c in line)[:320]
+        lines = [re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line).rstrip() for line in lines]
+        return ["".join(c if c.isprintable() else " " for c in line) for line in lines
+                if line and not re.match(r"^(?:\[\d{2}:\d{2}:\d{2}\]\s*)?=== ", line)]
     except OSError:
-        return ""
+        return []
+
+
+def task_detail(pairs, tasks, reads, parse):
+    completed = [t for t in tasks if t.get("status") != "running" and parse(t.get("finished_at"))]
+    running = [t for t in tasks if t.get("status") == "running"]
+    latest = max(completed, key=lambda t: parse(t["finished_at"])) if completed else None
+    current = min(running, key=lambda t: str(t.get("started_at") or "")) if running else None
+    def payload(task):
+        filename = task.get("filename") if task else None
+        if not isinstance(filename, str) or not re.fullmatch(r"[A-Za-z0-9_-]+\.json", filename):
+            return {}
+        data = reads.json(pairs / "async" / filename, TASK_LIMIT)
+        return data if isinstance(data, dict) else {}
+    data = payload(latest)
+    result = data.get("result")
+    reply = result.get("response") if isinstance(result, dict) else None
+    if not isinstance(reply, str):
+        reply = data.get("error") if isinstance(data.get("error"), str) else None
+    message = payload(current).get("message")
+    return {"reply": reply, "reply_at": latest.get("finished_at") if latest else None,
+            "working_on": message.splitlines()[0] if isinstance(message, str) and message else None,
+            "logs": [], "note": None if reply is not None else "Latest reply unavailable within the read limits."}
 
 
 def context_fill(reader, view, spec, defaults):
@@ -302,10 +329,16 @@ def snapshot(home, session=None, show_all=True, expanded=(), cache=None):
             turn = activity.get("turn") if isinstance(activity, dict) else None
             if isinstance(turn, dict) and isinstance(turn.get("task_id"), str):
                 references.add(turn["task_id"])
+            if name in expanded and isinstance(activity, dict):
+                finished = [item for item in activity.get("window_turns", []) if isinstance(item, dict)
+                            and item.get("ended_at") and isinstance(item.get("task_id"), str)]
+                if finished:
+                    references.add(max(finished, key=lambda item: str(item["ended_at"]))["task_id"])
     tasks, saved = task_summaries(pairs, set(names), references, reader, reads, now, cache, show_all) if names else ([], {})
     view_fn.__globals__["_av_scan_tasks"] = lambda *args, **kwargs: tasks
     view_fn.__globals__["_av_owner_files"] = lambda root, name: owner_files.get(name, [])
     rows = []
+    detail_bytes = 0
     for name in names:
         view = view_fn(pairs, name, now=now)
         waiting = watches.get(name, [])
@@ -354,6 +387,20 @@ def snapshot(home, session=None, show_all=True, expanded=(), cache=None):
         # since the UI's previous snapshot. Gate detail using this snapshot too.
         detail = name in expanded and (not show_all or waiting or attention or view["verdict"] == "busy"
                                       or (finished and (now - finished).total_seconds() <= RECENT_SECONDS))
+        details = task_detail(pairs, pair_tasks, reads, parse) if detail else None
+        if details is not None:
+            details["logs"] = tail(pairs / "logs" / name / "main.log")
+            size = len(json.dumps(details).encode("utf-8"))
+            if detail_bytes + size > 1024 * 1024:
+                details = {"reply": None, "reply_at": None, "working_on": None, "logs": [],
+                           "note": "Collapse another expanded row to load these details."}
+            else:
+                detail_bytes += size
+        activity_path = str(pairs / "activity" / name)
+        affected = any(issue == activity_path or issue.startswith(activity_path + os.sep) for issue in reads.issues)
+        affected = affected or any(str(pairs / "async" / (str(item.get("task_id")) + ".json")) in reads.issues
+                                   for key in ("turns", "running_tasks") for item in view[key])
+        affected = affected or bool(details and details["note"])
         rows.append({
             "name": name, "backend": spec.get("backend") or context.get("backend") or "unknown",
             "model": display_model(spec, view, pair_tasks, parse), "status": "needs attention" if attention else view["verdict"],
@@ -361,16 +408,77 @@ def snapshot(home, session=None, show_all=True, expanded=(), cache=None):
             "finished_at": finished.isoformat() if finished else None,
             "finished_ago_s": max(0, (now - finished).total_seconds()) if finished else None,
             "outcome": outcome,
-            "last_line": tail(pairs / "logs" / name / "main.log") if detail else "", "context": fill,
-            "reason": "; ".join(view["reasons"][:2]) if detail else "", "watches": waiting,
+            "detail": details, "context": fill, "watches": waiting,
+            "partial": bool(affected and (view["verdict"] == "busy" or waiting
+                             or (finished and (now - finished).total_seconds() <= RECENT_SECONDS))),
         })
-    if reads.partial:
-        for row in rows:
-            if row["status"] == "idle":
-                row["status"] = "unknown"
     return {"rows": rows, "error": error, "updated_at": now.isoformat(), "cache": saved,
-            "notice": "Partial snapshot: old, oversized or over-budget task/activity data omitted." if reads.partial else None,
+            "notice": "Some working/recent pair details are unavailable within the read limits." if any(r["partial"] for r in rows) else None,
             "io": {"bytes": reads.bytes, "files": reads.files}}
+
+
+def transcript_page(home, name, offset=0):
+    """An explicit user read: at most 64 KiB of a transcript per page."""
+    reads = Reads()
+    root = Path(home).expanduser().resolve()
+    registry = reads.json(root / "pairs" / "registry.json", 2 * 1024 * 1024) or {}
+    spec = registry.get("pairs", {}).get(name, {}) if safe_pair(name) else {}
+    session = spec.get("session_id")
+    path = None
+    if not isinstance(session, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", session):
+        return {"lines": [], "note": "No transcript is recorded for this pair.", "next": None}
+    if spec.get("backend") == "codex":
+        codex = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        databases = sorted(Path(e.path) for e in reads.entries(codex) if re.fullmatch(r"state_\d+\.sqlite", e.name))
+        if databases:
+            try:
+                con = sqlite3.connect(databases[-1].resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
+                try:
+                    record = con.execute("SELECT rollout_path FROM threads WHERE id=?", (session,)).fetchone()
+                    path = Path(record[0]) if record and record[0] else None
+                finally:
+                    con.close()
+            except (OSError, sqlite3.Error):
+                pass
+    elif isinstance(spec.get("cwd"), str):
+        path = root / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", spec["cwd"]) / (session + ".jsonl")
+    if path is None or path.suffix != ".jsonl" or not path.is_file():
+        return {"lines": [], "note": "Transcript unavailable (it may be archived or compressed).", "next": None}
+    offset = max(0, offset) if type(offset) is int else 0
+    try:
+        with path.open("rb") as stream:
+            size = stream.seek(0, 2)
+            stream.seek(min(offset, size))
+            data = stream.read(TASK_LIMIT)
+    except OSError:
+        return {"lines": [], "note": "Transcript could not be read.", "next": None}
+    end = len(data)
+    note = None
+    if offset + end < size:
+        boundary = data.rfind(b"\n")
+        if boundary >= 0:
+            end = boundary + 1
+        else:
+            note = "An oversized transcript record was skipped within this page's read limit."
+    lines = []
+    for raw in data[:end].splitlines():
+        try:
+            event = json.loads(raw)
+            message = event.get("message") or event.get("payload") or event
+            role = message.get("role")
+            content = message.get("content")
+            if role not in ("user", "assistant"):
+                continue
+            text = content if isinstance(content, str) else "\n".join(
+                block.get("text", "") for block in (content or []) if isinstance(block, dict)
+                and block.get("type") in ("text", "input_text", "output_text"))
+            if text:
+                stamp = event.get("timestamp") or ""
+                lines.append({"role": role, "at": stamp, "text": text})
+        except (ValueError, TypeError, AttributeError):
+            note = "Some transcript records could not be displayed within this page's read limit."
+    return {"lines": lines, "note": note, "next": offset + end if offset + end < size else None,
+            "offset": offset, "bytes": len(data)}
 
 
 def main():
@@ -385,8 +493,12 @@ def main():
         request = json.loads(raw) if raw else {}
         if not isinstance(request, dict):
             raise ValueError("snapshot request must be an object")
-        result = snapshot(args.home, session=request.get("session"), show_all=request.get("all", True),
-                          expanded=request.get("expanded", []), cache=request.get("cache"))
+        if isinstance(request.get("transcript"), dict):
+            target = request["transcript"]
+            result = {"transcript": transcript_page(args.home, target.get("pair"), target.get("offset", 0))}
+        else:
+            result = snapshot(args.home, session=request.get("session"), show_all=request.get("all", True),
+                              expanded=request.get("expanded", []), cache=request.get("cache"))
     except Exception as exc:
         result = {"rows": [], "error": f"Pair state could not be read: {exc}"}
     print(json.dumps(result, ensure_ascii=True))

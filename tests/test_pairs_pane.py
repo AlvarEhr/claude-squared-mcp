@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -72,7 +73,7 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual((row["name"], row["backend"], row["model"], row["status"]), ("scout", "codex", "luna", "busy"))
         self.assertGreaterEqual(row["elapsed_s"], 120)
         self.assertEqual(row["context"]["percent"], 25)
-        self.assertEqual(row["last_line"], "[T-9] Running tests ✓")
+        self.assertEqual(row["detail"]["logs"][-1], "[T-9] Running tests ✓")
         self.assertEqual(row["watches"][0]["session_id"], "manager")
         self.assertEqual(before, {str(p): p.read_bytes() for p in self.pairs.rglob("*") if p.is_file()})
 
@@ -193,8 +194,8 @@ class SnapshotTests(unittest.TestCase):
             data = P.snapshot(self.home)
         self.assertFalse(any(path.parent == folder for path in opened))
         self.assertLess(data["io"]["bytes"], 10000)
-        self.assertIn("Partial snapshot", data["notice"])
-        self.assertEqual(data["rows"][0]["status"], "unknown")
+        self.assertIsNone(data["notice"])
+        self.assertEqual(data["rows"][0]["status"], "idle")
 
     def test_task_count_budget_and_warm_summary_cache(self):
         for i in range(P.TASK_BUDGET + 20):
@@ -207,7 +208,7 @@ class SnapshotTests(unittest.TestCase):
         self.assertTrue(all(isinstance(item["mtime"], str) for item in cold["cache"]["tasks"].values()))
         warm = P.snapshot(self.home, cache=cold["cache"])
         self.assertLess(warm["io"]["bytes"], cold["io"]["bytes"])
-        self.assertIn("Partial snapshot", warm["notice"])
+        self.assertIsNone(warm["notice"])
 
     def test_filter_precedes_activity_reads_and_detail_requires_expansion(self):
         self.activity()
@@ -223,7 +224,7 @@ class SnapshotTests(unittest.TestCase):
             collapsed = P.snapshot(self.home, session="manager", show_all=False)
             detail.assert_not_called()
             self.assertEqual([r["name"] for r in collapsed["rows"]], ["scout"])
-            self.assertEqual(collapsed["rows"][0]["last_line"], "")
+            self.assertIsNone(collapsed["rows"][0]["detail"])
             self.assertFalse(any("hidden" in path.parts for path in read_paths))
             P.snapshot(self.home, session="manager", show_all=False, expanded=["hidden", "scout"])
             detail.assert_called_once_with(self.pairs / "logs/scout/main.log")
@@ -285,14 +286,14 @@ class SnapshotTests(unittest.TestCase):
         log.parent.mkdir(parents=True)
         log.write_text("[19:44:21] [T-9] Tests passed\n"
                        "[19:44:22] === TURN COMPLETED (in 36,632,455 / cached 36,319,616) ===\n", encoding="utf-8")
-        self.assertEqual(P.snapshot(self.home, expanded=["scout"])["rows"][0]["last_line"],
-                         "[19:44:21] [T-9] Tests passed")
+        self.assertEqual(P.snapshot(self.home, expanded=["scout"])["rows"][0]["detail"]["logs"],
+                         ["[19:44:21] [T-9] Tests passed"])
 
     def test_row_aging_into_idle_group_stops_detail_reads(self):
         self.activity(turn=None, window_turns=[{"started_at": self.started,
             "ended_at": (self.now - timedelta(hours=3)).isoformat(), "status": "done"}])
         with patch.object(P, "tail") as detail:
-            self.assertEqual(P.snapshot(self.home, expanded=["scout"])["rows"][0]["last_line"], "")
+            self.assertIsNone(P.snapshot(self.home, expanded=["scout"])["rows"][0]["detail"])
             detail.assert_not_called()
 
     def test_owner_pid_alone_does_not_guess_manager_session(self):
@@ -323,6 +324,81 @@ class SnapshotTests(unittest.TestCase):
         self.write("activity/scout/pair.json", {"reported_window": {"tokens": 1000000,
             "model_key": "fable|default", "model": "claude-fable-5-1", "at": self.now.isoformat()}})
         self.assertEqual(P.snapshot(self.home)["rows"][0]["model"], "claude-fable-5-1")
+
+    def test_expanded_detail_keeps_reply_and_log_lines_whole_without_caching_bodies(self):
+        reply = "A complete reply " * 100 + "\nlast line"
+        self.activity(window_turns=[{"task_id": "previous", "started_at": self.started,
+                                    "ended_at": self.started, "status": "done"}])
+        previous = self.write("async/previous.json", {"task_id": "previous", "pair_name": "scout", "status": "done",
+            "finished_at": self.started, "result": {"response": reply}})
+        os.utime(previous, (1, 1))  # activity reference makes an older reply eligible
+        self.write("async/task.json", {"task_id": "task", "pair_name": "scout", "status": "running",
+            "owner_pid": os.getpid(), "started_at": self.now.isoformat(), "message": "Investigate the failure\nMore instructions"})
+        log = self.pairs / "logs/scout/main.log"
+        log.parent.mkdir(parents=True)
+        long_line = "[21:30:00] " + "whole word " * 60
+        log.write_text("\n".join([f"[21:29:00] line {i}" for i in range(20)] + [long_line]), encoding="utf-8")
+        snapshot = P.snapshot(self.home, expanded=["scout"])
+        detail = snapshot["rows"][0]["detail"]
+        self.assertEqual(detail["reply"], reply)
+        self.assertEqual(detail["working_on"], "Investigate the failure")
+        self.assertEqual(len(detail["logs"]), 21)
+        self.assertEqual(detail["logs"][-1], long_line.strip())
+        self.assertNotIn(reply, json.dumps(snapshot["cache"]))
+        self.assertEqual(P.snapshot(self.home, expanded=["scout"], cache=snapshot["cache"])["rows"][0]["detail"], detail)
+        self.assertIsNone(P.snapshot(self.home, cache=snapshot["cache"])["rows"][0]["detail"])
+
+    def test_finished_status_and_notice_ignore_unrelated_old_history(self):
+        self.activity(turn=None, window_turns=[{"started_at": self.started, "ended_at": self.now.isoformat(), "status": "done"}])
+        old = self.write("async/old.json", {"status": "done", "pair_name": "other"})
+        os.utime(old, (1, 1))
+        data = P.snapshot(self.home)
+        self.assertEqual(data["rows"][0]["status"], "idle")
+        self.assertIsNone(data["notice"])
+        self.activity()
+        self.write("async/task.json", {"message": "x" * P.TASK_LIMIT})
+        data = P.snapshot(self.home)
+        self.assertEqual(data["rows"][0]["status"], "busy")
+        self.assertTrue(data["rows"][0]["partial"])
+        self.assertIn("read limits", data["notice"])
+
+    def test_transcript_is_explicit_bounded_and_paged(self):
+        self.write("registry.json", {"pairs": {"scout": {"backend": "claude", "cwd": "/fixture", "session_id": "thread"}}})
+        path = self.home / "projects/-fixture/thread.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_text("\n".join(json.dumps({"timestamp": self.now.isoformat(), "message": {
+            "role": "assistant", "content": [{"type": "text", "text": f"message {i} " + "words " * 200}]}})
+            for i in range(100)) + "\n", encoding="utf-8")
+        before = path.read_bytes()
+        with patch.object(P, "transcript_page", side_effect=AssertionError("implicit transcript read")):
+            P.snapshot(self.home)
+        page = P.transcript_page(self.home, "scout")
+        self.assertLessEqual(page["bytes"], P.TASK_LIMIT)
+        self.assertTrue(page["lines"][0]["text"].startswith("message 0 "))
+        self.assertIsNotNone(page["next"])
+        second = P.transcript_page(self.home, "scout", page["next"])
+        self.assertNotEqual(second["lines"][0]["text"], page["lines"][-1]["text"])
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_codex_transcript_lookup_is_read_only_and_does_not_restore_compressed_files(self):
+        codex = self.home / "codex"
+        codex.mkdir()
+        path = codex / "rollout-thread.jsonl"
+        path.write_text(json.dumps({"payload": {"role": "assistant", "content": [{"type": "output_text", "text": "Reply"}]}}) + "\n", encoding="utf-8")
+        database = codex / "state_5.sqlite"
+        con = sqlite3.connect(database)
+        con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT)")
+        con.execute("INSERT INTO threads VALUES (?, ?)", ("thread", str(path)))
+        con.commit()
+        con.close()
+        self.write("registry.json", {"pairs": {"scout": {"backend": "codex", "session_id": "thread"}}})
+        before = database.read_bytes()
+        with patch.dict(os.environ, {"CODEX_HOME": str(codex)}):
+            self.assertEqual(P.transcript_page(self.home, "scout")["lines"][0]["text"], "Reply")
+            path.rename(path.with_suffix(".jsonl.zst"))
+            self.assertIn("compressed", P.transcript_page(self.home, "scout")["note"])
+            self.assertFalse(path.exists())
+        self.assertEqual(database.read_bytes(), before)
 
 
 if __name__ == "__main__":
