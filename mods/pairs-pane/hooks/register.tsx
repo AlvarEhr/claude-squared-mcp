@@ -145,6 +145,11 @@ async function toggleDetail($: EngineInterface, name: string) {
   await refresh($)
 }
 
+// Box widths take a whole-number percentage; a fractional or non-numeric fill
+// made the desktop app reject the whole Pane tree.
+const barWidth = (percent: number): string =>
+  `${Number.isFinite(percent) ? Math.round(Math.max(0, Math.min(100, percent))) : 0}%`
+
 export const register: Register = (on, configured) => {
   options = configured
   on('session.start', async ($, e, next) => {
@@ -202,7 +207,7 @@ export const register: Register = (on, configured) => {
             <Text bold={row.context?.percent != null} color={row.context?.above_alert ? 'red' : undefined}>{contextLabel(row, e.surface === 'terminal')}</Text>
             {e.surface !== 'terminal' && row.context?.percent != null && (
               <Box key={`bar-${row.name}`} width="100%" height={1} backgroundColor="gray">
-                <Box width={`${Math.max(0, Math.min(100, row.context.percent))}%`} height={1}
+                <Box width={barWidth(row.context.percent)} height={1}
                   backgroundColor={row.context.above_alert ? 'red' : 'green'} />
               </Box>
             )}
@@ -222,7 +227,7 @@ export const register: Register = (on, configured) => {
             <Text bold wrap="truncate-end">{row.name}</Text><Text dimColor wrap="truncate-end">{modelLabel(row)} · {row.outcome === 'failed' || row.outcome === 'stopped' ? row.outcome : row.status}</Text>
             <Text wrap="truncate-end" color={row.context?.above_alert ? 'red' : undefined}>{contextLabel(row, e.surface === 'terminal')}</Text>
             {e.surface !== 'terminal' && row.context?.percent != null && <Box width={12} height={1} backgroundColor="gray">
-              <Box width={`${Math.max(0, Math.min(100, row.context.percent))}%`} height={1}
+              <Box width={barWidth(row.context.percent)} height={1}
                 backgroundColor={row.context.above_alert ? 'red' : 'green'} />
             </Box>}
           </Box>)}
