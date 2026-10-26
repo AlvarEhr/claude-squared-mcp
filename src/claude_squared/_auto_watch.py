@@ -33,6 +33,17 @@ def _read(path):
         return None
 
 
+def _without_reply(text):
+    # A handoff embeds the target's formatted reply after "Probe reply:",
+    # unlike pair_send's top-level reply. Strip either form before looking
+    # for server-authored handles (quench round 2, 2026-10-26).
+    header = re.search(r"(?m)^━━━ pair '([^\r\n]+)' replied ━━━\r?$", text)
+    if header is None:
+        return text
+    footer = text.rfind(f"\n[{header[1]}: ", header.end())
+    return text[:header.start()] + (text[footer:] if footer >= 0 else "")
+
+
 def _responses(value):
     """Unwrap MCP content blocks, FastMCP envelopes and verbose JSON strings.
 
@@ -83,10 +94,7 @@ def _target(payload, pairs):
     task_id = None
     for response in _responses(payload.get("tool_response")):
         if isinstance(response, str):
-            if response.startswith(f"━━━ pair '{name}' replied ━━━"):
-                # The reply can itself quote async handles. Only the server's
-                # footer, after the model text, can report background launches.
-                response = response.rsplit(f"\n[{name}: ", 1)[-1]
+            response = _without_reply(response)
             handle = re.search(r"(?m)^Async task: ([0-9a-f-]+)\s*$", response)
             if handle:
                 task_id = handle[1]

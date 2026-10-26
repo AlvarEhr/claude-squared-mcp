@@ -19,10 +19,21 @@ All notable changes to this project are documented here. Format follows
 
 ### Fixed
 
+- **Codex `auto` pairs could not escalate since 0.19.0**, including an approved
+  `git commit`: permission-profile deny-read entries caused Codex's Windows
+  helper to fail with `setup refresh had errors` before the command launched.
+  Profiles using `--approve-for-me` now omit those entries. Workspace and
+  read-only profiles still apply the permanent deny ACLs, which continue to
+  protect sandboxed reads by auto pairs. Create/update/info explain that auto
+  relies on existing entries; new or atomically replaced files need a
+  workspace/read-only turn to install or refresh the protection.
 - The auto-watch hook passes its resolved Claude home to `wait.py`, so a
   custom home configured only in the MCP server cannot make it watch a
-  same-named default-home pair. A pair forgotten between send and hook startup
+  same-named default-home pair. Printed timeout/alert re-arm commands preserve
+  that home too. A pair forgotten between send and hook startup
   wakes the manager with an explanation instead of silently dropping the handle.
+- A completed handoff's embedded model reply cannot arm auto-watch by quoting
+  an async handle; genuine handles outside the reply still arm it.
 - `pair_create(initial_message=..., verbose=True)` now preserves the queued
   task handle in its transparency messages instead of dropping it.
 

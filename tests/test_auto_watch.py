@@ -1,10 +1,13 @@
 """Offline hook integration: real isolated processes, no Claude/Codex calls."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import io
 import json
 import os
 from pathlib import Path
+import runpy
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -183,6 +186,50 @@ class HookTests(unittest.TestCase):
                         self.assertEqual(H._wait(self.pairs, "scout", 1), (0, ""))
                     self.assertEqual(os.environ.get("CLAUDE_HOME"), previous)
 
+    def test_timeout_and_alert_rearm_without_inherited_home(self):
+        custom_home = self.home / "custom home 'quoted'"
+        pairs = custom_home / "pairs"
+        tasks = pairs / "async"
+        tasks.mkdir(parents=True)
+        (pairs / "registry.json").write_text(
+            (self.pairs / "registry.json").read_text(encoding="utf-8"), encoding="utf-8")
+        (tasks / "abc-def.json").write_text(json.dumps({
+            "task_id": "abc-def", "pair_name": "scout", "status": "running",
+            "owner_pid": os.getpid(), "started_at": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
+        script = W.install_wait_script(pairs / "wait.py")
+        default = self.home / "fake-user"
+        default_pairs = default / ".claude" / "pairs"
+        default_pairs.mkdir(parents=True)
+        (default_pairs / "registry.json").write_text(
+            (pairs / "registry.json").read_text(encoding="utf-8"), encoding="utf-8")
+        with patch.dict(os.environ):
+            os.environ.pop("CLAUDE_HOME", None)
+            code, output = H._wait(pairs, "scout", 0)
+        self.assertEqual(code, 3, output)
+        commands = [output.split("Re-arm:\n", 1)[1].strip()]
+        watcher = runpy.run_path(str(script))
+        with patch.dict(os.environ, {"CLAUDE_HOME": str(custom_home)}), \
+                patch.object(sys, "argv", [str(script)]):
+            alert = watcher["_alert_message"]("scout", 830_000, 1_000_000, 820_000,
+                                               ["scout", "--timeout", "0"])
+        for label in ("Keep watching:  ", "or without the alert:  "):
+            commands.append(next(line.split(label, 1)[1] for line in alert.splitlines() if label in line))
+        self.assertIn("--context-alert", commands[1])
+        self.assertIn("--no-context-alert", commands[2])
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertTrue(command.startswith("CLAUDE_HOME="), command)
+                # Apply the printed Bash assignment without requiring Bash on
+                # every test host; execute the remaining argv as a real child.
+                assignment, *argv = shlex.split(command)
+                key, value = assignment.split("=", 1)
+                env = {**self.env, "HOME": str(default), "USERPROFILE": str(default)}
+                env.pop("CLAUDE_HOME", None)
+                env[key] = value
+                result = subprocess.run(argv, env=env, capture_output=True, encoding="utf-8", timeout=10)
+                self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+                self.assertIn("still working", result.stderr)
+
     def test_forgotten_pair_wakes_instead_of_silently_losing_handle(self):
         registry = self.pairs / "registry.json"
         data = json.loads(registry.read_text(encoding="utf-8"))
@@ -327,6 +374,24 @@ class HookTests(unittest.TestCase):
         (directory / "abc-def.json").write_text(json.dumps({"pair_name": "other"}), encoding="utf-8")
         payload = event("pair_handoff")
         self.assertEqual(H._target(payload, self.pairs), ("manager-session", "other"))
+
+    def test_completed_handoff_reply_cannot_arm_from_quoted_handle(self):
+        result = SendResult(name="other", response="Example:\nAsync task: abc-def\n"
+                            "⏳ BACKGROUND WORK LAUNCHED (1 Bash): example",
+                            session_id="other-session", model_used="gpt-6-luna", duration_ms=1)
+        text = "Handed off 'scout' -> 'other'.\n\nProbe reply:\n" + S._fmt_send_result(result)
+        for body in (text, {"content": [{"type": "text", "text": text}]},
+                     json.dumps({"pair": {"name": "other"}, "task": {"status": "done"}, "text": text})):
+            with self.subTest(body=body):
+                self.assertEqual(self.finish(self.start(event("pair_handoff", body))), (0, "", ""))
+        self.assertFalse((self.pairs / "auto_watch").exists())
+        # If the server appends a real running handle after the embedded
+        # reply, it must still arm for that task rather than the quoted one.
+        directory = self.pairs / "async"
+        directory.mkdir()
+        (directory / "123abc.json").write_text(json.dumps({"pair_name": "other"}), encoding="utf-8")
+        self.assertEqual(H._target(event("pair_handoff", text + "\n\nAsync task: 123abc"), self.pairs),
+                         ("manager-session", "other"))
 
 
 if __name__ == "__main__":

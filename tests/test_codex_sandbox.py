@@ -173,8 +173,45 @@ class ProfileArgvTests(SandboxCase):
             self.assertNotIn("-s", argv)
             self.assertEqual(config_values(argv)[f"permissions.{CX.PROFILE_NAME}.extends"], ":workspace")
         self.assertNotIn("--approve-for-me", ws)
-        # --approve-for-me coexists with a profile (verified: deny + guardian).
+        # Auto keeps the profile but must omit deny-read entries for escalation.
         self.assertIn("--approve-for-me", auto)
+
+    def test_denials_follow_effective_escalation_capability(self):
+        cases = (
+            ("read-only", {}, None, False),
+            ("plan", {}, None, False),
+            ("workspace", {}, None, False),
+            ("auto", {}, None, True),
+            ("workspace", {"approval": "approve-for-me"}, None, True),
+            ("auto", {"approval": "none"}, None, False),
+            ("auto", {"approval": "never"}, None, False),
+            ("workspace", {}, "auto", True),
+            ("auto", {}, "workspace", False),
+            ("auto", {}, "read-only", False),
+        )
+        for level, options, override, escalates in cases:
+            with self.subTest(level=level, options=options, override=override):
+                plans = []
+                with patch.object(CX, "secret_read_denials", wraps=CX.secret_read_denials) as secrets:
+                    argv = self.args(self.spec(permission_mode=level, backend_options=options),
+                                     permission_mode=override, plan_out=plans)
+                filesystem = config_values(argv)[f"permissions.{CX.PROFILE_NAME}.filesystem"]
+                expected = {str(self.scratch()): "write"}
+                if not escalates:
+                    expected[str(self.secret)] = "deny"
+                self.assertEqual(filesystem, expected)
+                self.assertEqual("--approve-for-me" in argv, escalates)
+                self.assertEqual(plans[0].deny, () if escalates else (str(self.secret),))
+                self.assertEqual(secrets.call_count, 0 if escalates else 1)
+
+    def test_read_only_guard_retains_denials_for_stored_approval_override(self):
+        # Old stored values can bypass create-time validation. The spawn's
+        # read-only guard removes approval before deciding whether to add denies.
+        spec = self.spec(permission_mode="read-only").model_copy(update={
+            "backend_options": {"approval": "approve-for-me"}})
+        argv = self.args(spec)
+        self.assertNotIn("--approve-for-me", argv)
+        self.assertEqual(config_values(argv)[f"permissions.{CX.PROFILE_NAME}.filesystem"][str(self.secret)], "deny")
 
     def test_unrestricted_gets_nothing(self):
         argv = self.args(self.spec(permission_mode="unrestricted"))
@@ -1038,6 +1075,27 @@ class ServerTests(SandboxCase):
         plain = " ".join(CX.sandbox_notes(spec, detail=True))  # config without windows.sandbox
         self.assertIn("verified only with", plain)
         self.assertNotIn("PERMANENT", plain)
+
+    def test_auto_create_update_and_info_explain_existing_denials(self):
+        with self.fake_create(), patch.object(CX, "python_sandbox_note", return_value=None), \
+                patch.object(CX, "_elevated_sandbox", return_value=True), \
+                patch.dict(os.environ, {"CLAUDE_PAIR_CODEX_PATH": str(self.exe)}):
+            created = tool(S.pair_create)("cx", backend="codex", model="sol", permission_mode="auto",
+                                           cwd=str(self.directory))
+            workspace = tool(S.pair_update)("cx", permission_mode="workspace")
+            updated = tool(S.pair_update)("cx", permission_mode="auto")
+            info = tool(S.pair_info)("cx")
+        for report in (created, updated, info):
+            self.assertIn("credential files protected by existing deny entries where already installed", report)
+            self.assertIn("not re-applied at auto because they break escalation", report)
+            self.assertNotIn("no credential files to protect", report)
+        self.assertIn("credential files unreadable to sandboxed commands", workspace)
+
+    def test_native_approval_override_has_the_auto_credential_note(self):
+        spec = self.spec(backend_options={"approval": "approve-for-me"})
+        notes = " ".join(CX.sandbox_notes(spec, detail=True))
+        self.assertIn("not re-applied at auto because they break escalation", notes)
+        self.assertIn("verified only with", notes)
 
     def test_clear_moves_a_wrapper_thread_to_developer_mode(self):
         R.add_pair(self.spec("cx", system_prompt_append="A"))

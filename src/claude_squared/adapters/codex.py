@@ -926,6 +926,9 @@ def secret_read_denials() -> list[str]:
     An atomic replace of the file drops the ACE until the next spawn that
     carries the deny re-applies it, and a process already running in the
     sandbox can read a file replaced under it (verified 2026-10-26).
+    Escalation-capable spawns omit these entries: deny-read entries break
+    Codex's escalation setup (2026-10-26 bisect). Workspace/read-only spawns
+    still apply them; their permanent ACEs also protect subsequent auto runs.
     Files only, never a directory: a directory deny is inherited by
     everything below it (scratch folders, a pair working under ~/.claude).
     Not exhaustive: other secrets readable by the sandbox group stay so.
@@ -1168,9 +1171,10 @@ def sandbox_plan(level: str, backend_options: dict[str, Any] | None = None, *,
     profile (``:read-only`` / ``:workspace`` + scratch write + credential
     read-denial) — WITHOUT ``-s``, which beats ``default_permissions``
     (verified: profile + ``-s read-only`` ran plain read-only).
-    ``--approve-for-me`` coexists with a profile (verified: deny entries and
-    the guardian both in force). Otherwise the legacy flags: read-only
-    stays plain ``-s read-only`` (no scratch — ``--add-dir`` is ignored
+    ``--approve-for-me`` coexists with a profile, but must omit deny-read
+    entries: they break escalation setup (2026-10-26 bisect). Existing
+    permanent deny ACEs still apply to sandboxed commands. Otherwise the legacy
+    flags: read-only stays plain ``-s read-only`` (no scratch — ``--add-dir`` is ignored
     there), workspace adds ``--add-dir <scratch>`` +
     ``exclude_tmpdir_env_var`` (verified: GetTempPath follows TEMP, the
     shared Temp becomes denied).
@@ -1266,7 +1270,11 @@ def sandbox_plan(level: str, backend_options: dict[str, Any] | None = None, *,
     if supported is None:
         return SandboxPlan([], kind, "unchecked", scratch, (), network, key, git_env, notes)
     if supported:
-        deny = secret_read_denials()
+        # 2026-10-26 live bisect: deny entries cause "setup refresh had errors"
+        # on escalation. Keep them on approval-never profiles, whose permanent
+        # ACEs persist for auto too. Use effective approval after the read-only
+        # guard above, so native overrides and per-send levels follow suit.
+        deny = [] if approval == "approve-for-me" else secret_read_denials()
         q = _toml_literal
         entries = ", ".join([f"{q(str(scratch))}={q('write')}"] + [f"{q(d)}={q('deny')}" for d in deny])
         args = (["--approve-for-me"] if approval == "approve-for-me" else []) + [
@@ -1307,7 +1315,12 @@ def sandbox_notes(spec: PairSpec, *, python_check: bool = False, detail: bool = 
             return notes
         plan = sandbox_plan(spec.permission_mode, bo, pair_name=spec.name, create=False, cwd=spec.cwd,
                             extra_dirs=spec.extra_dirs, probe=probe)
-        if plan.deny and not _elevated_sandbox():
+        if plan.mode == "profile" and "--approve-for-me" in plan.args:
+            denied = ("credential files protected by existing deny entries where already installed; "
+                      "not re-applied at auto because they break escalation")
+            if not _elevated_sandbox():
+                denied += '; existing entries were verified only with `[windows] sandbox = "elevated"`'
+        elif plan.deny and not _elevated_sandbox():
             # Verified only with the elevated sandbox (commands run as the
             # CodexSandboxOffline user, a member of the group the deny entry
             # names). Another mode may run them as you with a restricted
