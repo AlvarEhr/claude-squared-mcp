@@ -14,7 +14,7 @@ const transcript = atom({ plugin: 'pairs-pane', key: 'transcript' } as const, nu
 
 function tokens(value: number | null | undefined): string {
   if (value == null) return '—'
-  return value >= 1000000 ? `${Math.round(value / 100000) / 10}m` : value >= 1000 ? `${Math.round(value / 1000)}k` : String(value)
+  return value >= 1000000 ? `${Math.round(value / 100000) / 10}M` : value >= 1000 ? `${Math.round(value / 100) / 10}k` : String(value)
 }
 
 function localTime(at: string | null | undefined): string {
@@ -31,15 +31,33 @@ function duration(seconds: number | null): string {
   return `${Math.floor(n / 3600)}h ${Math.floor(n % 3600 / 60)}m`
 }
 
-function contextLabel(row: PairRow, terminal = false): string {
-  const context = row.context
-  const used = tokens(context?.used)
-  const window = tokens(context?.window)
-  if (context?.percent == null || !Number.isFinite(context.percent)) return 'context —'
-  const filled = Math.max(0, Math.min(10, Math.floor(context.percent / 10)))
-  const bar = '█'.repeat(filled) + '░'.repeat(10 - filled)
-  const alert = context.above_alert ? ` · ALERT ≥ ${tokens(context.alert_at)}` : ''
-  return `Context ${terminal ? `[${bar}] ` : ''}${used} / ${window} · ${Math.round(context.percent)}%${alert}`
+function knownContext(row: PairRow): boolean {
+  return row.context?.percent != null && Number.isFinite(row.context.percent)
+    && row.context.used != null && row.context.window != null
+}
+
+function contextColor(row: PairRow): string {
+  if (!knownContext(row)) return 'gray'
+  const context = row.context!
+  if (context.above_alert || (context.alert_at != null && context.used! >= context.alert_at)) return 'red'
+  if (context.alert_at != null && context.used! >= context.alert_at * 0.8) return 'yellow'
+  return 'blue'
+}
+
+function contextIndicator(row: PairRow): string {
+  if (!knownContext(row)) return '○'
+  return ['○', '◔', '◑', '◕', '●'][Math.max(0, Math.min(4, Math.round(row.context!.percent! / 25)))]
+}
+
+function contextBar(row: PairRow): string {
+  const filled = Math.max(0, Math.min(10, Math.floor(row.context!.percent! / 10)))
+  return '█'.repeat(filled) + '░'.repeat(10 - filled)
+}
+
+function contextRemaining(row: PairRow): string {
+  const alert = row.context?.alert_at
+  if (!knownContext(row) || alert == null || !Number.isFinite(alert) || alert <= 0) return ''
+  return row.context!.used! >= alert ? 'Alert reached' : `≈${tokens(alert - row.context!.used!)} until alert`
 }
 
 function modelLabel(row: PairRow): string {
@@ -286,18 +304,23 @@ export const register: Register = (on, configured) => {
         {prominent.map(row => (
           <Box key={`row-${row.name}`} flexDirection="column" marginTop={2} gap={1}>
             <Box justifyContent="space-between" flexWrap="wrap" gap={1}>
-              <Box gap={1}><Text bold>{row.name}</Text><Text dimColor>{modelLabel(row)}</Text></Box>
+              <Box gap={1}>
+                <Box key={`indicator-${row.name}`}><Text dimColor={!knownContext(row)} color={contextColor(row)}>{contextIndicator(row)}</Text></Box>
+                <Text bold>{row.name}</Text><Text dimColor>{modelLabel(row)}</Text>
+              </Box>
               <Text color={row.status !== 'busy' && row.outcome === 'failed' ? 'red' : undefined}>{statusLabel(row)}</Text>
             </Box>
-            <Box gap={1} alignItems="center">
-            {e.surface !== 'terminal' && row.context?.percent != null && (
-              <Box key={`bar-${row.name}`} width={12} height={1} backgroundColor="gray" flexShrink={0}>
-                <Box width={barWidth(row.context.percent)} height={1}
-                  backgroundColor={row.context.above_alert ? 'red' : 'green'} />
+            {knownContext(row) ? <Box flexDirection="column">
+              <Box justifyContent="space-between" width="100%" gap={1}>
+                <Text>{Math.round(row.context!.percent!)}% used</Text>
+                <Text dimColor>{tokens(row.context!.used)} / {tokens(row.context!.window)}</Text>
               </Box>
-            )}
-            <Text color={row.context?.above_alert ? 'red' : undefined}>{contextLabel(row, e.surface === 'terminal')}</Text>
-            </Box>
+              {e.surface === 'terminal' ? <Text color={contextColor(row)}>{contextBar(row)}</Text>
+                : <Box key={`bar-${row.name}`} width="100%" height={1} backgroundColor="gray">
+                  <Box width={barWidth(row.context!.percent!)} height={1} backgroundColor={contextColor(row)} />
+                </Box>}
+              {contextRemaining(row) && <Text dimColor color={contextColor(row)}>{contextRemaining(row)}</Text>}
+            </Box> : <Text dimColor>context —</Text>}
             <Button key={`detail-${row.name}`} label={details.includes(row.name) ? 'Hide detail' : 'Show detail'}
               onPress={() => { void toggleDetail($, row.name) }} />
             {details.includes(row.name) && <Box flexDirection="column" gap={1}>
@@ -326,12 +349,11 @@ export const register: Register = (on, configured) => {
           <Button key="idle" label={`${showIdle ? '▾' : '▸'} Idle (${dormant.length})`}
             onPress={() => { void toggleIdle($) }} />
           {showIdle && dormant.map(row => <Box key={`idle-${row.name}`} gap={1}>
+            <Box key={`indicator-${row.name}`}><Text dimColor={!knownContext(row)} color={contextColor(row)}>{contextIndicator(row)}</Text></Box>
             <Text bold wrap="truncate-end">{row.name}</Text><Text dimColor wrap="truncate-end">{modelLabel(row)} · {row.outcome === 'failed' || row.outcome === 'stopped' ? row.outcome : row.status}</Text>
-            <Text wrap="truncate-end" color={row.context?.above_alert ? 'red' : undefined}>{contextLabel(row, e.surface === 'terminal')}</Text>
-            {e.surface !== 'terminal' && row.context?.percent != null && <Box width={12} height={1} backgroundColor="gray">
-              <Box width={barWidth(row.context.percent)} height={1}
-                backgroundColor={row.context.above_alert ? 'red' : 'green'} />
-            </Box>}
+            <Text dimColor={!knownContext(row)} wrap="truncate-end" color={knownContext(row) ? contextColor(row) : undefined}>
+              {knownContext(row) ? `${tokens(row.context!.used)} / ${tokens(row.context!.window)} · ${Math.round(row.context!.percent!)}%` : 'context —'}
+            </Text>
           </Box>)}
         </Box>}
         {rows.some(row => row.partial && (foreground(row) || recent(row))) && <Box marginTop={2}>

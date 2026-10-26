@@ -547,8 +547,12 @@ first), then a collapsed **Idle (N)** group with compact rows. Other managers'
 waits and work with no auto-watch attached are included.
 
 Rows show a short model label, work elapsed time or completion time, and
-**used / window** context, abbreviated (for example, **121k / 828k · 15%**).
-Desktop uses a short inline coloured bar; terminal uses a text bar.
+context with **51% used** on the left and abbreviated counts such as
+**512.6k / 1M** on the right. Desktop uses a thin bar underneath; terminal
+uses a text bar. The bar and filling-circle indicator beside the name are blue,
+yellow from 80% of the pair's alert level, and red at/above that level.
+An **≈108k until alert** footer shows remaining headroom when known. Compact
+Idle rows keep the coloured indicator and counts without the full bar.
 Watch badges appear only when a watch exists, with elapsed time and the
 manager session (your own is marked **this session**).
 Model labels retain versions, such as **Opus 5.5** and **6.1 Sol**. Floating

@@ -11,7 +11,9 @@ All notable changes to this project are documented here. Format follows
 - Pairs pane controls redraw cached content immediately, with serial background
   refreshes every five seconds. Expanded rows show the latest/previous reply,
   current message and wrapped log lines, with local More controls and an explicit
-  paged transcript viewer. Context is a short inline bar with abbreviated counts.
+  paged transcript viewer. Context uses a Desktop-style percent/count header,
+  thin bar, alert headroom and filling-circle name indicator. Colours follow
+  the pair's alert level: blue, yellow from 80%, red at/above the threshold.
 - Skipping old task history no longer labels finished pairs unknown. Read-limit
   notices appear as a dim footnote only for affected working/recent rows.
 

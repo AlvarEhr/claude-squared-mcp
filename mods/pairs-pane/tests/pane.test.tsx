@@ -45,7 +45,7 @@ test('this session by default; toggle all; metadata on desktop and terminal', as
     expect(await ui.find({ type: 'Text', text: /reviewer/ })).toBeUndefined()
     expect((await ui.find({ type: 'Text', text: /working/ }))?.text).toBe('working · 2m5s')
     expect((await ui.find({ type: 'Text', text: /watched by/ }))?.text).toContain('this session')
-    expect((await ui.find({ type: 'Text', text: /Context/ }))?.text).toContain('20%')
+    expect((await ui.find({ type: 'Text', text: /% used/ }))?.text).toBe('20% used')
     await ui.press({ key: 'all' })
     await clock.advance(1)
     expect((await ui.find({ type: 'Text', text: /reviewer/ }))?.text).toContain('reviewer')
@@ -164,16 +164,14 @@ test('context bar and alert are visible in each row, including unknown idle cont
   await clock.advance(1)
   for (const surface of ['desktop', 'terminal'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    const context = (await ui.find({ type: 'Text', text: /^Context/ }))?.text
-    if (surface === 'terminal') expect(context).toContain('[█████░░░░░]')
+    if (surface === 'terminal') expect((await ui.find({ type: 'Text', text: /█████░░░░░/ }))?.text).toBe('█████░░░░░')
     else {
-      expect(context).not.toContain('[')
       const tree = JSON.stringify(await ui.drawn())
       expect(tree).toContain('"width":"55%"')
       expect(tree).toContain('"backgroundColor":"red"')
     }
-    expect(context).toContain('110k / 200k')
-    expect(context).toContain('ALERT ≥ 110k')
+    expect((await ui.find({ type: 'Text', text: /110k/ }))?.text).toBe('110k / 200k')
+    expect((await ui.find({ type: 'Text', text: /Alert reached/ }))?.text).toBe('Alert reached')
     await ui.press({ key: 'all' })
     await clock.advance(1)
     expect(await ui.find({ type: 'Text', text: /idle-codex/ })).toBeUndefined()
@@ -340,9 +338,9 @@ test('All and expanded Idle bars use bounded whole-number widths for edge-case f
         }
       }
     }
-    const fillsDrawn = boxes.filter(box => box.props.backgroundColor === 'green').map(box => box.props.width)
-    const expected = ['55%', '100%', '0%', '0%']
-    expect(fillsDrawn).toEqual(idleExpanded ? [...expected, ...expected] : expected)
+    const fillsDrawn = boxes.filter(box => box.props.backgroundColor === 'blue').map(box => box.props.width)
+    // Unknown/NaN have no bar; compact Idle rows use the filling glyph alone.
+    expect(fillsDrawn).toEqual(['55%', '100%', '0%'])
     expect(await ui.findAll({ type: 'Text', text: /^context —$/ })).toHaveLength(idleExpanded ? 4 : 2)
   }
   await ui.unmount()
@@ -409,8 +407,9 @@ test('expanded reply and log controls are local; transcript pages load only on r
   expect(calls).toBe(before)
   expect((await ui.find({ type: 'Text', text: /reply line 19/ }))?.text).toBe(reply)
   expect((await ui.find({ type: 'Text', text: /log line 0 / }))?.text).toBe(activity[0])
-  expect((await ui.find({ key: 'bar-scout' }))?.props.width).toBe(12)
-  expect((await ui.find({ type: 'Text', text: /121k/ }))?.text).toContain('121k / 828k · 15%')
+  expect((await ui.find({ key: 'bar-scout' }))?.props.width).toBe('100%')
+  expect((await ui.find({ type: 'Text', text: /121k/ }))?.text).toBe('121k / 828k')
+  expect((await ui.find({ type: 'Text', text: /% used/ }))?.text).toBe('15% used')
   expect(await ui.find({ type: 'Text', text: /PID|task-id|turn open/ })).toBeUndefined()
   await ui.press({ key: 'transcript-scout' })
   expect((await ui.find({ type: 'Text', text: /Loading transcript/ }))?.text).toContain('Loading')
@@ -437,5 +436,46 @@ test('partial history notices stay hidden unless a visible busy or recent row is
   affected = true
   await clock.advance(5000)
   expect((await ui.find({ type: 'Text', text: /read limits/ }))?.props.dimColor).toBe(true)
+  await ui.unmount()
+})
+
+test('context widget uses the pair alert level for bar and header indicator colours', async ($, on) => {
+  const clock = base(on)
+  const cases = [
+    { name: 'normal', used: 479900, alert: 600000, color: 'blue', glyph: '◑' },
+    { name: 'approaching', used: 480000, alert: 600000, color: 'yellow', glyph: '◑' },
+    { name: 'reached', used: 600000, alert: 600000, color: 'red', glyph: '◑' },
+    { name: 'override', used: 81000, alert: 100000, color: 'yellow', glyph: '○' },
+    { name: 'desktop-example', used: 512600, alert: 620600, color: 'yellow', glyph: '◑' },
+  ]
+  on('process.run', () => ({ value: { exitCode: 0, stdout: JSON.stringify({ rows: [
+    ...cases.map(item => ({ ...row(item.name, 'manager-session'), context: {
+      used: item.used, window: 1000000, percent: item.used / 10000, alert_at: item.alert, above_alert: item.used >= item.alert,
+    } })),
+    { ...row('idle-alert'), status: 'idle', context: { used: 900000, window: 1000000, percent: 90, alert_at: 600000, above_alert: true } },
+    { ...row('unknown', 'manager-session'), context: null },
+  ] }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: false })
+  await clock.advance(1)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  for (const item of cases) {
+    const bar = await ui.find({ key: `bar-${item.name}` })
+    expect(bar?.props).toMatchObject({ width: '100%', height: 1 })
+    expect(JSON.stringify(bar?.children)).toContain(`"backgroundColor":"${item.color}"`)
+    const indicator = await ui.find({ key: `indicator-${item.name}` })
+    expect(indicator?.text).toBe(item.glyph)
+    expect(JSON.stringify(indicator?.children)).toContain(`"color":"${item.color}"`)
+  }
+  expect((await ui.find({ type: 'Text', text: /^512.6k/ }))?.text).toBe('512.6k / 1M')
+  expect((await ui.find({ type: 'Text', text: /^51% used$/ }))?.text).toBe('51% used')
+  expect((await ui.find({ type: 'Text', text: /^≈108k until alert$/ }))?.text).toBe('≈108k until alert')
+  expect(await ui.find({ key: 'bar-unknown' })).toBeUndefined()
+  expect((await ui.find({ type: 'Text', text: /^context —$/ }))?.props.dimColor).toBe(true)
+  await ui.press({ key: 'all' })
+  await ui.press({ key: 'idle' })
+  expect(await ui.find({ key: 'bar-idle-alert' })).toBeUndefined()
+  const compact = await ui.find({ key: 'indicator-idle-alert' })
+  expect(compact?.text).toBe('●')
+  expect(JSON.stringify(compact?.children)).toContain('"color":"red"')
   await ui.unmount()
 })

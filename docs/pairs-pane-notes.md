@@ -53,8 +53,14 @@ be omitted; use pair_status/pair_poll when completeness matters.
 The view puts busy pairs first, then attention/watched rows, recent completions
 (newest first), and a collapsed compact Idle group. Desktop's element table has
 no Progress/Meter, but supports percentage-width Boxes with background colours;
-these draw context bars, with text bars only on terminal. Unknown fill has no
-bar. Idle Claude fallback reads already-budgeted activity/SendResult context,
+these draw height-1 context bars, with text bars only on terminal. The header
+places percent used left and k/M counts (at most one decimal) right. No ring or
+rounded-corner prop is available, so a filling-circle glyph beside the name
+also shows level. Both use blue below 80% of the shared alert_at, yellow from
+80%, and red at/above it; no independent compaction threshold is guessed. A
+footer reports remaining tokens until alert. Compact Idle rows keep only the
+indicator/counts; unknown fill has muted text and no bar. Idle Claude fallback
+reads already-budgeted activity/SendResult context,
 excluding known pre-compaction reports; it never uses cumulative result usage.
 Completion timestamps/outcomes come from activity history and task summaries,
 not log usage markers. Expanded log detail skips bookkeeping markers.
