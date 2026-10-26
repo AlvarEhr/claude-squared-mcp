@@ -54,12 +54,6 @@ function contextBar(row: PairRow): string {
   return '█'.repeat(filled) + '░'.repeat(10 - filled)
 }
 
-function contextRemaining(row: PairRow): string {
-  const alert = row.context?.alert_at
-  if (!knownContext(row) || alert == null || !Number.isFinite(alert) || alert <= 0) return ''
-  return row.context!.used! >= alert ? 'Alert reached' : `≈${tokens(alert - row.context!.used!)} until alert`
-}
-
 function modelLabel(row: PairRow): string {
   const model = row.model.replace(/^.*\//, '').replace(/\[.*\]$/, '')
   return model.replace(/^(claude|gpt)-/, '').replace(/-\d{8}$/, '')
@@ -319,7 +313,6 @@ export const register: Register = (on, configured) => {
                 : <Box key={`bar-${row.name}`} width="100%" height={1} backgroundColor="gray">
                   <Box width={barWidth(row.context!.percent!)} height={1} backgroundColor={contextColor(row)} />
                 </Box>}
-              {contextRemaining(row) && <Text dimColor color={contextColor(row)}>{contextRemaining(row)}</Text>}
             </Box> : <Text dimColor>context —</Text>}
             <Button key={`detail-${row.name}`} label={details.includes(row.name) ? 'Hide detail' : 'Show detail'}
               onPress={() => { void toggleDetail($, row.name) }} />

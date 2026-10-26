@@ -171,7 +171,7 @@ test('context bar and alert are visible in each row, including unknown idle cont
       expect(tree).toContain('"backgroundColor":"red"')
     }
     expect((await ui.find({ type: 'Text', text: /110k/ }))?.text).toBe('110k / 200k')
-    expect((await ui.find({ type: 'Text', text: /Alert reached/ }))?.text).toBe('Alert reached')
+    expect(await ui.find({ type: 'Text', text: /Alert reached|until alert/ })).toBeUndefined()
     await ui.press({ key: 'all' })
     await clock.advance(1)
     expect(await ui.find({ type: 'Text', text: /idle-codex/ })).toBeUndefined()
@@ -468,7 +468,7 @@ test('context widget uses the pair alert level for bar and header indicator colo
   }
   expect((await ui.find({ type: 'Text', text: /^512.6k/ }))?.text).toBe('512.6k / 1M')
   expect((await ui.find({ type: 'Text', text: /^51% used$/ }))?.text).toBe('51% used')
-  expect((await ui.find({ type: 'Text', text: /^≈108k until alert$/ }))?.text).toBe('≈108k until alert')
+  expect(await ui.find({ type: 'Text', text: /until alert|Alert reached/ })).toBeUndefined()
   expect(await ui.find({ key: 'bar-unknown' })).toBeUndefined()
   expect((await ui.find({ type: 'Text', text: /^context —$/ }))?.props.dimColor).toBe(true)
   await ui.press({ key: 'all' })

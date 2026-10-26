@@ -57,8 +57,8 @@ these draw height-1 context bars, with text bars only on terminal. The header
 places percent used left and k/M counts (at most one decimal) right. No ring or
 rounded-corner prop is available, so a filling-circle glyph beside the name
 also shows level. Both use blue below 80% of the shared alert_at, yellow from
-80%, and red at/above it; no independent compaction threshold is guessed. A
-footer reports remaining tokens until alert. Compact Idle rows keep only the
+80%, and red at/above it; no independent compaction threshold is guessed.
+The widget has no category breakdown or footer. Compact Idle rows keep only the
 indicator/counts; unknown fill has muted text and no bar. Idle Claude fallback
 reads already-budgeted activity/SendResult context,
 excluding known pre-compaction reports; it never uses cumulative result usage.
