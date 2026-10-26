@@ -5919,7 +5919,7 @@ def pair_invoke(
             _apply_context_alert(spec, result)
             if verbose:
                 return _verbose_dump(result)
-            return _fmt_send_result(result, tool="pair_invoke")
+            return _fmt_send_result(result)
     except FileLockTimeout:
         raise PairError(f"Pair '{name}' is busy in another process; could not acquire lock to invoke skill.")
 

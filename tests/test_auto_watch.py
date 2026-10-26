@@ -105,8 +105,10 @@ class HookTests(unittest.TestCase):
 
     def test_noop_and_pair_guards(self):
         cases = [None, {}, event("pair_send", "ordinary reply"), event("pair_fork"),
-                 event("pair_poll"), event(response={"isError": True, "content": ["Async task: abc"]}),
-                 event(name="../scout"), event(name="missing")]
+                 event("pair_poll"), event("pair_invoke"),
+                 event(response={"isError": True, "content": ["Async task: abc"]}),
+                 event(name="../scout"), event(name="missing", response="ordinary reply"),
+                 {**event(name="missing"), "session_id": "pair-session"}]
         for field, value in (("session_id", "pair-session"), ("session_id", ""),
                              ("hook_event_name", "PreToolUse"), ("tool_name", "Bash"),
                              ("tool_input", []), ("tool_response", None)):
@@ -139,6 +141,59 @@ class HookTests(unittest.TestCase):
         self.assertEqual(status, 2, err)
         self.assertIn("wait.py exit 0", err)
         self.assertIn("idle", err)
+
+    def test_installed_hook_without_home_env_uses_its_own_home(self):
+        W.install_wait_script(self.pairs / "wait.py")
+        tasks = self.pairs / "async"
+        tasks.mkdir()
+        (tasks / "abc-def.json").write_text(json.dumps({
+            "task_id": "abc-def", "pair_name": "scout", "status": "failed",
+            "started_at": "2020-01-01T00:00:00", "finished_at": "2020-01-01T00:00:01",
+            "error": "CUSTOM_HOME_FAILURE"}), encoding="utf-8")
+        default = self.home / "fake-user"
+        default_pairs = default / ".claude" / "pairs"
+        default_pairs.mkdir(parents=True)
+        (default_pairs / "registry.json").write_text(
+            (self.pairs / "registry.json").read_text(encoding="utf-8"), encoding="utf-8")
+        # A same-named default-home pair is idle. Watching the wrong home
+        # would falsely report exit 0 instead of this custom home's failure.
+        self.env.pop("CLAUDE_HOME")
+        self.env.update(HOME=str(default), USERPROFILE=str(default))
+        status, _, err = self.finish(self.start(event()))
+        self.assertEqual(status, 2, err)
+        self.assertIn("wait.py exit 1", err)
+        self.assertIn("CUSTOM_HOME_FAILURE", err)
+
+    def test_wait_restores_home_env_on_success_and_failure(self):
+        for previous in (None, "different-home"):
+            for fail in (False, True):
+                with self.subTest(previous=previous, fail=fail), patch.dict(os.environ):
+                    if previous is None:
+                        os.environ.pop("CLAUDE_HOME", None)
+                    else:
+                        os.environ["CLAUDE_HOME"] = previous
+                    self.stub("import os\nfrom pathlib import Path\n"
+                              "assert Path(os.environ['CLAUDE_HOME']) == Path(__file__).parent.parent\n"
+                              + ("raise RuntimeError('probe failure')\n" if fail else
+                                 "def main(argv):\n return 0\n"))
+                    if fail:
+                        with self.assertRaisesRegex(RuntimeError, "probe failure"):
+                            H._wait(self.pairs, "scout", 1)
+                    else:
+                        self.assertEqual(H._wait(self.pairs, "scout", 1), (0, ""))
+                    self.assertEqual(os.environ.get("CLAUDE_HOME"), previous)
+
+    def test_forgotten_pair_wakes_instead_of_silently_losing_handle(self):
+        registry = self.pairs / "registry.json"
+        data = json.loads(registry.read_text(encoding="utf-8"))
+        del data["pairs"]["scout"]
+        registry.write_text(json.dumps(data), encoding="utf-8")
+        status, _, err = self.finish(self.start(event()))
+        self.assertEqual(status, 2)
+        self.assertIn("pair 'scout' is no longer in the registry", err)
+        self.assertIn("forgotten after the send", err)
+        self.assertNotIn("(unresolved)", err)
+        self.assertFalse((self.pairs / "auto_watch").exists())
 
     def test_missing_or_broken_wait_wakes(self):
         for source in (None, "raise RuntimeError('broken watcher')"):

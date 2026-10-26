@@ -22,7 +22,7 @@ import uuid
 HOOK_TIMEOUT_SECONDS = 7 * 24 * 3600
 WAIT_TIMEOUT_SECONDS = HOOK_TIMEOUT_SECONDS - 60
 PAIR_ENV = "CLAUDE_SQUARED_PAIR"
-TOOLS = ("pair_send", "pair_send_async", "pair_compact", "pair_create", "pair_invoke", "pair_handoff")
+TOOLS = ("pair_send", "pair_send_async", "pair_compact", "pair_create", "pair_handoff")
 TOOL_PATTERN = r"^mcp__(?:pair|Claude_Squared)__(?:" + "|".join(TOOLS) + r")$"
 
 
@@ -115,11 +115,12 @@ def _target(payload, pairs):
             time.sleep(.05)
     if not isinstance(entries, dict):
         raise OSError("could not read the pair registry; use pair_poll and arm wait.py manually")
-    if name not in entries:
-        return None
     # Older pair runtimes predate PAIR_ENV, but still have registered sessions.
     if any(isinstance(p, dict) and p.get("session_id") == session for p in entries.values()):
         return None
+    if name not in entries:
+        raise OSError(f"pair '{name}' is no longer in the registry (it may have been forgotten "
+                      "after the send); no watcher was started")
     return session, name
 
 
@@ -180,16 +181,27 @@ class _Lock:
 def _wait(pairs, name, timeout):
     # Run in THIS process, not a child: a hook killed by its host must not
     # leave an orphan wait.py holding the dedupe lock for the next seven days.
+    pairs = pairs.resolve()
     script = pairs / "wait.py"
     output = io.StringIO()
     argv = sys.argv
+    home = os.environ.get("CLAUDE_HOME")
     try:
+        # The hook can discover a custom home from its installed path while
+        # only the MCP server inherited CLAUDE_HOME. wait.py must read that
+        # same home's registry/activity, not a same-named default-home pair
+        # (quench review, 2026-10-26).
+        os.environ["CLAUDE_HOME"] = str(pairs.parent)
         sys.argv = [str(script), name, "--timeout", str(max(0, timeout))]
         with redirect_stdout(output), redirect_stderr(output):
             watcher = runpy.run_path(str(script))
             code = watcher["main"](sys.argv[1:])
     finally:
         sys.argv = argv
+        if home is None:
+            os.environ.pop("CLAUDE_HOME", None)
+        else:
+            os.environ["CLAUDE_HOME"] = home
     return code, output.getvalue()
 
 
@@ -234,8 +246,10 @@ def watch(payload, pairs, timeout=WAIT_TIMEOUT_SECONDS):
                       "command above in background Bash.", file=sys.stderr)
             return 2
     except Exception as exc:
-        print(f"claude-squared auto-watch failed for '{name}': {exc}. "
-              f"Check pair_poll('{name}') and re-arm wait.py manually.", file=sys.stderr)
+        target_hint = f" for '{name}'" if name != "(unresolved)" else ""
+        recovery = (f"Check pair_poll('{name}') and re-arm wait.py manually."
+                    if target_hint else "Check the original tool response and current pair registry.")
+        print(f"claude-squared auto-watch failed{target_hint}: {exc}. {recovery}", file=sys.stderr)
         return 2
     finally:
         # Ownership is released BEFORE the gate, so a racing new request either

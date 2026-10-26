@@ -420,7 +420,7 @@ The snippet is:
 {
   "hooks": {
     "PostToolUse": [{
-      "matcher": "^mcp__(?:pair|Claude_Squared)__(?:pair_send|pair_send_async|pair_compact|pair_create|pair_invoke|pair_handoff)$",
+      "matcher": "^mcp__(?:pair|Claude_Squared)__(?:pair_send|pair_send_async|pair_compact|pair_create|pair_handoff)$",
       "hooks": [{
         "type": "command",
         "command": "python \"/absolute/path/to/.claude/pairs/auto_watch.py\"",
@@ -434,17 +434,19 @@ The snippet is:
 
 The hook watches an async handle from `pair_send_async`, a still-running
 `pair_send` or `pair_compact`, or `pair_create(initial_message=...)`. A
-`pair_send` or `pair_invoke` reply reporting background launches also arms
+`pair_send` reply reporting background launches also arms
 it. A still-running `pair_handoff` briefing watches the newly allocated
 target pair, not its source. Ordinary synchronous replies exit immediately. `pair_fork` completes
-synchronously and leaves no task to watch, so it is excluded. The supplied
+synchronously and leaves no task to watch, so it is excluded. `pair_invoke`
+does not report background launches and is also excluded. The supplied
 matcher recognizes the CLI `pair` and extension `Claude_Squared` aliases.
 
 One watcher follows each **(manager session, pair)** until idle, including
 queued sends, background work and self-woken turns. A second send to the
 same busy pair shares that watcher; another manager has its own watcher.
 Fast completions still notify even if the task finished before the hook
-started. All watcher outcomes wake the manager: done, failed, stopped,
+started. A pair forgotten before the hook starts also wakes the manager with
+an explanation. All watcher outcomes wake the manager: done, failed, stopped,
 context alert, lost work, unknown state, and timeout. The notification gives
 the original `wait.py` exit code and output. Read completed work with
 `pair_poll`, not a repeat send. After a context alert or timeout, follow the
@@ -456,6 +458,8 @@ processes, with a registered-session check for older runtimes. Sessions
 without these MCP tools never match. Kernel file locks release on watcher
 death, so an interrupted hook cannot leave a stale PID blocking later sends.
 The hook does not stop any process or modify pair tasks/activity.
+It passes its resolved Claude home to `wait.py`, including when a custom
+`CLAUDE_HOME` is configured only in the MCP server's environment.
 
 The server's "armed" hint is **best-effort settings detection**, not a
 receipt from the host. It recognizes the documented interpreter/script

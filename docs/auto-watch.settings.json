@@ -2,7 +2,7 @@
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "^mcp__(?:pair|Claude_Squared)__(?:pair_send|pair_send_async|pair_compact|pair_create|pair_invoke|pair_handoff)$",
+        "matcher": "^mcp__(?:pair|Claude_Squared)__(?:pair_send|pair_send_async|pair_compact|pair_create|pair_handoff)$",
         "hooks": [
           {
             "type": "command",

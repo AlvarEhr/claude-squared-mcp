@@ -9,7 +9,7 @@ All notable changes to this project are documented here. Format follows
 ### Added
 
 - Opt-in Claude Code auto-watch hook: a pair send/create/compact/handoff that returns
-  an async handle, or a send/invoke reporting background work, can wake its
+  an async handle, or a send reporting background work, can wake its
   manager when `wait.py` exits without a manual Bash watcher. One watcher per
   session and pair follows queued sends and background continuations; every
   outcome, including errors, context alerts and timeouts, wakes the manager.
@@ -19,6 +19,10 @@ All notable changes to this project are documented here. Format follows
 
 ### Fixed
 
+- The auto-watch hook passes its resolved Claude home to `wait.py`, so a
+  custom home configured only in the MCP server cannot make it watch a
+  same-named default-home pair. A pair forgotten between send and hook startup
+  wakes the manager with an explanation instead of silently dropping the handle.
 - `pair_create(initial_message=..., verbose=True)` now preserves the queued
   task handle in its transparency messages instead of dropping it.
 
