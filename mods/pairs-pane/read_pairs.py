@@ -22,7 +22,7 @@ FILE_BUDGET = 128
 SCAN_BUDGET = 2048
 TASK_BUDGET = 128
 ROW_BUDGET = 64
-RECENT_SECONDS = 15 * 60
+RECENT_SECONDS = 2 * 60 * 60
 
 
 class Reads:
@@ -126,6 +126,11 @@ def task_summaries(pairs, names, references, reader, reads, now, cache, show_all
             if not isinstance(data, dict):
                 continue
             summary = reader["_av_task_summary"](data)
+            # Retain only the last reported context, never the model reply.
+            result = data.get("result")
+            context = result.get("context") if isinstance(result, dict) else None
+            if isinstance(context, dict):
+                summary["result_context"] = {key: context.get(key) for key in ("tokens_used", "tokens_max")}
         # Nanosecond timestamps exceed JavaScript's exact integer range; the
         # cache crosses the mod's JSON boundary between refreshes.
         saved_item = {"mtime": str(stat.st_mtime_ns), "size": stat.st_size, "summary": summary}
@@ -157,8 +162,9 @@ def tail(path):
         lines = data.decode("utf-8", "replace").splitlines()
         if offset:
             lines = lines[1:]
-        line = next((line.strip() for line in reversed(lines) if line.strip()), "")
-        line = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line)
+        lines = [re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line).strip() for line in lines]
+        line = next((line for line in reversed(lines) if line and not re.search(
+            r"(?:^|\]\s*)===|\bTURN (?:COMPLETED|STARTED|FAILED|STOPPED)\b", line)), "")
         return "".join(c if c.isprintable() else " " for c in line)[:320]
     except OSError:
         return ""
@@ -169,6 +175,10 @@ def context_fill(reader, view, spec, defaults):
     context = view.get("context") or {}
     reported = view.get("reported_window") or {}
     window = context.get("window") or reported.get("tokens")
+    if (context.get("window_source") == "inferred" and type(reported.get("tokens")) is int
+            and reported["tokens"] > 0
+            and (reported.get("backend") or "claude") == (context.get("backend") or "claude")):
+        window = reported["tokens"]
     used = context.get("used")
     if not isinstance(window, int) or isinstance(window, bool) or window <= 0:
         window = None
@@ -288,13 +298,50 @@ def snapshot(home, session=None, show_all=True, expanded=(), cache=None):
         starts = [start for start in starts if start is not None]
         started = min(starts) if starts else parse(view.get("window_started_at"))
         context = view.get("context") or {}
+        pair_tasks = [task for task in tasks if task.get("pair") == name]
+        completions = [(parse(item.get("ended_at") or item.get("finished_at")), item.get("status"))
+                       for item in view["window_turns"] + view["background_finished"] + pair_tasks
+                       if item.get("status") != "running"]
+        completions = [(at, status) for at, status in completions if at is not None]
+        finished, outcome = max(completions, key=lambda item: item[0]) if completions else (None, None)
+        # Idle Claude runtimes can have no current context record. Reuse a
+        # bounded stored SendResult, but never restore pre-compaction usage or
+        # Codex cumulative usage. The merged view already keeps old owner reports.
+        if (spec.get("backend", "claude") == "claude" and view["verdict"] == "idle"
+                and context.get("used") is None and "implausible_used" not in context):
+            after = [parse(item.get("at")) for item in view["compactions"]]
+            after = [at for at in after if at is not None]
+            results = []
+            for path in owner_files[name]:
+                activity = reads.json(path)
+                ctx = activity.get("context") if isinstance(activity, dict) else None
+                if isinstance(ctx, dict):
+                    results.append((parse(ctx.get("at")), ctx))
+            for task in pair_tasks:
+                ctx = task.get("result_context")
+                if isinstance(ctx, dict):
+                    results.append((parse(task.get("finished_at")),
+                                    {"used": ctx.get("tokens_used"), "window": ctx.get("tokens_max")}))
+            results = [(at, ctx) for at, ctx in results if at is not None and (not after or at >= max(after))
+                       and type(ctx.get("used")) is int and type(ctx.get("window")) is int
+                       and 0 <= ctx["used"] <= ctx["window"] and ctx["window"] > 0]
+            if results:
+                at, ctx = max(results, key=lambda item: item[0])
+                view["context"] = dict(ctx, backend="claude", at=at.isoformat())
         fill = context_fill(reader, view, spec, defaults)
+        # A formerly expanded row may have aged into the collapsed Idle group
+        # since the UI's previous snapshot. Gate detail using this snapshot too.
+        detail = name in expanded and (not show_all or waiting or attention or view["verdict"] == "busy"
+                                      or (finished and (now - finished).total_seconds() <= RECENT_SECONDS))
         rows.append({
             "name": name, "backend": spec.get("backend") or context.get("backend") or "unknown",
             "model": spec.get("model") or "unknown", "status": "needs attention" if attention else view["verdict"],
             "elapsed_s": max(0, (now - started).total_seconds()) if started else None,
-            "last_line": tail(pairs / "logs" / name / "main.log") if name in expanded else "", "context": fill,
-            "reason": "; ".join(view["reasons"][:2]) if name in expanded else "", "watches": waiting,
+            "finished_at": finished.isoformat() if finished else None,
+            "finished_ago_s": max(0, (now - finished).total_seconds()) if finished else None,
+            "outcome": outcome,
+            "last_line": tail(pairs / "logs" / name / "main.log") if detail else "", "context": fill,
+            "reason": "; ".join(view["reasons"][:2]) if detail else "", "watches": waiting,
         })
     if reads.partial:
         for row in rows:

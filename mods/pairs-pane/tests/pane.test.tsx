@@ -39,16 +39,17 @@ test('this session by default; toggle all; metadata on desktop and terminal', as
   await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: false })
   for (const surface of ['desktop', 'terminal'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect((await ui.find({ type: 'Text', text: /scout/ }))?.text).toBe('scout · codex/luna')
+    expect((await ui.find({ type: 'Text', text: /scout/ }))?.text).toBe('scout')
+    expect((await ui.find({ type: 'Text', text: /Codex Luna/ }))?.text).toBe('Codex Luna')
     expect(await ui.find({ type: 'Text', text: /reviewer/ })).toBeUndefined()
-    expect((await ui.find({ type: 'Text', text: /running for/ }))?.text).toBe('busy · running for 2m 5s')
-    expect((await ui.find({ type: 'Text', text: /Watching for/ }))?.text).toContain('this session')
+    expect((await ui.find({ type: 'Text', text: /working/ }))?.text).toBe('working · 2m5s')
+    expect((await ui.find({ type: 'Text', text: /watched by/ }))?.text).toContain('this session')
     expect((await ui.find({ type: 'Text', text: /Context/ }))?.text).toContain('20%')
-    await ui.press({ key: 'scope' })
+    await ui.press({ key: 'all' })
     expect((await ui.find({ type: 'Text', text: /reviewer/ }))?.text).toContain('reviewer')
-    expect((await ui.find({ type: 'Text', text: /session another-session/ }))?.text).toContain('another-session')
-    expect((await ui.find({ type: 'Text', text: /No auto-watch/ }))?.text).toBe('No auto-watch')
-    await ui.press({ key: 'scope' })
+    expect((await ui.find({ type: 'Text', text: /session another-/ }))?.text).toContain('another-')
+    expect(await ui.find({ type: 'Text', text: /No auto-watch/ })).toBeUndefined()
+    await ui.press({ key: 'waiting' })
     await ui.unmount()
   }
 })
@@ -65,7 +66,7 @@ test('refresh removes finished waits and close cancels polling', async ($, on) =
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await clock.advance(2000)
   expect(await ui.find({ type: 'Text', text: /scout/ })).toBeUndefined()
-  expect((await ui.find({ type: 'Text', text: /No auto-watch waits/ }))?.text).toContain('this session')
+  expect((await ui.find({ type: 'Text', text: /No recorded waits/ }))?.text).toContain('this session')
   await ui.press({ key: 'close' })
   const stopped = calls
   await clock.advance(6000)
@@ -157,14 +158,22 @@ test('context bar and alert are visible in each row, including unknown idle cont
   for (const surface of ['desktop', 'terminal'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     const context = (await ui.find({ type: 'Text', text: /^Context/ }))?.text
-    expect(context).toContain('[█████░░░░░]')
+    if (surface === 'terminal') expect(context).toContain('[█████░░░░░]')
+    else {
+      expect(context).not.toContain('[')
+      const tree = JSON.stringify(await ui.drawn())
+      expect(tree).toContain('"width":"55%"')
+      expect(tree).toContain('"backgroundColor":"red"')
+    }
     expect(context).toContain('110,000 / 200,000')
     expect(context).toContain('ALERT ≥ 110,000')
-    await ui.press({ key: 'scope' })
+    await ui.press({ key: 'all' })
+    expect(await ui.find({ type: 'Text', text: /idle-codex/ })).toBeUndefined()
+    await ui.press({ key: 'idle' })
     expect((await ui.find({ type: 'Text', text: /idle-codex/ }))?.text).toContain('idle-codex')
-    expect((await ui.find({ type: 'Text', text: /Context.*unknown/ }))?.text)
-      .toBe('Context [??????????] ? / 200,000 · unknown')
-    await ui.press({ key: 'scope' })
+    expect((await ui.find({ type: 'Text', text: /context —/ }))?.text).toBe('context —')
+    await ui.press({ key: 'idle' })
+    await ui.press({ key: 'waiting' })
     await ui.unmount()
   }
 })
@@ -189,7 +198,7 @@ test('scope and expansion reach the reader; collapsed rows show no log detail', 
   expect(requests.at(-1)?.expanded).toEqual(['scout'])
   expect(requests.at(-1)?.cache).toEqual({ tasks: { example: { summary: { status: 'running' } } } })
   expect((await ui.find({ type: 'Text', text: /Running the tests/ }))?.text).toBe('Running the tests')
-  await ui.press({ key: 'scope' })
+  await ui.press({ key: 'all' })
   expect(requests.at(-1)?.all).toBe(true)
   await ui.unmount()
 })
@@ -222,4 +231,36 @@ test('hidden or unplaced panes do not start a filesystem refresh', async ($, on)
   placed = true
   await clock.advance(2000)
   expect(calls).toBe(2)
+})
+
+test('all view orders working then recent completions and collapses old idle pairs', async ($, on) => {
+  base(on)
+  const rows = [
+    { ...row('ancient'), status: 'idle', backend: 'claude', model: 'claude-sonnet-4-6',
+      finished_at: '2026-10-26T08:00:00Z', finished_ago_s: 14400 },
+    { ...row('older'), status: 'idle', backend: 'claude', model: 'claude-opus-5-5',
+      finished_at: '2026-10-26T11:00:00Z', finished_ago_s: 3600 },
+    { ...row('recent'), status: 'idle', outcome: 'failed', model: 'gpt-6-astra',
+      finished_at: '2026-10-26T11:48:00Z', finished_ago_s: 720 },
+    row('working'),
+  ]
+  on('process.run', () => ({ value: { exitCode: 0, stdout: JSON.stringify({ rows }), stderr: '',
+    isStdoutTruncated: false, isStderrTruncated: false } }))
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: false })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Button', key: 'waiting' }))?.text).toContain('● Waiting on')
+  expect((await ui.find({ type: 'Text', text: /No recorded waits/ }))?.text).toContain('Choose All')
+  await ui.press({ key: 'all' })
+  expect((await ui.find({ type: 'Button', key: 'all' }))?.text).toContain('● All')
+  expect((await ui.findAll({ type: 'Text', text: /^(working|recent|older|ancient)$/ })).map(item => item.text))
+    .toEqual(['working', 'recent', 'older'])
+  expect((await ui.find({ type: 'Text', text: /^Opus/ }))?.text).toBe('Opus 5.5')
+  expect((await ui.find({ type: 'Text', text: /^Codex Astra/ }))?.text).toBe('Codex Astra')
+  expect((await ui.find({ type: 'Text', text: /^failed/ }))?.text).toContain('(12 min ago)')
+  expect((await ui.find({ type: 'Button', key: 'idle' }))?.text).toContain('Idle (1)')
+  expect(await ui.find({ type: 'Button', key: 'refresh' })).toBeUndefined()
+  await ui.press({ key: 'idle' })
+  expect((await ui.find({ type: 'Text', text: /^ancient$/ }))?.text).toBe('ancient')
+  expect(await ui.find({ type: 'Button', key: 'detail-ancient' })).toBeUndefined()
+  await ui.unmount()
 })

@@ -541,26 +541,37 @@ still lose that notification.
 The **Pairs** pane restores the visible list of waits that background Bash
 watchers used to provide. Open it with `/pairs`; it also opens at session
 start when a pane surface is available. It defaults to pairs **this session
-is waiting on**. Toggle **This session / All pairs** to see every registered
-pair, including idle pairs, other managers' waits and work with no auto-watch attached.
+is waiting on**. The **Waiting on | All** buttons mark the active view. **All**
+shows working pairs first, then completions from the last two hours (newest
+first), then a collapsed **Idle (N)** group with compact rows. Other managers'
+waits and work with no auto-watch attached are included.
 
-Each row prominently shows a compact context bar and **used / window** directly
-below its name, plus backend/model, work elapsed time, and each watcher's
-elapsed time and manager session/project (your own is marked **this session**).
-**Show detail** loads the last log line and activity reasons for that row. Queued work,
+Rows show a short model label, work elapsed time or completion time, and
+**used / window** context. Desktop uses a coloured bar; terminal uses a text
+bar. Watch badges appear only when a watch exists, with elapsed time and the
+manager session (your own is marked **this session**).
+**Show detail** loads the last meaningful log line, skipping TURN bookkeeping,
+and activity reasons for that row. Queued work,
 background tasks and pending self-wakes count as active. Unresolved activity
 is labelled `unknown`; orphaned tasks needing recovery stay visible as
 `needs attention`. The pane is read-only: filtering, refreshing and closing
 it never stop or send work. It does not replace the completion hook.
 
-Context is the last activity-file report, including for idle pairs. Missing
-or implausible measurements show **unknown**, never an empty/zero context.
+Context is the last activity-file report, including for idle pairs. Idle
+Claude pairs can also use a bounded stored result when activity has no fill;
+pre-compaction measurements are excluded. Missing or implausible measurements
+show **context —** with no bar, never an empty/zero context.
 No transcript is read or compressed Codex thread restored to obtain a value;
 an older usable activity record remains a last-reported measurement. **ALERT**
 marks fill at or above the same threshold as `pair_status` / `wait.py` exit 8:
 global `context_alert_headroom`, per-pair `context_alert_at`, and Codex's
 reported auto-compaction limit all apply. The pane marks the current level;
 the watcher additionally requires observing a threshold crossing before waking.
+
+Older servers without watch records cannot reliably attribute tasks to a
+manager session: task owner PIDs identify the MCP process, not the session.
+The empty **Waiting on** view explains how to see running work in **All** and
+enable tracking with auto-watch on a current server.
 
 Install from a release of this repository that includes the mod:
 
@@ -596,7 +607,7 @@ expanded rows read at most 8 KiB each. No transcript or separate reply-detail
 read is performed; task files are byte-capped and used only as metadata.
 
 Each refresh scans at most 2,048 task-directory entries and considers at most
-128 tasks: files modified in the last 15 minutes, plus task IDs referenced by
+128 tasks: files modified in the last two hours, plus task IDs referenced by
 selected activity or known-running cached summaries. Task JSON is capped at
 64 KiB per file; metadata at 128 KiB (registry: 2 MiB), with a combined 4 MiB /
 128-file JSON-read budget. At most 64 rows are displayed. Compact task summaries

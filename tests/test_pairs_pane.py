@@ -244,6 +244,64 @@ class SnapshotTests(unittest.TestCase):
             "started_at": record["started_at"]}), encoding="utf-8")
         self.assertEqual(P.snapshot(self.home, session="manager", show_all=False)["rows"], [])
 
+    def test_recent_completion_and_last_claude_result_context(self):
+        self.write("registry.json", {"pairs": {"scout": {"backend": "claude", "model": "claude-opus-5-5"}}})
+        finished = (self.now - timedelta(minutes=90)).isoformat()
+        path = self.write("async/result.json", {"task_id": "result", "pair_name": "scout", "status": "done",
+            "finished_at": finished, "result": {"context": {"tokens_used": 123000, "tokens_max": 1000000},
+                                                "response": "not retained"}})
+        os.utime(path, (self.now.timestamp() - 5400,) * 2)
+        data = P.snapshot(self.home)
+        row = data["rows"][0]
+        self.assertEqual(row["finished_at"], finished)
+        self.assertAlmostEqual(row["finished_ago_s"], 5400, delta=5)
+        self.assertEqual(row["context"]["used"], 123000)
+        self.assertNotIn("not retained", json.dumps(data["cache"]))
+        self.assertEqual(P.snapshot(self.home, cache=data["cache"])["rows"][0]["context"], row["context"])
+        self.activity(backend="claude", turn=None, context=None, compactions=[{"at": self.now.isoformat()}])
+        self.assertIsNone(P.snapshot(self.home)["rows"][0]["context"]["used"])
+
+    def test_idle_owner_context_and_failed_status_come_from_activity(self):
+        self.activity(turn=None, window_turns=[{"started_at": self.started, "ended_at": self.now.isoformat(),
+                                               "status": "failed"}])
+        row = P.snapshot(self.home)["rows"][0]
+        self.assertEqual(row["outcome"], "failed")
+        self.assertEqual(row["context"]["used"], 50000)
+        self.assertAlmostEqual(row["finished_ago_s"], 0, delta=5)
+
+    def test_idle_claude_keeps_last_known_owner_context(self):
+        self.write("registry.json", {"pairs": {"scout": {"backend": "claude"}}})
+        self.activity(backend="claude", turn=None,
+                      context={"used": None, "window": 1000000, "at": self.now.isoformat()})
+        self.write("activity/scout/999999999.json", {"version": 1, "state": "closed", "backend": "claude",
+            "context": {"used": 75000, "window": 200000, "window_source": "inferred", "at": self.started}})
+        self.write("activity/scout/pair.json", {"reported_window": {"tokens": 1000000, "backend": "claude"}})
+        fill = P.snapshot(self.home)["rows"][0]["context"]
+        self.assertEqual((fill["used"], fill["window"], fill["percent"]), (75000, 1000000, 7.5))
+
+    def test_detail_skips_turn_bookkeeping(self):
+        self.activity()
+        log = self.pairs / "logs/scout/main.log"
+        log.parent.mkdir(parents=True)
+        log.write_text("[19:44:21] [T-9] Tests passed\n"
+                       "[19:44:22] === TURN COMPLETED (in 36,632,455 / cached 36,319,616) ===\n", encoding="utf-8")
+        self.assertEqual(P.snapshot(self.home, expanded=["scout"])["rows"][0]["last_line"],
+                         "[19:44:21] [T-9] Tests passed")
+
+    def test_row_aging_into_idle_group_stops_detail_reads(self):
+        self.activity(turn=None, window_turns=[{"started_at": self.started,
+            "ended_at": (self.now - timedelta(hours=3)).isoformat(), "status": "done"}])
+        with patch.object(P, "tail") as detail:
+            self.assertEqual(P.snapshot(self.home, expanded=["scout"])["rows"][0]["last_line"], "")
+            detail.assert_not_called()
+
+    def test_owner_pid_alone_does_not_guess_manager_session(self):
+        self.activity()
+        self.write("async/task.json", {"task_id": "task", "pair_name": "scout", "status": "running",
+            "owner_pid": os.getpid(), "started_at": self.now.isoformat()})
+        self.assertEqual(P.snapshot(self.home, session="manager", show_all=False)["rows"], [])
+        self.assertEqual(P.snapshot(self.home)["rows"][0]["status"], "busy")
+
 
 if __name__ == "__main__":
     unittest.main()

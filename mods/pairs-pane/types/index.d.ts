@@ -5,6 +5,7 @@ export type PairWatch = {
 export type PairRow = {
   name: string; backend: string; model: string; status: string;
   elapsed_s: number | null; last_line: string; reason: string;
+  finished_at?: string | null; finished_ago_s?: number | null; outcome?: string | null;
   context: {
     used: number | null; window: number | null; percent: number | null;
     alert_at: number | null; above_alert: boolean;
@@ -15,6 +16,6 @@ export type PairsView = { rows: PairRow[]; error: string | null; notice: string 
 
 declare module 'claude-code' {
   interface PluginState {
-    'pairs-pane': { view: PairsView; all: boolean; expanded: string[] }
+    'pairs-pane': { view: PairsView; all: boolean; expanded: string[]; idle: boolean }
   }
 }

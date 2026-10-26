@@ -6,8 +6,8 @@
   kept the session ID on `--resume`; a SessionStart `asyncRewake` hook woke the
   idle stream-json manager. This was reported by the main session after running
   `tests/smoke_live_sessionstart.py`, not run by the implementer. No inference is
-  needed for plugin validation/testing. Actual pane painting remains a separate
-  user-facing check.
+  needed for plugin validation/testing. Alvar subsequently confirmed the pane
+  loads and works in Desktop; his screenshots motivated the layout round below.
 - Quench found an approximately 80 MiB snapshot read from ten completed task
   files. The reader now caps reads before opening oversized files and filters
   old history by mtime. The regression uses ten 8 MiB historical task files plus
@@ -28,7 +28,7 @@ a bounded task set and bounded JSON reads. Limits live beside the reader:
 
 | Limit | Value |
 | --- | --- |
-| Recent task window | 15 minutes |
+| Recent task window | 2 hours (also the recent-completion group) |
 | Task-directory entries examined | 2,048 per refresh |
 | Candidate tasks | 128, with activity-referenced / previously running IDs eligible regardless of age |
 | Task file | 64 KiB; size checked before opening |
@@ -44,6 +44,20 @@ reads. No separate reply-detail/transcript fetch is performed. Budget/age omissi
 notice, and idle becomes unknown rather than claiming all work was observed.
 An old queued task without an activity reference or cached running summary may
 be omitted; use pair_status/pair_poll when completeness matters.
+
+The view puts busy pairs first, then attention/watched rows, recent completions
+(newest first), and a collapsed compact Idle group. Desktop's element table has
+no Progress/Meter, but supports percentage-width Boxes with background colours;
+these draw context bars, with text bars only on terminal. Unknown fill has no
+bar. Idle Claude fallback reads already-budgeted activity/SendResult context,
+excluding known pre-compaction reports; it never uses cumulative result usage.
+Completion timestamps/outcomes come from activity history and task summaries,
+not log usage markers. Expanded log detail skips bookkeeping markers.
+
+Task state has owner_pid but no manager-session identifier. Without watches,
+PID alone cannot safely supply the requested session fallback, so Waiting on
+offers All and auto-watch setup guidance. No extra process inspection or
+transcript scan was added. Hidden idle groups request no log detail.
 
 The two-second timer asks `$.ui.panes()` about placement and visibility before
 launching a Python reader. Hidden tabs and unplaced panes perform no filesystem
