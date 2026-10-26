@@ -6,6 +6,18 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- Optional Claude Code **Pairs** pane (`mods/pairs-pane`), opened by `/pairs`
+  or at session start. Shows this session's auto-watch waits by default, with
+  an all-pairs toggle, backend/model, elapsed work/watch times, last activity
+  and context fill. A read-only Python helper reuses `wait.py`'s activity and
+  PID checks; no model calls. Polling stops when the pane closes.
+- Auto-watch publishes a small record while it owns a watch, including the
+  manager session/cwd, start time and hook PID. Records are removed on exit;
+  stale PIDs are hidden by the pane. Display-record failures do not prevent
+  completion notifications.
+
 ## [0.20.0] — 2026-10-26
 
 An optional hook that wakes the manager when a pair's work finishes (no manual

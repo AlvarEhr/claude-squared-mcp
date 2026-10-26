@@ -7,6 +7,7 @@ settings own the outer timeout. Keep it above HOOK_TIMEOUT_SECONDS (README).
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
 import hashlib
 import io
 import json
@@ -213,10 +214,38 @@ def _wait(pairs, name, timeout):
     return code, output.getvalue()
 
 
+def _publish_watch(pairs, key, session, name, payload):
+    """Best-effort pane discovery, written only by the dedupe lock's owner.
+
+    Hashing the session/pair also keeps arbitrary session names out of paths.
+    The pane checks the PID (and its birth against started_at), so a killed
+    hook's leftover record never establishes that a watcher is still alive.
+    """
+    target = pairs / "watches" / (key + ".json")
+    tmp = target.with_name(key + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps({
+            "version": 1, "pair": name, "session_id": session,
+            "cwd": payload.get("cwd") if isinstance(payload.get("cwd"), str) else None,
+            "started_at": datetime.now(timezone.utc).isoformat(), "hook_pid": os.getpid(),
+        }), encoding="utf-8")
+        tmp.replace(target)
+        return target
+    except OSError:
+        return None  # a display failure must not lose the completion wake
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def watch(payload, pairs, timeout=WAIT_TIMEOUT_SECONDS):
     deadline = time.monotonic() + timeout
     name = "(unresolved)"
     gate = owner = None
+    record = None
     try:
         target = _target(payload, pairs)
         if target is None:
@@ -233,6 +262,7 @@ def watch(payload, pairs, timeout=WAIT_TIMEOUT_SECONDS):
         gate.revision(revision)
         if not owner.acquire():
             return 0
+        record = _publish_watch(pairs, key, session, name, payload)
         gate.release()
         while True:
             code, output = _wait(pairs, name, deadline - time.monotonic())
@@ -260,6 +290,13 @@ def watch(payload, pairs, timeout=WAIT_TIMEOUT_SECONDS):
         print(f"claude-squared auto-watch failed{target_hint}: {exc}. {recovery}", file=sys.stderr)
         return 2
     finally:
+        # Remove before releasing ownership: a new watcher may reuse the path
+        # immediately after unlock. A failed unlink is harmless once this PID exits.
+        if record is not None:
+            try:
+                record.unlink()
+            except OSError:
+                pass
         # Ownership is released BEFORE the gate, so a racing new request either
         # reaches the existing owner above or starts its own watcher.
         if owner is not None:

@@ -283,10 +283,19 @@ class HookTests(unittest.TestCase):
 
     def test_live_dedupe_and_session_pair_scope(self):
         self.blocking_stub()
-        first = self.start(event())
+        first = self.start({**event(), "cwd": str(self.home / "manager-project")})
         self.await_file("started")
+        files = list((self.pairs / "watches").glob("*.json"))
+        self.assertEqual(len(files), 1)
+        record = json.loads(files[0].read_text(encoding="utf-8"))
+        self.assertEqual(record["pair"], "scout")
+        self.assertEqual(record["session_id"], "manager-session")
+        self.assertEqual(record["hook_pid"], first.pid)
+        self.assertEqual(record["cwd"], str(self.home / "manager-project"))
+        self.assertIsNotNone(H.datetime.fromisoformat(record["started_at"]))
         duplicate = self.start(event())
         self.assertEqual(self.finish(duplicate), (0, "", ""))
+        self.assertEqual(json.loads(files[0].read_text(encoding="utf-8")), record)
         self.assertIsNone(first.poll())
         independent_session = self.start({**event(), "session_id": "another-manager"})
         independent_pair = self.start(event(name="other"))
@@ -298,6 +307,19 @@ class HookTests(unittest.TestCase):
         (self.pairs / "release").touch()
         for child in (first, independent_session, independent_pair):
             self.assertEqual(self.finish(child)[0], 2)
+        self.assertEqual(list((self.pairs / "watches").glob("*.json")), [])
+
+    def test_display_record_failure_does_not_prevent_wake(self):
+        (self.pairs / "watches").write_text("not a directory", encoding="utf-8")
+        self.stub("def main(argv):\n print('completed')\n return 0\n")
+        status, _, err = self.finish(self.start(event()))
+        self.assertEqual(status, 2)
+        self.assertIn("wait.py exit 0", err)
+
+    def test_display_record_is_removed_when_wait_raises(self):
+        self.stub("raise RuntimeError('failed watcher')\n")
+        self.assertEqual(self.finish(self.start(event()))[0], 2)
+        self.assertEqual(list((self.pairs / "watches").glob("*.json")), [])
 
     def test_killed_watcher_releases_kernel_lock(self):
         self.blocking_stub()
@@ -305,8 +327,10 @@ class HookTests(unittest.TestCase):
         self.await_file("started")
         first.terminate()  # only the process started by this test
         first.communicate(timeout=10)
+        self.assertEqual(len(list((self.pairs / "watches").glob("*.json"))), 1)
         (self.pairs / "release").touch()
         self.assertEqual(self.finish(self.start(event()))[0], 2)
+        self.assertEqual(list((self.pairs / "watches").glob("*.json")), [])
 
     def test_send_at_idle_boundary_is_not_lost(self):
         calls = []

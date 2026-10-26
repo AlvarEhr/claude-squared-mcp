@@ -1,0 +1,12 @@
+{
+  "name": "pairs-pane",
+  "version": "0.1.0",
+  "description": "Read-only view of claude-squared pair work and auto-watch waits.",
+  "author": { "name": "Alvar" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "python": { "type": "string", "title": "Python executable", "description": "Python 3.7+ executable or absolute path (no shell arguments).", "default": "python" },
+    "claudeHome": { "type": "string", "title": "Claude home", "description": "Absolute path override; otherwise CLAUDE_HOME or ~/.claude.", "default": "" },
+    "openOnStart": { "type": "boolean", "title": "Open Pairs at session start", "description": "Open the pane when a surface is available at startup.", "default": true }
+  }
+}

@@ -90,6 +90,10 @@ def main() -> int:
         "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
         "-p", "test_auto_watch.py", "-v",
     ]))
+    commands.append(("pairs_pane", [
+        "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
+        "-p", "test_pairs_pane.py", "-v",
+    ]))
     scratch = ROOT / ".test-homes"
     scratch.mkdir(exist_ok=True)
     failures = []

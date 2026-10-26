@@ -1,0 +1,6 @@
+{
+  "name": "claude-squared",
+  "description": "Optional Claude Code views for claude-squared pairs.",
+  "owner": { "name": "Alvar" },
+  "plugins": [{ "name": "pairs-pane", "source": "./mods/pairs-pane" }]
+}

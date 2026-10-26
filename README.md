@@ -482,6 +482,76 @@ beside `wait.py`. Maintainers can run
 stream-json manager; it keeps isolated evidence under `.test-homes` and
 does not edit user settings.
 
+## Pairs pane (optional Claude Code mod)
+
+The **Pairs** pane restores the visible list of waits that background Bash
+watchers used to provide. Open it with `/pairs`; it also opens at session
+start when a pane surface is available. It defaults to pairs **this session
+is waiting on**. Toggle **This session / All pairs** to see other managers'
+waits and work with no auto-watch attached.
+
+Each row shows the pair's backend/model, work elapsed time, last log line,
+context fill when reported, and each watcher's elapsed time and manager
+session/project (your own is marked **this session**). Queued work,
+background tasks and pending self-wakes count as active. Unresolved activity
+is labelled `unknown`; orphaned tasks needing recovery stay visible as
+`needs attention`. The pane is read-only: filtering, refreshing and closing
+it never stop or send work. It does not replace the completion hook.
+
+Install from a release of this repository that includes the mod:
+
+```text
+/plugin install pairs-pane --marketplace AlvarEhr/claude-squared-mcp
+```
+
+Confirm adding the marketplace and choose the desired scope. For a local
+development checkout, use:
+
+```bash
+claude --plugin-dir /absolute/path/to/claude-squared/mods/pairs-pane
+```
+
+Desktop hosts without a CLI flag can load that same absolute directory via
+`CLAUDE_CODE_PLUGIN_DIRS` in the host's environment. Alternatively add the
+checkout as a local plugin marketplace, install `pairs-pane` from it, then
+use `/reload-plugins`. The mod never changes user settings itself.
+
+After upgrading the server, start a fresh pair MCP server so it installs the
+updated hook script. **New** hook invocations publish small records under
+`<CLAUDE_HOME>/pairs/watches/`; watchers already running from an older script
+will not appear as waits. Records are removed on completion; dead watcher
+PIDs and detected PID reuse are hidden even if cleanup failed.
+
+The pane refreshes about every two seconds while open. A bundled stdlib Python
+reader calls the installed `wait.py`'s merged activity reader and PID checks,
+so it uses the same rules as the watcher across multiple MCP processes. It
+reads task/activity/watch files and at most 8 KiB from each displayed pair's
+log; it makes no model calls and writes no pair state. Closing it cancels
+refreshes. A failed read clears the display and shows an error instead of
+presenting an old wait as live.
+
+Python 3.7+ must be available to the host. In `/config`, the plugin exposes
+`pairs-pane.python` (an executable path, no shell arguments),
+`pairs-pane.claudeHome` (optional absolute home override), and
+`pairs-pane.openOnStart`. Home resolution is the override, then the host's
+`CLAUDE_HOME`, then `~/.claude`. If only the MCP server has a custom
+`CLAUDE_HOME`, set the same directory in the plugin's option.
+
+The mod API is early access. Validated and tested with the local CLI's
+function-hook test harness; actual Desktop painting still needs a user check.
+The API has no direct PID-liveness query, so the pane uses the read-only
+Python helper through `$.process.run`. A host that refuses that call cannot
+provide the pane's live view. Without an attached surface, `/pairs` reports
+that no pane is available and does not start polling.
+
+Maintainer checks (local, no model calls):
+
+```bash
+claude plugin validate mods/pairs-pane
+claude plugin test mods/pairs-pane
+python scripts/run_offline_tests.py
+```
+
 ## Self-woken turns (v0.12.0, Claude)
 
 A pair that launches background work — `Agent(run_in_background=True)`, a
