@@ -16,9 +16,15 @@ All notable changes to this project are documented here. Format follows
   (including per-pair overrides). A read-only Python helper reuses `wait.py`'s activity and
   PID checks; no model calls. Polling stops when the pane closes.
 - Auto-watch publishes a small record while it owns a watch, including the
-  manager session/cwd, start time and hook PID. Records are removed on exit;
+  manager session/cwd, start time and hook PID. Records are removed after reporting an outcome;
   stale PIDs are hidden by the pane. Display-record failures do not prevent
   completion notifications.
+- Opt-in SessionStart recovery for interrupted watches belonging to the
+  resumed session. Finished or forgotten pairs report promptly; busy pairs
+  are watched concurrently until the first outcome. Reading it with `pair_poll`
+  re-arms remaining recovery records. Existing live watchers are deduplicated
+  across startup/resume/clear/compact/fork. Includes an opt-in stream-json
+  SessionStart wake probe; live delivery is not yet verified.
 
 ## [0.20.0] — 2026-10-26
 

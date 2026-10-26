@@ -2,11 +2,24 @@
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "^mcp__(?:pair|Claude_Squared)__(?:pair_send|pair_send_async|pair_compact|pair_create|pair_handoff)$",
+        "matcher": "^mcp__(?:pair|Claude_Squared)__(?:pair_send|pair_send_async|pair_compact|pair_create|pair_handoff|pair_poll)$",
         "hooks": [
           {
             "type": "command",
             "command": "python \"/absolute/path/to/.claude/pairs/auto_watch.py\"",
+            "asyncRewake": true,
+            "timeout": 604800
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact|fork",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"/absolute/path/to/.claude/pairs/auto_watch.py\" --resume",
             "asyncRewake": true,
             "timeout": 604800
           }

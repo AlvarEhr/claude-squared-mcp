@@ -64,8 +64,8 @@ class HookTests(unittest.TestCase):
     def stub(self, source):
         (self.pairs / "wait.py").write_text(source, encoding="utf-8")
 
-    def start(self, payload):
-        p = subprocess.Popen([sys.executable, "-S", str(self.script)], stdin=subprocess.PIPE,
+    def start(self, payload, *args):
+        p = subprocess.Popen([sys.executable, "-S", str(self.script), *args], stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              env=self.env, encoding="utf-8")
         p.stdin.write(json.dumps(payload))
@@ -80,7 +80,7 @@ class HookTests(unittest.TestCase):
         return p
 
     def finish(self, p):
-        out, err = p.communicate(timeout=10)
+        out, err = p.communicate(timeout=20)
         return p.returncode, out, err
 
     def await_file(self, name):
@@ -417,6 +417,167 @@ class HookTests(unittest.TestCase):
         (directory / "123abc.json").write_text(json.dumps({"pair_name": "other"}), encoding="utf-8")
         self.assertEqual(H._target(event("pair_handoff", text + "\n\nAsync task: 123abc"), self.pairs),
                          ("manager-session", "other"))
+
+    def recovery_record(self, pair="scout", session="manager-session", **changes):
+        record = {"version": 1, "pair": pair, "session_id": session, "cwd": "/old-project",
+                  "hook_pid": 999999999, "started_at": "2020-01-01T00:00:00+00:00"}
+        record.update(changes)
+        path = self.pairs / "watches" / (H._watch_key(session, pair) + ".json")
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps(record), encoding="utf-8")
+        return path
+
+    def recovery_task(self, pair="scout", status="running"):
+        path = self.pairs / "async" / (pair + "-task.json")
+        path.parent.mkdir(exist_ok=True)
+        data = {"task_id": pair + "-task", "pair_name": pair, "status": status,
+                "owner_pid": os.getpid() if status == "running" else None,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "finished_at": "2020-01-01T00:00:01" if status != "running" else None,
+                "result": {"response": "RECOVERED-" + pair}, "error": "FAILED-" + pair}
+        # Atomic like the server, so a reader never sees a torn test update.
+        temp = path.with_suffix(".tmp")
+        temp.write_text(json.dumps(data), encoding="utf-8")
+        temp.replace(path)
+
+    def start_recovery(self, source="resume", session="manager-session"):
+        return self.start({"hook_event_name": "SessionStart", "source": source,
+                           "session_id": session, "cwd": "/resumed-project"}, "--resume")
+
+    def await_recovery_owner(self, path, pid):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                if json.loads(path.read_text(encoding="utf-8")).get("hook_pid") == pid:
+                    return
+            except (OSError, ValueError):
+                pass
+            time.sleep(.02)
+        self.fail("recovery did not claim the dead watch")
+
+    def test_recovery_reports_outcome_finished_during_downtime(self):
+        W.install_wait_script(self.pairs / "wait.py")
+        for status, code in (("done", 0), ("failed", 1), ("stopped", 5)):
+            with self.subTest(status=status):
+                path = self.recovery_record()
+                self.recovery_task(status=status)
+                result, _, err = self.finish(self.start_recovery())
+                self.assertEqual(result, 2, err)
+                self.assertIn(f"wait.py exit {code}", err)
+                self.assertFalse(path.exists())
+                self.assertEqual(self.finish(self.start_recovery()), (0, "", ""))
+
+    def test_recovery_claims_busy_pair_and_clear_compact_do_not_duplicate(self):
+        W.install_wait_script(self.pairs / "wait.py")
+        path = self.recovery_record()
+        self.recovery_task()
+        first = self.start_recovery()
+        self.await_recovery_owner(path, first.pid)
+        record = path.read_bytes()
+        for source in H.START_SOURCES:
+            self.assertEqual(self.finish(self.start_recovery(source)), (0, "", ""))
+        self.assertEqual(path.read_bytes(), record)
+        self.recovery_task(status="done")
+        code, _, err = self.finish(first)
+        self.assertEqual(code, 2, err)
+        self.assertIn("pair 'scout', wait.py exit 0", err)
+        self.assertFalse(path.exists())
+
+    def test_completed_pair_wakes_without_waiting_for_other_busy_pair(self):
+        W.install_wait_script(self.pairs / "wait.py")
+        done = self.recovery_record()
+        busy = self.recovery_record("other")
+        self.recovery_task(status="done")
+        self.recovery_task("other")
+        code, _, err = self.finish(self.start_recovery())
+        self.assertEqual(code, 2, err)
+        self.assertIn("pair 'scout', wait.py exit 0", err)
+        self.assertFalse(done.exists())
+        self.assertTrue(busy.exists())
+        # Reading the result re-arms the remaining pair without a Bash step.
+        follow = self.start({**event("pair_poll", "done"), "tool_input": {"task_id": "scout"}})
+        self.await_recovery_owner(busy, follow.pid)
+        self.recovery_task("other", status="done")
+        code, _, err = self.finish(follow)
+        self.assertEqual(code, 2, err)
+        self.assertIn("pair 'other', wait.py exit 0", err)
+        self.assertNotIn("pair 'scout', wait.py exit", err)
+        self.assertFalse(busy.exists())
+
+    def test_recovery_explains_gone_pair_and_removes_record(self):
+        W.install_wait_script(self.pairs / "wait.py")
+        path = self.recovery_record("gone")
+        code, _, err = self.finish(self.start_recovery())
+        self.assertEqual(code, 2, err)
+        self.assertIn("pair 'gone' is gone from the registry", err)
+        self.assertFalse(path.exists())
+
+    def test_recovery_keeps_other_session_and_pair_session_records(self):
+        W.install_wait_script(self.pairs / "wait.py")
+        foreign = self.recovery_record(session="old-session")
+        pair = self.recovery_record(session="pair-session")
+        self.assertEqual(self.finish(self.start_recovery()), (0, "", ""))
+        self.assertEqual(self.finish(self.start_recovery(session="pair-session")), (0, "", ""))
+        self.assertTrue(foreign.exists())
+        self.assertTrue(pair.exists())
+
+    def test_recovery_survives_another_hook_death(self):
+        W.install_wait_script(self.pairs / "wait.py")
+        path = self.recovery_record()
+        self.recovery_task()
+        first = self.start_recovery()
+        self.await_recovery_owner(path, first.pid)
+        first.terminate()  # only the hook process this test launched
+        first.communicate(timeout=10)
+        self.assertTrue(path.exists())
+        second = self.start_recovery()
+        self.await_recovery_owner(path, second.pid)
+        self.recovery_task(status="done")
+        self.assertEqual(self.finish(second)[0], 2)
+
+    def test_recovery_uses_installed_home_without_environment_override(self):
+        W.install_wait_script(self.pairs / "wait.py")
+        self.recovery_record()
+        self.recovery_task(status="failed")
+        self.env.pop("CLAUDE_HOME")
+        code, _, err = self.finish(self.start_recovery())
+        self.assertEqual(code, 2)
+        self.assertIn("FAILED-scout", err)
+
+    def test_interrupted_watch_keeps_record_for_restart(self):
+        with patch.object(H, "_wait", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            H.watch(event(), self.pairs)
+        self.assertEqual(len(list((self.pairs / "watches").glob("*.json"))), 1)
+
+    def test_recovery_timeout_keeps_resolved_home_in_rearm_command(self):
+        W.install_wait_script(self.pairs / "wait.py")
+        self.recovery_record()
+        self.recovery_task()
+        output = io.StringIO()
+        with patch("sys.stderr", output):
+            code = H.resume_watches({"hook_event_name": "SessionStart", "source": "resume",
+                                     "session_id": "manager-session"}, self.pairs, timeout=0)
+        self.assertEqual(code, 2)
+        self.assertIn("wait.py exit 3", output.getvalue())
+        self.assertIn("CLAUDE_HOME=", output.getvalue())
+        self.assertIn(self.home.as_posix(), output.getvalue())
+
+    def test_two_restart_hooks_claim_a_stale_record_only_once(self):
+        W.install_wait_script(self.pairs / "wait.py")
+        self.recovery_record()
+        self.recovery_task(status="done")
+        first, second = self.start_recovery(), self.start_recovery()
+        results = [self.finish(first), self.finish(second)]
+        self.assertEqual(sorted(result[0] for result in results), [0, 2], results)
+
+    def test_recovery_preserves_record_when_registry_is_unreadable(self):
+        W.install_wait_script(self.pairs / "wait.py")
+        record = self.recovery_record()
+        (self.pairs / "registry.json").write_text("broken", encoding="utf-8")
+        code, _, err = self.finish(self.start_recovery())
+        self.assertEqual(code, 2)
+        self.assertIn("registry unavailable", err)
+        self.assertTrue(record.exists())
 
 
 if __name__ == "__main__":

@@ -401,8 +401,9 @@ To opt in:
 1. Start a new pair MCP server after upgrading so both scripts are installed.
 2. Merge [docs/auto-watch.settings.json](docs/auto-watch.settings.json) into
    your Claude Code user settings (`~/.claude/settings.json`, or the settings
-   directory selected by `CLAUDE_CONFIG_DIR`). Append its `PostToolUse` entry
-   if you already have hooks; keep your existing entries.
+   directory selected by `CLAUDE_CONFIG_DIR`). Add its `SessionStart` entry and
+   use the updated `PostToolUse` matcher, including `pair_poll`. Keep other
+   hooks; replace an older auto-watch entry rather than duplicating it.
 3. Replace `/absolute/path/to/.claude/pairs/auto_watch.py` with the installed
    script's absolute path. Use a working Python interpreter (Python ≥ 3.7);
    if `python` is not on the hook shell's PATH, quote its absolute path too.
@@ -420,10 +421,19 @@ The snippet is:
 {
   "hooks": {
     "PostToolUse": [{
-      "matcher": "^mcp__(?:pair|Claude_Squared)__(?:pair_send|pair_send_async|pair_compact|pair_create|pair_handoff)$",
+      "matcher": "^mcp__(?:pair|Claude_Squared)__(?:pair_send|pair_send_async|pair_compact|pair_create|pair_handoff|pair_poll)$",
       "hooks": [{
         "type": "command",
         "command": "python \"/absolute/path/to/.claude/pairs/auto_watch.py\"",
+        "asyncRewake": true,
+        "timeout": 604800
+      }]
+    }],
+    "SessionStart": [{
+      "matcher": "startup|resume|clear|compact|fork",
+      "hooks": [{
+        "type": "command",
+        "command": "python \"/absolute/path/to/.claude/pairs/auto_watch.py\" --resume",
         "asyncRewake": true,
         "timeout": 604800
       }]
@@ -455,7 +465,7 @@ Re-arming does not stop or re-send the work.
 
 Pairs inherit user settings too: the hook is suppressed inside pair
 processes, with a registered-session check for older runtimes. Sessions
-without these MCP tools never match. Kernel file locks release on watcher
+without matching pair tools or watch records do not arm a watcher. Kernel file locks release on watcher
 death, so an interrupted hook cannot leave a stale PID blocking later sends.
 The hook does not stop any process or modify pair tasks/activity.
 It passes its resolved Claude home to `wait.py`, including when a custom
@@ -469,7 +479,8 @@ command, matcher, `asyncRewake: true` and timeout in user settings, provided
 shell wrappers and custom MCP aliases are not detectable. In those cases
 use the manual watcher. This feature is for Claude Code managers; Codex and
 other MCP hosts need their own notification mechanism. Closing the manager
-ends hook delivery; hooks are not durable subscriptions across sessions.
+ends hook delivery; the SessionStart hook can recover interrupted watches
+when that same session resumes, as described below.
 
 Evidence (2026-10-26): the existing Haiku probe verified an idle
 stream-json manager waking after 30 seconds and 15 minutes, and a hook
@@ -481,6 +492,49 @@ beside `wait.py`. Maintainers can run
 `python tests/smoke_live_auto_watch.py --live` for a real Haiku pair and
 stream-json manager; it keeps isolated evidence under `.test-homes` and
 does not edit user settings.
+
+### Recovering waits after a restart
+
+`auto_watch.py --resume` handles `SessionStart`. It finds this session's watch
+records whose hook PID is dead (including detected PID reuse), rechecks each
+record under the existing dedupe lock, and resumes `wait.py` with the same
+Claude home. Work finished while the manager was down produces an immediate
+outcome; a forgotten pair produces an explanation and removes its stale record.
+Live watchers are left alone, including on repeated `clear` or `compact`
+events. Recovery never re-sends or stops pair work.
+
+**Several recovered pairs:** a hook process can deliver only one exit wake.
+Recovery waits concurrently and wakes on the first outcome, so a completed
+pair is not hidden behind a long-running one. Unfinished records are retained.
+Read the reported result with `pair_poll`; its updated PostToolUse hook then
+automatically re-arms the remaining records. This requires both entries in
+the updated settings snippet. Until that poll, the unfinished recovery records
+are pending, not live watches. Normal PostToolUse watchers remain independent.
+
+Normal `--resume <id>` reuses the original session ID; `--fork-session` creates
+a new one. This is stated in the [CLI reference](https://code.claude.com/docs/en/cli-reference#cli-flags)
+and confirmed in the installed CLI's help strings (2026-10-26). Thus Desktop
+launching `--resume=<id>` without forking preserves ownership. A new chat,
+fork, or Desktop rewind that creates a new ID does not inherit another
+session's watches. The [hooks reference](https://code.claude.com/docs/en/hooks#sessionstart)
+and the copied 2.1.308 type declarations list `startup`, `resume`, `clear`,
+`compact`, and `fork`; recovery handles all five but always requires an exact
+session-ID match.
+
+The local restart tests are offline. **SessionStart asyncRewake delivery in the
+Desktop transport still needs the live check.** The opt-in probe costs three
+short Haiku turns, verifies the hook's `source` and resumed `session_id`, and
+checks that the hook wakes an idle stream-json manager:
+
+```bash
+python tests/smoke_live_sessionstart.py --live
+```
+
+Use `--claude /path/to/claude.exe` to select Desktop's bundled CLI. Evidence
+stays under `.test-homes`; the probe does not edit user settings. Interrupted
+watches retain records, but there is no acknowledgement protocol: an app killed
+after a completed hook removes its record but before it delivers the wake may
+still lose that notification.
 
 ## Pairs pane (optional Claude Code mod)
 
