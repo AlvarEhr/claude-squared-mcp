@@ -6,6 +6,11 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.20.0] — 2026-10-26
+
+An optional hook that wakes the manager when a pair's work finishes (no manual
+`wait.py`), and Codex `auto` pairs can escalate again.
+
 ### Added
 
 - Opt-in Claude Code auto-watch hook: a pair send/create/compact/handoff that returns
