@@ -290,7 +290,8 @@ class HookTests(unittest.TestCase):
         self.assertIsNone(first.poll())
         independent_session = self.start({**event(), "session_id": "another-manager"})
         independent_pair = self.start(event(name="other"))
-        deadline = time.monotonic() + 5
+        # Two fresh interpreters must start; slow CI runners took >5 s.
+        deadline = time.monotonic() + 20
         while len((self.pairs / "started").read_text().splitlines()) < 3:
             self.assertLess(time.monotonic(), deadline)
             time.sleep(.02)
