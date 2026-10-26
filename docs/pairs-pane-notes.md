@@ -6,8 +6,8 @@
   kept the session ID on `--resume`; a SessionStart `asyncRewake` hook woke the
   idle stream-json manager. This was reported by the main session after running
   `tests/smoke_live_sessionstart.py`, not run by the implementer. No inference is
-  needed for plugin validation/testing. Alvar subsequently confirmed the pane
-  loads and works in Desktop; his screenshots motivated the layout round below.
+  needed for plugin validation/testing. The maintainer then confirmed the pane
+  loads and works in Desktop; screenshots of it motivated the layout round below.
 - Quench found an approximately 80 MiB snapshot read from ten completed task
   files. The reader now caps reads before opening oversized files and filters
   old history by mtime. The regression uses ten 8 MiB historical task files plus

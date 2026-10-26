@@ -6,6 +6,10 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.21.0] — 2026-10-26
+
+A Pairs pane for the Claude desktop app, and auto-watch waits that survive a restart.
+
 ### Added
 
 - Optional Claude Code **Pairs** pane (`mods/pairs-pane`), opened by `/pairs`
