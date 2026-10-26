@@ -9,7 +9,8 @@ const PANE = {
 
 function row(name: string, session: string | null = null) {
   return { name, backend: 'codex', model: 'luna', status: 'busy', elapsed_s: 125,
-    last_line: 'Running the tests', reason: 'turn open', context: { used: 40000, window: 200000, percent: 20 },
+    last_line: 'Running the tests', reason: 'turn open', context: {
+      used: 40000, window: 200000, percent: 20, alert_at: 140000, above_alert: false },
     watches: session ? [{ session_id: session, cwd: '/project', hook_pid: 20, elapsed_s: 65,
       started_at: '2026-10-26T12:00:00Z', verified: true }] : [] }
 }
@@ -139,4 +140,28 @@ test('clearing the session clears the view and ends polling', async ($, on) => {
   await clock.advance(6000)
   expect(calls).toBe(1)
   await ui.unmount()
+})
+
+test('context bar and alert are visible in each row, including unknown idle context', async ($, on) => {
+  base(on)
+  const alerted = { ...row('scout', 'manager-session'), context: {
+    used: 110000, window: 200000, percent: 55, alert_at: 110000, above_alert: true } }
+  const idle = { ...row('idle-codex'), status: 'idle', context: {
+    used: null, window: 200000, percent: null, alert_at: 140000, above_alert: false } }
+  on('process.run', () => ({ value: { exitCode: 0, stdout: JSON.stringify({ rows: [alerted, idle] }),
+    stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: false })
+  for (const surface of ['desktop', 'terminal'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const context = (await ui.find({ type: 'Text', text: /^Context/ }))?.text
+    expect(context).toContain('[█████░░░░░]')
+    expect(context).toContain('110,000 / 200,000')
+    expect(context).toContain('ALERT ≥ 110,000')
+    await ui.press({ key: 'scope' })
+    expect((await ui.find({ type: 'Text', text: /idle-codex/ }))?.text).toContain('idle-codex')
+    expect((await ui.find({ type: 'Text', text: /Context.*unknown/ }))?.text)
+      .toBe('Context [??????????] ? / 200,000 · unknown')
+    await ui.press({ key: 'scope' })
+    await ui.unmount()
+  }
 })

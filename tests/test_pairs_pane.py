@@ -35,8 +35,7 @@ class SnapshotTests(unittest.TestCase):
         self.now = datetime.now(timezone.utc)
         self.started = (self.now - timedelta(seconds=120)).isoformat()
         self.write("registry.json", {"pairs": {
-            "scout": {"backend": "codex", "model": "luna"},
-            "idle": {"backend": "claude", "model": "haiku"}}})
+            "scout": {"backend": "codex", "model": "luna"}}})
 
     def write(self, relative, data):
         path = self.pairs / relative
@@ -95,7 +94,7 @@ class SnapshotTests(unittest.TestCase):
     def test_dead_and_reused_watcher_pids_are_hidden(self):
         self.watch("dead", hook_pid=999999999)
         self.watch("reused", started_at="2000-01-01T00:00:00+00:00")
-        self.assertEqual(P.snapshot(self.home)["rows"], [])
+        self.assertEqual(P.snapshot(self.home)["rows"][0]["watches"], [])
         self.assertEqual(len(list((self.pairs / "watches").glob("*.json"))), 2)
         self.watch("alive")
         self.watch("another-session", session_id="another-manager")
@@ -120,9 +119,60 @@ class SnapshotTests(unittest.TestCase):
         result = subprocess.run([sys.executable, "-S", "-B", str(ROOT / "mods/pairs-pane/read_pairs.py"),
                                  "--home", str(self.home)], capture_output=True, encoding="utf-8", timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["rows"], [])
+        row = json.loads(result.stdout)["rows"][0]
+        self.assertEqual((row["name"], row["status"]), ("scout", "idle"))
+        self.assertIsNone(row["context"]["percent"])
         (self.pairs / "wait.py").unlink()
         self.assertIn("install wait.py", P.snapshot(self.home)["error"])
+
+    def test_context_alert_matches_claude_and_codex_thresholds(self):
+        cases = (
+            ("claude", 1_000_000, 819_999, None, None, None, 820_000, False),
+            ("claude", 1_000_000, 820_000, None, None, None, 820_000, True),
+            ("claude", 1_000_000, 350_000, None, None, 350_000, 350_000, True),
+            ("claude", 1_000_000, 770_000, None, 200_000, None, 770_000, True),
+            ("claude", 1_000_000, 400_000, None, 2_000_000, 350_000, 350_000, True),
+            ("codex", 200_000, 110_000, 150_000, None, None, 110_000, True),
+            ("codex", 200_000, 139_999, None, None, 0, 140_000, False),
+            ("codex", 200_000, 50_000, 150_000, None, 50_000, 50_000, True),
+        )
+        for backend, window, used, limit, headroom, override, expected, above in cases:
+            with self.subTest(backend=backend, used=used, headroom=headroom, override=override):
+                self.write("registry.json", {"pairs": {"scout": {"backend": backend,
+                    "model": "test", "context_alert_at": override}}})
+                self.write("defaults.json", {"context_alert_headroom": headroom})
+                self.activity(context={"backend": backend, "used": used, "window": window,
+                    "auto_compact_token_limit": limit, "at": self.now.isoformat()})
+                fill = P.snapshot(self.home)["rows"][0]["context"]
+                self.assertEqual(fill["alert_at"], expected)
+                self.assertEqual(fill["above_alert"], above)
+                self.assertEqual(fill["used"], used)
+                self.assertEqual(fill["window"], window)
+
+    def test_reported_window_and_codex_limit_supply_missing_context_fields(self):
+        self.activity(context={"backend": "codex", "used": 110_000, "at": self.now.isoformat()})
+        self.write("activity/scout/pair.json", {"reported_window": {
+            "backend": "codex", "tokens": 200_000, "auto_compact_token_limit": 150_000}})
+        fill = P.snapshot(self.home)["rows"][0]["context"]
+        self.assertEqual(fill["window"], 200_000)
+        self.assertEqual(fill["alert_at"], 110_000)
+        self.assertTrue(fill["above_alert"])
+
+    def test_idle_missing_context_and_invalid_fill_are_unknown_not_zero(self):
+        row = P.snapshot(self.home)["rows"][0]
+        self.assertEqual(row["status"], "idle")
+        self.assertIsNone(row["context"]["used"])
+        self.assertIsNone(row["context"]["percent"])
+        self.assertFalse(row["context"]["above_alert"])
+        for used in (None, True, -1, 300_000):
+            self.activity(turn=None, context={"used": used, "window": 200_000, "at": self.now.isoformat()})
+            fill = P.snapshot(self.home)["rows"][0]["context"]
+            self.assertIsNone(fill["used"])
+            self.assertEqual(fill["window"], 200_000)
+            self.assertIsNone(fill["percent"])
+            self.assertFalse(fill["above_alert"])
+        self.activity(turn=None, context={"used": 0, "window": 200_000, "at": self.now.isoformat()})
+        self.assertEqual(P.snapshot(self.home)["rows"][0]["context"]["percent"], 0)
 
 
 if __name__ == "__main__":

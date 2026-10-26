@@ -5,7 +5,10 @@ export type PairWatch = {
 export type PairRow = {
   name: string; backend: string; model: string; status: string;
   elapsed_s: number | null; last_line: string; reason: string;
-  context: { used: number; window: number; percent: number } | null;
+  context: {
+    used: number | null; window: number | null; percent: number | null;
+    alert_at: number | null; above_alert: boolean;
+  } | null;
   watches: PairWatch[];
 }
 export type PairsView = { rows: PairRow[]; error: string | null; session: string; home: string }

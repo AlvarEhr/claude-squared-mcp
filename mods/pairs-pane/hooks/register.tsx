@@ -15,6 +15,17 @@ function duration(seconds: number | null): string {
   return `${Math.floor(n / 3600)}h ${Math.floor(n % 3600 / 60)}m`
 }
 
+function contextLabel(row: PairRow): string {
+  const context = row.context
+  const used = context?.used == null ? '?' : context.used.toLocaleString()
+  const window = context?.window == null ? '?' : context.window.toLocaleString()
+  if (context?.percent == null) return `Context [??????????] ${used} / ${window} · unknown`
+  const filled = Math.max(0, Math.min(10, Math.floor(context.percent / 10)))
+  const bar = '█'.repeat(filled) + '░'.repeat(10 - filled)
+  const alert = context.above_alert ? ` · ALERT ≥ ${context.alert_at?.toLocaleString()}` : ''
+  return `Context [${bar}] ${used} / ${window} · ${Math.round(context.percent)}%${alert}`
+}
+
 let options: PluginOptions = {}
 let refreshing = false
 let cancel: (() => void) | undefined
@@ -110,14 +121,14 @@ export const register: Register = (on, configured) => {
           <Button key="refresh" label="Refresh" onPress={() => { void refresh($) }} />
           <Button key="close" label="Close" onPress={() => { stopPolling(); void $.ui.close({ id: PANE }) }} />
         </Box>
-        <Text dimColor>{showAll ? 'Work in flight and active watchers' : 'Pairs this session is waiting on'}</Text>
+        <Text dimColor>{showAll ? 'All pairs · last reported context' : 'Pairs this session is waiting on'}</Text>
         {current.error && <Text>{current.error}</Text>}
-        {!current.error && rows.length === 0 && <Text dimColor>{showAll ? 'No work in flight.' : 'No auto-watch waits for this session.'}</Text>}
+        {!current.error && rows.length === 0 && <Text dimColor>{showAll ? 'No pairs found.' : 'No auto-watch waits for this session.'}</Text>}
         {rows.map(row => (
           <Box flexDirection="column" marginTop={1}>
             <Text bold>{row.name} · {row.backend}/{row.model}</Text>
+            <Text bold color={row.context?.above_alert ? 'red' : undefined}>{contextLabel(row)}</Text>
             <Text>{row.status}{row.elapsed_s !== null && row.status !== 'idle' ? ` · ${row.status === 'busy' ? 'running for' : 'work started'} ${duration(row.elapsed_s)}${row.status === 'busy' ? '' : ' ago'}` : ''}</Text>
-            {row.context && <Text>Context {Math.round(row.context.percent)}% · {row.context.used.toLocaleString()} / {row.context.window.toLocaleString()}</Text>}
             {row.last_line && <Text>{row.last_line}</Text>}
             {row.reason && <Text dimColor>{row.reason}</Text>}
             {row.watches.length === 0 && <Text dimColor>No auto-watch</Text>}

@@ -44,6 +44,32 @@ def tail(path):
         return ""
 
 
+def context_fill(reader, view, spec, defaults):
+    """Last activity-file fill and the watcher's threshold, without a model call."""
+    context = view.get("context") or {}
+    reported = view.get("reported_window") or {}
+    window = context.get("window") or reported.get("tokens")
+    used = context.get("used")
+    if not isinstance(window, int) or isinstance(window, bool) or window <= 0:
+        window = None
+    if (not isinstance(used, int) or isinstance(used, bool) or used < 0
+            or (window is not None and used > window)):
+        used = None
+    headroom = defaults.get("context_alert_headroom")
+    if not isinstance(headroom, int) or isinstance(headroom, bool) or headroom < 0:
+        headroom = None
+    # Match pair_status and wait.py's Alert.level, including the persisted
+    # Codex compaction limit and per-pair override. The pane marks the current
+    # level; unlike wait.py's exit 8 it need not observe a crossing first.
+    threshold = reader["context_alert_threshold"](
+        window, headroom, context.get("backend") or reported.get("backend") or "claude",
+        context.get("auto_compact_token_limit") or reported.get("auto_compact_token_limit"),
+        reader["_alert_at"](spec))
+    return {"used": used, "window": window,
+            "percent": used * 100 / window if used is not None and window else None,
+            "alert_at": threshold, "above_alert": bool(threshold and used is not None and used >= threshold)}
+
+
 def snapshot(home):
     pairs = Path(home).expanduser().resolve() / "pairs"
     script = pairs / "wait.py"
@@ -73,6 +99,9 @@ def snapshot(home):
     if not isinstance(specs, dict):
         specs = {}
         error = "Pair registry unavailable; showing observable work only."
+    defaults = read_json(pairs / "defaults.json")
+    if not isinstance(defaults, dict):
+        defaults = {}
     watches = {}
     for path in (pairs / "watches").glob("*.json"):
         record = read_json(path)
@@ -99,7 +128,7 @@ def snapshot(home):
         view = view_fn(pairs, name, now=now)
         waiting = watches.get(name, [])
         attention = any(t.get("state") in ("orphaned", "finished_detached") for t in view["running_tasks"])
-        if view["verdict"] == "idle" and not waiting and not attention:
+        if view["verdict"] == "idle" and not waiting and not attention and name not in specs:
             continue
         spec = specs.get(name) if isinstance(specs.get(name), dict) else {}
         starts = [parse(item.get("started_at")) for key in ("turns", "running_tasks", "background")
@@ -108,10 +137,7 @@ def snapshot(home):
         starts = [start for start in starts if start is not None]
         started = min(starts) if starts else parse(view.get("window_started_at"))
         context = view.get("context") or {}
-        window = context.get("window") or (view.get("reported_window") or {}).get("tokens")
-        used = context.get("used")
-        fill = ({"used": used, "window": window, "percent": used * 100 / window}
-                if isinstance(used, (int, float)) and isinstance(window, (int, float)) and window > 0 else None)
+        fill = context_fill(reader, view, spec, defaults)
         rows.append({
             "name": name, "backend": spec.get("backend") or context.get("backend") or "unknown",
             "model": spec.get("model") or "unknown", "status": "needs attention" if attention else view["verdict"],

@@ -10,8 +10,10 @@ All notable changes to this project are documented here. Format follows
 
 - Optional Claude Code **Pairs** pane (`mods/pairs-pane`), opened by `/pairs`
   or at session start. Shows this session's auto-watch waits by default, with
-  an all-pairs toggle, backend/model, elapsed work/watch times, last activity
-  and context fill. A read-only Python helper reuses `wait.py`'s activity and
+  an all-pairs toggle (including idle pairs), backend/model, elapsed work/watch
+  times and last activity. Every row shows used/window context with a compact
+  bar, an explicit unknown state, and the shared context-alert threshold
+  (including per-pair overrides). A read-only Python helper reuses `wait.py`'s activity and
   PID checks; no model calls. Polling stops when the pane closes.
 - Auto-watch publishes a small record while it owns a watch, including the
   manager session/cwd, start time and hook PID. Records are removed on exit;

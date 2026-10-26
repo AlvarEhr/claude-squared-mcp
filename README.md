@@ -487,16 +487,26 @@ does not edit user settings.
 The **Pairs** pane restores the visible list of waits that background Bash
 watchers used to provide. Open it with `/pairs`; it also opens at session
 start when a pane surface is available. It defaults to pairs **this session
-is waiting on**. Toggle **This session / All pairs** to see other managers'
-waits and work with no auto-watch attached.
+is waiting on**. Toggle **This session / All pairs** to see every registered
+pair, including idle pairs, other managers' waits and work with no auto-watch attached.
 
-Each row shows the pair's backend/model, work elapsed time, last log line,
-context fill when reported, and each watcher's elapsed time and manager
+Each row prominently shows a compact context bar and **used / window** directly
+below its name, plus backend/model, work elapsed time, last log line,
+and each watcher's elapsed time and manager
 session/project (your own is marked **this session**). Queued work,
 background tasks and pending self-wakes count as active. Unresolved activity
 is labelled `unknown`; orphaned tasks needing recovery stay visible as
 `needs attention`. The pane is read-only: filtering, refreshing and closing
 it never stop or send work. It does not replace the completion hook.
+
+Context is the last activity-file report, including for idle pairs. Missing
+or implausible measurements show **unknown**, never an empty/zero context.
+No transcript is read or compressed Codex thread restored to obtain a value;
+an older usable activity record remains a last-reported measurement. **ALERT**
+marks fill at or above the same threshold as `pair_status` / `wait.py` exit 8:
+global `context_alert_headroom`, per-pair `context_alert_at`, and Codex's
+reported auto-compaction limit all apply. The pane marks the current level;
+the watcher additionally requires observing a threshold crossing before waking.
 
 Install from a release of this repository that includes the mod:
 
