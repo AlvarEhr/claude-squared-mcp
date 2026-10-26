@@ -83,6 +83,12 @@ except OSError:
     # User can still poll manually via pair_poll.
     _WAIT_SCRIPT_PATH = None
 
+from claude_squared._auto_watch_script import auto_watch_configured, install_auto_watch_script
+try:
+    _AUTO_WATCH_SCRIPT_PATH = install_auto_watch_script(reg_mod.pairs_dir() / "auto_watch.py")
+except OSError:
+    _AUTO_WATCH_SCRIPT_PATH = None
+
 
 # Server-side cap on how long pair_send will hold the JSON-RPC call before
 # returning an async handle. Bounded by the MCP host's RPC timeout (typically
@@ -213,7 +219,7 @@ def _normalize_path_list(paths: list[str] | None) -> list[str] | None:
 _CODEX_POLICY_REFUSALS = ("policy-blocked", "escalation-refused")
 
 
-def _fmt_send_result(r: SendResult) -> str:
+def _fmt_send_result(r: SendResult, tool: str | None = None) -> str:
     # Visual separator so the agent can clearly see where the pair's response
     # starts/ends in the UI (otherwise the response text bleeds into the agent's
     # surrounding message). Bottom marker doubles as the footer (in brackets).
@@ -309,14 +315,19 @@ def _fmt_send_result(r: SendResult) -> str:
         from collections import Counter as _Counter
         _kinds = _Counter(r.background_launches)
         _desc = ", ".join(f"{n} {k}" for k, n in _kinds.items())
+        watch_hint = (
+            "auto-watch hook armed — don't start wait.py"
+            if tool and auto_watch_configured(_AUTO_WATCH_SCRIPT_PATH, tool) else
+            f'Bash(run_in_background=True, command="{_watcher_cmd(r.name)}") '
+            "follows the pair until it is idle"
+        )
         lines.append(
             f"⏳ BACKGROUND WORK LAUNCHED ({_desc}): this turn started background work "
             f"and ended before it finished — the reply above may be a placeholder. "
             f"The pair will wake itself when the work completes; that continuation is "
             f"tracked as its OWN task: pair_poll('{r.name}', wait_seconds=30) waits "
             f"for the wake-up and shows its reply; pair_status('{r.name}') shows what's "
-            f"still out; Bash(run_in_background=True, command=\"{_watcher_cmd(r.name)}\") "
-            f"follows the pair until it is idle. Do NOT re-send the same request."
+            f"still out; {watch_hint}. Do NOT re-send the same request."
         )
     _lost = [c for c in (r.self_woken_completed or []) if c.get("status") == "background_lost"]
     for _c in _lost:
@@ -1173,12 +1184,16 @@ def pair_create(
             # Reuse the standard async-handle framing so initial-message guidance
             # matches what agents see from pair_send / pair_send_async — keeps
             # the imperative "RUN THIS NOW" wording consistent across all paths.
-            line += "\n" + _format_async_handle(
+            handle = _format_async_handle(
                 state.task_id,
                 "Initial message queued as an async task (long Opus briefings "
                 "can take minutes; this avoids the host RPC timeout).",
                 pair_name=name,
+                tool="pair_create",
             )
+            line += "\n" + handle
+            if verbose:
+                transparency_msgs.append(handle)
         except Exception as e:
             line += f"\n(initial_message queue failed: {e}; send manually via pair_send)"
 
@@ -2134,19 +2149,18 @@ def _watcher_cmd(ref: str) -> str:
     return f"{py} -m claude_squared wait {shlex.quote(ref)}"
 
 
-def _format_async_handle(task_id: str, why: str, pair_name: str | None = None) -> str:
+def _format_async_handle(task_id: str, why: str, pair_name: str | None = None,
+                         tool: str = "pair_send_async") -> str:
     """Terse runtime hint when an operation degrades to async.
 
-    Returns the task_id, three concrete poll commands, and a one-line nudge to
-    run the Bash watcher for hands-off notification — full pedagogy lives in
-    pair_send / pair_send_async docstrings.
+    Returns the task_id and poll hints. With the opt-in hook configured, tell
+    the manager to await its wake; otherwise suggest the manual Bash watcher.
 
     When ``pair_name`` is given, the poll hints use the PAIR NAME rather than the
     raw UUID — ``pair_poll('reviewer')`` resolves to the pair's latest task.
     Agents reliably fumble the long task id but always know the pair name, so
-    this is the easy, hard-to-get-wrong path. (The Bash watcher still uses the
-    exact task id — it's pasted programmatically right here, not retyped later,
-    and wait.py resolves by task file.)
+    this is the easy, hard-to-get-wrong path. The watcher also follows the pair
+    by name, through background work and subsequent self-woken turns.
 
     The watcher command points at the standalone ``~/.claude/pairs/wait.py``
     (installed at server startup) — stdlib-only, so it works regardless of
@@ -2176,6 +2190,14 @@ def _format_async_handle(task_id: str, why: str, pair_name: str | None = None) -
         "included; add --each-turn to return after the next turn instead)\n"
         if pair_name else ""
     )
+    if pair_name and auto_watch_configured(_AUTO_WATCH_SCRIPT_PATH, tool):
+        return (
+            f"{why}\nAsync task: {task_id}\n"
+            f"  pair_poll('{poll_ref}', with_turn_log=True)  # read the result on wake\n"
+            f"{name_hint}"
+            "auto-watch hook armed — don't start wait.py. "
+            "The hook follows the pair until idle, including background work and self-woken turns."
+        )
     return (
         f"{why}\n"
         f"Async task: {task_id}\n"
@@ -2610,8 +2632,9 @@ async def pair_send(
     ``CLAUDE_PAIR_SYNC_CAP_SECONDS`` (default 45s) below the host's RPC timeout —
     if your patience > cap, the handle includes both numbers and the remaining
     patience for ``pair_poll``/``pair_wait``. See README "Async handles" for
-    the recommended notification-driven pattern (run a backgrounded
-    ``python -m claude_squared wait <id>`` to get fired a completion notification).
+    the notification-driven pattern: when the response says "auto-watch hook
+    armed", await its wake without starting wait.py; otherwise run the suggested
+    Bash watcher in the background.
     ``wait.py <pair>`` follows the pair until idle (``--each-turn``: until the next turn
     ends); exits 0 done/idle, 1 failed, 2 not found, 3 timeout (re-arm), 4 orphaned,
     5 stopped, 6 crashed, 7 finished detached, 8 context alert, 9 background lost,
@@ -2686,7 +2709,7 @@ async def pair_send(
     if final.status == "done" and final.result is not None:
         if verbose:
             return _verbose_dump(final.result)
-        return _fmt_send_result(final.result)
+        return _fmt_send_result(final.result, tool="pair_send")
 
     if final.status == "failed":
         raise PairError(f"pair_send to '{name}' failed: {final.error or '(no error message)'}")
@@ -2720,7 +2743,7 @@ async def pair_send(
             f"Sync wait timed out at {rpc_hold_s}s (pair '{name}' still working "
             f"under hard_timeout={hard_str})."
         )
-    return _format_async_handle(state.task_id, framing, pair_name=name)
+    return _format_async_handle(state.task_id, framing, pair_name=name, tool="pair_send")
 
 
 @mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False})
@@ -2735,7 +2758,8 @@ def pair_send_async(
     """Send a message to a pair asynchronously. Returns task_id immediately.
 
     Use ``pair_poll(task_id)`` for status. For notification-on-completion (no
-    manual polling), background-run the wait script via the Bash tool — see
+    manual polling), use the optional auto-watch hook (an "armed" response
+    means do not start wait.py), or background-run the wait script via Bash — see
     README "Async handles" for the full pattern.
     ``wait.py <pair>`` follows the pair until idle (``--each-turn``: until the next turn
     ends); exits 0 done/idle, 1 failed, 2 not found, 3 timeout (re-arm), 4 orphaned,
@@ -4852,6 +4876,7 @@ def pair_handoff(
                 state.task_id,
                 f"Sync wait held for {rpc_hold}s (stated patience {timeout_seconds}s); "
                 f"handoff briefing for '{target}' continues with no auto-kill.", pair_name=target,
+                tool="pair_handoff",
             ))
     except Exception as exc:
         lines.append(f"Pair '{target}' remains registered, but its briefing could not be completed: {exc}. "
@@ -5158,8 +5183,9 @@ def pair_compact(
 
     Runs as an async task like pair_send: the sync wait blocks up to
     ``timeout_seconds`` (capped at the sync cap); past that you get an async
-    handle and compaction continues — poll with ``pair_poll(name)`` or the
-    background wait script.
+    handle and compaction continues. The optional auto-watch hook wakes the
+    manager (the handle says "armed"); otherwise use the background wait script
+    or ``pair_poll(name)``.
 
     Args:
         name: Pair to compact.
@@ -5249,7 +5275,7 @@ def pair_compact(
             f"Sync wait timed out at {rpc_hold_s}s (compaction of '{name}' "
             f"still running under compact_timeout={hard_str})."
         )
-    return _format_async_handle(state.task_id, framing, pair_name=name)
+    return _format_async_handle(state.task_id, framing, pair_name=name, tool="pair_compact")
 
 
 class _HardResetSkipped(Exception):
@@ -5893,7 +5919,7 @@ def pair_invoke(
             _apply_context_alert(spec, result)
             if verbose:
                 return _verbose_dump(result)
-            return _fmt_send_result(result)
+            return _fmt_send_result(result, tool="pair_invoke")
     except FileLockTimeout:
         raise PairError(f"Pair '{name}' is busy in another process; could not acquire lock to invoke skill.")
 

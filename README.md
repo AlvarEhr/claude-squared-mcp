@@ -285,9 +285,15 @@ expires (`timeout_seconds` exceeded, or > server's RPC-hold cap of
 `CLAUDE_PAIR_SYNC_CAP_SECONDS`, default 45s), the response is a "still running,
 here's the task_id" handle — work continues, no second turn is queued.
 
+**With the optional [auto-watch hook](#automatic-wake-up-opt-in-claude-code-hook),
+the manager needs no Bash watcher step.** When the response says
+"auto-watch hook armed — don't start wait.py", finish independent work or end
+your turn. The hook wakes you with the watcher outcome; read the result with
+`pair_poll(name, with_turn_log=True)`. Without the hook, use the pattern below.
+
 Three ways to consume the handle:
 
-1. **Notification-driven (recommended for long tasks)**: background-run the
+1. **Notification-driven (without the optional hook)**: background-run the
    watcher; the harness fires you a notification when it exits.
 
    ```python
@@ -382,6 +388,94 @@ until grep -q '"status": "done"\|"status": "failed"' \
 Same on-disk state file (`~/.claude/pairs/async/<task_id>.json`); the MCP writes
 atomically so a watcher in a different process (different MCP install) sees the
 result.
+
+### Automatic wake-up (opt-in Claude Code hook)
+
+Claude Code's `asyncRewake` command hook runs in the background and wakes an
+idle manager when it exits with code 2. claude-squared installs a stdlib-only
+`~/.claude/pairs/auto_watch.py` beside `wait.py` at server startup. Installing
+the scripts does **not** enable the feature or change your settings.
+
+To opt in:
+
+1. Start a new pair MCP server after upgrading so both scripts are installed.
+2. Merge [docs/auto-watch.settings.json](docs/auto-watch.settings.json) into
+   your Claude Code user settings (`~/.claude/settings.json`, or the settings
+   directory selected by `CLAUDE_CONFIG_DIR`). Append its `PostToolUse` entry
+   if you already have hooks; keep your existing entries.
+3. Replace `/absolute/path/to/.claude/pairs/auto_watch.py` with the installed
+   script's absolute path. Use a working Python interpreter (Python ≥ 3.7);
+   if `python` is not on the hook shell's PATH, quote its absolute path too.
+   On Windows use forward slashes, for example:
+   `"command": "python \"C:/Users/YOU/.claude/pairs/auto_watch.py\""`.
+4. Start a new Claude Code session to load the settings. Keep the hook's
+   `timeout` at **604800 seconds (seven days)** or longer. The script gives
+   `wait.py` 604740 seconds, leaving one minute to report a timeout and wake
+   the manager. The host silently kills an expired hook; lowering only the
+   settings timeout can therefore lose the notification.
+
+The snippet is:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [{
+      "matcher": "^mcp__(?:pair|Claude_Squared)__(?:pair_send|pair_send_async|pair_compact|pair_create|pair_invoke|pair_handoff)$",
+      "hooks": [{
+        "type": "command",
+        "command": "python \"/absolute/path/to/.claude/pairs/auto_watch.py\"",
+        "asyncRewake": true,
+        "timeout": 604800
+      }]
+    }]
+  }
+}
+```
+
+The hook watches an async handle from `pair_send_async`, a still-running
+`pair_send` or `pair_compact`, or `pair_create(initial_message=...)`. A
+`pair_send` or `pair_invoke` reply reporting background launches also arms
+it. A still-running `pair_handoff` briefing watches the newly allocated
+target pair, not its source. Ordinary synchronous replies exit immediately. `pair_fork` completes
+synchronously and leaves no task to watch, so it is excluded. The supplied
+matcher recognizes the CLI `pair` and extension `Claude_Squared` aliases.
+
+One watcher follows each **(manager session, pair)** until idle, including
+queued sends, background work and self-woken turns. A second send to the
+same busy pair shares that watcher; another manager has its own watcher.
+Fast completions still notify even if the task finished before the hook
+started. All watcher outcomes wake the manager: done, failed, stopped,
+context alert, lost work, unknown state, and timeout. The notification gives
+the original `wait.py` exit code and output. Read completed work with
+`pair_poll`, not a repeat send. After a context alert or timeout, follow the
+output's re-arm command in background Bash if you want to keep watching.
+Re-arming does not stop or re-send the work.
+
+Pairs inherit user settings too: the hook is suppressed inside pair
+processes, with a registered-session check for older runtimes. Sessions
+without these MCP tools never match. Kernel file locks release on watcher
+death, so an interrupted hook cannot leave a stale PID blocking later sends.
+The hook does not stop any process or modify pair tasks/activity.
+
+The server's "armed" hint is **best-effort settings detection**, not a
+receipt from the host. It recognizes the documented interpreter/script
+command, matcher, `asyncRewake: true` and timeout in user settings, provided
+`disableAllHooks` is not set. Project/managed overrides, unsupported hosts,
+shell wrappers and custom MCP aliases are not detectable. In those cases
+use the manual watcher. This feature is for Claude Code managers; Codex and
+other MCP hosts need their own notification mechanism. Closing the manager
+ends hook delivery; hooks are not durable subscriptions across sessions.
+
+Evidence (2026-10-26): the existing Haiku probe verified an idle
+stream-json manager waking after 30 seconds and 15 minutes, and a hook
+being killed silently past its timeout. Actual Desktop UI delivery and
+laptop sleep remain unverified. The CLI strings recommending
+`~/.claude/hooks` appear in cloud-hook forwarding diagnostics; they do not
+establish a local Desktop restriction. This implementation keeps the hook
+beside `wait.py`. Maintainers can run
+`python tests/smoke_live_auto_watch.py --live` for a real Haiku pair and
+stream-json manager; it keeps isolated evidence under `.test-homes` and
+does not edit user settings.
 
 ## Self-woken turns (v0.12.0, Claude)
 

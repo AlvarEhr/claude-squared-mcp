@@ -378,6 +378,9 @@ def claude_env(billing: str = "plan") -> dict[str, str]:
     on 2.1.296 it forces the permission mode to ``default`` ("allowed_non_write_users
     hardening"; review round 1, 2026-10-11), and Bash could read the key file anyway."""
     env = dict(os.environ)
+    # User hooks are inherited by pairs too. They must not arm manager
+    # watchers recursively (also covers create/fork before registration).
+    env["CLAUDE_SQUARED_PAIR"] = "1"
     env.pop("ANTHROPIC_API_KEY", None)
     if billing != "api":
         return env

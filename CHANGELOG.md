@@ -6,6 +6,22 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in Claude Code auto-watch hook: a pair send/create/compact/handoff that returns
+  an async handle, or a send/invoke reporting background work, can wake its
+  manager when `wait.py` exits without a manual Bash watcher. One watcher per
+  session and pair follows queued sends and background continuations; every
+  outcome, including errors, context alerts and timeouts, wakes the manager.
+  The server installs the stdlib script beside `wait.py` and recognizes the
+  documented user-settings snippet for its "auto-watch hook armed" hint.
+  Pair processes suppress the hook. Settings remain opt-in and untouched.
+
+### Fixed
+
+- `pair_create(initial_message=..., verbose=True)` now preserves the queued
+  task handle in its transparency messages instead of dropping it.
+
 ## [0.19.1] — 2026-10-25
 
 Codex threads the Codex app compressed after a week idle (`.jsonl.zst`) work
