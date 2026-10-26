@@ -550,6 +550,9 @@ Rows show a short model label, work elapsed time or completion time, and
 **used / window** context. Desktop uses a coloured bar; terminal uses a text
 bar. Watch badges appear only when a watch exists, with elapsed time and the
 manager session (your own is marked **this session**).
+Model labels retain versions, such as **Opus 5.5** and **6.1 Sol**. Floating
+aliases use the latest matching resolved ID in available activity/turn metadata;
+without that evidence, the alias stays unversioned (for example, **Sol**).
 **Show detail** loads the last meaningful log line, skipping TURN bookkeeping,
 and activity reasons for that row. Queued work,
 background tasks and pending self-wakes count as active. Unresolved activity

@@ -59,6 +59,12 @@ PID alone cannot safely supply the requested session fallback, so Waiting on
 offers All and auto-watch setup guidance. No extra process inspection or
 transcript scan was added. Hidden idle groups request no log detail.
 
+Model labels retain slug versions. Floating aliases use same-family IDs from
+already-read reported-window metadata (matching model_key) or bounded task
+SendResult.model_used, newest report first. This is last-observed resolution,
+not a query of the provider's current alias mapping. Explicit versioned registry
+IDs stay authoritative; a different family's old turn cannot resolve an alias.
+
 The two-second timer asks `$.ui.panes()` about placement and visibility before
 launching a Python reader. Hidden tabs and unplaced panes perform no filesystem
 refresh. Close/clear cancels polling and invalidates any in-flight result.

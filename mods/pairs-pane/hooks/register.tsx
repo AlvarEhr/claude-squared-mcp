@@ -30,10 +30,9 @@ function contextLabel(row: PairRow, terminal = false): string {
 
 function modelLabel(row: PairRow): string {
   const model = row.model.replace(/^.*\//, '').replace(/\[.*\]$/, '')
-  const short = model.replace(/^claude-/, '').replace(/-\d{8}$/, '')
-    .replace(/^gpt-\d+(?:\.\d+)?-(?=[a-z])/, '').replace(/(\d)-(\d)/g, '$1.$2')
+  return model.replace(/^(claude|gpt)-/, '').replace(/-\d{8}$/, '')
+    .replace(/(\d)-(\d)/g, '$1.$2')
     .split('-').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ')
-  return row.backend === 'codex' ? `Codex ${short}` : short
 }
 
 function foreground(row: PairRow): boolean {

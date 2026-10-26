@@ -11,7 +11,8 @@ All notable changes to this project are documented here. Format follows
 - Optional Claude Code **Pairs** pane (`mods/pairs-pane`), opened by `/pairs`
   or at session start. Shows this session's auto-watch waits by default, with
   a Waiting on / All switch, working pairs first, recent completions newest
-  first, and a collapsed compact Idle group. Rows show short model labels,
+  first, and a collapsed compact Idle group. Rows show versioned model labels
+  (floating aliases use available last-reported resolution),
   work/completion times, watch badges and expanded meaningful activity. Context
   uses graphical Desktop bars (text on terminal), used/window, a plain unknown
   state, idle Claude last-report fallback, and the shared context-alert threshold

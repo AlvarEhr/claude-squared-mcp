@@ -302,6 +302,28 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(P.snapshot(self.home, session="manager", show_all=False)["rows"], [])
         self.assertEqual(P.snapshot(self.home)["rows"][0]["status"], "busy")
 
+    def test_floating_model_uses_latest_matching_report_without_extra_reads(self):
+        self.write("registry.json", {"pairs": {"scout": {"backend": "codex", "model": "sol"}}})
+        self.assertEqual(P.snapshot(self.home)["rows"][0]["model"], "sol")
+        self.write("activity/scout/pair.json", {"reported_window": {"tokens": 200000,
+            "model_key": "sol|default", "model": "gpt-6-sol", "at": self.started}})
+        self.assertEqual(P.snapshot(self.home)["rows"][0]["model"], "gpt-6-sol")
+        self.write("async/result.json", {"task_id": "result", "pair_name": "scout", "status": "done",
+            "finished_at": self.now.isoformat(), "result": {"model_used": "gpt-6.1-sol"}})
+        data = P.snapshot(self.home)
+        self.assertEqual(data["rows"][0]["model"], "gpt-6.1-sol")
+        self.assertEqual(P.snapshot(self.home, cache=data["cache"])["rows"][0]["model"], "gpt-6.1-sol")
+        self.write("registry.json", {"pairs": {"scout": {"backend": "codex", "model": "astra"}}})
+        self.assertEqual(P.snapshot(self.home)["rows"][0]["model"], "astra")
+        self.write("registry.json", {"pairs": {"scout": {"backend": "codex", "model": "gpt-6-sol"}}})
+        self.assertEqual(P.snapshot(self.home)["rows"][0]["model"], "gpt-6-sol")
+
+    def test_claude_alias_uses_resolved_model_metadata(self):
+        self.write("registry.json", {"pairs": {"scout": {"backend": "claude", "model": "fable"}}})
+        self.write("activity/scout/pair.json", {"reported_window": {"tokens": 1000000,
+            "model_key": "fable|default", "model": "claude-fable-5-1", "at": self.now.isoformat()}})
+        self.assertEqual(P.snapshot(self.home)["rows"][0]["model"], "claude-fable-5-1")
+
 
 if __name__ == "__main__":
     unittest.main()

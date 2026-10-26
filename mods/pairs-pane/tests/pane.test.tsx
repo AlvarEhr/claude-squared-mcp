@@ -40,7 +40,7 @@ test('this session by default; toggle all; metadata on desktop and terminal', as
   for (const surface of ['desktop', 'terminal'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect((await ui.find({ type: 'Text', text: /scout/ }))?.text).toBe('scout')
-    expect((await ui.find({ type: 'Text', text: /Codex Luna/ }))?.text).toBe('Codex Luna')
+    expect((await ui.find({ type: 'Text', text: /^Luna$/ }))?.text).toBe('Luna')
     expect(await ui.find({ type: 'Text', text: /reviewer/ })).toBeUndefined()
     expect((await ui.find({ type: 'Text', text: /working/ }))?.text).toBe('working · 2m5s')
     expect((await ui.find({ type: 'Text', text: /watched by/ }))?.text).toContain('this session')
@@ -255,12 +255,28 @@ test('all view orders working then recent completions and collapses old idle pai
   expect((await ui.findAll({ type: 'Text', text: /^(working|recent|older|ancient)$/ })).map(item => item.text))
     .toEqual(['working', 'recent', 'older'])
   expect((await ui.find({ type: 'Text', text: /^Opus/ }))?.text).toBe('Opus 5.5')
-  expect((await ui.find({ type: 'Text', text: /^Codex Astra/ }))?.text).toBe('Codex Astra')
+  expect((await ui.find({ type: 'Text', text: /^6 Astra/ }))?.text).toBe('6 Astra')
   expect((await ui.find({ type: 'Text', text: /^failed/ }))?.text).toContain('(12 min ago)')
   expect((await ui.find({ type: 'Button', key: 'idle' }))?.text).toContain('Idle (1)')
   expect(await ui.find({ type: 'Button', key: 'refresh' })).toBeUndefined()
   await ui.press({ key: 'idle' })
   expect((await ui.find({ type: 'Text', text: /^ancient$/ }))?.text).toBe('ancient')
   expect(await ui.find({ type: 'Button', key: 'detail-ancient' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('model labels preserve versions and leave unresolved aliases unversioned', async ($, on) => {
+  base(on)
+  const models = ['claude-opus-5-5', 'claude-fable-5-1', 'claude-sonnet-5-5', 'claude-haiku-5-5',
+    'gpt-6-astra', 'gpt-6.1-sol', 'sol']
+  on('process.run', () => ({ value: { exitCode: 0, stdout: JSON.stringify({ rows: models.map((model, index) => ({
+    ...row(`pair-${index}`, 'manager-session'), model, backend: model.startsWith('claude-') ? 'claude' : 'codex',
+  })) }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: false })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const texts = (await ui.findAll({ type: 'Text' })).map(item => item.text)
+  for (const label of ['Opus 5.5', 'Fable 5.1', 'Sonnet 5.5', 'Haiku 5.5', '6 Astra', '6.1 Sol', 'Sol']) {
+    expect(texts).toContain(label)
+  }
   await ui.unmount()
 })

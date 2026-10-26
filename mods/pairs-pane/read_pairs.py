@@ -128,6 +128,8 @@ def task_summaries(pairs, names, references, reader, reads, now, cache, show_all
             summary = reader["_av_task_summary"](data)
             # Retain only the last reported context, never the model reply.
             result = data.get("result")
+            if isinstance(result, dict) and isinstance(result.get("model_used"), str):
+                summary["model_used"] = result["model_used"][:160]
             context = result.get("context") if isinstance(result, dict) else None
             if isinstance(context, dict):
                 summary["result_context"] = {key: context.get(key) for key in ("tokens_used", "tokens_max")}
@@ -198,6 +200,25 @@ def context_fill(reader, view, spec, defaults):
     return {"used": used, "window": window,
             "percent": used * 100 / window if used is not None and window else None,
             "alert_at": threshold, "above_alert": bool(threshold and used is not None and used >= threshold)}
+
+
+def display_model(spec, view, tasks, parse):
+    """Resolve floating aliases only from already-read, same-family evidence."""
+    requested = spec.get("model") or "unknown"
+    if not isinstance(requested, str) or re.search(r"\d", requested):
+        return requested
+    alias = re.escape(re.sub(r"^claude-", "", requested))
+    pattern = (r"gpt-\d+(?:\.\d+)?-" + alias + r"(?:-|$)" if spec.get("backend") == "codex"
+               else r"claude-" + alias + r"-\d")
+    reported = view.get("reported_window") or {}
+    key = reported.get("model_key")
+    candidates = []
+    if not key or (isinstance(key, str) and key.split("|", 1)[0] == requested):
+        candidates.append((parse(reported.get("at")), reported.get("model")))
+    candidates.extend((parse(task.get("finished_at")), task.get("model_used")) for task in tasks)
+    candidates = [(at, model) for at, model in candidates
+                  if at is not None and isinstance(model, str) and re.match(pattern, model)]
+    return max(candidates, key=lambda item: item[0])[1] if candidates else requested
 
 
 def snapshot(home, session=None, show_all=True, expanded=(), cache=None):
@@ -335,7 +356,7 @@ def snapshot(home, session=None, show_all=True, expanded=(), cache=None):
                                       or (finished and (now - finished).total_seconds() <= RECENT_SECONDS))
         rows.append({
             "name": name, "backend": spec.get("backend") or context.get("backend") or "unknown",
-            "model": spec.get("model") or "unknown", "status": "needs attention" if attention else view["verdict"],
+            "model": display_model(spec, view, pair_tasks, parse), "status": "needs attention" if attention else view["verdict"],
             "elapsed_s": max(0, (now - started).total_seconds()) if started else None,
             "finished_at": finished.isoformat() if finished else None,
             "finished_ago_s": max(0, (now - finished).total_seconds()) if finished else None,
