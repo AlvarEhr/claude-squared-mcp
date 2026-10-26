@@ -280,3 +280,53 @@ test('model labels preserve versions and leave unresolved aliases unversioned', 
   }
   await ui.unmount()
 })
+
+test('All and expanded Idle bars use bounded whole-number widths for edge-case fills', async ($, on) => {
+  base(on)
+  const fills = [54.7, 123.4, -4.2, NaN, null]
+  const rows = ['busy', 'idle'].flatMap(status => fills.map((percent, index) => ({
+    ...row(`${status}-${index}`), status,
+    context: { ...row('context').context, percent },
+  })))
+  // JSON.stringify turns NaN into null. Inject the view at the state boundary
+  // so this regression exercises barWidth's non-finite branch as well.
+  let stateReads = 0
+  on('state.get', { plugin: 'pairs-pane', key: 'view' }, async (_, e, next) => {
+    stateReads++
+    const result = await next(e)
+    return { value: { ...result.value,
+      value: { rows, error: null, notice: null, session: 'manager-session', home: '/custom/claude' } } }
+  })
+  on('process.run', () => ({ value: { exitCode: 0, stdout: '{"rows":[]}', stderr: '',
+    isStdoutTruncated: false, isStderrTruncated: false } }))
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: false })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'all' })
+  expect(stateReads).toBeGreaterThan(0)
+  for (const idleExpanded of [false, true]) {
+    if (idleExpanded) await ui.press({ key: 'idle' })
+    const boxes = await ui.findAll({ type: 'Box' })
+    expect(boxes.length).toBeGreaterThan(0)
+    for (const { props } of boxes) {
+      if (props.width !== undefined) {
+        expect(typeof props.width === 'number' ? Number.isInteger(props.width)
+          : typeof props.width === 'string' && /^\d+%$/.test(props.width)).toBe(true)
+      }
+      // Audit every numeric layout/spacing prop too, including fixed heights,
+      // gap and marginTop, so new sizing expressions cannot hide elsewhere.
+      for (const value of Object.values(props)) {
+        if (typeof value === 'number') expect(Number.isInteger(value)).toBe(true)
+        if (typeof value === 'string' && value.endsWith('%')) {
+          expect(/^\d+%$/.test(value)).toBe(true)
+          expect(Number(value.slice(0, -1))).toBeGreaterThanOrEqual(0)
+          expect(Number(value.slice(0, -1))).toBeLessThanOrEqual(100)
+        }
+      }
+    }
+    const fillsDrawn = boxes.filter(box => box.props.backgroundColor === 'green').map(box => box.props.width)
+    const expected = ['55%', '100%', '0%', '0%']
+    expect(fillsDrawn).toEqual(idleExpanded ? [...expected, ...expected] : expected)
+    expect(await ui.findAll({ type: 'Text', text: /^context —$/ })).toHaveLength(idleExpanded ? 2 : 1)
+  }
+  await ui.unmount()
+})
