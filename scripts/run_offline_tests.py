@@ -78,12 +78,31 @@ def main() -> int:
         "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
         "-p", "test_billing.py", "-v",
     ]))
+    commands.append(("process_spawn", [
+        "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
+        "-p", "test_process_spawn.py", "-v",
+    ]))
+    commands.append(("codex_sandbox", [
+        "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
+        "-p", "test_codex_sandbox.py", "-v",
+    ]))
+    commands.append(("codex_zst", [
+        "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
+        "-p", "test_codex_zst.py", "-v",
+    ]))
+    commands.append(("auto_watch", [
+        "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
+        "-p", "test_auto_watch.py", "-v",
+    ]))
+    scratch = ROOT / ".test-homes"
+    scratch.mkdir(exist_ok=True)
     failures = []
     for name, arguments in commands:
         print(f"\n=== {name} ===", flush=True)
         # Set isolation in the child environment BEFORE it imports the package:
         # server/async_tasks imports can otherwise touch real user state.
-        with tempfile.TemporaryDirectory(prefix=f"cs-offline-{name}-", ignore_cleanup_errors=True) as tmp:
+        with tempfile.TemporaryDirectory(prefix=f"cs-offline-{name}-", dir=scratch,
+                                         ignore_cleanup_errors=True) as tmp:
             env = os.environ.copy()
             env.update({
                 "CLAUDE_HOME": str(Path(tmp) / "claude"),

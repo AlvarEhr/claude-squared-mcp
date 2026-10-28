@@ -50,11 +50,20 @@ class PairAlreadyExists(PairError):
 
 
 class SessionMissing(PairError):
-    def __init__(self, name: str, session_id: str):
+    def __init__(self, name: str, session_id: str, *, backend: str = "claude", where: str | None = None):
+        if backend == "codex":
+            # A rollout compressed by the Codex app (.jsonl.zst) or moved by
+            # `codex archive` still resolves, so missing means gone.
+            body = (f"Pair '{name}' references Codex thread '{session_id}' but its rollout was not found "
+                    f"under {where or '~/.codex/sessions'} nor where Codex's state database records it. "
+                    f"The thread may have been deleted (codex delete, or in the Codex app).")
+            sid = "thread id"
+        else:
+            body = (f"Pair '{name}' references session '{session_id}' but its transcript was not found "
+                    f"under {where or '~/.claude/projects/'}. The session may have been deleted manually.")
+            sid = "session_id"
         super().__init__(
-            f"Pair '{name}' references session '{session_id}' but its transcript was not found "
-            f"under ~/.claude/projects/. The session may have been deleted manually. "
-            f"Run pair_forget('{name}') and pair_create to start fresh, or pair_adopt with a valid session_id."
+            f"{body} Run pair_forget('{name}') and pair_create to start fresh, or pair_adopt with a valid {sid}."
         )
         self.name = name
         self.session_id = session_id

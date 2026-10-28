@@ -4,6 +4,198 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.20.0] — 2026-10-26
+
+An optional hook that wakes the manager when a pair's work finishes (no manual
+`wait.py`), and Codex `auto` pairs can escalate again.
+
+### Added
+
+- Opt-in Claude Code auto-watch hook: a pair send/create/compact/handoff that returns
+  an async handle, or a send reporting background work, can wake its
+  manager when `wait.py` exits without a manual Bash watcher. One watcher per
+  session and pair follows queued sends and background continuations; every
+  outcome, including errors, context alerts and timeouts, wakes the manager.
+  The server installs the stdlib script beside `wait.py` and recognizes the
+  documented user-settings snippet for its "auto-watch hook armed" hint.
+  Pair processes suppress the hook. Settings remain opt-in and untouched.
+
+### Fixed
+
+- **Codex `auto` pairs could not escalate since 0.19.0**, including an approved
+  `git commit`: permission-profile deny-read entries caused Codex's Windows
+  helper to fail with `setup refresh had errors` before the command launched.
+  Profiles using `--approve-for-me` now omit those entries. Workspace and
+  read-only profiles still apply the permanent deny ACLs, which continue to
+  protect sandboxed reads by auto pairs. Create/update/info explain that auto
+  relies on existing entries; new or atomically replaced files need a
+  workspace/read-only turn to install or refresh the protection.
+- The auto-watch hook passes its resolved Claude home to `wait.py`, so a
+  custom home configured only in the MCP server cannot make it watch a
+  same-named default-home pair. Printed timeout/alert re-arm commands preserve
+  that home too. A pair forgotten between send and hook startup
+  wakes the manager with an explanation instead of silently dropping the handle.
+- A completed handoff's embedded model reply cannot arm auto-watch by quoting
+  an async handle; genuine handles outside the reply still arm it.
+- `pair_create(initial_message=..., verbose=True)` now preserves the queued
+  task handle in its transparency messages instead of dropping it.
+
+## [0.19.1] — 2026-10-25
+
+Codex threads the Codex app compressed after a week idle (`.jsonl.zst`) work
+again, with no new dependency.
+
+### Fixed
+
+- **Codex pairs idle for about a week failed with `SessionMissing`.** The
+  Codex app compresses idle rollouts to `rollout-….jsonl.zst` while its
+  state database still names the `.jsonl`, and claude-squared looked only for
+  the `.jsonl`. A compressed thread now resolves, so `pair_adopt` accepts it,
+  and `pair_send`, `pair_compact` and `pair_fork` work as before: Codex
+  restores the plain rollout first (measured on codex-cli 0.164.0-alpha.11.1:
+  byte-identical, the `.zst` removed). The post-turn sandbox check, the context sampler and the
+  compaction sizes read the restored file. No new dependency: claude-squared
+  does not decompress rollouts itself.
+- `pair_rewind_points` and `pair_rewind` on a compressed thread have Codex
+  restore it first (app-server `thread/resume`, no model call; Codex appends
+  one `thread_settings_applied` record) and say so in the result.
+- `pair_transcript`, `pair_context`, `pair_info`, `pair_status` and the CLI
+  `transcript` / `info` / `context` say "the Codex app compressed this idle
+  thread; the next pair_send or pair_compact restores it" instead of reporting
+  nothing or a missing transcript. `pair_forget` / `pair_clear` archive a
+  compressed rollout as-is (`….jsonl.zst`) and say so.
+- The `SessionMissing` hint for Codex pairs named `~/.claude/projects`; it
+  names the Codex sessions folder and thread id.
+
+## [0.19.0] — 2026-10-25
+
+Codex sandbox ergonomics, Windows first: a private TEMP per pair, a real
+read-only sandbox, credential files out of the sandbox's reach, network on
+request, and instructions that survive compaction. Measured on codex-cli
+0.164.0-alpha.11.1.
+
+**Restart every open session after installing.** The new registry data is
+additive (`codex_instructions` on Codex pairs, `network` / `sandbox_note`
+inside `backend_options`) and older processes keep it, but a 0.18 process
+sending to a Codex pair created by 0.19 doesn't re-send its instructions, so
+a compaction during that turn drops them until the next 0.19 compaction.
+
+### Added
+
+- **Per-pair scratch folder as TEMP (Codex, Windows).** `TEMP`/`TMP`/`TMPDIR`
+  point at `~/.claude/pairs/scratch/<pair>`, writable at every sandboxed level;
+  the shared user Temp is no longer writable from a pair (it used to be a
+  writable root at `workspace`/`auto`, and nothing was writable at
+  `read-only`). Kept across `pair_clear`/`pair_rewind`, removed by
+  `pair_forget` (a leftover is reported).
+- **Codex pairs run on a permission profile (Windows)** — `:read-only` or
+  `:workspace` plus the scratch folder — when the binary supports profiles,
+  checked once per binary with `codex exec --strict-config` and no model call.
+  After every turn the profile Codex recorded is checked; one that is less
+  confined than asked (an unexpected writable root, network on) marks the
+  binary in `~/.claude/pairs/codex_profile_unsupported.json` and every later
+  turn of every Codex pair runs the plain flags (read-only: `-s read-only`, no
+  scratch folder). Delete that file to clear a false mark; a Codex update
+  starts fresh anyway.
+- **Credential read-denial (Codex, Windows).** On a profile-capable build every
+  sandboxed level denies sandboxed commands reads of
+  `~/.claude/.credentials.json`, `~/.claude/pairs/api_key`,
+  `~/.codex/auth.json` and `~/.claude.json`, which the sandbox user could read
+  before (a partial list: other secrets the sandbox group can read stay
+  readable). **This changes ACLs on those files, existing pairs included,
+  without asking:** Codex enforces the denial with a permanent
+  `CodexSandboxUsers:(DENY)(R)` entry on each file, which stays after the pair
+  is gone and applies to every Codex sandbox on the machine — so a `claude` or
+  `codex` CLI started inside a Codex sandbox can no longer log in. You and the
+  unsandboxed codex process are unaffected. Undo per file:
+  `icacls <file> /remove:d CodexSandboxUsers`. A program that replaces the file
+  atomically drops the entry until the next pair turn re-applies it. Verified
+  with `[windows] sandbox = "elevated"` only; another sandbox mode may run
+  commands as you, where the group deny doesn't apply (the create result says so).
+  `CLAUDE_PAIR_CODEX_DENY_READ` replaces the list (empty: none).
+- **`backend_options={"network": true}`** for Codex pairs: network inside the
+  `workspace`/`auto` sandbox, with git's HTTPS fixed for the sandbox
+  (`http.sslBackend=openssl` via `GIT_CONFIG_*`, skipped with a note when you
+  already use those). Refused at `read-only` and on Claude pairs.
+- **A sandbox note** in the instructions of every sandboxed Codex pair created
+  on Windows: scratch TEMP, stopping processes, headless Chrome, refused
+  `-Force`/escalations, network, credentials. `backend_options={"sandbox_note": false}`
+  leaves it out.
+- **Create-time Python check (Windows):** `pair_create` runs `python` on PATH
+  inside the sandbox (`codex sandbox`, no model) and names the `icacls` fix
+  when the sandbox user can't run it.
+- **`pair_update(system_prompt_append=…)`** (`""` clears it).
+
+### Changed
+
+- **Codex instructions are developer instructions.** `profile_name` /
+  `system_prompt_append` (and the sandbox note) go in as
+  `developer_instructions`, re-sent on every turn and to `pair_compact`: Codex
+  rebuilds a thread's instructions at each compaction from the current
+  settings and silently dropped them otherwise. Older, adopted and handed-off
+  threads keep the first-message form until `pair_clear`; instructions over
+  ~28K command-line characters fall back to it, with a note.
+- `backend_options.config` refuses, on Windows, the keys the new features
+  manage (`default_permissions`, `permissions.*`, `sandbox_workspace_write.*`,
+  `TEMP`/`TMP`/`TMPDIR`, whole-table `shell_environment_policy`) and the ones that
+  would reshape the sandbox around `permission_mode` (`sandbox_mode`,
+  `approval_policy`, `approvals_reviewer`, `sandbox_permissions`, `profile(s)`);
+  `developer_instructions` on every platform. `backend_options.args` takes only
+  `--enable`, `--disable`, `--color` and `--output-schema` (an allowlist: on 0.164
+  `--yolo` and `--not-so-yolo` are hidden aliases of the bypass and approve-for-me
+  flags; older CLIs have `--full-auto`); features that touch the sandbox,
+  approvals or command execution can't be switched through `--enable`/`--disable`
+  or `features.*`; and `backend_options.approval='approve-for-me'` is refused at a
+  read-only level. A read-only spawn never passes `--approve-for-me`, a stored
+  bypass flag or such a feature switch, in any mode.
+  Only a NEW value is checked: a stored one keeps working, and in profile mode
+  whatever would override the profile is left out of the spawn with a note.
+- A permission profile ignores `sandbox_workspace_write.network_access` /
+  `writable_roots` (from config.toml or a stored value); profile mode carries
+  them over itself.
+- `extra_dirs` are no longer passed at read-only (they were never writable
+  there).
+- A Codex binary that is a script (`codex.cmd`) never gets the instructions on
+  its command line (cmd.exe would re-parse them); they go in the first message.
+- **Claude:** changing `system_prompt_append` / `profile_name` no longer
+  restarts a warm runtime (or refuses while background work runs): the CLI keeps
+  a session's first appended system prompt, so the change applies at
+  `pair_clear` either way.
+
+### Fixed
+
+- Commands Codex refuses before running them at `workspace`
+  (`Remove-Item -Force` "blocked by policy", escalation requests at approval
+  policy never) were silent; they are reported as denials that say the
+  command never ran, with the remedies.
+- The Codex `pair_invoke` error pointed at `~/.codex/skills`, which pairs
+  don't load; it names the workspace skill folders.
+
+## [0.18.1] — 2026-10-15
+
+Codex compaction reports the real context size; Windows CLI launches use hidden consoles.
+
+### Fixed
+
+- Windows CLI launchers request hidden consoles for tool-capable roots, so
+  ordinary console children can inherit them. Version/help queries, the
+  tool-free triage classifier and PID-scoped `taskkill` run without a console.
+  This closes missing hide options in Codex version/app-server launches,
+  Claude launches and cancellation helpers. Pipes, file-backed Codex turns and
+  the detached PID creation-time guard are preserved. Children that explicitly
+  create or show other windows can still display them; the source of previously
+  reported flashes remains unproven.
+- Codex `pair_compact` no longer reports the thread's cumulative token usage
+  as the compacted size (seen: `318,367 → 56,802,796`, which `pair_status`
+  then showed as 11958% and `wait.py` exited 8 on). The post-compaction size
+  is Codex's own estimate from its post-compaction `token_count`
+  (`last_token_usage.total_tokens`), falling back to the summary-size
+  estimate; live context, `pair_context` and the send footer read the same
+  figure until the next model call. A recorded context larger than its window
+  now reads as unknown, so `pair_status` and `wait.py` never alert on one.
+
 ## [0.18.0] — 2026-10-11
 
 API-key billing for Claude pairs, honest per-turn cost, and a shutdown fix.

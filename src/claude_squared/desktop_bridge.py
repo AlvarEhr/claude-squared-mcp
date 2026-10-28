@@ -14,7 +14,7 @@ import struct
 import sys
 import time
 
-PIPE_PATTERN = re.compile(r"^\\\\\.\\pipe\\codex-browser-use-[0-9a-f-]{36}$")
+PIPE_PATTERN = re.compile(r"^\\\\\.\\pipe\\codex-(?:app-tools|browser-use)-[0-9a-f-]{36}$")
 MAX_FRAME = 1024 * 1024
 
 

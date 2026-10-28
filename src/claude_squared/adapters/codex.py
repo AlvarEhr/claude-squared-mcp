@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import glob
 import json
+import logging
 import os
 import queue
 import re
@@ -25,7 +26,7 @@ import subprocess
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -52,6 +53,7 @@ from claude_squared.models import (
     normalize_permission,
 )
 from claude_squared.registry import logs_dir
+from claude_squared.process_spawn import hidden_process_kwargs
 from claude_squared.runtime import ToolCounter
 from claude_squared.tool_details import save_codex_item
 
@@ -61,6 +63,7 @@ STRONG_WARNING_THRESHOLD = 0.85
 THREAD_SOURCE = "claude-squared"   # tags our threads in ~/.codex sqlite + the Desktop UI
 PROBE_PROMPT = "Reply with exactly: pair-ready"
 CONTEXT_POLL_SECONDS = 10.0
+logger = logging.getLogger(__name__)
 
 
 class _NoCodexActivity:
@@ -151,7 +154,10 @@ class _CodexActivity:
         if not force and now < self._next_sample:
             return
         self._next_sample = now + CONTEXT_POLL_SECONDS
-        if self._rollout is None:
+        if self._rollout is None or is_compressed_rollout(self._rollout):
+            # Never keep a compressed path: Codex restores the plain .jsonl
+            # as the turn starts and deletes the .zst, so re-resolve until
+            # the plain file is back (2026-10-25).
             self._rollout = rollout_path_for(self.spec.session_id)
         # Codex 0.155, 2026-09-25 live probe: token_count may be flushed only
         # after the tool call it launched finishes. This is the latest REPORTED
@@ -165,14 +171,14 @@ class _CodexActivity:
         self.writer.note_reported_window(window, model_key=f"{self.spec.model}|{self.spec.context_window}",
                                           model=self.spec.model, source="rollout",
                                           auto_compact_token_limit=limit)
-        last = info.get("last_token_usage") or {}
         # Match the SendResult footer: current model-call input, never the
         # rollout's cumulative total_token_usage (design revision E). Whether
         # native auto-compaction counts output too is unmeasured; this proxy
         # and the default 90% compaction point are alerting estimates.
-        if last.get("input_tokens") is None:
+        used = live_context_tokens(info)
+        if used is None:
             return
-        self.used = max(0, int(last["input_tokens"]))
+        self.used = used
         self.writer.note_context(self.used, window, window_source="rollout", source="rollout",
                                   auto_compact_token_limit=limit)
 
@@ -290,9 +296,21 @@ CONFIG_READD_KEYS: tuple[str, ...] = (
 # failed tool call — so this is the only structured signal.
 _DENIAL_RE = re.compile(
     r"rejected by user approval settings|blocked by read-only sandbox|"
-    r"writing outside of the project|sandbox.*denied|approval.*denied",
+    r"writing outside of the project|sandbox.*denied|approval.*denied|"
+    r"blocked by policy|approval policy is never",
     re.IGNORECASE,
 )
+# v0.19: refusals BEFORE a command runs, at approval policy never (the
+# 'workspace' level) — stderr only, no command_execution item. Verified
+# 2026-10-25 (0.164.0-alpha.11.1):
+#   ERROR codex_core::tools::router: error=exec_command failed: CreateProcess {
+#     message: "Rejected(\"`…powershell.exe\" -Command 'Remove-Item -Force x'` rejected: blocked by policy\")" }
+#   ERROR codex_core::tools::router: error=approval policy is Never; reject command — you
+#     cannot ask for escalated permissions if the approval policy is Never
+# Matched loosely (R15); reported as denials, the turn itself is not failed.
+_POLICY_BLOCKED_RE = re.compile(r"blocked by policy", re.IGNORECASE)
+_APPROVAL_NEVER_RE = re.compile(r"approval policy is never", re.IGNORECASE)
+_REJECTED_CMD_RE = re.compile(r"-Command '([^']*)'")
 _READONLY_DEGRADE_RE = re.compile(r"blocked by read-only sandbox", re.IGNORECASE)
 _OS_DENIED_RE = re.compile(
     r"Access to the path '[^']*' is denied|Access is denied|PermissionDenied|"
@@ -326,7 +344,8 @@ def _tree_kill(proc: subprocess.Popen) -> str:
     try:
         if os.name == "nt":
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           capture_output=True, timeout=10, check=False)
+                           capture_output=True, timeout=10, check=False,
+                           **hidden_process_kwargs(console=False))
         else:
             import signal
             try:
@@ -381,7 +400,7 @@ def stop_detached(state) -> str | None:
             if os.name == "nt":
                 result = subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
                                         capture_output=True, timeout=10, check=False,
-                                        creationflags=subprocess.CREATE_NO_WINDOW)
+                                        **hidden_process_kwargs(console=False))
                 return "tree-killed" if result.returncode == 0 else "kill-failed"
             import signal
             os.killpg(pid, signal.SIGKILL)  # exec starts its own session/process group
@@ -454,7 +473,8 @@ _EXE_CACHE: dict[str, Any] = {}
 def _codex_version(exe: str) -> tuple[int, ...]:
     try:
         out = subprocess.run([exe, "--version"], capture_output=True, text=True,
-                             timeout=15, stdin=subprocess.DEVNULL).stdout
+                             timeout=15, stdin=subprocess.DEVNULL,
+                             **hidden_process_kwargs(console=False)).stdout
         m = re.search(r"(\d+)\.(\d+)\.(\d+)", out or "")
         return tuple(int(x) for x in m.groups()) if m else ()
     except Exception:
@@ -555,12 +575,12 @@ def _with_fresh_codex(spawn: Callable, args: list[str], **kwargs: Any):
 
 def popen_codex(args: list[str], **kwargs: Any) -> subprocess.Popen:
     """``subprocess.Popen`` with :func:`_with_fresh_codex`'s one retry."""
-    return _with_fresh_codex(subprocess.Popen, args, **kwargs)
+    return _with_fresh_codex(subprocess.Popen, args, **hidden_process_kwargs(kwargs))
 
 
 def run_codex(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
     """``subprocess.run`` with :func:`_with_fresh_codex`'s one retry."""
-    return _with_fresh_codex(subprocess.run, args, **kwargs)
+    return _with_fresh_codex(subprocess.run, args, **hidden_process_kwargs(kwargs))
 
 
 def codex_spawn_error(args: list[str], exc: OSError, cwd: str | None, what: str = "codex") -> str:
@@ -583,7 +603,13 @@ def _toml_literal(v: Any) -> str:
     if isinstance(v, (int, float)):
         return str(v)
     if isinstance(v, str):
-        return json.dumps(v)  # TOML basic strings share JSON escaping for our values
+        # TOML basic strings share JSON's escapes, except that an astral
+        # character must not become a surrogate-pair escape (TOML rejects
+        # those — codex would then take the whole value as a raw literal,
+        # quotes included), so ensure_ascii=False keeps it as itself; and
+        # TOML also requires DEL (U+007F) escaped, which JSON leaves raw.
+        # JSON already escapes the C0 controls.
+        return json.dumps(v, ensure_ascii=False).replace("\x7f", "\\u007f")
     if isinstance(v, list):
         return "[" + ", ".join(_toml_literal(x) for x in v) + "]"
     return json.dumps(str(v))
@@ -631,6 +657,921 @@ def sandbox_support_note() -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Windows sandbox ergonomics (v0.19) — scratch TEMP, permission profiles,
+# credential read-denial, network, the sandbox note, the Python check.
+# Measured on codex-cli 0.164.0-alpha.11.1, 2026-10-25 (HANDOFF "Codex
+# Windows sandbox limits"). Everything here is Windows-only; POSIX argv is
+# unchanged.
+# ---------------------------------------------------------------------------
+
+PROFILE_NAME = "claude_squared"
+# Windows' command line is ~32K characters; leave room for quoting slack.
+ARGV_BUDGET = 28_000
+_TEMP_VARS = ("TEMP", "TMP", "TMPDIR")
+# Keys the v0.19 features set on every spawn — refused in
+# backend_options.config (codex -c is last-wins, so a user value would
+# silently lose or, for a whole-table spelling, replace ours). Windows only,
+# where the features exist, except developer_instructions (every platform).
+_MANAGED_CONFIG = {
+    "default_permissions": "the sandbox permission profile (Windows, v0.19)",
+    "permissions": "the sandbox permission profile (Windows, v0.19)",
+    "sandbox_workspace_write": "the scratch folder, extra_dirs and backend_options.network",
+    "developer_instructions": "system_prompt_append / profile_name",
+    "shell_environment_policy": "the scratch folder (pass dotted leaves, e.g. shell_environment_policy.set.FOO)",
+    "shell_environment_policy.set": "the scratch folder (pass dotted leaves, e.g. shell_environment_policy.set.FOO)",
+}
+# Config keys that shape the sandbox or approvals themselves — permission_mode
+# owns those. Verified 2026-10-26 (0.164): sandbox_mode="danger-full-access"
+# and approval_policy="on-request" next to the read-only profile left the
+# profile in force (the key alone does switch the sandbox — positive
+# control). Refused for new values on Windows and dropped at spawn in
+# profile mode anyway, rather than trusted to stay inert in a later build.
+_SANDBOX_SHAPING_CONFIG = ("sandbox_mode", "approval_policy", "approvals_reviewer", "sandbox_permissions",
+                           "profile", "profiles")
+# backend_options.args takes only these exec flags (each with one value) for
+# NEW values: an allowlist, because the exec CLI is an alpha with hidden
+# aliases — on 0.164, --yolo is --dangerously-bypass-approvals-and-sandbox and
+# --not-so-yolo is --approve-for-me (verified 2026-10-26 from clap's
+# "cannot be used multiple times" / "cannot be used with" errors).
+# -i/--image is left out: it takes several values and could swallow the
+# trailing "-" / "resume <sid> -" (temper, round 3).
+_ALLOWED_ARGS = ("--enable", "--disable", "--color", "--output-schema")
+# Features (``--enable``/``--disable`` X, ``features.X`` in config) that touch
+# the sandbox, approvals or how commands execute, matched by name against
+# ``codex features list`` on 0.164 (2026-10-26): *sandbox*,
+# use_legacy_landlock / use_linux_sandbox_bwrap, network_proxy /
+# respect_system_proxy / system_proxy_fallback, guardian*,
+# exec_permission_approvals, request_permissions_tool, request_rule,
+# write_stdin_approval, unified_exec*, shell_* , executor_*, hooks /
+# plugin_hooks, code_mode*, js_repl*, browser_use*, computer_use,
+# in_app_browser, prefer_mxc. Either direction is refused for new values and
+# stripped from stored ones where the sandbox must hold.
+_RISKY_FEATURE_WORDS = ("sandbox", "landlock", "bwrap", "proxy", "approval", "guardian", "permission", "rule",
+                        "exec", "shell", "hook", "code_mode", "repl", "browser_use", "computer_use",
+                        "in_app_browser", "mxc")
+# Where a refused flag's job is done instead (the refusal names it).
+_ARG_FIELDS = {
+    "-s": "permission_mode (or backend_options.sandbox)",
+    "--sandbox": "permission_mode (or backend_options.sandbox)",
+    "--approve-for-me": "permission_mode='auto'", "--not-so-yolo": "permission_mode='auto'",
+    "--full-auto": "permission_mode",
+    "--dangerously-bypass-approvals-and-sandbox": "permission_mode='unrestricted'",
+    "--yolo": "permission_mode='unrestricted'",
+    "-c": "backend_options.config", "--config": "backend_options.config",
+    "--add-dir": "extra_dirs", "-m": "model", "--model": "model", "-C": "cwd", "--cd": "cwd",
+}
+_VALUE_FLAGS = {"-s", "--sandbox", "-p", "--profile", "-c", "--config", "--add-dir", "-m", "--model", "-C", "--cd",
+                "--enable", "--disable", "-i", "--image", "--color", "--output-schema"}
+# The ones a stored (pre-0.19) value may still carry; dropped at spawn in
+# profile mode, where they would override the profile, and at read-only in
+# every mode (fail closed).
+# --full-auto: gone from 0.164's exec, but older CLIs accept it and it beats -s.
+_SANDBOX_SHAPING_ARGS = {"-s", "--sandbox", "-p", "--profile", "--approve-for-me", "--not-so-yolo",
+                         "--dangerously-bypass-approvals-and-sandbox", "--yolo", "--full-auto"}
+
+
+def _risky_feature(name: Any) -> bool:
+    n = str(name or "").strip().lower()
+    return any(word in n for word in _RISKY_FEATURE_WORDS)
+
+
+def _risky_feature_key(key: str) -> bool:
+    """A ``backend_options.config`` key that sets a risky feature (or the
+    whole ``features`` table, which could hold one)."""
+    k = key.strip()
+    return k == "features" or (k.startswith("features.") and _risky_feature(k.split(".", 1)[1]))
+_GIT_HTTPS_ENV = (("GIT_CONFIG_COUNT", "1"), ("GIT_CONFIG_KEY_0", "http.sslBackend"),
+                  ("GIT_CONFIG_VALUE_0", "openssl"))
+
+
+def _managed_config_feature(key: str) -> str | None:
+    """The v0.19 feature that owns a ``backend_options.config`` key, if any.
+    Dotted ``shell_environment_policy`` leaves other than TEMP/TMP/TMPDIR
+    merge with ours (verified), so they stay allowed."""
+    k = key.strip()
+    if k == "developer_instructions" or k.startswith("developer_instructions."):
+        return _MANAGED_CONFIG["developer_instructions"]
+    if not _windows_sandbox():
+        return None
+    if k in ("shell_environment_policy", "shell_environment_policy.set"):
+        return _MANAGED_CONFIG[k]
+    if k.startswith("shell_environment_policy.set."):
+        return _MANAGED_CONFIG["shell_environment_policy.set"] if k.rsplit(".", 1)[-1].upper() in _TEMP_VARS else None
+    if k.startswith("shell_environment_policy."):
+        return None
+    for managed in ("default_permissions", "permissions", "sandbox_workspace_write"):
+        if k == managed or k.startswith(managed + "."):
+            return _MANAGED_CONFIG[managed]
+    for shaping in _SANDBOX_SHAPING_CONFIG:
+        if k == shaping or k.startswith(shaping + "."):
+            return "permission_mode"
+    return None
+
+
+def _arg_flag(token: str) -> str | None:
+    """The flag a raw token spells (``--x=v`` and ``-cVALUE`` forms too)."""
+    if token.startswith("--"):
+        return token.split("=", 1)[0]
+    if token.startswith("-") and len(token) >= 2:
+        return token[:2]
+    return None
+
+
+def validate_codex_args(args: Any) -> None:
+    """``backend_options.args`` (create/update): only :data:`_ALLOWED_ARGS`,
+    each followed by its value (or ``--flag=value``). Anything else could
+    bypass permission_mode, a field or ``backend_options.config``'s checks —
+    or, as a bare token, become exec's prompt."""
+    if args is None:
+        return
+    if not isinstance(args, list):
+        raise ValueError("backend_options.args must be a list of strings")
+    tokens = [str(t) for t in args]
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        flag = _arg_flag(token)
+        # A short flag must stand alone (no attached "-ifile" spellings).
+        if flag not in _ALLOWED_ARGS or (not token.startswith("--") and token != flag):
+            hint = _ARG_FIELDS.get(flag or "")
+            raise ValueError(
+                f"backend_options.args may not contain {token!r}"
+                + (f": use {hint} instead" if hint else "")
+                + f". Allowed: {', '.join(_ALLOWED_ARGS)}, each with its value.")
+        if "=" in token:
+            value, step = token.split("=", 1)[1], 1
+        elif i + 1 < len(tokens):
+            value, step = tokens[i + 1], 2
+        else:
+            raise ValueError(f"backend_options.args: {token} needs a value")
+        if flag in ("--enable", "--disable") and _risky_feature(value):
+            raise ValueError(f"backend_options.args can't {flag[2:]} the {value!r} feature: it touches the "
+                             f"sandbox, approvals or how commands run (permission_mode decides those).")
+        i += step
+
+
+def _strip_sandbox_args(args: list[Any]) -> tuple[list[str], list[str]]:
+    """Spawn time, profile mode: drop stored sandbox-shaping flags (and their
+    values) and ``-c`` assignments of keys the profile owns."""
+    kept: list[str] = []
+    dropped: list[str] = []
+    tokens = [str(t) for t in args]
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        flag = _arg_flag(token)
+        takes_value = flag in _VALUE_FLAGS and token == flag
+        value = tokens[i + 1] if takes_value and i + 1 < len(tokens) else None
+        assignment = None
+        if flag in ("-c", "--config"):
+            if takes_value:
+                assignment = value
+            elif flag == "--config" and "=" in token:
+                assignment = token.split("=", 1)[1]   # --config=key=value
+            elif flag == "-c":
+                assignment = token[2:]                # -ckey=value
+        feature = None
+        if flag in ("--enable", "--disable"):
+            feature = value if takes_value else (token.split("=", 1)[1] if "=" in token else None)
+        shaping = flag in _SANDBOX_SHAPING_ARGS or (feature is not None and _risky_feature(feature))
+        if assignment is not None:
+            key = assignment.split("=", 1)[0]
+            shaping = shaping or _managed_config_feature(key) is not None or _risky_feature_key(key)
+        if shaping:
+            dropped.append(" ".join([token] + ([value] if value is not None else [])))
+        else:
+            kept.append(token)
+            if value is not None:
+                kept.append(value)
+        i += 2 if takes_value else 1
+    return kept, dropped
+
+
+# The fixed note for sandboxed Codex pairs on Windows (point 5). It is part
+# of the thread's instructions, which Codex pins per thread and rebuilds only
+# at a compaction, so it is written state-neutrally: no scratch path, no
+# level name, the network line conditional.
+SANDBOX_NOTE = (
+    "Windows sandbox notes (from claude-squared; they apply whenever your commands run in the Codex sandbox):\n"
+    "- TEMP/TMP point to a private scratch folder for this pair; the shared user Temp folder is not writable.\n"
+    "- Stop processes you started with Stop-Process -Id <pid> or from Python (Popen.terminate / psutil); "
+    "tasklist, taskkill and CIM/WMI queries are denied.\n"
+    "- Headless Chrome/Edge needs --no-sandbox.\n"
+    "- When the approval policy is never, Remove-Item -Force and requests for escalated permissions are refused "
+    "before they run: use plain Remove-Item. The .git folder is write-protected, so leave git commits to the "
+    "manager unless you can request escalation.\n"
+    "- If network access is on, HTTPS works from Python and git but not from PowerShell (Invoke-WebRequest) or curl.exe.\n"
+    "- Never read or print credential files (Claude/Codex logins, API keys); the sandbox may block them, so the "
+    "claude and codex CLIs can't log in from inside it."
+)
+
+
+def _windows_sandbox() -> bool:
+    """The v0.19 sandbox features apply on Windows only (POSIX workspace-write
+    already scopes TMPDIR and /tmp; not probed there)."""
+    return os.name == "nt"
+
+
+def _elevated_sandbox() -> bool:
+    """``[windows] sandbox = "elevated"`` in the user's config (re-added for
+    pairs): the mode the credential deny was verified in."""
+    windows = _load_user_config().get("windows")
+    return isinstance(windows, dict) and str(windows.get("sandbox") or "") == "elevated"
+
+
+def _text_argv_ok(exe: str) -> bool:
+    """Free text (developer instructions) may go on argv only for a real
+    executable. A ``codex.cmd`` (the npm shim on PATH) runs through
+    cmd.exe, which re-parses the command line (``%VAR%``, ``&``, quotes) and
+    caps it at 8191 characters — instructions there go in the first message."""
+    return os.name != "nt" or str(exe).lower().endswith(".exe")
+
+
+def scratch_dir(pair_name: str, *, create: bool = True) -> Path:
+    """``<pairs_dir>/scratch/<pair>``: the pair's TEMP/TMP/TMPDIR inside the
+    sandbox. ONE stable path per pair — Codex writes permanent ACEs for every
+    writable root it is given (Modify for a capability SID per run plus
+    ``CodexSandboxUsers:(M)``, verified 2026-10-25), so a fresh path per turn
+    would pile them up. Kept across clear/rewind (test caches); removed by
+    pair_forget."""
+    from claude_squared.registry import pairs_dir
+    p = pairs_dir() / "scratch" / pair_name
+    if create:
+        p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def remove_scratch(pair_name: str) -> str | None:
+    """Best-effort removal at pair_forget; a leftover is reported, never fatal."""
+    p = scratch_dir(pair_name, create=False)
+    if not p.exists():
+        return None
+    shutil.rmtree(p, ignore_errors=True)
+    if p.exists():
+        return f"scratch folder {p} could not be fully removed (a file may still be open); delete it by hand"
+    return None
+
+
+def secret_read_denials() -> list[str]:
+    """Credential files sandboxed commands must not read (R16).
+
+    Verified 2026-10-25: as CodexSandboxOffline, ``~/.claude/.credentials.json``,
+    ``~/.claude/pairs/api_key`` and ``~/.codex/auth.json`` were readable
+    (``~/.claude`` and ``~/.codex`` grant CodexSandboxUsers RX), and
+    ``~/.claude.json`` (MCP server env blocks can hold keys) grants it RX
+    explicitly. A profile ``"deny"`` entry blocks the read — Codex implements
+    it as a PERMANENT ``CodexSandboxUsers:(DENY)(R)`` ACE on the path, so the
+    denial applies to every Codex sandbox on the machine from then on; the
+    user (not a member) and the unsandboxed codex process are unaffected.
+    An atomic replace of the file drops the ACE until the next spawn that
+    carries the deny re-applies it, and a process already running in the
+    sandbox can read a file replaced under it (verified 2026-10-26).
+    Escalation-capable spawns omit these entries: deny-read entries break
+    Codex's escalation setup (2026-10-26 bisect). Workspace/read-only spawns
+    still apply them; their permanent ACEs also protect subsequent auto runs.
+    Files only, never a directory: a directory deny is inherited by
+    everything below it (scratch folders, a pair working under ~/.claude).
+    Not exhaustive: other secrets readable by the sandbox group stay so.
+    Existing files only (a missing path is harmless but noise).
+    ``CLAUDE_PAIR_CODEX_DENY_READ`` (os.pathsep-separated; empty = none)
+    replaces the list — the live harness points it at canaries."""
+    override = os.environ.get("CLAUDE_PAIR_CODEX_DENY_READ")
+    if override is not None:
+        candidates = [Path(p) for p in override.split(os.pathsep) if p.strip()]
+    else:
+        from claude_squared.registry import claude_home, pairs_dir
+        candidates = [claude_home() / ".credentials.json", pairs_dir() / "api_key",
+                      codex_home() / "auth.json", Path.home() / ".claude.json"]
+    out: list[str] = []
+    for p in candidates:
+        try:
+            if p.is_file() and str(p) not in out:
+                out.append(str(p))
+        except OSError:
+            continue
+    return out
+
+
+def _exe_key(exe: str) -> str | None:
+    """(path, mtime, size): a Codex update installs a new ``bin/<hash>/`` — a
+    changed binary is a new key, so every capability answer is re-earned."""
+    try:
+        st = os.stat(exe)
+    except OSError:
+        return None
+    return f"{os.path.normcase(os.path.abspath(exe))}|{st.st_mtime_ns}|{st.st_size}"
+
+
+_PROFILE_CACHE: dict[str, bool] = {}
+
+
+def _unsupported_path() -> Path:
+    from claude_squared.registry import pairs_dir
+    return pairs_dir() / "codex_profile_unsupported.json"
+
+
+def _unsupported_marks() -> dict[str, str]:
+    try:
+        data = json.loads(_unsupported_path().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def mark_profile_unsupported(exe_key: str, reason: str) -> bool:
+    """The post-turn check saw a profile run that wasn't confined as asked:
+    every process stops using profiles for this binary (fail closed).
+    Read-modify-write under a file lock (two processes can mark at once);
+    a failed write is logged and returned, the in-process answer is set
+    either way."""
+    from filelock import FileLock, Timeout
+    _PROFILE_CACHE[exe_key] = False
+    path = _unsupported_path()
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with FileLock(str(path) + ".lock", timeout=10):
+            marks = _unsupported_marks()
+            marks[exe_key] = f"{datetime.now().isoformat(timespec='seconds')}: {reason}"[:500]
+            tmp.write_text(json.dumps(marks, indent=1), encoding="utf-8")
+            os.replace(tmp, path)
+        return True
+    except (OSError, Timeout) as exc:
+        tmp.unlink(missing_ok=True)
+        logger.warning("could not record unsupported Codex permission profiles in %s: %s", path, exc)
+        return False
+
+
+def profile_support(exe: str, *, probe: bool = True) -> bool | None:
+    """Does this binary take permission profiles (``default_permissions`` +
+    ``[permissions.<n>]``) together with the re-added user config? The keys
+    come from an alpha build and the binary is re-resolved per spawn, so it
+    is checked per (exe, mtime, size). ``probe=False`` (pair_info) answers
+    from what is known and returns None instead of spawning.
+
+    Fail closed: without ``--strict-config`` an unknown key is silently
+    ignored and exec would run its default — workspace-write — at the
+    read-only level (verified: an unknown -c key ran normally). With it,
+    exec rejects unknown top-level keys and type errors before any model
+    call; empty stdin then stops it at "No prompt provided via stdin."
+    (0.1 s), which is the only answer that counts as support. A spawn
+    failure or timeout is not cached (the updater may be mid-swap)."""
+    key = _exe_key(exe)
+    if key is None:
+        return False if probe else None
+    # Read on every call: another process's post-turn check may have marked
+    # this binary since our own answer was cached.
+    if key in _unsupported_marks():
+        _PROFILE_CACHE[key] = False
+        return False
+    if key in _PROFILE_CACHE:
+        return _PROFILE_CACHE[key]
+    if not probe:
+        return None
+    from claude_squared.registry import pairs_dir
+    root = pairs_dir() / "scratch"
+    q = _toml_literal
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        args = ([exe, "exec", "--strict-config", "--ignore-user-config", "--skip-git-repo-check",
+                 "-C", str(root)] + config_readd_args() + [
+                "-c", f"default_permissions={q(PROFILE_NAME)}",
+                "-c", f"permissions.{PROFILE_NAME}.extends={q(':read-only')}",
+                "-c", f"permissions.{PROFILE_NAME}_ws.extends={q(':workspace')}",
+                "-c", f"permissions.{PROFILE_NAME}.filesystem="
+                      f"{{{q(str(root))}={q('write')}, {q(str(root / 'deny-check'))}={q('deny')}}}",
+                "-c", f"permissions.{PROFILE_NAME}.network.enabled=false", "-"])
+        r = run_codex(args, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                      encoding="utf-8", errors="replace", timeout=20, cwd=str(root))
+    except Exception:
+        return False
+    ok = "No prompt provided" in f"{r.stderr or ''}{r.stdout or ''}"
+    _PROFILE_CACHE[key] = ok
+    return ok
+
+
+def _q_env(var: str, value: str) -> list[str]:
+    # Dotted leaves only: an inline ``set={…}`` would replace the user's
+    # re-added table (verified: dotted leaves merge with it).
+    return ["-c", f"shell_environment_policy.set.{var}={_toml_literal(value)}"]
+
+
+def _git_env_conflict(backend_options: dict[str, Any]) -> bool:
+    """R7: someone already uses GIT_CONFIG_* — ours would clobber index 0."""
+    policy = _load_user_config().get("shell_environment_policy")
+    policy = policy if isinstance(policy, dict) else {}
+    user_set = policy.get("set") if isinstance(policy.get("set"), dict) else {}
+    inherit = str(policy.get("inherit") or "all")
+    if any(str(k).upper() == "GIT_CONFIG_COUNT" for k in user_set):
+        return True
+    for k, v in ((backend_options or {}).get("config") or {}).items():
+        key = str(k).strip()
+        if key.upper() == "SHELL_ENVIRONMENT_POLICY.SET.GIT_CONFIG_COUNT":
+            return True
+        if key == "shell_environment_policy.inherit":
+            inherit = str(v)
+    return inherit == "all" and any(k.upper() == "GIT_CONFIG_COUNT" for k in os.environ)
+
+
+def _workspace_write_settings(backend_options: dict[str, Any]) -> tuple[bool, list[str], list[str]]:
+    """``sandbox_workspace_write.network_access`` / ``writable_roots`` from
+    the user's config.toml (re-added) and a stored backend_options.config,
+    the latter winning. A permission profile IGNORES them (verified
+    2026-10-26: network stayed restricted and the root unwritable, while the
+    same keys with ``-s workspace-write`` applied both), so profile mode
+    carries them over itself. Returns (network, roots, where-from)."""
+    table: dict[str, Any] = {}
+    sources: list[str] = []
+    user = _load_user_config().get("sandbox_workspace_write")
+    if isinstance(user, dict) and (user.get("network_access") or user.get("writable_roots")):
+        table.update(user)
+        sources.append("config.toml")
+    stored: dict[str, Any] = {}
+    for k, v in ((backend_options or {}).get("config") or {}).items():
+        key = str(k).strip()
+        if key == "sandbox_workspace_write" and isinstance(v, dict):
+            stored.update(v)
+        elif key.startswith("sandbox_workspace_write."):
+            stored[key.split(".", 1)[1]] = v
+    if stored.get("network_access") is not None or stored.get("writable_roots"):
+        table.update({k: v for k, v in stored.items() if k in ("network_access", "writable_roots")})
+        sources.append("backend_options.config")
+    roots = table.get("writable_roots")
+    roots = [str(r) for r in roots] if isinstance(roots, list) else []
+    return table.get("network_access") is True, roots, sources
+
+
+@dataclass
+class SandboxPlan:
+    """What one spawn's sandbox looks like. ``kind``: read-only | workspace |
+    none (no sandbox). ``mode``: profile (permission profile) | legacy
+    (``-s``/``--approve-for-me`` + scratch) | native (plain flags: POSIX, no
+    pair, or no sandbox) | unchecked (pair_info before any spawn checked the
+    binary). ``config_args`` / ``extra_args`` are backend_options.config /
+    .args as this spawn passes them; ``spawn_notes`` go on the turn's
+    result; ``writes`` are the roots the recorded profile may write besides
+    the scratch folder."""
+    args: list[str]
+    kind: str
+    mode: str
+    scratch: Path | None = None
+    deny: tuple[str, ...] = ()
+    network: bool = False
+    exe_key: str | None = None
+    git_env: bool = False
+    notes: list[str] = field(default_factory=list)
+    spawn_notes: list[str] = field(default_factory=list)
+    writes: tuple[str, ...] = ()
+    config_args: list[str] = field(default_factory=list)
+    extra_args: list[str] = field(default_factory=list)
+
+
+def _effective(level: str, backend_options: dict[str, Any] | None) -> tuple[str | None, str | None]:
+    """(sandbox, approval) after the native overrides."""
+    sandbox, approval = CODEX_PERMISSION_MAP[normalize_permission(level)]
+    bo = backend_options or {}
+    if bo.get("sandbox"):
+        sandbox = str(bo["sandbox"])
+    if bo.get("approval"):
+        a = str(bo["approval"]).lower()
+        approval = None if a in ("none", "never") else a
+    return sandbox, approval
+
+
+def sandbox_kind(level: str, backend_options: dict[str, Any] | None) -> str:
+    sandbox, approval = _effective(level, backend_options)
+    if approval == "bypass" or sandbox == "danger-full-access":
+        return "none"
+    return "read-only" if sandbox == "read-only" else "workspace"
+
+
+def _known_exe() -> str | None:
+    """The Codex binary without scanning (pair_info must not spawn)."""
+    env = os.environ.get("CLAUDE_PAIR_CODEX_PATH")
+    if env and Path(env).exists():
+        return env
+    for srv in (_load_user_config().get("mcp_servers") or {}).values():
+        envblk = (srv or {}).get("env") if isinstance(srv, dict) else None
+        cand = (envblk or {}).get("CODEX_CLI_PATH") if isinstance(envblk, dict) else None
+        if cand and os.path.isfile(str(cand)):
+            return str(cand)
+    cached = _EXE_CACHE.get("exe")
+    return cached if cached and os.path.isfile(cached) else None
+
+
+def sandbox_plan(level: str, backend_options: dict[str, Any] | None = None, *,
+                 pair_name: str | None = None, exe: str | None = None,
+                 create: bool = True, cwd: str | None = None,
+                 extra_dirs: list[str] | None = None, probe: bool = True) -> SandboxPlan:
+    """The ONE place a spawn's sandbox is decided (R5), from the EFFECTIVE
+    level — so a per-send override and the native sandbox/approval overrides
+    follow automatically.
+
+    Windows with a pair: TEMP/TMP/TMPDIR → the pair's scratch folder. When
+    the binary passes :func:`profile_support`, the sandbox is a permission
+    profile (``:read-only`` / ``:workspace`` + scratch write + credential
+    read-denial) — WITHOUT ``-s``, which beats ``default_permissions``
+    (verified: profile + ``-s read-only`` ran plain read-only).
+    ``--approve-for-me`` coexists with a profile, but must omit deny-read
+    entries: they break escalation setup (2026-10-26 bisect). Existing
+    permanent deny ACEs still apply to sandboxed commands. Otherwise the legacy
+    flags: read-only stays plain ``-s read-only`` (no scratch — ``--add-dir`` is ignored
+    there), workspace adds ``--add-dir <scratch>`` +
+    ``exclude_tmpdir_env_var`` (verified: GetTempPath follows TEMP, the
+    shared Temp becomes denied).
+
+    ``extra_dirs`` become ``--add-dir`` except at read-only, where they
+    were never writable (verified 2026-10-26 under the read-only profile
+    too); under the workspace profile ``--add-dir`` still makes them
+    writable (verified 2026-10-25). ``.git`` / ``.codex`` / ``.agents`` /
+    ``.aws`` inside a root stay write-protected under the profile as in
+    legacy mode (verified 2026-10-26), though the recorded profile no
+    longer lists them."""
+    sandbox, approval = _effective(level, backend_options)
+    bo = backend_options or {}
+    kind = sandbox_kind(level, backend_options)
+    network = bool(bo.get("network")) and kind == "workspace"
+    raw_config = dict(bo.get("config") or {})
+    raw_args = list(bo.get("args") or [])
+    extra = [str(d) for d in (extra_dirs or [])] if kind != "read-only" else []
+    add_dirs = [a for d in extra for a in ("--add-dir", d)]
+
+    def _cfg(items: dict[str, Any]) -> list[str]:
+        return [a for k, v in items.items() for a in ("-c", f"{k}={_toml_literal(v)}")]
+
+    if approval == "bypass":
+        return SandboxPlan(["--dangerously-bypass-approvals-and-sandbox"] + add_dirs, "none", "native",
+                           config_args=_cfg(raw_config), extra_args=[str(a) for a in raw_args])
+    spawn_notes: list[str] = []
+    if kind == "read-only":
+        # Fail closed in EVERY mode (legacy, POSIX, after a breach mark):
+        # without a profile --approve-for-me implies workspace-write, so a
+        # stored approval='approve-for-me' — or a stored sandbox-shaping arg —
+        # must never reach a read-only spawn.
+        if approval == "approve-for-me":
+            spawn_notes.append("backend_options.approval='approve-for-me' is ignored at read-only; "
+                               "use permission_mode='auto' for reviewed escalations")
+            approval = None
+        raw_args, dropped = _strip_sandbox_args(raw_args)
+        for d in dropped:
+            spawn_notes.append(f"backend_options.args {d!r} was not passed: a read-only pair runs "
+                               f"plain read-only (remove it with pair_update(backend_options=…))")
+        for k in [k for k in raw_config if _risky_feature_key(str(k))]:
+            raw_config.pop(k)
+            spawn_notes.append(f"backend_options.config {str(k).strip()!r} was not passed: a read-only pair "
+                               f"runs with Codex's default features (remove it with pair_update(backend_options=…))")
+    flags = ["--approve-for-me"] if approval == "approve-for-me" else (["-s", sandbox] if sandbox else [])
+    net_legacy = ["-c", "sandbox_workspace_write.network_access=true"] if network else []
+    if pair_name is None or kind == "none" or not _windows_sandbox():
+        return SandboxPlan(flags + net_legacy + add_dirs, kind, "native", network=network,
+                           spawn_notes=spawn_notes, config_args=_cfg(raw_config),
+                           extra_args=[str(a) for a in raw_args])
+    scratch = scratch_dir(pair_name, create=create)
+    exe = exe or (codex_executable() if probe else _known_exe())
+    key = _exe_key(exe) if exe else None
+    supported = profile_support(exe, probe=probe) if exe else (False if probe else None)
+    notes: list[str] = []
+    roots: list[str] = []
+    if supported:
+        # Settings a profile ignores are carried over, the rest dropped.
+        sww_net, sww_roots, sources = _workspace_write_settings(bo)
+        if kind == "workspace" and (sww_net or sww_roots):
+            network = network or sww_net
+            roots = [r for r in sww_roots if r not in extra]
+            notes.append(f"sandbox_workspace_write settings from {' and '.join(sources)} are applied through "
+                         f"the permission profile (network: {'on' if sww_net else 'unchanged'}"
+                         f"{', writable roots: ' + ', '.join(roots) if roots else ''})")
+        kept: dict[str, Any] = {}
+        for k, v in raw_config.items():
+            key_s = str(k).strip()
+            if key_s.startswith("sandbox_workspace_write") or _managed_config_feature(key_s) \
+                    or _risky_feature_key(key_s):
+                spawn_notes.append(f"backend_options.config {key_s!r} was not passed: the sandbox permission "
+                                   f"profile decides it (remove it with pair_update(backend_options=…))")
+            else:
+                kept[k] = v
+        raw_config = kept
+        kept_args, dropped = _strip_sandbox_args(raw_args)
+        for d in dropped:
+            spawn_notes.append(f"backend_options.args {d!r} was not passed: it would override the sandbox "
+                               f"permission profile (remove it with pair_update(backend_options=…))")
+        raw_args = kept_args
+    env: list[str] = []
+    for var in _TEMP_VARS:
+        env += _q_env(var, str(scratch))
+    git_env = False
+    if network:
+        if _git_env_conflict(bo):
+            notes.append("your GIT_CONFIG_* variables are already in use, so git's HTTPS fix wasn't added — "
+                         "add http.sslBackend=openssl to them for git HTTPS in the sandbox")
+        else:
+            git_env = True
+            for var, value in _GIT_HTTPS_ENV:
+                env += _q_env(var, value)
+    if supported is None:
+        return SandboxPlan([], kind, "unchecked", scratch, (), network, key, git_env, notes)
+    if supported:
+        # 2026-10-26 live bisect: deny entries cause "setup refresh had errors"
+        # on escalation. Keep them on approval-never profiles, whose permanent
+        # ACEs persist for auto too. Use effective approval after the read-only
+        # guard above, so native overrides and per-send levels follow suit.
+        deny = [] if approval == "approve-for-me" else secret_read_denials()
+        q = _toml_literal
+        entries = ", ".join([f"{q(str(scratch))}={q('write')}"] + [f"{q(d)}={q('deny')}" for d in deny])
+        args = (["--approve-for-me"] if approval == "approve-for-me" else []) + [
+            "-c", f"default_permissions={q(PROFILE_NAME)}",
+            "-c", f"permissions.{PROFILE_NAME}.extends={q(':read-only' if kind == 'read-only' else ':workspace')}",
+            "-c", f"permissions.{PROFILE_NAME}.filesystem={{{entries}}}",
+        ]
+        if network:
+            args += ["-c", f"permissions.{PROFILE_NAME}.network.enabled=true"]
+        args += env + add_dirs + [a for r in roots for a in ("--add-dir", r)]
+        writes = tuple(([cwd] if cwd and kind == "workspace" else []) + extra + roots)
+        return SandboxPlan(args, kind, "profile", scratch, tuple(deny), network, key, git_env, notes,
+                           spawn_notes, writes, _cfg(raw_config), [str(a) for a in raw_args])
+    if kind == "read-only":
+        return SandboxPlan(flags, kind, "legacy", None, (), False, key, False, notes, spawn_notes,
+                           config_args=_cfg(raw_config), extra_args=[str(a) for a in raw_args])
+    args = flags + ["--add-dir", str(scratch), "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true"]
+    return SandboxPlan(args + env + net_legacy + add_dirs, kind, "legacy", scratch, (), network, key, git_env,
+                       notes, spawn_notes, config_args=_cfg(raw_config), extra_args=[str(a) for a in raw_args])
+
+
+def sandbox_notes(spec: PairSpec, *, python_check: bool = False, detail: bool = False,
+                  probe: bool = True) -> list[str]:
+    """One-line summaries of a Codex pair's sandbox for create (``detail``:
+    what the credential denial does to the machine) / update / info
+    (``probe=False``: no spawn, no directories). Advisory: never raises."""
+    try:
+        kind = sandbox_kind(spec.permission_mode, spec.backend_options)
+        bo = spec.backend_options or {}
+        notes: list[str] = []
+        if kind == "none":
+            if bo.get("network"):
+                notes.append("network: this level has no sandbox, so network is already on")
+            return notes
+        if not _windows_sandbox():
+            if bo.get("network"):
+                notes.append("network on (sandbox_workspace_write.network_access)")
+            return notes
+        plan = sandbox_plan(spec.permission_mode, bo, pair_name=spec.name, create=False, cwd=spec.cwd,
+                            extra_dirs=spec.extra_dirs, probe=probe)
+        if plan.mode == "profile" and "--approve-for-me" in plan.args:
+            denied = ("credential files protected by existing deny entries where already installed; "
+                      "not re-applied at auto because they break escalation")
+            if not _elevated_sandbox():
+                denied += '; existing entries were verified only with `[windows] sandbox = "elevated"`'
+        elif plan.deny and not _elevated_sandbox():
+            # Verified only with the elevated sandbox (commands run as the
+            # CodexSandboxOffline user, a member of the group the deny entry
+            # names). Another mode may run them as you with a restricted
+            # token, which a group deny doesn't reach — not probed.
+            denied = ("credential read-denial requested, but it was verified only with `[windows] sandbox = "
+                      "\"elevated\"`, which this config doesn't set: with another sandbox mode commands may run "
+                      "as you, and the files stay readable")
+        elif plan.deny and detail:
+            denied = (f"{len(plan.deny)} credential file(s) unreadable to sandboxed commands — Codex enforces "
+                      f"this with a PERMANENT deny entry on each file for every Codex sandbox on this machine "
+                      f"(undo: icacls <file> /remove:d CodexSandboxUsers); a claude or codex CLI run inside the "
+                      f"sandbox can't log in")
+        elif plan.deny:
+            denied = "credential files unreadable to sandboxed commands"
+        else:
+            denied = "no credential files to protect were found"
+        if plan.mode == "profile":
+            notes.append(f"sandbox: {kind} permission profile; TEMP/TMP → {plan.scratch}; {denied}")
+        elif plan.mode == "unchecked":
+            notes.append(f"sandbox: {kind}; TEMP/TMP → {plan.scratch}; whether this Codex build takes "
+                         f"permission profiles is checked at the next spawn")
+        elif kind == "read-only":
+            notes.append("sandbox: plain read-only (this Codex build has no usable permission profiles): "
+                         "nothing is writable, not even TEMP, and credential files stay readable to "
+                         "sandboxed commands")
+        else:
+            notes.append(f"sandbox: workspace via plain flags (no permission profiles on this Codex build); "
+                         f"TEMP/TMP → {plan.scratch}; credential files stay readable to sandboxed commands")
+        if plan.network:
+            notes.append("network on — HTTPS works from Python and git"
+                         + (" (http.sslBackend=openssl is set for git)" if plan.git_env else "")
+                         + ", not from PowerShell (Invoke-WebRequest) or curl.exe (Schannel fails in the sandbox)")
+        elif bo.get("network") and kind == "read-only":
+            notes.append("network: off at read-only (backend_options.network applies at workspace/auto)")
+        notes.extend(plan.notes)
+        notes.extend(plan.spawn_notes)
+        if python_check:
+            py = python_sandbox_note(spec.name)
+            if py:
+                notes.append(py)
+        return notes
+    except Exception:
+        return []
+
+
+_PY_CACHE: dict[tuple[str, str], str | None] = {}
+
+
+def python_sandbox_note(pair_name: str) -> str | None:
+    """Create-time check (Windows): does ``python`` on PATH run as the sandbox
+    user? ``codex sandbox -P :read-only -C <scratch> -- python -c …`` runs a
+    command in the sandbox without a model (verified: as
+    codexsandboxoffline, ~2–3 s). cwd = the scratch folder, never the repo
+    — every sandbox run writes permanent ACEs on its cwd's gitdir. Cached
+    per (binary, interpreter) for the process; advisory, never fails a
+    create. A denied interpreter fails with "CreateProcessAsUserW failed: 5
+    (Access is denied.)" (verified on a fixture copy)."""
+    if not _windows_sandbox():
+        return None
+    py = shutil.which("python")
+    if not py:
+        return None
+    exe = codex_executable()
+    key = _exe_key(exe)
+    if key is None:
+        return None
+    cache_key = (key, os.path.normcase(py))
+    if cache_key in _PY_CACHE:
+        return _PY_CACHE[cache_key]
+    scratch = scratch_dir(pair_name)
+    env: list[str] = []
+    for var in _TEMP_VARS:
+        env += _q_env(var, str(scratch))
+    args = [exe, "sandbox", "-P", ":read-only", "-C", str(scratch)] + env + ["--", py, "-c", "print('PYOK')"]
+    try:
+        r = run_codex(args, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                      encoding="utf-8", errors="replace", timeout=30, cwd=str(scratch))
+    except Exception:
+        return None  # couldn't check (spawn failure / timeout) — try again next create
+    out, err = r.stdout or "", (r.stderr or "").strip()
+    reason = err.splitlines()[-1][:200] if err else f"exit {r.returncode}"
+    if r.returncode == 0 and "PYOK" in out:
+        note = None
+    elif r.returncode == 2 and ("Usage:" in err or "unexpected argument" in err):
+        note = None  # this Codex build can't run the check
+    elif "\\windowsapps\\" in py.lower().replace("/", "\\"):
+        # Not os.path.normcase: it's a no-op off Windows, and this is a Windows path.
+        note = (f"`python` on PATH ({py}) is the Microsoft Store app alias, which doesn't run inside the "
+                f"Codex sandbox ({reason}). Install Python from python.org (or put a real interpreter first "
+                f"on PATH) and, if it lives under your user folder, grant the sandbox group read+execute on "
+                f"it: icacls \"<python dir>\" /grant \"CodexSandboxUsers:(OI)(CI)RX\" /T — the user runs it. "
+                f"Only `python` on PATH was checked.")
+    else:
+        folder = os.path.dirname(os.path.realpath(py))
+        note = (f"`python` on PATH ({py}) does not run inside the Codex sandbox ({reason}). Sandboxed "
+                f"commands run as the CodexSandboxUsers group, which needs read+execute on the interpreter's "
+                f"folder. Fix (the user runs it): icacls \"{folder}\" /grant \"CodexSandboxUsers:(OI)(CI)RX\" "
+                f"/T (for a venv, the base install's folder) — or give the pair a Python inside its workspace. "
+                f"Only `python` on PATH was checked.")
+    _PY_CACHE[cache_key] = note
+    return note
+
+
+def _iso_epoch(stamp: Any) -> float | None:
+    """Epoch of a rollout ``timestamp`` ("2026-10-25T17:55:02.569Z"); None if unparsable."""
+    if not isinstance(stamp, str) or not stamp:
+        return None
+    s = stamp.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(s).timestamp()
+    except ValueError:
+        # 3.10's fromisoformat takes only 3- or 6-digit fractions.
+        s = re.sub(r"\.\d+", "", s)
+        try:
+            return datetime.fromisoformat(s).timestamp()
+        except ValueError:
+            return None
+
+
+def _turn_contexts_since(rollout: Path | None, offset: int | None, *,
+                         not_before: float | None = None) -> list[dict[str, Any]]:
+    """``turn_context`` payloads appended to a rollout after ``offset`` (None:
+    from the start). With ``not_before`` only records stamped at or after it
+    count — send passes it whenever the rollout was compressed before the
+    turn: the offset is then the frame's recorded size (or unknown), which is
+    only right while Codex keeps restoring byte-identically."""
+    if rollout is None or is_compressed_rollout(rollout):
+        return []
+    out: list[dict[str, Any]] = []
+    try:
+        with open(rollout, "rb") as f:
+            f.seek(max(0, offset or 0))
+            for raw in f:
+                if b'"turn_context"' not in raw:
+                    continue
+                try:
+                    d = json.loads(raw.decode("utf-8", errors="replace"))
+                except ValueError:
+                    continue
+                if not (isinstance(d, dict) and d.get("type") == "turn_context" and isinstance(d.get("payload"), dict)):
+                    continue
+                if not_before is not None:
+                    ts = _iso_epoch(d.get("timestamp"))
+                    if ts is None or ts < not_before:
+                        continue
+                out.append(d["payload"])
+    except OSError:
+        return []
+    return out
+
+
+def _norm_path(p: Any) -> str:
+    """Comparable form: ``\\\\?\\`` prefix dropped, junctions/symlinks
+    resolved (a home behind a junction must not read as a breach), case
+    folded on Windows."""
+    s = str(p or "")
+    if s.startswith("\\\\?\\"):
+        s = s[4:]
+    if not s:
+        return ""
+    try:
+        s = os.path.realpath(s)
+    except (OSError, ValueError):
+        pass
+    return os.path.normcase(os.path.normpath(s))
+
+
+# Special roots the :workspace profile records as writable (verified
+# 2026-10-25: tmpdir resolves to the scratch TEMP; slash_tmp is /tmp).
+_WORKSPACE_SPECIAL_WRITES = (":tmpdir", ":slash_tmp")
+
+
+def profile_breach(turn_context: dict[str, Any], plan: SandboxPlan) -> tuple[str | None, str | None]:
+    """Post-turn check of what Codex RECORDED for a profile run (the rollout's
+    ``turn_context.permission_profile``, written per turn — verified to match
+    enforcement). Returns (breach, warning). A breach (fail closed): any
+    write besides the scratch folder (read-only) or besides cwd, extra_dirs,
+    carried-over writable roots, the scratch folder and the :tmpdir /
+    :slash_tmp specials (workspace/auto); or network on although not asked
+    for. Missing credential denials, or network asked for but off, warn."""
+    prof = turn_context.get("permission_profile")
+    fs = prof.get("file_system") if isinstance(prof, dict) else None
+    entries = fs.get("entries") if isinstance(fs, dict) else None
+    if not isinstance(entries, list):
+        return "no permission profile recorded for the turn", None
+
+    def _path(e: dict) -> str:
+        path = e.get("path") if isinstance(e, dict) else None
+        if isinstance(path, dict) and path.get("type") == "path":
+            return _norm_path(path.get("path"))
+        return f":{(path or {}).get('value', {}).get('kind', '?')}" if isinstance(path, dict) else "?"
+
+    allowed = {_norm_path(plan.scratch)}
+    if plan.kind == "workspace":
+        allowed |= {_norm_path(w) for w in plan.writes} | set(_WORKSPACE_SPECIAL_WRITES)
+    writes = [_path(e) for e in entries if isinstance(e, dict) and e.get("access") == "write"]
+    bad = [w for w in writes if w not in allowed]
+    network = prof.get("network")
+    breach = None
+    if bad or (network != "restricted" and not plan.network):
+        breach = (f"{plan.kind} profile not confined as asked (unexpected writable: {', '.join(bad) or 'none'}; "
+                  f"network: {network})")
+    warnings = []
+    denied = {_path(e) for e in entries if isinstance(e, dict) and e.get("access") == "deny"}
+    missing = [d for d in plan.deny if _norm_path(d) not in denied]
+    if missing:
+        warnings.append(f"credential read-denial was not in effect this turn ({len(missing)} file(s) missing "
+                        f"from the recorded profile)")
+    if plan.network and network == "restricted":
+        warnings.append("network was asked for but Codex recorded it as off this turn")
+    return breach, "; ".join(warnings) or None
+
+
+def instructions_text(spec: PairSpec) -> str | None:
+    """A Codex thread's instructions: profile + system_prompt_append + (on
+    Windows, for a sandboxed level, unless backend_options.sandbox_note is
+    false) the sandbox note. The note follows the STORED level, not a
+    per-send override, so one override can't change the text a compaction
+    rebuilds."""
+    parts: list[str] = []
+    base = CodexAdapter()._resolve_system_prompt(spec)
+    if base:
+        parts.append(base)
+    bo = spec.backend_options or {}
+    try:
+        sandboxed = sandbox_kind(spec.permission_mode, bo) != "none"
+    except Exception:
+        sandboxed = False
+    if _windows_sandbox() and sandboxed and bo.get("sandbox_note", True) is not False:
+        parts.append(SANDBOX_NOTE)
+    return "\n\n".join(parts) if parts else None
+
+
+def instructions_record(mode: str, text: str | None) -> dict[str, Any]:
+    import hashlib
+    return {"mode": mode, "sha256": hashlib.sha256((text or "").encode("utf-8")).hexdigest(),
+            "chars": len(text or "")}
+
+
+def instructions_changed(spec: PairSpec) -> bool:
+    rec = spec.codex_instructions or {}
+    if not rec.get("sha256"):
+        return False
+    return instructions_record("x", instructions_text(spec))["sha256"] != rec["sha256"]
+
+
+def _argv_chars(args: list[str]) -> int:
+    return len(subprocess.list2cmdline([str(a) for a in args]))
+
+
+# ---------------------------------------------------------------------------
 # Thread store access (read-only)
 # ---------------------------------------------------------------------------
 
@@ -645,7 +1586,8 @@ def _ro_connect(p: Path) -> sqlite3.Connection:
 
 def rollout_path_for(thread_id: str) -> Path | None:
     """Authoritative: ``threads.rollout_path`` in the state sqlite; fallback:
-    glob the sessions tree for ``rollout-*-<id>.jsonl``."""
+    glob the sessions tree for ``rollout-*-<id>.jsonl``. Either may resolve to
+    the compressed ``….jsonl.zst`` sibling (see ``is_compressed_rollout``)."""
     db = _state_db_path()
     if db is not None:
         try:
@@ -657,13 +1599,111 @@ def rollout_path_for(thread_id: str) -> Path | None:
                 con.close()
             if row and row[0]:
                 p = Path(row[0])
-                if p.exists():
-                    return p
+                # Plain again last: Codex may restore the file between the
+                # first two checks (writing the .jsonl and dropping the .zst).
+                for cand in (p, compressed_sibling(p), p):
+                    if cand.exists():
+                        return cand
         except Exception:
             pass
-    for cand in glob.glob(str(codex_home() / "sessions" / "*" / "*" / "*" / f"rollout-*{thread_id}*.jsonl")):
+    pattern = str(codex_home() / "sessions" / "*" / "*" / "*" / f"rollout-*{thread_id}*.jsonl")
+    for cand in glob.glob(pattern) or glob.glob(pattern + ZST_SUFFIX):
         return Path(cand)
     return None
+
+
+# The Codex app (0.16x) recompresses rollouts idle about a week to
+# ``rollout-….jsonl.zst`` while ``threads.rollout_path`` keeps naming the
+# ``.jsonl`` (its app-server ``rollout/compress``: "best-effort background
+# compression pass for cold local rollouts"). Verified 2026-10-25 on 0.164 with
+# a .zst made by that method: ``exec resume``, ``exec fork`` and the
+# app-server's ``thread/resume`` (so compaction too) all accept a .zst-only
+# thread and restore the plain .jsonl first — byte-identical prefix, .zst
+# removed. claude-squared has no zstd decoder (stdlib zstd is 3.14+ and the
+# fix takes no new dependency), so readers treat a compressed rollout as "not
+# readable until Codex restores it" and say so; pair_rewind restores it first.
+ZST_SUFFIX = ".zst"
+COMPRESSED_NOTE = "the Codex app compressed this idle thread; the next pair_send or pair_compact restores it"
+
+
+_RESTORE_WAIT_SECONDS = 10.0  # CodexAdapter.restore_rollout: for the plain file after thread/resume
+
+
+def compressed_sibling(p: Path) -> Path:
+    return p.with_name(p.name + ZST_SUFFIX)
+
+
+def is_compressed_rollout(p: Path | None) -> bool:
+    return p is not None and p.name.endswith(".jsonl" + ZST_SUFFIX)
+
+
+def compressed_rollout_note(spec: PairSpec) -> str | None:
+    """``COMPRESSED_NOTE`` when the pair's rollout is currently compressed."""
+    if spec.backend != "codex" or not spec.session_id:
+        return None
+    return COMPRESSED_NOTE if is_compressed_rollout(rollout_path_for(spec.session_id)) else None
+
+
+_ZSTD_MAGIC = 0xFD2FB528
+
+
+def zstd_content_size(path: Path) -> int | None:
+    """Decompressed size a zstd file's frame headers record (summed over its
+    frames), or None when a frame omits it or the file is not zstd. A header
+    walk, not a decoder: blocks are skipped by their 3-byte headers (RFC 8878).
+    Codex writes one frame with the size recorded (both variants seen
+    2026-10-25: single-segment, and windowed on an older file)."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    pos, total = 0, 0
+    while pos < len(data):
+        if len(data) - pos < 8:
+            return None
+        magic = int.from_bytes(data[pos:pos + 4], "little")
+        if magic & 0xFFFFFFF0 == 0x184D2A50:  # skippable frame
+            pos += 8 + int.from_bytes(data[pos + 4:pos + 8], "little")
+            continue
+        fhd = data[pos + 4]
+        if magic != _ZSTD_MAGIC or fhd & 0x08:  # reserved bit must be 0
+            return None
+        single = (fhd >> 5) & 1
+        fcs_len = (1 if single else 0, 2, 4, 8)[fhd >> 6]
+        p = pos + 5 + (0 if single else 1) + (0, 1, 2, 4)[fhd & 3]
+        if not fcs_len or p + fcs_len > len(data):
+            return None
+        total += int.from_bytes(data[p:p + fcs_len], "little") + (256 if fcs_len == 2 else 0)
+        p += fcs_len
+        while True:
+            if p + 3 > len(data):
+                return None
+            header = int.from_bytes(data[p:p + 3], "little")
+            block_type = (header >> 1) & 3
+            if block_type == 3:
+                return None
+            p += 3 + (1 if block_type == 1 else header >> 3)  # an RLE block stores one byte
+            if header & 1:
+                break
+        pos = p + (4 if (fhd >> 2) & 1 else 0)
+        if pos > len(data):
+            return None
+    return total if data else None
+
+
+def rollout_size(path: Path | None) -> int | None:
+    """Byte size of the rollout's plain content: the file size, or what a
+    compressed rollout's frame header records (Codex restores the plain file
+    byte-identical, so it is where the next turn's records start). None when
+    unknown."""
+    if path is None:
+        return None
+    if is_compressed_rollout(path):
+        return zstd_content_size(path)
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
 
 
 def guardian_verdicts_since(since_epoch: float, parent_thread_id: str | None = None) -> list[dict[str, Any]]:
@@ -761,8 +1801,9 @@ def read_last_token_count(rollout: Path | None) -> dict[str, Any] | None:
     ``info.model_context_window`` (the EFFECTIVE window — 258,400 default,
     828,400 with the 1M config) and ``rate_limits`` (plan quota). Scans backward
     in chunks and returns at the first valid token_count; a long old thread
-    must not stall exec supervision on every ten-second sample."""
-    if rollout is None:
+    must not stall exec supervision on every ten-second sample. None for a
+    compressed rollout (unreadable until Codex restores it)."""
+    if rollout is None or is_compressed_rollout(rollout):
         return None
     try:
         with open(rollout, "rb") as f:
@@ -781,10 +1822,42 @@ def read_last_token_count(rollout: Path | None) -> dict[str, Any] | None:
     return None
 
 
+def live_context_tokens(info: dict[str, Any] | None) -> int | None:
+    """Live context fill from a ``token_count`` payload's ``info``: the last
+    model call's ``input_tokens`` — never ``total_token_usage``, which is the
+    thread's cumulative usage across every call (tens of millions on a long
+    thread). After a compaction Codex writes a token_count whose
+    ``last_token_usage`` has ``input_tokens`` 0 and ``total_tokens`` set to
+    its estimate of the new history (verified 2026-10-15: 0 / 27,527 while
+    the cumulative total stayed 56,802,796); that estimate is the fill until
+    the next model call. None when neither is reported."""
+    last = (info or {}).get("last_token_usage") or {}
+    inp = last.get("input_tokens")
+    if isinstance(inp, int) and inp > 0:
+        return inp
+    est = last.get("total_tokens")
+    if isinstance(est, int) and est > 0:
+        return est
+    return None
+
+
+def _post_compaction_tokens(before: dict[str, Any] | None, after: dict[str, Any] | None) -> int | None:
+    """Codex's own post-compaction estimate, when compaction wrote a NEW
+    token_count with the ``input_tokens`` 0 marker (see
+    ``live_context_tokens``); None otherwise — the last token_count may still
+    be the pre-compaction one, whose figures describe the old context."""
+    if not after or after == before:
+        return None
+    last = (after.get("info") or {}).get("last_token_usage") or {}
+    if last.get("input_tokens"):
+        return None
+    return live_context_tokens(after.get("info"))
+
+
 def _estimate_compacted_tokens(rollout: Path | None) -> int:
     """Rough size of the LAST ``compacted`` record's replacement history
     (chars / 4). 0 when there is none."""
-    if rollout is None or not rollout.exists():
+    if rollout is None or is_compressed_rollout(rollout) or not rollout.exists():
         return 0
     last: dict[str, Any] | None = None
     try:
@@ -804,6 +1877,43 @@ def _estimate_compacted_tokens(rollout: Path | None) -> int:
         return 0
     text = json.dumps(last.get("replacement_history") or last.get("message") or "", default=str)
     return max(0, len(text) // 4)
+
+
+def _pre_compaction_token_count(rollout: Path | None, limit: int | None) -> dict[str, Any] | None:
+    """The pre-compaction ``token_count`` payload for a compaction whose
+    rollout was compressed beforehand (unreadable then): the last one within
+    the first ``limit`` bytes — Codex restored the file byte-identical first,
+    so that is what the plain file said, even if the compaction wrote no
+    record. With ``limit`` None (the frame did not record its size): the last
+    one before the LAST ``compacted`` record. None when there is none."""
+    if rollout is None or is_compressed_rollout(rollout):
+        return None
+    last: dict[str, Any] | None = None
+    before: dict[str, Any] | None = None
+    pos = 0
+    try:
+        with open(rollout, "rb") as f:
+            for raw in f:
+                start, pos = pos, pos + len(raw)
+                if limit is not None and start >= limit:
+                    break
+                is_tc = b'"token_count"' in raw
+                if not is_tc and b'"compacted"' not in raw:
+                    continue
+                try:
+                    d = json.loads(raw.decode("utf-8", errors="replace"))
+                except ValueError:
+                    continue
+                pl = d.get("payload") if isinstance(d, dict) else None
+                if not isinstance(pl, dict):
+                    continue
+                if d.get("type") == "compacted":
+                    before = last
+                elif is_tc and d.get("type") == "event_msg" and pl.get("type") == "token_count":
+                    last = pl
+    except OSError:
+        return None
+    return last if limit is not None else before
 
 
 def plan_usage_text(rate_limits: dict[str, Any] | None) -> str | None:
@@ -846,6 +1956,8 @@ def plan_usage_text(rate_limits: dict[str, Any] | None) -> str | None:
 # ---------------------------------------------------------------------------
 
 def is_codex_rollout(path: Path) -> bool:
+    if is_compressed_rollout(path):
+        return True  # by name; never parse its bytes as JSONL (see tail_turns)
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             first = f.readline()
@@ -867,9 +1979,12 @@ def _content_text(content: Any) -> str:
 
 def tail_turns_codex(path: Path, last_n: int = 10) -> list[dict[str, Any]]:
     """Last N user/assistant turns from a Codex rollout JSONL, in the same
-    shape ``transcript.tail_turns`` returns for Claude sessions."""
+    shape ``transcript.tail_turns`` returns for Claude sessions. [] for a
+    compressed rollout (callers show ``COMPRESSED_NOTE``)."""
     turns: list[dict[str, Any]] = []
     pending_tools: list[dict[str, Any]] = []
+    if is_compressed_rollout(path):
+        return []
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except Exception:
@@ -913,7 +2028,10 @@ def list_turn_points_codex(path: Path) -> list[dict[str, Any]]:
     turn starts with one, followed by the user message). Truncating the file
     just before a ``turn_context`` line drops that turn and everything after —
     verified 2026-09-07: ``exec resume`` reads the rollout JSONL (a truncated
-    thread forgot the dropped turn; sqlite still held it, harmlessly)."""
+    thread forgot the dropped turn; sqlite still held it, harmlessly). [] for
+    a compressed rollout — pair_rewind restores it first."""
+    if is_compressed_rollout(path):
+        return []
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except Exception:
@@ -1018,6 +2136,8 @@ def truncate_rollout_before_line(path: Path, raw_line_index: int,
     """Keep lines [0, raw_line_index); drop the rest (atomic via tmp +
     replace), then re-sync Codex's sqlite projection when ``thread_id`` is
     given. Returns ``(lines_dropped, resync_note)``."""
+    if is_compressed_rollout(path):
+        raise CLIError(f"cannot truncate a compressed rollout ({path.name}); restore it first")
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     kept = lines[:raw_line_index]
     dropped = len(lines) - len(kept)
@@ -1195,16 +2315,35 @@ class CodexAdapter(PairAdapter):
         ``thread.started``, so the caller MUST take ``session_id`` from the
         result (never a pre-generated id)."""
         prompt = initial_message or PROBE_PROMPT
-        sys_text = self._resolve_system_prompt(spec)
-        if sys_text:
-            # Codex exec has no --append-system-prompt; the thread's first user
-            # message is the closest persistent equivalent (it stays in the
-            # thread history for every later resume).
-            prompt = (
-                "<operating instructions for this thread — follow them in every turn>\n"
-                f"{sys_text}\n</operating instructions>\n\n{prompt}"
-            )
+        sys_text = instructions_text(spec)
         args = self._exec_args(spec, model=None, effort=None, permission_mode=None)
+        # v0.19: the instructions are a developer message (``-c
+        # developer_instructions``), re-sent on every later exec (see
+        # PairSpec.codex_instructions). Over the argv budget (R9) they fall
+        # back to the thread's first user message — never truncated.
+        mode = "developer"
+        notes: list[str] = []
+        if sys_text:
+            extra = ["-c", f"developer_instructions={_toml_literal(sys_text)}"]
+            if not _text_argv_ok(args[0]):
+                mode = "wrapper"
+                notes.append(f"the Codex binary is a script ({os.path.basename(args[0])}), which runs through "
+                             f"cmd.exe, so the instructions were delivered as the thread's first message "
+                             f"instead of on its command line (point CLAUDE_PAIR_CODEX_PATH at codex.exe to "
+                             f"get developer instructions)")
+            elif _argv_chars(args + extra + ["-"]) <= ARGV_BUDGET:
+                args += extra
+            else:
+                mode = "wrapper"
+                notes.append(f"the pair's instructions ({len(sys_text):,} chars) are too long for the Codex "
+                             f"command line, so they were delivered as the thread's first message instead "
+                             f"(a compaction may summarise them away; shorten the profile or "
+                             f"system_prompt_append to get developer instructions)")
+            if mode == "wrapper":
+                prompt = (
+                    "<operating instructions for this thread — follow them in every turn>\n"
+                    f"{sys_text}\n</operating instructions>\n\n{prompt}"
+                )
         # Prompt over stdin ("-"): a long briefing as an argv element would
         # exceed Windows' ~32K command-line limit (Astra catch). Verified:
         # ``exec … -`` reads the prompt from stdin and proceeds on EOF.
@@ -1238,7 +2377,9 @@ class CodexAdapter(PairAdapter):
         return CreateResult(name=spec.name, session_id=tid,
                             transcript_path=str(tp) if tp else None,
                             initial_response=reply or None,
-                            notes=connectors.codex_startup_notes(spec.mcp_whitelist, spec.cwd, stderr, events))
+                            notes=connectors.codex_startup_notes(spec.mcp_whitelist, spec.cwd, stderr, events)
+                            + notes,
+                            instructions=instructions_record(mode, sys_text))
 
     def send(self, spec: PairSpec, message: str, *, model: str | None = None,
              effort: str | None = None, permission_mode: str | None = None,
@@ -1249,9 +2390,37 @@ class CodexAdapter(PairAdapter):
         turn = _new_codex_activity(spec, task_id)
         try:
             if not self.session_exists(spec):
-                raise SessionMissing(spec.name, spec.session_id)
-            args = self._exec_args(spec, model=model, effort=effort, permission_mode=permission_mode)
+                raise SessionMissing(spec.name, spec.session_id, backend="codex",
+                                     where=str(codex_home() / "sessions"))
+            plans: list[SandboxPlan] = []
+            args = self._exec_args(spec, model=model, effort=effort, permission_mode=permission_mode,
+                                   plan_out=plans)
+            notes: list[str] = []
+            if (spec.codex_instructions or {}).get("mode") == "developer":
+                # Re-sent on EVERY exec: Codex ignores it on resume (the
+                # thread's initial context already exists) but rebuilds the
+                # initial context from it at an auto-compaction — without it
+                # the instructions vanish there (verified 2026-10-25, A/B).
+                text = instructions_text(spec)
+                if text:
+                    extra = ["-c", f"developer_instructions={_toml_literal(text)}"]
+                    if not _text_argv_ok(args[0]):
+                        notes.append(f"the Codex binary is a script ({os.path.basename(args[0])}) that runs "
+                                     f"through cmd.exe, so the instructions were not re-sent on its command "
+                                     f"line; Codex drops them at the next compaction — point "
+                                     f"CLAUDE_PAIR_CODEX_PATH at codex.exe")
+                    elif _argv_chars(args + extra + ["resume", spec.session_id, "-"]) <= ARGV_BUDGET:
+                        args += extra
+                    else:
+                        notes.append(f"the pair's instructions ({len(text):,} chars) no longer fit the Codex "
+                                     f"command line and were not re-sent; Codex drops them at the next "
+                                     f"compaction — shorten the profile or system_prompt_append")
             args += ["resume", spec.session_id, "-"]
+            # A compressed rollout's offset is its recorded plain size: Codex
+            # restores it byte-identical before appending this turn.
+            pre_rollout = self.transcript_path(spec)
+            rollout_offset = rollout_size(pre_rollout)
+            stamp_filter = rollout_offset is None or is_compressed_rollout(pre_rollout)
             run_spec = spec.model_copy(update={
                 "model": self._model_for(spec, model),
                 "effort": effort if effort is not None else spec.effort,
@@ -1269,6 +2438,36 @@ class CodexAdapter(PairAdapter):
                 spec, events, stderr, code, dur_ms, started,
                 model_used=run_spec.model, permission_level=run_spec.permission_mode,
             )
+            result.notes.extend(notes)
+            plan = plans[-1] if plans else None
+            if plan is not None:
+                result.notes.extend(plan.spawn_notes)
+            if plan is not None and plan.mode == "profile":
+                # R1 belt: check what Codex RECORDED for this turn. Only this
+                # exec's turn_context lines count (an early failure leaves
+                # none, and an older turn's record proves nothing). Resolved
+                # again: a compressed rollout is plain by now; its offset is
+                # backed by the turn-start stamp in case a restore ever
+                # stops being byte-identical (temper, 2026-10-25).
+                recorded = _turn_contexts_since(self.transcript_path(spec), rollout_offset,
+                                                not_before=started - 2 if stamp_filter else None)[-1:]
+                for tc in recorded:
+                    breach, warning = profile_breach(tc, plan)
+                    if breach:
+                        if plan.exe_key:
+                            mark_profile_unsupported(plan.exe_key, breach)
+                        result.notes.append(
+                            f"⚠ SANDBOX: {breach}. claude-squared stops using permission profiles for this "
+                            f"Codex build — every Codex pair now runs the plain sandbox flags (read-only: no "
+                            f"scratch folder; no credential read-denial). Check what this turn did (pair_log). "
+                            f"If this was a false alarm, delete {_unsupported_path()} (a Codex update starts "
+                            f"fresh anyway: the mark is per binary).")
+                    if warning:
+                        result.notes.append(f"⚠ SANDBOX: {warning}")
+                if not recorded and any(e.get("type") == "turn.completed" for e in events):
+                    result.notes.append("⚠ SANDBOX: Codex recorded no permission profile for this turn, so its "
+                                        "sandbox could not be verified")
+                    self._log_line(spec, "=== SANDBOX UNVERIFIED: no turn_context recorded for this turn ===")
             completed = any(e.get("type") == "turn.completed" for e in events)
             failed = any(e.get("type") == "turn.failed" for e in events)
             turn.status = "failed" if failed or (code not in (0, None) and not completed) else "done"
@@ -1323,22 +2522,36 @@ class CodexAdapter(PairAdapter):
         ignored with a note.
         """
         if not self.session_exists(spec):
-            raise SessionMissing(spec.name, spec.session_id)
+            raise SessionMissing(spec.name, spec.session_id, backend="codex",
+                                 where=str(codex_home() / "sessions"))
         rollout = self.transcript_path(spec)
+        was_compressed = is_compressed_rollout(rollout)
+        restored_size = rollout_size(rollout) if was_compressed else None
         tc0 = read_last_token_count(rollout) or {}
-        info0 = tc0.get("info") or {}
-        pre = current_context_tokens(info0)
         t0 = time.monotonic()
         outcome = self._appserver_compact(spec, timeout_seconds=timeout_seconds, should_stop=should_stop)
         dur_ms = int((time.monotonic() - t0) * 1000)
+        # Resolved again: the app-server restores a compressed rollout to its
+        # plain path first (verified 2026-10-25); the pre-compaction figures
+        # then come from the restored prefix.
+        rollout = self.transcript_path(spec)
+        if was_compressed:
+            tc0 = _pre_compaction_token_count(rollout, restored_size) or {}
+        pre = live_context_tokens(tc0.get("info")) or 0
         tc1 = read_last_token_count(rollout) or {}
-        info1 = tc1.get("info") or {}
-        post = current_context_tokens(info1)
+        # Never total_token_usage: it is cumulative thread usage, not the
+        # context (2026-10-15: reported 318,367 -> 56,802,796 and tripped the
+        # context alert). Codex's post-compaction token_count carries its own
+        # estimate of the new history in last_token_usage.total_tokens.
+        post = _post_compaction_tokens(tc0, tc1) or 0
         notes: list[str] = []
-        if not post:
-            # Codex's post-compaction token_count reports zeros (verified on a
-            # 164k thread); estimate from the compaction record's replacement
-            # history instead — the next reply's footer shows the real fill.
+        if post:
+            notes.append("post-compaction size is Codex's estimate of the compacted history; "
+                         "the next reply's footer shows the real context fill")
+        else:
+            # Older Codex wrote all zeros here (verified on a 164k thread);
+            # estimate from the compaction record's replacement history
+            # instead — the next reply's footer shows the real fill.
             est = _estimate_compacted_tokens(rollout)
             if est:
                 post = est
@@ -1361,6 +2574,69 @@ class CodexAdapter(PairAdapter):
                              post_tokens=post, duration_ms=dur_ms, trigger="manual (app-server)",
                              summary_preview=note)
 
+    def _thread_resume_params(self, spec: PairSpec) -> dict[str, Any]:
+        """app-server ``thread/resume`` params: a per-thread ``config`` that
+        blanks ``mcp_servers`` (this MCP must not start recursively) and drops
+        ``developer_instructions`` (compaction passes them as
+        ``developerInstructions``), read-only sandbox, no turns echoed back."""
+        cfg: dict[str, Any] = {"mcp_servers": {}}
+        if spec.effort:
+            cfg["model_reasoning_effort"] = spec.effort
+        for k, v in (spec.backend_options or {}).get("config", {}).items():
+            cfg[k] = v
+        cfg.pop("developer_instructions", None)
+        return {
+            "threadId": spec.session_id, "cwd": spec.cwd or os.getcwd(),
+            "model": self._model_for(spec), "sandbox": "read-only",
+            "config": cfg, "excludeTurns": True,
+        }
+
+    def restore_rollout(self, spec: PairSpec, timeout_seconds: int = 120) -> str:
+        """Have Codex restore a rollout the Codex app compressed (see
+        ``COMPRESSED_NOTE``) without a model call: app-server ``thread/resume``
+        alone. Verified 2026-10-25 on 0.164: the plain .jsonl is back in ~1 s,
+        byte-identical, and Codex appends one ``thread_settings_applied``
+        record (the same one compaction's resume writes). Returns a one-line
+        note; raises CLIError unless the plain file is back AND the .zst is
+        gone (a half-finished restore must not be truncated by a rewind)."""
+        client = AppServerClient(
+            [codex_executable(), "app-server"] + config_readd_args(),
+            cwd=spec.cwd or None, timeout_seconds=timeout_seconds, kill=_tree_kill,
+        )
+        try:
+            with client:
+                with _INFLIGHT_LOCK:
+                    _INFLIGHT[spec.name] = {
+                        "proc": client.proc, "task_id": None, "started_at": datetime.utcnow(),
+                        "last_activity": datetime.utcnow(), "label": "restore",
+                    }
+                client.initialize()
+                client.request("thread/resume", self._thread_resume_params(spec))
+                # The reply can precede the rename; give it a few seconds.
+                deadline = time.monotonic() + _RESTORE_WAIT_SECONDS
+                while not self._rollout_plain(spec) and time.monotonic() < deadline:
+                    time.sleep(0.2)
+        finally:
+            with _INFLIGHT_LOCK:
+                if _INFLIGHT.get(spec.name, {}).get("proc") is client.proc:
+                    _INFLIGHT.pop(spec.name, None)
+        if not self._rollout_plain(spec):
+            p = self.transcript_path(spec)
+            state = ("the plain rollout is back but the .zst is still there"
+                     if p is not None and p.exists() and not is_compressed_rollout(p) else "no plain rollout")
+            raise CLIError(f"codex app-server thread/resume did not finish restoring the compressed rollout of "
+                           f"'{spec.name}' (thread {spec.session_id}: {state}); a pair_send restores it too")
+        self._log_line(spec, "=== ROLLOUT RESTORED from the Codex app's .zst (app-server thread/resume) ===")
+        return ("the Codex app had compressed this idle thread; restored it with codex app-server "
+                "thread/resume (no model call; Codex appended one thread_settings_applied record)")
+
+    def _rollout_plain(self, spec: PairSpec) -> bool:
+        """Restored: the plain rollout exists and its .zst is gone (only the
+        end state was observed, not the order of Codex's write and delete)."""
+        p = self.transcript_path(spec)
+        return (p is not None and not is_compressed_rollout(p) and p.exists()
+                and not compressed_sibling(p).exists())
+
     def _appserver_compact(self, spec: PairSpec, *, timeout_seconds: int,
                            should_stop: Callable[[], bool] | None = None) -> str | None:
         """Drive compaction through the shared stdio JSON-RPC client."""
@@ -1379,16 +2655,17 @@ class CodexAdapter(PairAdapter):
                         "last_activity": datetime.utcnow(), "label": "compact",
                     }
                 client.initialize()
-                cfg: dict[str, Any] = {"mcp_servers": {}}
-                if spec.effort:
-                    cfg["model_reasoning_effort"] = spec.effort
-                for k, v in (spec.backend_options or {}).get("config", {}).items():
-                    cfg[k] = v
-                client.request("thread/resume", {
-                    "threadId": spec.session_id, "cwd": spec.cwd or os.getcwd(),
-                    "model": self._model_for(spec), "sandbox": "read-only",
-                    "config": cfg, "excludeTurns": True,
-                })
+                params = self._thread_resume_params(spec)
+                # v0.19: compaction rebuilds the thread's initial context from
+                # THIS session's settings — without the instructions here they
+                # were gone afterwards (verified 2026-10-25: "NONE" after
+                # compacting; with ``developerInstructions`` the code word
+                # survived). JSON-RPC over stdin: no argv budget.
+                if (spec.codex_instructions or {}).get("mode") == "developer":
+                    text = instructions_text(spec)
+                    if text:
+                        params["developerInstructions"] = text
+                client.request("thread/resume", params)
                 client.request("thread/compact/start", {"threadId": spec.session_id})
                 # Keep the existing compaction notification/status interpretation.
                 saw_item = False
@@ -1430,19 +2707,26 @@ class CodexAdapter(PairAdapter):
 
     def context(self, spec: PairSpec, timeout_seconds: int = 60) -> ContextReport:
         """Zero-inference: the rollout's last ``token_count`` event."""
-        tc = read_last_token_count(self.transcript_path(spec))
+        path = self.transcript_path(spec)
+        if is_compressed_rollout(path):
+            raise CLIError(f"pair '{spec.name}': {COMPRESSED_NOTE}")
+        tc = read_last_token_count(path)
         if not tc:
             raise CLIError(f"no token_count recorded yet for pair '{spec.name}' (send a message first)")
         info = tc.get("info") or {}
         last = info.get("last_token_usage") or {}
         total = info.get("total_token_usage") or {}
         window = int(info.get("model_context_window") or 0)
-        used = current_context_tokens(info)
+        used = int(last.get("input_tokens") or 0) + int(last.get("output_tokens") or 0)
+        compacted = not last.get("input_tokens") and bool(live_context_tokens(info))
+        if compacted:
+            used = live_context_tokens(info) or 0
         pct = (used / window * 100) if window else 0.0
         cw = context_windows(spec.model)
         md = [
             f"**Model:** {spec.model}",
-            f"**Tokens:** {_fmt_tokens(used)} / {_fmt_tokens(window)} ({pct:.0f}%)",
+            f"**Tokens:** {_fmt_tokens(used)} / {_fmt_tokens(window)} ({pct:.0f}%)"
+            + (" — Codex's estimate after compaction; the next reply reports the real fill" if compacted else ""),
             f"- last call: input {last.get('input_tokens', 0):,} (cached {last.get('cached_input_tokens', 0):,}), "
             f"output {last.get('output_tokens', 0):,} (reasoning {last.get('reasoning_output_tokens', 0):,})",
             f"- thread total: input {total.get('input_tokens', 0):,}, output {total.get('output_tokens', 0):,}, "
@@ -1463,7 +2747,8 @@ class CodexAdapter(PairAdapter):
         raise CLIError(
             f"pair_invoke is not available for Codex pairs ('{spec.name}'): codex exec has "
             f"no slash-command channel. Ask for the behaviour in plain language via "
-            f"pair_send instead (Codex skills under ~/.codex/skills are picked up by name)."
+            f"pair_send instead (Codex loads skills from <workspace>/.codex/skills and "
+            f"<workspace>/.agents/skills by name; ~/.codex/skills does not load for pairs)."
         )
 
     def transcript_path(self, spec: PairSpec) -> Path | None:
@@ -1494,13 +2779,21 @@ class CodexAdapter(PairAdapter):
         return "\n\n".join(parts) if parts else None
 
     @staticmethod
-    def validate_backend_options(level: str, backend_options: dict[str, Any] | None) -> None:
+    def validate_backend_options(level: str, backend_options: dict[str, Any] | None, *,
+                                 spawn: bool = False) -> None:
         """Reject combinations the CLI itself refuses. Verified 0.153.4:
         ``--sandbox`` "cannot be used with ``--approve-for-me``" — the
         approve-for-me flag IMPLIES the workspace-write sandbox (help text +
         the recorded sandbox_policy of every auto-level probe thread), so an
         explicit ``backend_options.sandbox`` at the ``auto`` level has no
-        legal spelling. Raises ``ValueError`` with the remedy."""
+        legal spelling. Raises ``ValueError`` with the remedy.
+
+        v0.19 (create/update only — ``spawn=True`` skips these, so a value
+        stored before them, or a per-send override, never bricks a turn):
+        ``network`` / ``sandbox_note`` must be booleans, network needs a
+        sandbox that has it (read-only + network is refused, R8; a spawn
+        drops the network instead), and ``config`` may not set a key a v0.19
+        feature manages (R4)."""
         bo = backend_options or {}
         if not bo:
             return
@@ -1523,36 +2816,52 @@ class CodexAdapter(PairAdapter):
                 "workspace-write sandbox). Use permission_mode='workspace' (+ sandbox) or set "
                 "backend_options.approval='none'."
             )
+        if spawn:
+            return
+        for key in ("network", "sandbox_note"):
+            if key in bo and not isinstance(bo[key], bool):
+                raise ValueError(f"backend_options.{key} must be true or false (got {bo[key]!r})")
+        if bo.get("network") and sandbox_kind(lvl, bo) == "read-only":
+            raise ValueError(
+                "backend_options.network needs a sandbox with network access: use "
+                "permission_mode='workspace' (or 'auto') with network, not a read-only level.")
+        if approval == "approve-for-me" and sandbox_kind(lvl, bo) == "read-only":
+            # Without a profile --approve-for-me implies workspace-write, so
+            # this spelling would quietly make a read-only pair writable.
+            raise ValueError(
+                "backend_options.approval='approve-for-me' contradicts a read-only level: use "
+                "permission_mode='auto' for reviewed escalations.")
+        config = bo.get("config") or {}
+        if not isinstance(config, dict):
+            raise ValueError("backend_options.config must be an object of {toml key: value}")
+        for raw in config:
+            feature = _managed_config_feature(str(raw))
+            if feature:
+                raise ValueError(f"backend_options.config can't set {str(raw).strip()!r}: claude-squared "
+                                 f"manages it for {feature}.")
+            if _risky_feature_key(str(raw)):
+                raise ValueError(f"backend_options.config can't set {str(raw).strip()!r}: that feature touches "
+                                 f"the sandbox, approvals or how commands run (permission_mode decides those; "
+                                 f"set other features as features.<name>).")
+        validate_codex_args(bo.get("args"))
 
     @staticmethod
-    def permission_args(level: str, backend_options: dict[str, Any] | None = None) -> list[str]:
+    def permission_args(level: str, backend_options: dict[str, Any] | None = None, *,
+                        pair_name: str | None = None, exe: str | None = None) -> list[str]:
         """Neutral level → exec flags, honoring ``backend_options.sandbox`` /
         ``backend_options.approval`` native overrides.
 
-        ``auto`` emits ONLY ``--approve-for-me``: the flag implies the
-        workspace-write sandbox and the CLI refuses an explicit ``-s`` next to
-        it (verified 0.153.4). ``unrestricted`` emits only the bypass flag.
+        ``auto`` emits ``--approve-for-me`` and never ``-s``: the flag implies
+        the workspace-write sandbox and the CLI refuses an explicit ``-s``
+        next to it (verified 0.153.4). ``unrestricted`` emits only the bypass
+        flag. With ``pair_name`` on Windows the scratch folder, the
+        permission profile and network come along (:func:`sandbox_plan`).
         """
-        CodexAdapter.validate_backend_options(level, backend_options)
-        lvl = normalize_permission(level)
-        sandbox, approval = CODEX_PERMISSION_MAP[lvl]
-        bo = backend_options or {}
-        if bo.get("sandbox"):
-            sandbox = str(bo["sandbox"])
-        if bo.get("approval"):
-            a = str(bo["approval"]).lower()
-            approval = None if a in ("none", "never") else a
-        if approval == "bypass":
-            return ["--dangerously-bypass-approvals-and-sandbox"]
-        args: list[str] = []
-        if approval == "approve-for-me":
-            args.append("--approve-for-me")
-        elif sandbox:
-            args += ["-s", sandbox]
-        return args
+        CodexAdapter.validate_backend_options(level, backend_options, spawn=True)
+        return sandbox_plan(level, backend_options, pair_name=pair_name, exe=exe).args
 
     def _exec_args(self, spec: PairSpec, *, model: str | None, effort: str | None,
-                   permission_mode: str | None) -> list[str]:
+                   permission_mode: str | None, plan_out: list | None = None) -> list[str]:
         exe = codex_executable()
         cwd = spec.cwd or os.getcwd()
         args = [exe, "exec", "--json", "--skip-git-repo-check", "-C", cwd,
@@ -1577,13 +2886,18 @@ class CodexAdapter(PairAdapter):
             limit = int(cw[1] * 0.9) if cw and cw[1] else CODEX_1M_CONFIG["model_auto_compact_token_limit"]
             args += ["-c", f"model_auto_compact_token_limit={limit}"]
         bo = spec.backend_options or {}
-        for k, v in (bo.get("config") or {}).items():
-            args += ["-c", f"{k}={_toml_literal(v)}"]
-        args += self.permission_args(permission_mode or spec.permission_mode, bo)
-        for d in spec.extra_dirs or []:
-            args += ["--add-dir", d]
-        for extra in bo.get("args") or []:
-            args.append(str(extra))
+        level = permission_mode or spec.permission_mode
+        CodexAdapter.validate_backend_options(level, bo, spawn=True)
+        # The plan also filters backend_options.config / .args (profile mode
+        # drops what would override the profile) and places extra_dirs.
+        plan = sandbox_plan(level, bo, pair_name=spec.name, exe=exe, cwd=cwd, extra_dirs=spec.extra_dirs)
+        if plan_out is not None:
+            plan_out.append(plan)
+        # After backend_options.config: codex -c is last-wins, so the managed
+        # sandbox keys can't be overridden by a stored value.
+        args += plan.config_args
+        args += plan.args
+        args += plan.extra_args
         return args
 
     # ---- subprocess + logging --------------------------------------------
@@ -1652,9 +2966,7 @@ class CodexAdapter(PairAdapter):
                         log_available = False
 
         popen_kwargs: dict[str, Any] = {"cwd": spec.cwd or None}
-        if os.name == "nt":
-            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
-        else:
+        if os.name != "nt":
             popen_kwargs["start_new_session"] = True
         t0 = time.monotonic()
         if activity_turn is not None:
@@ -1867,6 +3179,17 @@ class CodexAdapter(PairAdapter):
             codex_turns.append_log(events_path, receipt, output, offset)
 
     @staticmethod
+    def _log_line(spec: PairSpec, text: str) -> None:
+        """One line in the pair's main.log outside a turn's own logging."""
+        try:
+            log_dir = logs_dir() / spec.name
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with open(log_dir / "main.log", "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {text}\n")
+        except OSError:
+            pass
+
+    @staticmethod
     def _count_lines(p: Path) -> int:
         if not p.exists():
             return 0
@@ -1983,12 +3306,11 @@ class CodexAdapter(PairAdapter):
         rollout = self.transcript_path(spec)
         tc = read_last_token_count(rollout)
         info = (tc or {}).get("info") or {}
-        last = info.get("last_token_usage") or {}
         window = int(info.get("model_context_window") or 0)
         if not window:
             cw = context_windows(model_used)
             window = (cw[1] if spec.context_window == "1m" else cw[0]) if cw else 258_400
-        used = int(last.get("input_tokens") or usage.get("input_tokens") or 0)
+        used = live_context_tokens(info) or int(usage.get("input_tokens") or 0)
         pct = (used / window * 100) if window else 0.0
         warning = None
         if pct >= STRONG_WARNING_THRESHOLD * 100:
@@ -2004,10 +3326,39 @@ class CodexAdapter(PairAdapter):
         notes.extend(e["message"] for e in events if e.get("type") == "_log_warning")
         denials: list[PermissionDenial] = []
         for line in (stderr or "").splitlines():
-            if _DENIAL_RE.search(line):
-                tool = "apply_patch" if "patch" in line.lower() else "exec"
-                denials.append(PermissionDenial(tool_name=tool,
-                                                tool_input={"detail": line.strip()[:300]}))
+            if not _DENIAL_RE.search(line):
+                continue
+            if _POLICY_BLOCKED_RE.search(line) or _APPROVAL_NEVER_RE.search(line):
+                tool_input: dict[str, Any] = {"detail": line.strip()[-300:]}
+                m = _REJECTED_CMD_RE.search(line)
+                if m:
+                    tool_input["command"] = m.group(1)[:200]
+                denials.append(PermissionDenial(
+                    tool_name="policy-blocked" if _POLICY_BLOCKED_RE.search(line) else "escalation-refused",
+                    tool_input=tool_input))
+                continue
+            tool = "apply_patch" if "patch" in line.lower() else "exec"
+            denials.append(PermissionDenial(tool_name=tool,
+                                            tool_input={"detail": line.strip()[:300]}))
+        # A policy refusal the pair recovered from in the same turn (plain
+        # Remove-Item after -Force was refused) is a note, not a handoff: a
+        # later successful command carries every non-flag word of the
+        # refused one.
+        succeeded = [self._item_preview(e["item"]) for e in events
+                     if e.get("type") == "item.completed"
+                     and (e.get("item") or {}).get("type") == "command_execution"
+                     and e["item"].get("exit_code") == 0 and e["item"].get("status") == "completed"]
+        kept: list[PermissionDenial] = []
+        for d in denials:
+            cmd = (d.tool_input or {}).get("command") if d.tool_name == "policy-blocked" else None
+            words = [w.strip("'\"").lower() for w in str(cmd or "").split() if not w.startswith("-")]
+            ran = next((c for c in succeeded if words and all(w in c.lower() for w in words)), None)
+            if ran:
+                notes.append(f"Codex refused `{cmd}` before running it (approval policy never); the pair then "
+                             f"ran `{ran}` instead")
+            else:
+                kept.append(d)
+        denials = kept
         # A shell command that the SANDBOX blocked fails with an OS
         # permission error in its own output (no router-level "rejected"
         # line): "Access to the path '…' is denied" (PowerShell), "Permission

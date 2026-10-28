@@ -80,6 +80,12 @@ your real `codex` auth and delete the threads they create.
 - `python tests/smoke_live_codex_update.py` — a running server following a
   Codex app update, including the binary vanishing between lookup and spawn
   (a create probe + three one-line Luna turns)
+- `python tests/smoke_live_codex_sandbox.py` — the Windows sandbox features
+  (0.19): scratch TEMP at workspace and read-only, credential read-denial on
+  canary files, the `-Force` refusal, network, developer instructions across
+  resume / `pair_compact` / `pair_clear`, the Python check (about ten short
+  Luna turns and one compaction). Its fixtures live under `~` (never under
+  `%TEMP%`); it prints any trust entries Codex adds to your `config.toml`
 
 ## Releasing
 

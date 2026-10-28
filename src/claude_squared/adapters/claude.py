@@ -33,6 +33,7 @@ from claude_squared.models import (
     split_model_tier,
 )
 from claude_squared.registry import claude_home, pairs_dir, profiles_dir
+from claude_squared.process_spawn import hidden_process_kwargs
 
 
 WARNING_THRESHOLD = 0.60
@@ -377,6 +378,9 @@ def claude_env(billing: str = "plan") -> dict[str, str]:
     on 2.1.296 it forces the permission mode to ``default`` ("allowed_non_write_users
     hardening"; review round 1, 2026-10-11), and Bash could read the key file anyway."""
     env = dict(os.environ)
+    # User hooks are inherited by pairs too. They must not arm manager
+    # watchers recursively (also covers create/fork before registration).
+    env["CLAUDE_SQUARED_PAIR"] = "1"
     env.pop("ANTHROPIC_API_KEY", None)
     if billing != "api":
         return env
@@ -497,7 +501,8 @@ def _cli_permission_choices() -> tuple[str, ...]:
     choices: tuple[str, ...] = ()
     try:
         out = subprocess.run([_claude_executable(), "--help"], capture_output=True, text=True,
-                             timeout=20, stdin=subprocess.DEVNULL, env=claude_env()).stdout
+                             timeout=20, stdin=subprocess.DEVNULL, env=claude_env(),
+                             **hidden_process_kwargs(console=False)).stdout
         i = out.find("--permission-mode")
         seg = out[i:i + 600] if i >= 0 else ""
         m = re.search(r"choices:\s*(.*?)\)", seg, re.S)
@@ -599,7 +604,8 @@ class ClaudeAdapter(PairAdapter):
             raise ValueError(
                 f"backend_options {unknown} are not Claude options. Claude takes 'settings' (a "
                 f"settings JSON object, passed as --settings) and 'args' (a list of raw CLI args); "
-                f"'config' / 'sandbox' / 'approval' are Codex-only.")
+                f"'config' / 'sandbox' / 'approval' / 'network' / 'sandbox_note' are Codex-only "
+                f"(a Claude pair already has network access).")
         if "settings" in bo:
             settings = bo["settings"]
             if isinstance(settings, str):
@@ -1021,6 +1027,7 @@ class ClaudeAdapter(PairAdapter):
                 check=False,
                 cwd=cwd,
                 env=env,
+                **hidden_process_kwargs(),
             )
         except subprocess.TimeoutExpired as e:
             raise CommandTimeout(pair_name, timeout_seconds) from e
@@ -1101,6 +1108,7 @@ class ClaudeAdapter(PairAdapter):
                 check=False,
                 cwd=spec.cwd,
                 env=env,
+                **hidden_process_kwargs(),
             )
         except subprocess.TimeoutExpired as e:
             raise CommandTimeout(spec.name, timeout_seconds) from e

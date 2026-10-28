@@ -218,7 +218,14 @@ def _dur(seconds: float) -> str:
 def _cmd(*args: str) -> str:
     """The exact command to re-arm this watcher."""
     here = Path(sys.argv[0]).resolve().as_posix() if sys.argv and sys.argv[0] else "wait.py"
-    return " ".join([shlex.quote(sys.executable), shlex.quote(here)] + [shlex.quote(a) for a in args])
+    command = " ".join([shlex.quote(sys.executable), shlex.quote(here)] + [shlex.quote(a) for a in args])
+    # A hook can supply a home the manager's Bash does not inherit. Preserve
+    # it in every re-arm line, including the alert's changed threshold/off
+    # alternatives (quench round 2, 2026-10-26).
+    home = os.environ.get("CLAUDE_HOME")
+    if home:
+        command = f"CLAUDE_HOME={shlex.quote(Path(home).resolve().as_posix())} {command}"
+    return command
 
 
 class Alert:

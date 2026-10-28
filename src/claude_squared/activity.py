@@ -570,6 +570,15 @@ def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,
         used = ctx.get("used")
         ctx.update(window=rep["tokens"], window_source="reported",
                    pct=round(used * 100.0 / rep["tokens"], 1) if isinstance(used, int) and used else None)
+    # A fill larger than the window is not a live context — e.g. a Codex
+    # compaction that recorded the thread's cumulative token usage
+    # (2026-10-15: 56,802,796 / 475,000). Treat it as unknown so pair_status
+    # and wait.py raise no context alert from it; the next turn re-reports.
+    if isinstance(ctx, dict):
+        used = ctx.get("used")
+        window = ctx.get("window") or rep.get("tokens")
+        if isinstance(used, int) and isinstance(window, int) and window > 0 and used > window:
+            ctx.update(used=None, pct=None, implausible_used=used)
 
     owner_pids = set(p for p, _s, _d in owners)
     lookback = now - timedelta(seconds=_AV_OWNER_LOOKBACK_S)
@@ -1158,8 +1167,13 @@ class ActivityWriter:
             ctx = st["context"]
             if post is not None and isinstance(ctx, dict):
                 window = ctx.get("window")
-                ctx.update(used=int(post), at=now, source="compaction",
-                           pct=round(post * 100.0 / window, 1) if window else None)
+                if window and post > window:
+                    # Not a context size (cumulative usage, say): unknown
+                    # until the next turn reports, never an alert.
+                    ctx.update(used=None, at=now, source="compaction", pct=None)
+                else:
+                    ctx.update(used=int(post), at=now, source="compaction",
+                               pct=round(post * 100.0 / window, 1) if window else None)
             self._mark(_URGENT)
         _poke()
 

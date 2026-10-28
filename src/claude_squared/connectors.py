@@ -14,6 +14,7 @@ from typing import Any
 
 from claude_squared.errors import PairError
 from claude_squared.models import normalize_permission
+from claude_squared.process_spawn import hidden_process_kwargs
 
 
 INVENTORY_TTL_SECONDS = 600
@@ -79,6 +80,8 @@ def _list_output(backend: str, cwd: str | None) -> str:
         from claude_squared.adapters.claude import _claude_executable, claude_env
         exe, spawn = _claude_executable(), subprocess.run
         extra["env"] = claude_env()  # v0.18.0: the plan, like every claude spawn
+        # Inventory queries can start connector subprocesses.
+        extra.update(hidden_process_kwargs())
     else:
         from claude_squared.adapters.codex import codex_executable, run_codex
         exe, spawn = codex_executable(), run_codex  # retries once if an update removed the binary

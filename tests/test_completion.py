@@ -559,6 +559,26 @@ class CompletionTests(unittest.TestCase):
         self.assertNotIn("Bash(run_in_background", text)
         self.assertIn("pair_poll", text)
 
+    def test_codex_notifications_take_precedence_over_configured_claude_hook(self):
+        with patch.object(S, "auto_watch_configured", return_value=True):
+            for notification in ("Codex completion notification armed", "Codex completion not armed"):
+                text = S._format_async_handle(str(uuid.uuid4()), "running", "child", notification)
+                self.assertIn(notification,text)
+                self.assertNotIn("auto-watch hook armed",text)
+                result = SendResult(name="child",session_id=self.session,response="INTERIM",model_used="fixture",duration_ms=1,background_launches=["Agent"])
+                text = S._fmt_send_result(result,tool="pair_send",notification=notification)
+                self.assertIn(notification,text)
+                self.assertNotIn("Bash(run_in_background",text)
+                self.assertNotIn("auto-watch hook armed",text)
+
+    def test_compressed_manager_defers_without_reading_or_restoring_it(self):
+        compressed=self.rollout.with_suffix(".jsonl.zst")
+        compressed.write_bytes(b"not plaintext")
+        with patch("claude_squared.adapters.codex.rollout_path_for",return_value=compressed):
+            with self.assertRaisesRegex(N.Deferred,"compressed"):
+                N.caller_snapshot(self.thread,self.turn)
+        self.assertEqual(compressed.read_bytes(),b"not plaintext")
+
     def test_inline_background_placeholder_arms_but_final_reply_does_not(self):
         result = SendResult(name="child", session_id=self.session, response="INTERIM",
                             model_used="fixture", duration_ms=1, background_launches=["Agent"])
@@ -573,9 +593,11 @@ class CompletionTests(unittest.TestCase):
         # not make that final inline reply arm a duplicate notification.
         result.background_launches = ["Agent"]
         self.view["background"] = []
-        with patch.object(S, "_build_send_runner", return_value=runner):
+        with patch.object(S, "_build_send_runner", return_value=runner), patch.object(S, "auto_watch_configured", return_value=True):
             text = asyncio.run(getattr(S.pair_send, "fn", S.pair_send)("child", "work", ctx=self.ctx))
         self.assertNotIn("notification armed", text)
+        self.assertNotIn("auto-watch hook armed", text)
+        self.assertNotIn("Bash(run_in_background", text)
         self.assertEqual(len(N.records()), 1)
 
     def test_fast_completed_self_woken_final_still_notifies_interim_caller(self):
@@ -604,6 +626,11 @@ class CompletionTests(unittest.TestCase):
 
 
 class BridgeTests(unittest.TestCase):
+    def test_current_and_legacy_app_pipe_names_only(self):
+        for prefix in ("codex-app-tools-", "codex-browser-use-"):
+            self.assertIsNotNone(B.PIPE_PATTERN.fullmatch("\\\\.\\pipe\\"+prefix+str(uuid.uuid4())))
+        for path in ("\\\\.\\pipe\\codex-ipc", "\\\\other\\pipe\\codex-app-tools-"+str(uuid.uuid4())):
+            self.assertIsNone(B.PIPE_PATTERN.fullmatch(path))
     def test_compaction_context_counter_never_uses_lifetime_total(self):
         from claude_squared.adapters.codex import current_context_tokens
         self.assertEqual(current_context_tokens({"last_token_usage":{"input_tokens":0,"output_tokens":0,"total_tokens":5094},

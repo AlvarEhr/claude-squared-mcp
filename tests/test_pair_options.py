@@ -1000,7 +1000,7 @@ class ServerToolTests(PairOptionsCase):
         # warm runtime must notice the change at its next get_or_start.
         for change in ({"disallowed_tools": ["Artifact"]}, {"backend_options": {"settings": {"language": "x"}}},
                        {"ultracode": True}, {"fallback_model": "sonnet"}, {"extra_dirs": ["D:/x"]},
-                       {"allowed_tools": ["Read"]}, {"system_prompt_append": "x"}, {"profile_name": "x"}):
+                       {"allowed_tools": ["Read"]}):
             with self.subTest(change=change):
                 registry = RuntimeRegistry()
                 old = SimpleNamespace(spec=self.spec(), is_alive=lambda: True, stop=Mock())
@@ -1010,19 +1010,24 @@ class ServerToolTests(PairOptionsCase):
                     result = registry.get_or_start(self.spec(**change), CL.ClaudeAdapter())
                 old.stop.assert_called_once()
                 self.assertIs(result, replacement)
-        registry = RuntimeRegistry()
-        same = SimpleNamespace(spec=self.spec(context_alert_at=1), is_alive=lambda: True, stop=Mock())
-        registry._runtimes["p"] = same
-        # context_alert_at is not spawn-pinned: the warm runtime is kept.
-        self.assertIs(registry.get_or_start(self.spec(context_alert_at=350_000), CL.ClaudeAdapter()), same)
-        same.stop.assert_not_called()
+        # context_alert_at is not spawn-pinned, and (v0.19) neither are the
+        # appended system prompt fields — the CLI keeps a session's first
+        # one, so a respawn would change nothing: the warm runtime is kept.
+        for change in ({"context_alert_at": 350_000}, {"system_prompt_append": "x"}, {"profile_name": "x"}):
+            with self.subTest(change=change):
+                registry = RuntimeRegistry()
+                same = SimpleNamespace(spec=self.spec(), is_alive=lambda: True, stop=Mock())
+                registry._runtimes["p"] = same
+                self.assertIs(registry.get_or_start(self.spec(**change), CL.ClaudeAdapter()), same)
+                same.stop.assert_not_called()
 
     def test_runtime_and_update_share_one_spawn_field_list(self):
         self.assertIs(S._SPAWN_PINNED_FIELDS, RT.SPAWN_PINNED_FIELDS)
         for field in ("disallowed_tools", "backend_options", "ultracode", "fallback_model", "extra_dirs",
-                      "allowed_tools", "mcp_whitelist", "system_prompt_append", "profile_name"):
+                      "allowed_tools", "mcp_whitelist"):
             self.assertIn(field, RT.SPAWN_PINNED_FIELDS)
-        self.assertNotIn("context_alert_at", RT.SPAWN_PINNED_FIELDS)
+        for field in ("context_alert_at", "system_prompt_append", "profile_name"):
+            self.assertNotIn(field, RT.SPAWN_PINNED_FIELDS)
 
     def test_unchanged_options_keep_the_warm_runtime(self):
         # Both specs are read back from the registry: unchanged, non-empty

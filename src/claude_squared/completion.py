@@ -24,7 +24,7 @@ from claude_squared.registry import claude_home
 logger = logging.getLogger(__name__)
 # Fence older dispatchers whose path/build preflight could reject a valid
 # manager or impose shared retry_at backoff. Existing work remains readable.
-VERSION = 5
+VERSION = 6
 MAX_WAIT = 6 * 3600
 MAX_CONTROL_RECORD = 8 * 1024 * 1024
 # Codex's canonical JSONL envelope lets us skip huge messages/tool outputs
@@ -62,7 +62,7 @@ def _read(path):
         if path.stat().st_size > 128 * 1024:
             return None
         data = json.loads(path.read_text(encoding="utf-8"))
-        if (not isinstance(data, dict) or data.get("version") not in (1, 2, 3, 4, VERSION)
+        if (not isinstance(data, dict) or data.get("version") not in (1, 2, 3, 4, 5, VERSION)
                 or not UUID.fullmatch(str(data.get("id", "")))
                 or path.stem != data.get("id")
                 or not UUID.fullmatch(str(data.get("thread", "")))
@@ -221,11 +221,13 @@ def manager_records(stream, marker=None):
 
 
 def caller_snapshot(thread, turn, marker=None):
-    from claude_squared.adapters.codex import codex_home, rollout_path_for
+    from claude_squared.adapters.codex import codex_home, rollout_path_for, is_compressed_rollout
 
     path = rollout_path_for(thread)
     if path is None:
         raise Refused("manager rollout is unavailable or archived")
+    if is_compressed_rollout(path):
+        raise Deferred("manager rollout is compressed; resume the manager chat to restore it")
     path = path.resolve()
     if not comparison_path(path).is_relative_to(comparison_path((codex_home() / "sessions").resolve())):
         raise Refused("manager is not an active local session")

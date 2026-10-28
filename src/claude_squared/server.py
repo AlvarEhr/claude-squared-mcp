@@ -36,7 +36,7 @@ from claude_squared import settings as settings_mod
 from claude_squared.adapters import ClaudeAdapter, CodexAdapter, PairAdapter
 from claude_squared.adapters import codex as codex_adapter_mod
 from claude_squared.cli_paths import encode_cwd_for_project as _encode_cwd_for_project
-from claude_squared.errors import BillingError, PairAlreadyExists, PairError, PairNotFound
+from claude_squared.errors import BillingError, CLIError, PairAlreadyExists, PairError, PairNotFound
 from claude_squared.models import (
     BACKENDS,
     BILLING_MODES,
@@ -83,6 +83,12 @@ except OSError:
     # Non-fatal: the runtime hint will fall back to the in-package form.
     # User can still poll manually via pair_poll.
     _WAIT_SCRIPT_PATH = None
+
+from claude_squared._auto_watch_script import auto_watch_configured, install_auto_watch_script
+try:
+    _AUTO_WATCH_SCRIPT_PATH = install_auto_watch_script(reg_mod.pairs_dir() / "auto_watch.py")
+except OSError:
+    _AUTO_WATCH_SCRIPT_PATH = None
 
 
 # Server-side cap on how long pair_send will hold the JSON-RPC call before
@@ -209,7 +215,12 @@ def _normalize_path_list(paths: list[str] | None) -> list[str] | None:
     return out or None
 
 
-def _fmt_send_result(r: SendResult) -> str:
+# PermissionDenial.tool_name values CodexAdapter gives refusals at approval
+# policy never (stderr only; the command never ran).
+_CODEX_POLICY_REFUSALS = ("policy-blocked", "escalation-refused")
+
+
+def _fmt_send_result(r: SendResult, tool: str | None = None, notification: str | None = None) -> str:
     # Visual separator so the agent can clearly see where the pair's response
     # starts/ends in the UI (otherwise the response text bleeds into the agent's
     # surrounding message). Bottom marker doubles as the footer (in brackets).
@@ -305,14 +316,19 @@ def _fmt_send_result(r: SendResult) -> str:
         from collections import Counter as _Counter
         _kinds = _Counter(r.background_launches)
         _desc = ", ".join(f"{n} {k}" for k, n in _kinds.items())
+        watch_hint = notification if notification is not None else (
+            "auto-watch hook armed — don't start wait.py"
+            if tool and auto_watch_configured(_AUTO_WATCH_SCRIPT_PATH, tool) else
+            f'Bash(run_in_background=True, command="{_watcher_cmd(r.name)}") '
+            "follows the pair until it is idle"
+        )
         lines.append(
             f"⏳ BACKGROUND WORK LAUNCHED ({_desc}): this turn started background work "
             f"and ended before it finished — the reply above may be a placeholder. "
             f"The pair will wake itself when the work completes; that continuation is "
             f"tracked as its OWN task: pair_poll('{r.name}', wait_seconds=30) waits "
             f"for the wake-up and shows its reply; pair_status('{r.name}') shows what's "
-            f"still out; Bash(run_in_background=True, command=\"{_watcher_cmd(r.name)}\") "
-            f"follows the pair until it is idle. Do NOT re-send the same request."
+            f"still out; {watch_hint}. Do NOT re-send the same request."
         )
     _lost = [c for c in (r.self_woken_completed or []) if c.get("status") == "background_lost"]
     for _c in _lost:
@@ -368,7 +384,10 @@ def _fmt_send_result(r: SendResult) -> str:
         # any content the model composed inside the call is gone with it.
         interactive = [t for t in counts if t in HEADLESS_INCOMPATIBLE_TOOLS]
         guardian = [t for t in counts if t == "guardian-review"]
-        permissionish = [t for t in counts if t not in HEADLESS_INCOMPATIBLE_TOOLS and t != "guardian-review"]
+        # v0.19: Codex refused these BEFORE running them (approval never).
+        policy = [t for t in counts if t in _CODEX_POLICY_REFUSALS]
+        permissionish = [t for t in counts if t not in HEADLESS_INCOMPATIBLE_TOOLS and t != "guardian-review"
+                         and t not in _CODEX_POLICY_REFUSALS]
 
         lines.append(
             f"\n⛔ PAIR HANDOFF: pair '{r.name}' (permission level '{mode}'{native}) had "
@@ -396,6 +415,21 @@ def _fmt_send_result(r: SendResult) -> str:
                 f"To allow it, the USER must authorize: then re-send with "
                 f"override_permission_mode=\"unrestricted\", or widen the workspace "
                 f"(pair_update extra_dirs=[...]) so the action no longer needs an escalation."
+            )
+        if policy:
+            _cmds = [str((d.tool_input or {}).get("command")) for d in r.permission_denials
+                     if d.tool_name in _CODEX_POLICY_REFUSALS and (d.tool_input or {}).get("command")]
+            lines.append(
+                f"\n   • {', '.join(policy)}: Codex refused "
+                + (f"`{_cmds[0]}`" + (f" (+{len(_cmds) - 1} more)" if len(_cmds) > 1 else "") if _cmds
+                   else "the command")
+                + f" BEFORE running it — it never ran. At this level the approval policy is "
+                f"\"never\", so Codex can't ask anyone: `Remove-Item -Force` and any request for "
+                f"escalated permissions (a git commit writes the protected .git folder) are refused "
+                f"outright.\n"
+                f"     Remedies: ask the pair to rephrase (plain `Remove-Item` without -Force works); "
+                f"or, with the user's OK, pair_update('{r.name}', permission_mode='auto') so escalations "
+                f"go to Codex's auto-reviewer; or make the commit yourself."
             )
         if permissionish:
             denied_p = ", ".join(permissionish)
@@ -868,8 +902,9 @@ def pair_create(
             tokens per turn. **If the pair will scour large files or whole repos,
             pick ``1m``** — a compaction costs a full-context turn, so the window is the budget.
         system_prompt_append: Text appended to the default system prompt. Pinned at
-            create. Codex: delivered as the thread's first user message (exec has no
-            system-prompt flag); it persists in the thread history.
+            create (``pair_update`` changes it for the next ``pair_clear``). Codex:
+            delivered as developer instructions, re-sent every turn so they survive
+            compaction (over ~28K command-line chars: the thread's first message).
         profile_name: ``~/.claude/pairs/profiles/<name>.md``, a shared role prompt. Combines
             with ``system_prompt_append``: profile text first, then the append.
         allowed_tools: Claude permission patterns like ``["Bash(git *)", "Read"]``.
@@ -893,7 +928,10 @@ def pair_create(
             ``config`` {toml key: value} extra ``-c`` overrides; ``args`` [raw exec
             args]; ``sandbox`` / ``approval`` native override of the permission
             translation (sandbox: read-only|workspace-write|danger-full-access;
-            approval: none|approve-for-me|bypass). Claude keys: ``settings`` {settings
+            approval: none|approve-for-me|bypass); ``network`` true = network inside
+            the workspace/auto sandbox (Windows: HTTPS works from Python and git, not
+            PowerShell/curl; refused at read-only); ``sandbox_note`` false drops the
+            Windows sandbox note from the instructions. Claude keys: ``settings`` {settings
             JSON}, merged with ``ultracode`` into the one ``--settings`` flag; ``args``
             [raw CLI args], appended at the end of every spawn. Both re-applied at every
             spawn. ``settings`` takes only ``permissions`` (``deny`` / ``ask`` /
@@ -1091,7 +1129,10 @@ def pair_create(
             _refuse_detached_codex(name)
             adapter = _adapter_for(spec)
             result = adapter.create(spec, initial_message=None)
-            reg_mod.update_pair(name, session_id=result.session_id, turn_count=0)
+            _created: dict[str, Any] = {"session_id": result.session_id, "turn_count": 0}
+            if result.instructions is not None:
+                _created["codex_instructions"] = result.instructions
+            reg_mod.update_pair(name, **_created)
     except FileLockTimeout:
         try:
             reg_mod.remove_pair(name)
@@ -1106,6 +1147,10 @@ def pair_create(
         raise
 
     transparency_msgs.extend(result.notes)
+    if be == "codex":
+        # v0.19: scratch / profile / network, plus the Python-in-sandbox check
+        # (Windows; advisory, cached per binary + interpreter).
+        transparency_msgs.extend(codex_adapter_mod.sandbox_notes(spec, python_check=True, detail=True))
     # Echo the RESOLVED values (not what the caller passed) so the agent always
     # sees what got applied — defaults filled in, match-parent expanded, effort
     # coerced. Followed by any transparency messages (one per line of context).
@@ -1145,13 +1190,17 @@ def pair_create(
             # Reuse the standard async-handle framing so initial-message guidance
             # matches what agents see from pair_send / pair_send_async — keeps
             # the imperative "RUN THIS NOW" wording consistent across all paths.
-            line += "\n" + _format_async_handle(
+            handle = _format_async_handle(
                 state.task_id,
                 "Initial message queued as an async task (long Opus briefings "
                 "can take minutes; this avoids the host RPC timeout).",
                 pair_name=name,
                 notification=notification,
+                tool="pair_create",
             )
+            line += "\n" + handle
+            if verbose:
+                transparency_msgs.append(handle)
         except Exception as e:
             line += f"\n(initial_message queue failed: {e}; send manually via pair_send)"
 
@@ -1225,10 +1274,35 @@ def pair_adopt(
     eff_display = coerced_effort if coerced_effort is not None else "none"
     line = (f"Adopted {'codex thread' if be == 'codex' else 'session'} {_short(session_id)} as "
             f"pair '{name}' (model {model}, effort {eff_display}, permission {level})")
-    for m in (coercion_msg, model_note):
+    for m in (coercion_msg, model_note, codex_adapter_mod.compressed_rollout_note(spec)):
         if m:
             line += f"\n  {m}"
     return line
+
+
+def _archive_transcript(adapter: PairAdapter, spec: PairSpec, stem: str) -> tuple[str | None, str | None]:
+    """Copy the pair's transcript into the archive as ``<stem>.jsonl``; a
+    rollout the Codex app compressed is copied as-is to ``<stem>.jsonl.zst``
+    (there is no zstd decoder here). Returns ``(path, note)`` — (None, None)
+    when there is no transcript. The path is looked up again and the copy
+    retried once on OSError: Codex can restore (or the app compress) the
+    rollout between the lookup and the copy. A second failure raises."""
+    for attempt in (1, 2):
+        src = adapter.transcript_path(spec)
+        if not src or not src.exists():
+            return None, None
+        compressed = codex_adapter_mod.is_compressed_rollout(src)
+        dst = reg_mod.archive_dir() / (f"{stem}.jsonl{codex_adapter_mod.ZST_SUFFIX}" if compressed
+                                       else f"{stem}.jsonl")
+        try:
+            shutil.copy2(src, dst)
+        except OSError:
+            if attempt == 2:
+                raise
+            continue
+        return str(dst), ("copied as-is: the Codex app had compressed the idle thread, so the copy is zstd"
+                          if compressed else None)
+    return None, None
 
 
 @mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False})
@@ -1271,21 +1345,35 @@ def _forget_pair(name: str, archive: bool) -> str:
             pass
     spec = reg_mod.remove_pair(name)
     archived: str | None = None
+    archive_note: str | None = None
+    archive_failed: str | None = None
     if archive:
-        adapter = _adapter_for(spec)
-        src = adapter.transcript_path(spec)
-        if src and src.exists():
-            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-            dst = reg_mod.archive_dir() / f"{name}-{ts}.jsonl"
-            shutil.copy2(src, dst)
-            archived = str(dst)
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        try:
+            archived, archive_note = _archive_transcript(_adapter_for(spec), spec, f"{name}-{ts}")
+        except OSError as e:
+            # The pair is already out of the registry: finish the cleanup
+            # below and report the copy instead of failing half-way.
+            archive_failed = f"transcript not archived: {e}"
     try:
         activity_mod.forget(name)
     except Exception:
         pass
+    scratch_left: str | None = None
+    if spec.backend == "codex":
+        # v0.19 (R12): after the turn was stopped above; best-effort, a
+        # leftover is reported and never fails the forget.
+        try:
+            scratch_left = codex_adapter_mod.remove_scratch(name)
+        except Exception as e:
+            scratch_left = f"scratch folder not removed: {e}"
     msg = f"Forgot '{name}' (session {_short(spec.session_id)})"
     if archived:
-        msg += f"; archived to {archived}"
+        msg += f"; archived to {archived}" + (f" ({archive_note})" if archive_note else "")
+    if archive_failed:
+        msg += f"\n⚠ {archive_failed}"
+    if scratch_left:
+        msg += f"\n⚠ {scratch_left}"
     note = _lost_note(lost)
     if note:
         msg += f"\n⚠ {note}"
@@ -2069,19 +2157,17 @@ def _watcher_cmd(ref: str) -> str:
 
 
 def _format_async_handle(task_id: str, why: str, pair_name: str | None = None,
-                         notification: str | None = None) -> str:
+                         notification: str | None = None, tool: str = "pair_send_async") -> str:
     """Terse runtime hint when an operation degrades to async.
 
-    Returns the task_id, three concrete poll commands, and a one-line nudge to
-    run the Bash watcher for hands-off notification — full pedagogy lives in
-    pair_send / pair_send_async docstrings.
+    Returns the task_id and poll hints. With the opt-in hook configured, tell
+    the manager to await its wake; otherwise suggest the manual Bash watcher.
 
     When ``pair_name`` is given, the poll hints use the PAIR NAME rather than the
     raw UUID — ``pair_poll('reviewer')`` resolves to the pair's latest task.
     Agents reliably fumble the long task id but always know the pair name, so
-    this is the easy, hard-to-get-wrong path. (The Bash watcher still uses the
-    exact task id — it's pasted programmatically right here, not retyped later,
-    and wait.py resolves by task file.)
+    this is the easy, hard-to-get-wrong path. The watcher also follows the pair
+    by name, through background work and subsequent self-woken turns.
 
     The watcher command points at the standalone ``~/.claude/pairs/wait.py``
     (installed at server startup) — stdlib-only, so it works regardless of
@@ -2111,6 +2197,14 @@ def _format_async_handle(task_id: str, why: str, pair_name: str | None = None,
         "included; add --each-turn to return after the next turn instead)\n"
         if pair_name else ""
     )
+    if notification is None and pair_name and auto_watch_configured(_AUTO_WATCH_SCRIPT_PATH, tool):
+        return (
+            f"{why}\nAsync task: {task_id}\n"
+            f"  pair_poll('{poll_ref}', with_turn_log=True)  # read the result on wake\n"
+            f"{name_hint}"
+            "auto-watch hook armed — don't start wait.py. "
+            "The hook follows the pair until idle, including background work and self-woken turns."
+        )
     return (
         f"{why}\n"
         f"Async task: {task_id}\n"
@@ -2547,8 +2641,9 @@ async def pair_send(
     ``CLAUDE_PAIR_SYNC_CAP_SECONDS`` (default 45s) below the host's RPC timeout —
     if your patience > cap, the handle includes both numbers and the remaining
     patience for ``pair_poll``/``pair_wait``. See README "Async handles" for
-    the recommended notification-driven pattern (run a backgrounded
-    ``python -m claude_squared wait <id>`` to get fired a completion notification).
+    the notification-driven pattern: when the response says "auto-watch hook
+    armed", await its wake without starting wait.py; otherwise run the suggested
+    Bash watcher in the background.
     ``wait.py <pair>`` follows the pair until idle (``--each-turn``: until the next turn
     ends); exits 0 done/idle, 1 failed, 2 not found, 3 timeout (re-arm), 4 orphaned,
     5 stopped, 6 crashed, 7 finished detached, 8 context alert, 9 background lost,
@@ -2636,7 +2731,10 @@ async def pair_send(
             if notification is not None:
                 value["codex_completion_notification"] = notification
             return json.dumps(value, ensure_ascii=False, indent=2)
-        return _fmt_send_result(final.result) + ("\n" + notification if notification else "")
+        codex_caller = ("hint" not in notification_context or notification_context["hint"] is not None)
+        guidance = notification or ("Inspect pair_status or pair_poll for any background continuation."
+                                    if codex_caller else None)
+        return _fmt_send_result(final.result, tool="pair_send", notification=guidance)
 
     if final.status == "failed":
         raise PairError(f"pair_send to '{name}' failed: {final.error or '(no error message)'}")
@@ -2670,7 +2768,7 @@ async def pair_send(
             f"Sync wait timed out at {rpc_hold_s}s (pair '{name}' still working "
             f"under hard_timeout={hard_str})."
         )
-    return _format_async_handle(state.task_id, framing, pair_name=name,
+    return _format_async_handle(state.task_id, framing, pair_name=name, tool="pair_send",
                                 notification=completion.arm(state, ctx, notification_context))
 
 
@@ -2689,7 +2787,7 @@ def pair_send_async(
     Use ``pair_poll(task_id)`` for status. An opt-in Codex Desktop completion
     adapter can wake the calling full-access manager; the returned handle says
     whether it was armed. Other hosts: background-run wait.py through your
-    harness's notification mechanism — see README "Async handles".
+    optional Claude auto-watch hook or harness notification mechanism — see README "Async handles".
     ``wait.py <pair>`` follows the pair until idle (``--each-turn``: until the next turn
     ends); exits 0 done/idle, 1 failed, 2 not found, 3 timeout (re-arm), 4 orphaned,
     5 stopped, 6 crashed, 7 finished detached, 8 context alert, 9 background lost,
@@ -3187,6 +3285,12 @@ def pair_list(verbose: bool = False) -> str:
     )
 
 
+def _transcript_state(path: Path | None, exists: bool) -> str:
+    if exists and codex_adapter_mod.is_compressed_rollout(path):
+        return f"ok, compressed — {codex_adapter_mod.COMPRESSED_NOTE}"
+    return "ok" if exists else "MISSING"
+
+
 @mcp.tool(output_schema=None, annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True})
 def pair_info(name: str, verbose: bool = False) -> str:
     """Get full configuration + stats for one pair.
@@ -3223,11 +3327,27 @@ def pair_info(name: str, verbose: bool = False) -> str:
         bo += f"\n  cost: ${spec.total_cost_usd:.2f} at list prices"
         if spec.api_cost_usd or spec.billing == "api":
             bo += f", ${spec.api_cost_usd:.2f} of it billed to the API key"
+    else:
+        # v0.19: the sandbox (scratch / profile / network) and how this
+        # thread got its instructions.
+        for _n in codex_adapter_mod.sandbox_notes(spec, probe=False):
+            bo += f"\n  {_n}"
+        _rec = spec.codex_instructions or {}
+        if _rec.get("mode") == "developer":
+            _changed = codex_adapter_mod.instructions_changed(spec)
+            if _rec.get("chars") or _changed:
+                bo += f"\n  instructions: developer instructions ({_rec.get('chars', 0):,} chars at thread start)"
+            if _changed:
+                bo += (" — changed since; the new text takes effect at the next compaction or "
+                       "pair_clear")
+        elif spec.system_prompt_append or spec.profile_name:
+            bo += ("\n  instructions: in the thread's first message (thread predates 0.19, adopted "
+                   "or handed off); pair_clear moves it to developer instructions")
     return (
         f"{name}:\n"
         f"  backend: {spec.backend}\n"
         f"  {'thread' if spec.backend == 'codex' else 'session'}: {spec.session_id} "
-        f"(transcript: {'ok' if info.transcript_exists else 'MISSING'})\n"
+        f"(transcript: {_transcript_state(tpath, info.transcript_exists)})\n"
         f"  model: {spec.model}, effort: {spec.effort}, permission: {spec.permission_mode}{native}, "
         f"context_window: {spec.context_window}{bo}\n"
         f"  turns: {spec.turn_count}, last active: {_fmt_local(spec.last_active_at)}\n"
@@ -3272,6 +3392,8 @@ def pair_transcript(
     tpath = adapter.transcript_path(spec)
     if not tpath:
         return "(no transcript found)"
+    if codex_adapter_mod.is_compressed_rollout(tpath):
+        return f"Pair '{name}': {codex_adapter_mod.COMPRESSED_NOTE}."
     turns = transcript_mod.tail_turns(tpath, last_n=last_n)
     if not turns:
         return "(no turns)"
@@ -3377,6 +3499,7 @@ def pair_update(
     disallowed_tools: str | list[str] | None = None,
     context_alert_at: int | str | None = None,
     billing: str | None = None,
+    system_prompt_append: str | None = None,
 ) -> str:
     """Update mutable settings of an existing pair (per-pair, not defaults —
     use ``pair_settings_set`` for user-wide defaults).
@@ -3412,7 +3535,10 @@ def pair_update(
         takes effect on next ``pair_invoke``. Pass ``[]`` for lockdown.
       - **Pinned-at-create** (``allowed_tools``/
         ``system_prompt_append``): registry updated but only takes effect after
-        ``pair_clear`` (rotates session). ``cwd``/``extra_dirs`` take effect on
+        ``pair_clear`` (rotates session) — the Claude CLI keeps a session's
+        first appended system prompt. Codex threads created by 0.19+ get their
+        instructions re-sent every turn and pick a change up at the next
+        compaction too. ``""`` clears it. ``cwd``/``extra_dirs`` take effect on
         next spawn after eviction; a Claude ``cwd`` change also moves the session
         JSONL across project dirs (rejected with recovery hint if move fails).
     """
@@ -3483,8 +3609,11 @@ def pair_update(
                 _bo = fields.get("backend_options", cur_spec.backend_options)
                 _lvl = fields.get("permission_mode", cur_spec.permission_mode)
                 if _bo:
+                    # v0.19: only an INCOMING value gets the full check — a
+                    # stored pre-0.19 value must not stop, say, an effort
+                    # change; the stored one is held to what the CLI refuses.
                     try:
-                        CodexAdapter.validate_backend_options(_lvl, _bo)
+                        CodexAdapter.validate_backend_options(_lvl, _bo, spawn="backend_options" not in fields)
                     except ValueError as e:
                         raise PairError(str(e))
                 if ultracode:
@@ -3493,6 +3622,8 @@ def pair_update(
                     raise PairError("fallback_model is Claude-only (--fallback-model); Codex has no equivalent.")
             if purpose is not None:
                 fields["purpose"] = purpose
+            if system_prompt_append is not None:
+                fields["system_prompt_append"] = system_prompt_append.strip() or None
             if allowed_tools is not None:
                 fields["allowed_tools"] = _coerce_to_str_list(allowed_tools)
             if mcp_whitelist is not None:
@@ -3645,7 +3776,19 @@ def pair_update(
             # it inline so they don't have to dig into the README.
             pinned_at_create = {"allowed_tools", "system_prompt_append"}
             pinned_changed = sorted(pinned_at_create & fields.keys())
-            if pinned_changed:
+            if pinned_changed and spec.backend == "codex" and pinned_changed == ["system_prompt_append"]:
+                # v0.19: a developer-instructions thread is re-sent the text
+                # every turn, but Codex rebuilds it only at a compaction.
+                if (spec.codex_instructions or {}).get("mode") == "developer":
+                    pinned_warning = (
+                        f"Note: system_prompt_append takes effect at this thread's next compaction "
+                        f"(pair_compact('{name}') or Codex's own) or at pair_clear('{name}').")
+                else:
+                    pinned_warning = (
+                        f"Note: this thread carries its instructions in its first message; "
+                        f"pair_clear('{name}') starts a thread with the new value (as developer "
+                        f"instructions).")
+            elif pinned_changed:
                 pinned_warning = (
                     f"Note: {', '.join(pinned_changed)} pinned to existing session. "
                     f"Run pair_clear('{name}') for the new value(s) to take effect "
@@ -3653,6 +3796,8 @@ def pair_update(
                 )
             else:
                 pinned_warning = None
+            if spec.backend == "codex" and {"backend_options", "permission_mode"} & fields.keys():
+                transparency_msgs.extend(codex_adapter_mod.sandbox_notes(spec))
             update_msgs = list(transparency_msgs)
             if cwd_move_msg:
                 update_msgs.append(cwd_move_msg)
@@ -4398,7 +4543,6 @@ def pair_clear(name: str, archive_old: bool = True, verbose: bool = False, force
             spec = reg_mod.get_pair(name)
             adapter = _adapter_for(spec)
             old_sid = spec.session_id
-            old_path = adapter.transcript_path(spec)
             _refuse_if_background(name, "clearing", force)
 
             # Tear down any live runtime — it's pinned to the old session_id
@@ -4415,23 +4559,38 @@ def pair_clear(name: str, archive_old: bool = True, verbose: bool = False, force
             # Initialize the new session by sending a minimal probe
             created = adapter.create(new_spec)
             new_sid = created.session_id
+            _cleared: dict[str, Any] = {}
+            if created.instructions is not None:
+                # v0.19: a new Codex thread — a pre-0.19 or handed-off pair moves
+                # to developer instructions here.
+                _cleared["codex_instructions"] = created.instructions
             reg_mod.update_pair(name, session_id=new_sid, turn_count=0, total_cost_usd=0.0,
-                                last_active_at=datetime.utcnow())
+                                last_active_at=datetime.utcnow(), **_cleared)
 
             archived: str | None = None
-            if archive_old and old_path and old_path.exists():
+            archive_note: str | None = None
+            archive_failed: str | None = None
+            if archive_old:
                 ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-                dst = reg_mod.archive_dir() / f"{name}-{ts}-cleared.jsonl"
-                shutil.copy2(old_path, dst)
-                archived = str(dst)
+                try:
+                    # ``spec`` still names the OLD session here.
+                    archived, archive_note = _archive_transcript(adapter, spec, f"{name}-{ts}-cleared")
+                except OSError as e:
+                    # The pair already runs on its new session: report, don't fail.
+                    archive_failed = f"old transcript not archived: {e}"
             if verbose:
                 return json.dumps({"old_session_id": old_sid, "new_session_id": new_sid,
-                                   "archived_to": archived}, indent=2)
+                                   "archived_to": archived, "archive_note": archive_note or archive_failed},
+                                  indent=2)
             msg = f"Cleared '{name}': {_short(old_sid)} → {_short(new_sid)}"
             if archived:
-                msg += f" (archived to {archived})"
+                msg += f" (archived to {archived}" + (f"; {archive_note})" if archive_note else ")")
+            if archive_failed:
+                msg += f"\n⚠ {archive_failed}"
             if _lost_note(lost):
                 msg += f"\n⚠ {_lost_note(lost)}"
+            for _n in created.notes:
+                msg += f"\n  {_n}"
             return msg
     except FileLockTimeout:
         raise PairError(f"Pair '{name}' is busy in another process; could not acquire lock to clear.")
@@ -4753,6 +4912,7 @@ def pair_handoff(
                 f"Sync wait held for {rpc_hold}s (stated patience {timeout_seconds}s); "
                 f"handoff briefing for '{target}' continues with no auto-kill.", pair_name=target,
                 notification=completion.arm(state, ctx, notification_context),
+                tool="pair_handoff",
             ))
     except Exception as exc:
         lines.append(f"Pair '{target}' remains registered, but its briefing could not be completed: {exc}. "
@@ -4842,30 +5002,48 @@ def pair_fork(name: str, new_name: str | None = None, verbose: bool = False) -> 
     return msg
 
 
-@mcp.tool(output_schema=None, annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True})
+@mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False})
 def pair_rewind_points(name: str, last_n: int = 20, verbose: bool = False) -> str:
     """List the points a pair can be rewound to (genuine user-message boundaries).
 
-    Read-only. Each point is a "back to when you said X" boundary, enriched with
+    Changes nothing, except on a Codex thread the Codex app compressed (idle
+    about a week): Codex restores it first, without a model call, appending
+    one settings record — the result says so. Each point is a "back to when
+    you said X" boundary, enriched with
     what the pair DID afterward (assistant turns / tool calls / files written
     before the next user message) so you can choose WITHOUT reading the
     transcript. Pass the chosen point number to ``pair_rewind(name, to_point=N)``.
 
     Cutting only at user-message boundaries guarantees no dangling tool_use is
     left (which would make the next turn invalid).
+
+    verbose=True returns the JSON list of points — or, when a compressed
+    thread was restored, ``{"restore_note": ..., "points": [...]}``.
     """
     from claude_squared.transcript import list_user_turn_points
     spec = reg_mod.get_pair(name)
     adapter = _adapter_for(spec)
     path = adapter.transcript_path(spec)
+    restored: str | None = None
+    if spec.backend == "codex" and codex_adapter_mod.is_compressed_rollout(path):
+        try:
+            with _with_pair_lock(name):
+                _refuse_detached_codex(name)
+                spec = reg_mod.get_pair(name)
+                restored = _restore_compressed_rollout(spec, adapter)
+        except FileLockTimeout:
+            raise PairError(f"Pair '{name}' is busy in another process; could not acquire lock to "
+                            f"restore its compressed rollout.")
+        path = adapter.transcript_path(spec)
     if spec.backend == "codex":
         points = codex_adapter_mod.list_turn_points_codex(path) if path and path.exists() else []
     else:
         points = list_user_turn_points(path) if path and path.exists() else []
     if verbose:
-        return json.dumps(points, indent=2, default=str)
+        return json.dumps({"restore_note": restored, "points": points} if restored else points,
+                          indent=2, default=str)
     if not points:
-        return f"Pair '{name}': no user-message rewind points yet."
+        return f"Pair '{name}': no user-message rewind points yet." + (f"\n  {restored}" if restored else "")
     shown = points[-last_n:] if last_n and last_n > 0 else points
     header = f"Pair '{name}' — {len(points)} rewind point(s)"
     if len(shown) < len(points):
@@ -4873,6 +5051,8 @@ def pair_rewind_points(name: str, last_n: int = 20, verbose: bool = False) -> st
     lines = [header + ":",
              "  → pair_rewind(name, to_point=N) rewinds to BEFORE that user message.",
              "  (conversation only — files the pair wrote to disk are NOT reverted)"]
+    if restored:
+        lines.append(f"  {restored}")
     for p in shown:
         after = f"{p['after_assistant_turns']} asst turn(s), {p['after_tool_calls']} tool call(s)"
         if p["after_files"]:
@@ -4880,6 +5060,19 @@ def pair_rewind_points(name: str, last_n: int = 20, verbose: bool = False) -> st
         lines.append(f"  [{p['point']}] {_fmt_local(p['timestamp'])}  \"{p['preview']}\"")
         lines.append(f"        then: {after}")
     return "\n".join(lines)
+
+
+def _restore_compressed_rollout(spec: PairSpec, adapter) -> str | None:
+    """Rewinding needs the plain rollout: if the Codex app compressed it, have
+    Codex restore it (app-server thread/resume, no model call). Caller holds
+    the pair lock. Returns the note for the result; None if already plain."""
+    if not codex_adapter_mod.is_compressed_rollout(adapter.transcript_path(spec)):
+        return None
+    try:
+        return adapter.restore_rollout(spec)
+    except CLIError as e:
+        raise PairError(f"Pair '{spec.name}': {codex_adapter_mod.COMPRESSED_NOTE}, but restoring it for the "
+                        f"rewind failed ({e})") from e
 
 
 @mcp.tool(output_schema=None, annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False})
@@ -4917,6 +5110,18 @@ def pair_rewind(name: str, to_point: int, archive: bool = True, verbose: bool = 
             path = adapter.transcript_path(spec)
             if not path or not path.exists():
                 raise PairError(f"Pair '{name}' has no transcript to rewind.")
+            restored: str | None = None
+            refused_checked = False
+            if spec.backend == "codex" and codex_adapter_mod.is_compressed_rollout(path):
+                # Refuse what can be refused before Codex rewrites the file
+                # (temper, 2026-10-25); the exact point is only known after.
+                if to_point < 1:
+                    raise PairError(f"No rewind point {to_point} for '{name}' (points start at 1). "
+                                    f"Use pair_rewind_points('{name}') to list them.")
+                _refuse_if_background(name, "rewinding", force)
+                refused_checked = True
+                restored = _restore_compressed_rollout(spec, adapter)
+                path = adapter.transcript_path(spec)
             if spec.backend == "codex":
                 # Verified 2026-09-07: ``exec resume`` reads the rollout JSONL,
                 # so truncating it at a turn boundary rewinds the thread. The
@@ -4931,11 +5136,13 @@ def pair_rewind(name: str, to_point: int, archive: bool = True, verbose: bool = 
                 raise PairError(
                     f"No rewind point {to_point} for '{name}' (valid: {valid}). "
                     f"Use pair_rewind_points('{name}') to list them."
+                    + (f" Nothing was rewound; {restored}." if restored else "")
                 )
             # The session JSONL is about to be truncated — a warm runtime pinned
             # to it holds stale in-memory state, so evict it (next send respawns
             # from the rewound file).
-            _refuse_if_background(name, "rewinding", force)
+            if not refused_checked:
+                _refuse_if_background(name, "rewinding", force)
             rewind_lost: list[dict] = []
             try:
                 rewind_lost = runtime_mod.registry().evict(
@@ -4968,9 +5175,11 @@ def pair_rewind(name: str, to_point: int, archive: bool = True, verbose: bool = 
             "name": name, "rewound_to_point": to_point,
             "preview": match["preview"], "archived_to": archived,
             "dropped_events": len(dropped), "files_modified_in_dropped_range": dropped_files,
-            "projection_note": codex_note,
+            "projection_note": codex_note, "restore_note": restored,
         }, indent=2, default=str)
     lines = [f"Rewound '{name}' to before point {to_point}: \"{match['preview']}\""]
+    if restored:
+        lines.append(f"  {restored}")
     lines.append(f"  Dropped {len(dropped)} event(s); the pair now continues from there on next send.")
     if codex_note:
         lines.append(f"  {codex_note}")
@@ -5011,8 +5220,9 @@ def pair_compact(
 
     Runs as an async task like pair_send: the sync wait blocks up to
     ``timeout_seconds`` (capped at the sync cap); past that you get an async
-    handle and compaction continues — poll with ``pair_poll(name)`` or the
-    background wait script.
+    handle and compaction continues. The optional auto-watch hook wakes the
+    manager (the handle says "armed"); otherwise use the background wait script
+    or ``pair_poll(name)``.
 
     Args:
         name: Pair to compact.
@@ -5103,7 +5313,7 @@ def pair_compact(
             f"Sync wait timed out at {rpc_hold_s}s (compaction of '{name}' "
             f"still running under compact_timeout={hard_str})."
         )
-    return _format_async_handle(state.task_id, framing, pair_name=name,
+    return _format_async_handle(state.task_id, framing, pair_name=name, tool="pair_compact",
                                 notification=completion.arm(state, ctx, notification_context))
 
 
@@ -5295,10 +5505,15 @@ def pair_stop(
                 # v0.13.0 (historian F1): use the id the backend reports.
                 new_sid = str(uuid.uuid4()) if cur_spec.backend == "claude" else "pending-hard-stop"
                 new_spec = cur_spec.model_copy(update={"session_id": new_sid, "turn_count": 0})
-                new_sid = adapter.create(new_spec).session_id
+                created = adapter.create(new_spec)
+                new_sid = created.session_id
+                # v0.19: a new Codex thread records its instructions mode,
+                # exactly like pair_clear.
+                _rotated = ({"codex_instructions": created.instructions}
+                            if created.instructions is not None else {})
                 reg_mod.update_pair(
                     name, session_id=new_sid, turn_count=0, total_cost_usd=0.0,
-                    last_active_at=datetime.utcnow(),
+                    last_active_at=datetime.utcnow(), **_rotated,
                 )
                 actions.append(f"rotated session: {_short(cur_spec.session_id)} → {_short(new_sid)} (hard reset)")
         except FileLockTimeout:
@@ -5637,6 +5852,7 @@ def _codex_status(spec: PairSpec, *, last_n_log: int, verbose: bool) -> str:
             recent_lines = [l.rstrip("\n") for l in all_lines[-max(1, int(last_n_log)):]]
         except Exception:
             pass
+    compressed = codex_adapter_mod.compressed_rollout_note(spec)
     if verbose:
         return json.dumps({
             "name": name, "backend": "codex",
@@ -5649,10 +5865,13 @@ def _codex_status(spec: PairSpec, *, last_n_log: int, verbose: bool) -> str:
             "inflight_async_tasks": inflight_tasks,
             "recent_log_lines": recent_lines,
             "persistent": spec.persistent,
+            "rollout_compressed": bool(compressed),
         }, indent=2, default=str)
     lines = [f"Pair '{name}' status (codex):"]
     lines.append(f"  turn process: {'running' if info else 'none'}")
     lines.append(f"  liveness: {heuristic}")
+    if compressed:
+        lines.append(f"  rollout: {compressed}")
     lines.extend(_activity_status_lines(name))
     if inflight_tasks:
         ids_str = ", ".join(inflight_tasks) if len(inflight_tasks) <= 2 else ", ".join(t[:8] for t in inflight_tasks[:3]) + "..."
@@ -5758,6 +5977,9 @@ def pair_context(name: str, timeout_seconds: int = 60, verbose: bool = False) ->
     """
     spec = reg_mod.get_pair(name)
     adapter = _adapter_for(spec)
+    note = codex_adapter_mod.compressed_rollout_note(spec)
+    if note:
+        return f"Pair '{name}': {note} (its context fill is unreadable until then)."
     report = adapter.context(spec, timeout_seconds=timeout_seconds)
     if verbose:
         return _verbose_dump(report)

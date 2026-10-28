@@ -83,6 +83,12 @@ pair_compact(name="reviewer", steering_prompt="Focus on what was reviewed and an
 
 ## Backends: Claude Code and Codex
 
+On Windows, tool-capable CLI processes start with a hidden console that ordinary
+console children can inherit. Short version/help queries and cancellation
+helpers run without a console. Redirected output and cancellation behavior are
+preserved. A command that explicitly creates or shows another window can still
+display it. See [Windows launch verification](docs/windows-hidden-spawn.md).
+
 | | Claude (`backend="claude"`, default) | Codex (`backend="codex"`) |
 |---|---|---|
 | Session | `claude --print --resume <uuid>`; warm stream-json runtime kept between sends | `codex exec --json … resume <thread-id>`; one process per turn, thread named by Codex |
@@ -121,7 +127,8 @@ A denied action produces a `⛔ PAIR HANDOFF` block in the reply with the pair's
 - **Which `codex` runs.** Re-resolved on every spawn: `CLAUDE_PAIR_CODEX_PATH`, else the `CODEX_CLI_PATH` the Codex app records in `~/.codex/config.toml`, else the newest `%LOCALAPPDATA%/OpenAI/Codex/bin/<hash>/codex.exe`, else `codex` on `PATH`. The app's updater replaces that folder and rewrites the path, so open sessions follow an update without a restart (0.16.2); each turn's `CODEX TURN START` line in `main.log` names the binary it ran.
 - **Config isolation.** Pairs run with `--ignore-user-config` (your `~/.codex/config.toml` mounts MCP servers, Desktop plugins and hooks a pair shouldn't inherit — including this MCP itself) and re-add a whitelist of keys the sandbox needs: `windows.sandbox`, `sandbox_workspace_write`, `model_provider(s)`, `web_search`, `shell_environment_policy`. Extra `-c key=value` overrides go through `backend_options={"config": {...}}`.
 - **Per-call model + effort + sandbox.** Codex never inherits them from the thread; the adapter re-passes them on every send, exactly like `claude --model`.
-- **System prompt.** `codex exec` has no system-prompt flag; `system_prompt_append` / `profile_name` become the thread's first user message (persisted in the thread history).
+- **System prompt.** `codex exec` has no system-prompt flag; since 0.19 `system_prompt_append` / `profile_name` (and, on Windows, the sandbox note below) go in as `developer_instructions` — re-sent on every turn and to `pair_compact`, because Codex rebuilds a thread's instructions at every compaction from the current settings and drops them if they aren't passed. A change (`pair_update(system_prompt_append=…)`, an edited profile file) takes effect at the thread's next compaction or `pair_clear`; `pair_info` says when the text changed. Threads created before 0.19, adopted or handed-off threads, and instructions over ~28K command-line characters keep the older form: the thread's first user message (persisted in history, but a long thread's compaction may summarise it away) — `pair_clear` moves such a pair to developer instructions.
+- **Skills and `AGENTS.md`.** Pairs load skills from `<workspace>/.codex/skills` and `<workspace>/.agents/skills` (and Codex's bundled `~/.codex/skills/.system`), not from your `~/.codex/skills` (that comes with the user config pairs ignore). Repo and user `AGENTS.md` files are read.
 - **Threads are tagged** `thread_source = claude-squared` in Codex's own store, so they're distinguishable in the Codex app.
 - **`pair_rewind` works** (Codex resumes from the rollout JSONL); the adapter re-syncs Codex's sqlite history projection so `pair_fork` keeps working afterwards.
 - **`pair_compact` works** through `codex app-server` (stdio JSON-RPC: `thread/resume` → `thread/compact/start`); `codex exec` itself has no compaction command (a literal `/compact` is just text to the model). The daemon starts the Desktop's plugin MCP servers first (~10 s); this MCP is excluded so nothing recurses. Codex compaction takes no steering text, and its post-compaction size is an estimate until the next reply's footer.
@@ -130,6 +137,25 @@ A denied action produces a `⛔ PAIR HANDOFF` block in the reply with the pair's
 - **Live context and the context alert** (0.16.0) come from the rollout's latest `token_count`. The rollout can lag one tool call (the count for a call that starts a long command lands after the command finishes), and Codex's own compaction point is estimated unless `model_auto_compact_token_limit` is set.
 - **`pair_tool_detail` works** for turns run since 0.14.0: each item's full started/completed events are kept under `logs/<pair>/codex-tool-items/T-N.json`. Older turns only have the log previews and say so.
 - **Unavailable models** (not on your ChatGPT plan) are refused by the API with HTTP 400 — `pair_create` warns when a slug isn't listed in the cache, and a failed turn is labeled `⛔ MODEL UNAVAILABLE`.
+
+### The Codex sandbox on Windows (0.19)
+
+Sandboxed commands run as a separate local user (`CodexSandboxOffline`, or `…Online` with network) in the `CodexSandboxUsers` group. Measured on codex-cli 0.164 (alpha); what claude-squared does about each limit:
+
+| | What happens in the sandbox | What claude-squared does / what you do |
+|---|---|---|
+| Temp files | The whole user Temp used to be writable at `workspace`/`auto`, and nothing at `read-only` (pytest, vitest and PowerShell broke there) | Each pair gets its own scratch folder, `~/.claude/pairs/scratch/<pair>`, as `TEMP`/`TMP`/`TMPDIR`, writable at every sandboxed level; the shared Temp is not writable. Created at the first spawn, kept across `pair_clear`/`pair_rewind`, removed by `pair_forget` |
+| Sandbox mode | — | Every sandboxed level runs on a Codex permission profile (`:read-only` or `:workspace` + the scratch folder) when the Codex build supports profiles (checked once per binary, no model call). Without them: plain `-s read-only` (no scratch) or `-s workspace-write`. A read-only level never passes `--approve-for-me` (which implies workspace-write), whatever `backend_options` says. After every turn the profile Codex recorded is checked; if a turn at **any** level was less confined than asked (an unexpected writable root, network on), the build is marked and **every** Codex pair falls back to the plain flags. A false mark (the result names it with `⚠ SANDBOX`) is cleared by deleting `~/.claude/pairs/codex_profile_unsupported.json`; a Codex update starts fresh anyway, since the mark is per binary |
+| Credentials | `~/.claude` and `~/.codex` are readable by the sandbox group, so a sandboxed command could read your Claude login, API key and Codex login | On a profile-capable build `workspace`, `read-only` and `plan` deny reads of `~/.claude/.credentials.json`, `~/.claude/pairs/api_key`, `~/.codex/auth.json` and `~/.claude.json` — a partial list: other secrets the sandbox group can read stay readable. Codex implements the denial as a **permanent** `CodexSandboxUsers:(DENY)(R)` entry on each file: it stays after the pair is gone and applies to every Codex sandbox on the machine, existing pairs included (you and the unsandboxed codex process are unaffected; a `claude` or `codex` CLI run *inside* a Codex sandbox can no longer log in). Undo per file: `icacls <file> /remove:d CodexSandboxUsers`. Escalation-capable profiles (`auto`, including native approval overrides) omit the deny-read entries because they break Codex's escalation setup (`setup refresh had errors`); existing permanent entries still protect sandboxed reads by auto pairs. Auto does not install entries on new files. A program that replaces a file atomically (a token refresh) drops the entry until the next `workspace`/`read-only`/`plan` turn re-applies it, and a command already running in the sandbox can read a file replaced under it. `CLAUDE_PAIR_CODEX_DENY_READ` (paths separated by `;`, empty for none) replaces the list. Verified with `[windows] sandbox = "elevated"` (commands run as `CodexSandboxOffline`, a group member); another sandbox mode may run them as you with a restricted token, where the group deny doesn't apply — the create result says so. Without profiles, no new deny entries are applied; existing permanent entries still take effect. Whether Codex re-applies the entry before each command or once per turn is not verified |
+| Deletes | Plain `Remove-Item` works; `Remove-Item -Force` is refused before it runs at `workspace` | Reported as a denial ("never ran") with the remedies: rephrase, or `auto` |
+| Git commits | `.git` is write-protected by Codex itself (no setting changes it) | At `auto` the model can request escalation (the auto-reviewer judges it); at `workspace` an escalation request is refused before it runs — commit as the manager, or use `auto` |
+| Sibling worktrees | Writes outside the pair's roots fail | Add them with `extra_dirs` (writable at `workspace`/`auto`; never at `read-only`) |
+| Network | Off at `workspace` and `auto` | `backend_options={"network": true}` turns it on. HTTPS from PowerShell (`Invoke-WebRequest`) and `curl.exe` fails in the sandbox (Schannel); Python works, and git works because the pair's env sets `http.sslBackend=openssl` through `GIT_CONFIG_*` (skipped with a note if you already use those variables). Refused at `read-only` |
+| Python | A Python installed under `%LOCALAPPDATA%\Programs` isn't readable by the sandbox user | `pair_create` checks that `python` on `PATH` runs in the sandbox and, if not, names the fix you run yourself: `icacls "<python dir>" /grant "CodexSandboxUsers:(OI)(CI)RX" /T` — or give the pair a Python inside its workspace |
+| Processes | `Get-Process`, `Stop-Process -Id` and Python's `Popen.terminate` work; `tasklist`, `taskkill` and CIM queries are denied | — |
+| Headless Chrome/Edge | Exits at once without `--no-sandbox` | — |
+
+The scratch folder, the sandbox note and the credential denial apply on Windows only; other platforms run the plain flags as before. Every sandboxed Codex pair created on Windows also gets a short **sandbox note** in its instructions summarising the rows above for the model (`backend_options={"sandbox_note": false}` leaves it out). On Windows `backend_options.config` can no longer set the keys these features manage (`default_permissions`, `permissions.*`, `sandbox_workspace_write.*`, `TEMP`/`TMP`/`TMPDIR`, whole-table `shell_environment_policy`) or that shape the sandbox around `permission_mode` (`sandbox_mode`, `approval_policy`, `approvals_reviewer`, `sandbox_permissions`, `profile(s)`); `developer_instructions` is refused on every platform. `backend_options.args` (new values) takes only `--enable`, `--disable`, `--color` and `--output-schema`, each with one value — an allowlist, because the exec CLI has hidden aliases (0.164: `--yolo` = `--dangerously-bypass-approvals-and-sandbox`, `--not-so-yolo` = `--approve-for-me`; older CLIs: `--full-auto`); the refusal names the field for the rest (`permission_mode`, `config`, `extra_dirs`, `model`, `cwd`). Features that touch the sandbox, approvals or how commands run (by name: `*sandbox*`, landlock/bwrap, `*proxy*`, `guardian*`, `*approval*`, `*permission*`, `*rule*`, `*exec*`, `shell_*`, `hooks`, `code_mode*`, `*repl*`, `browser_use*`, `computer_use`, `in_app_browser`, `prefer_mxc`) can't be switched either way, through `--enable`/`--disable` or `features.<name>` in `config` (nor the whole `features` table). Values stored before 0.19 keep working; in profile mode the ones that would override the profile are left out of the spawn, with a note on the reply. A permission profile ignores `sandbox_workspace_write.network_access` / `writable_roots` (from your config.toml or a stored value), so profile mode carries them over itself (network on, extra writable roots). If the Codex binary is a script (`codex.cmd` from npm), the instructions go in the thread's first message rather than through cmd.exe. Codex also writes permanent ACL entries for every writable root it is given (one per root per run), which is why the scratch path is stable.
 
 ### Handing a Claude pair to Codex (`pair_handoff`, 0.15.0)
 
@@ -266,9 +292,15 @@ expires (`timeout_seconds` exceeded, or > server's RPC-hold cap of
 `CLAUDE_PAIR_SYNC_CAP_SECONDS`, default 45s), the response is a "still running,
 here's the task_id" handle — work continues, no second turn is queued.
 
+**With the optional [auto-watch hook](#automatic-wake-up-opt-in-claude-code-hook),
+the manager needs no Bash watcher step.** When the response says
+"auto-watch hook armed — don't start wait.py", finish independent work or end
+your turn. The hook wakes you with the watcher outcome; read the result with
+`pair_poll(name, with_turn_log=True)`. Without the hook, use the pattern below.
+
 Three ways to consume the handle:
 
-1. **Notification-driven (recommended for long tasks)**: background-run the
+1. **Notification-driven (without the optional hook)**: background-run the
    watcher; the harness fires you a notification when it exits.
 
    ```python
@@ -363,6 +395,99 @@ until grep -q '"status": "done"\|"status": "failed"' \
 Same on-disk state file (`~/.claude/pairs/async/<task_id>.json`); the MCP writes
 atomically so a watcher in a different process (different MCP install) sees the
 result.
+
+### Automatic wake-up (opt-in Claude Code hook)
+
+Claude Code's `asyncRewake` command hook runs in the background and wakes an
+idle manager when it exits with code 2. claude-squared installs a stdlib-only
+`~/.claude/pairs/auto_watch.py` beside `wait.py` at server startup. Installing
+the scripts does **not** enable the feature or change your settings.
+
+To opt in:
+
+1. Start a new pair MCP server after upgrading so both scripts are installed.
+2. Merge [docs/auto-watch.settings.json](docs/auto-watch.settings.json) into
+   your Claude Code user settings (`~/.claude/settings.json`, or the settings
+   directory selected by `CLAUDE_CONFIG_DIR`). Append its `PostToolUse` entry
+   if you already have hooks; keep your existing entries.
+3. Replace `/absolute/path/to/.claude/pairs/auto_watch.py` with the installed
+   script's absolute path. Use a working Python interpreter (Python ≥ 3.7);
+   if `python` is not on the hook shell's PATH, quote its absolute path too.
+   On Windows use forward slashes, for example:
+   `"command": "python \"C:/Users/YOU/.claude/pairs/auto_watch.py\""`.
+4. Start a new Claude Code session to load the settings. Keep the hook's
+   `timeout` at **604800 seconds (seven days)** or longer. The script gives
+   `wait.py` 604740 seconds, leaving one minute to report a timeout and wake
+   the manager. The host silently kills an expired hook; lowering only the
+   settings timeout can therefore lose the notification.
+
+The snippet is:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [{
+      "matcher": "^mcp__(?:pair|Claude_Squared)__(?:pair_send|pair_send_async|pair_compact|pair_create|pair_handoff)$",
+      "hooks": [{
+        "type": "command",
+        "command": "python \"/absolute/path/to/.claude/pairs/auto_watch.py\"",
+        "asyncRewake": true,
+        "timeout": 604800
+      }]
+    }]
+  }
+}
+```
+
+The hook watches an async handle from `pair_send_async`, a still-running
+`pair_send` or `pair_compact`, or `pair_create(initial_message=...)`. A
+`pair_send` reply reporting background launches also arms
+it. A still-running `pair_handoff` briefing watches the newly allocated
+target pair, not its source. Ordinary synchronous replies exit immediately. `pair_fork` completes
+synchronously and leaves no task to watch, so it is excluded. `pair_invoke`
+does not report background launches and is also excluded. The supplied
+matcher recognizes the CLI `pair` and extension `Claude_Squared` aliases.
+
+One watcher follows each **(manager session, pair)** until idle, including
+queued sends, background work and self-woken turns. A second send to the
+same busy pair shares that watcher; another manager has its own watcher.
+Fast completions still notify even if the task finished before the hook
+started. A pair forgotten before the hook starts also wakes the manager with
+an explanation. All watcher outcomes wake the manager: done, failed, stopped,
+context alert, lost work, unknown state, and timeout. The notification gives
+the original `wait.py` exit code and output. Read completed work with
+`pair_poll`, not a repeat send. After a context alert or timeout, follow the
+output's re-arm command in background Bash if you want to keep watching.
+Re-arming does not stop or re-send the work.
+
+Pairs inherit user settings too: the hook is suppressed inside pair
+processes, with a registered-session check for older runtimes. Sessions
+without these MCP tools never match. Kernel file locks release on watcher
+death, so an interrupted hook cannot leave a stale PID blocking later sends.
+The hook does not stop any process or modify pair tasks/activity.
+It passes its resolved Claude home to `wait.py`, including when a custom
+`CLAUDE_HOME` is configured only in the MCP server's environment. Printed
+timeout and alert re-arm commands carry that home into the manager's Bash too.
+
+The server's "armed" hint is **best-effort settings detection**, not a
+receipt from the host. It recognizes the documented interpreter/script
+command, matcher, `asyncRewake: true` and timeout in user settings, provided
+`disableAllHooks` is not set. Project/managed overrides, unsupported hosts,
+shell wrappers and custom MCP aliases are not detectable. In those cases
+use the manual watcher. This feature is for Claude Code managers; Codex and
+other MCP hosts need their own notification mechanism. Closing the manager
+ends hook delivery; hooks are not durable subscriptions across sessions.
+
+Evidence (2026-10-26): the existing Haiku probe verified an idle
+stream-json manager waking after 30 seconds and 15 minutes, and a hook
+being killed silently past its timeout. Actual Desktop UI delivery and
+laptop sleep remain unverified. The CLI strings recommending
+`~/.claude/hooks` appear in cloud-hook forwarding diagnostics; they do not
+establish a local Desktop restriction. This implementation keeps the hook
+beside `wait.py`. Maintainers can run
+`python tests/smoke_live_auto_watch.py --live` for a real Haiku pair and
+stream-json manager; it keeps isolated evidence under `.test-homes` and
+does not edit user settings.
 
 ## Self-woken turns (v0.12.0, Claude)
 
@@ -495,7 +620,7 @@ Since October 2026 Max and Team plans include monthly API credits for one linked
 |---|---|---|
 | Per-send | `model`, `effort`, `permission_mode`, `context_window`, `backend_options`, `ultracode`, `fallback_model`, `mcp_whitelist`, `disallowed_tools`, `billing` (0.18.0; `pair_billing` for the API) | Next `pair_send` (registry write + runtime eviction → respawn with new values; Codex: every send is a fresh process) |
 | Server-side | `allowed_invocations`, `context_alert_at` | No eviction needed (MCP-layer, not pinned to the CLI subprocess). `allowed_invocations`: next `pair_invoke`. `context_alert_at`: next send's result, `pair_status`, and running `wait.py` watchers at their next poll (exit 8 at once if the new level is already behind the context). Mutable freely. |
-| Pinned-at-create | `allowed_tools`, `system_prompt_append` | **Only after `pair_clear`** — the existing session was started with the OLD values; rotation creates a fresh session with the new pinned config |
+| Pinned-at-create | `allowed_tools`, `system_prompt_append` | **Only after `pair_clear`** — the existing session was started with the OLD values (the Claude CLI keeps a session's first appended system prompt); rotation creates a fresh session with the new pinned config. Codex threads created by 0.19+ also pick up a new `system_prompt_append` at their next compaction |
 | Pinned-at-spawn | `cwd`, `extra_dirs` | Next spawn after eviction. A Claude `cwd` change ALSO moves the session JSONL across project dirs (rejected with recovery hint if the move fails); Codex threads aren't cwd-keyed |
 
 Since 0.16.0 only an *actual* change evicts the runtime — a `pair_update` that sends the current values is a no-op (restart a warm runtime with `pair_stop(name, force=True)`), and a change to a spawn-pinned field refuses while the pair has background work pending unless you pass `force=True` (the work is killed and recorded).
