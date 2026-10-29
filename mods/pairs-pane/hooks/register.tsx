@@ -90,6 +90,64 @@ function statusLabel(row: PairRow): string {
   return `${status} · finished ${at} (${ago})`
 }
 
+const RING: Record<string, string> = { red: '#e5484d', yellow: '#e5a00d', blue: '#3e7bfa', gray: '#8a8a8a' }
+
+// A small filling ring, like the desktop's own context indicator.
+function ring(row: PairRow): string {
+  const percent = knownContext(row) ? Math.max(0, Math.min(100, row.context!.percent!)) : 0
+  const circumference = 2 * Math.PI * 5.5
+  return '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 14 14">'
+    + '<circle cx="7" cy="7" r="5.5" fill="none" stroke="#8a8a8a" stroke-opacity="0.3" stroke-width="2.5"/>'
+    + `<circle cx="7" cy="7" r="5.5" fill="none" stroke="${RING[contextColor(row)]}" stroke-width="2.5" `
+    + `stroke-dasharray="${(circumference * percent / 100).toFixed(2)} ${circumference.toFixed(2)}" transform="rotate(-90 7 7)"/></svg>`
+}
+
+function statusColor(row: PairRow): string | undefined {
+  if (row.status === 'busy') return 'success'
+  if (row.status === 'crashed' || row.outcome === 'crashed') return 'error'
+  if (row.status === 'needs attention' || interrupted(row.status) || interrupted(row.outcome)) return 'warning'
+  return undefined
+}
+
+function watchLabel(row: PairRow, session: string): string {
+  return row.watches.map(w => `watched by ${w.session_id === session ? 'this session' : `session ${w.session_id.slice(0, 8)}`}`
+    + ` · ${duration(w.elapsed_s)}${w.verified ? '' : ' · unverified'}`).join(', ')
+}
+
+function replyHeading(row: PairRow): string {
+  const d = row.detail!
+  const at = localTime(d.reply_at)
+  if (interrupted(d.outcome)) return `No reply (turn ${d.outcome})${at ? ` · ${at}` : ''}`
+  // A busy pair's last reply belongs to the task before the one now running.
+  if (row.status === 'busy') return `Previous task done${at ? ` · ${at}` : ''} · next task running`
+  return `Latest reply${at ? ` · ${at}` : ''}`
+}
+
+// The first lines of a markdown reply, closing a code fence the cut left open.
+function clip(lines: string[]): string {
+  const head = lines.slice(0, 12)
+  const fences = head.filter(line => /^\s*(```|~~~)/.test(line)).length
+  return head.join('\n') + (fences % 2 ? '\n```' : '') + (lines.length > 12 ? '\n\n…' : '')
+}
+
+type LogEntry = { at: string; kind: string; text: string; color?: string; dim?: boolean }
+
+// main.log lines read "[HH:MM:SS] [T-n] [kind] text"; time, turn and kind are each optional.
+export function parseLog(line: string): LogEntry {
+  const match = /^(?:\[(\d\d:\d\d):\d\d\]\s*)?(?:\[T-\d+\]\s*)?(?:\[([a-z_]+(?::[a-z_]+)?)\]\s*)?([\s\S]*)$/.exec(line)
+  if (!match) return { at: '', kind: '', text: line }
+  const [, at = '', kind = '', body = ''] = match
+  if (kind === 'tool_use') {
+    const call = /^([\w.-]+)\(([\s\S]*?)\)?$/.exec(body)
+    return { at, kind: call ? call[1].replace(/^mcp__.+?__/, '') : 'tool', text: call ? call[2] : body, color: 'suggestion' }
+  }
+  if (kind === 'tool_result') return { at, kind: '↳', text: body, dim: true }
+  if (kind === 'thinking') return { at, kind: 'thinking', text: body, dim: true }
+  if (kind === 'text') return { at, kind: 'says', text: body, color: 'claude' }
+  if (kind.startsWith('system:')) return { at, kind: kind.slice(7).replace(/_/g, ' '), text: body, dim: true }
+  return { at, kind: kind.replace(/_/g, ' '), text: body }
+}
+
 let options: PluginOptions = {}
 let refreshing = false
 let cancel: (() => void) | undefined
@@ -269,6 +327,17 @@ export const register: Register = (on, configured) => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
+    const resolved = $.ui.resolve(e) as unknown as Record<string, any>
+    const desktop = e.surface !== 'terminal'
+    const Svg = desktop ? resolved.Svg : undefined
+    const Markdown = desktop ? resolved.Markdown : undefined
+    // Type sizes, weights and tabular digits are drawn by the desktop surface
+    // alone; older terminal engines refuse the props outright.
+    const cap = desktop ? { size: 'caption' as const } : {}
+    const heading = desktop ? { size: 'heading' as const } : { bold: true }
+    const semi = desktop ? { weight: 'semibold' as const } : { bold: true }
+    const num = desktop ? { tabular: true } : {}
+    const mono = desktop ? { mono: true, tabular: true } : {}
     const current = await read($, view)
     const showAll = await read($, all)
     const details = await read($, expanded)
@@ -278,94 +347,131 @@ export const register: Register = (on, configured) => {
     const page = await read($, transcript)
     if (page) return <Box flexDirection="column" gap={1}>
       <Box gap={1}>
-        <Button key="back" label="Back to pairs" onPress={() => { void closeTranscript($) }} />
-        {page.offset > 0 && <Button key="transcript-first" label="Start" onPress={() => { void openTranscript($, page.pair) }} />}
-        {page.next !== null && <Button key="transcript-next" label="Next page" onPress={() => { void openTranscript($, page.pair, page.next!) }} />}
+        <Button key="back" label="‹ Pairs" onPress={() => { void closeTranscript($) }} />
+        {page.offset > 0 && <Button key="transcript-first" label="Start" dimColor onPress={() => { void openTranscript($, page.pair) }} />}
+        {page.next !== null && <Button key="transcript-next" label="Next page" dimColor onPress={() => { void openTranscript($, page.pair, page.next!) }} />}
       </Box>
-      <Text bold>{page.pair} · transcript</Text>
+      <Text {...heading} {...semi}>{page.pair}</Text>
       {page.loading && <Text dimColor>Loading transcript…</Text>}
       {page.note && <Text dimColor>{page.note}</Text>}
       {!page.loading && page.lines.length === 0 && !page.note && <Text dimColor>No messages on this page.</Text>}
       {page.lines.map(line => <Box flexDirection="column" marginTop={1}>
-        <Text bold>{line.role} {localTime(line.at)}</Text><Text wrap="wrap">{line.text}</Text>
+        <Text {...cap} dimColor {...semi}>{line.role} · {localTime(line.at)}</Text><Text wrap="wrap">{line.text}</Text>
       </Box>)}
     </Box>
     const rows = current.rows.filter(row => showAll || row.watches.some(w => w.session_id === current.session)).sort(orderRows)
     const skipped = rows.filter(row => row.details_skipped)
     const dormant = showAll ? rows.filter(row => !row.details_skipped && (row.compact || (!foreground(row) && !recent(row)))) : []
     const prominent = rows.filter(row => !dormant.includes(row) && !row.details_skipped)
+    const waitingCount = current.rows.filter(row => row.watches.some(w => w.session_id === current.session)).length
+
+    const indicator = (row: PairRow) => <Box key={`indicator-${row.name}`}>{Svg
+      ? <Svg source={ring(row)} alt={knownContext(row) ? `${Math.round(row.context!.percent!)}% of context used` : 'context unknown'} width={14} height={14} />
+      : <Text dimColor={!knownContext(row)} color={contextColor(row)}>{contextIndicator(row)}</Text>}</Box>
+
+    const activity = (row: PairRow) => {
+      // Newest first, one line each: new entries land on top instead of
+      // pushing the list around as the log grows.
+      const entries = row.detail!.logs.slice().reverse()
+      const open = moreLogs.includes(row.name)
+      return <Box flexDirection="column">
+        {(open ? entries : entries.slice(0, 8)).map((line, index) => {
+          const item = parseLog(line)
+          return <Box key={`log-${row.name}-${index}`} gap={1}>
+            <Text {...cap} {...mono} dimColor>{item.at || '--:--'}</Text>
+            <Text {...cap} {...semi} color={item.color} dimColor={item.dim}>{item.kind}</Text>
+            <Box flexShrink={1} flexGrow={1}><Text {...cap} dimColor={item.dim} wrap={open ? 'wrap' : 'truncate-end'}>{item.text}</Text></Box>
+          </Box>
+        })}
+        {entries.length === 0 && <Text {...cap} dimColor>No activity logged yet.</Text>}
+        {entries.length > 8 && <Button key={`logs-more-${row.name}`} plain dimColor
+          label={open ? 'Show less' : `Show all ${entries.length}`} onPress={() => { void toggleMore($, row.name, 'log') }} />}
+      </Box>
+    }
+
+    const card = (row: PairRow) => {
+      const open = details.includes(row.name)
+      const d = row.detail
+      const replyLines = d?.reply?.split('\n') || []
+      const fullReply = moreReplies.includes(row.name)
+      return <Box key={`row-${row.name}`} flexDirection="column" marginTop={1} paddingX={1}
+        borderStyle="round" borderDimColor={row.status !== 'busy'} borderColor={row.status === 'busy' ? 'claude' : undefined}>
+        <Box justifyContent="space-between" gap={1}>
+          <Box gap={1} alignItems="center" flexShrink={1}>
+            {indicator(row)}
+            <Text {...semi} wrap="truncate-end">{row.name}</Text>
+            <Text {...cap} dimColor wrap="truncate-end">{modelLabel(row)}</Text>
+          </Box>
+          <Text {...cap} {...num} color={statusColor(row)} dimColor={!statusColor(row)}>{statusLabel(row)}</Text>
+        </Box>
+        <Box justifyContent="space-between" gap={1} flexWrap="wrap">
+          {knownContext(row)
+            ? <Text {...cap} {...num} dimColor>{Math.round(row.context!.percent!)}% used · {tokens(row.context!.used)} / {tokens(row.context!.window)}</Text>
+            : <Text {...cap} dimColor>context —</Text>}
+          {row.watches.length > 0 && <Text {...cap} dimColor>{watchLabel(row, current.session)}</Text>}
+        </Box>
+        {!desktop && knownContext(row) && <Text color={contextColor(row)}>{contextBar(row)}</Text>}
+        {row.status === 'busy' && d?.working_on && <Text {...cap} italic wrap={open ? 'wrap' : 'truncate-end'}>Working on: {d.working_on}</Text>}
+        <Box gap={2}>
+          <Button key={`detail-${row.name}`} plain dimColor label={open ? '▾ Hide details' : '▸ Details'}
+            onPress={() => { void toggleDetail($, row.name) }} />
+          <Button key={`transcript-${row.name}`} plain dimColor label="Transcript" onPress={() => { void openTranscript($, row.name) }} />
+        </Box>
+        {open && <Box flexDirection="column" gap={1} marginBottom={1}>
+          {!d && <Text {...cap} dimColor>Loading reply and activity…</Text>}
+          {d && <Box flexDirection="column" gap={1}>
+            <Text {...cap} {...semi} dimColor>{replyHeading(row)}</Text>
+            {d.reply != null && (Markdown
+              ? <Markdown key={`reply-${row.name}`} text={fullReply ? d.reply : clip(replyLines)} />
+              : <Text wrap="wrap">{fullReply ? d.reply : replyLines.slice(0, 12).join('\n')}</Text>)}
+            {replyLines.length > 12 && <Button key={`reply-more-${row.name}`} plain dimColor
+              label={fullReply ? 'Show less' : `Show full reply (${replyLines.length} lines)`} onPress={() => { void toggleMore($, row.name, 'reply') }} />}
+            {d.note && <Text {...cap} dimColor>{d.note}</Text>}
+            <Text {...cap} {...semi} dimColor>Activity · newest first</Text>
+            {activity(row)}
+          </Box>}
+        </Box>}
+      </Box>
+    }
+
+    const section = (label: string, list: PairRow[]) => list.length > 0 && <Box key={`section-${label}`} flexDirection="column" marginTop={1}>
+      <Text {...cap} {...semi} dimColor>{label.toUpperCase()} · {list.length}</Text>
+      {list.map(card)}
+    </Box>
+
     return (
       <Box flexDirection="column">
-        <Box gap={1}>
-          <Button key="waiting" label={!showAll ? '● Waiting on' : 'Waiting on'}
-            onPress={() => { void changeScope($, false) }} />
-          <Button key="all" label={showAll ? '● All' : 'All'}
-            onPress={() => { void changeScope($, true) }} />
-          <Button key="close" label="Close" onPress={() => { stopPolling(); void $.ui.close({ id: PANE }) }} />
-        </Box>
-        <Text dimColor>{showAll ? 'Working and recently finished' : 'Pairs this session is waiting on'}</Text>
-        {current.error && <Text>{current.error}</Text>}
-        {!current.error && rows.length === 0 && <Text dimColor>{showAll ? 'No pairs found.' : 'No recorded waits for this session. Choose All to see running pairs. Enable auto-watch on a current server to track waits here.'}</Text>}
-        {prominent.map(row => (
-          <Box key={`row-${row.name}`} flexDirection="column" marginTop={2} gap={1}>
-            <Box justifyContent="space-between" flexWrap="wrap" gap={1}>
-              <Box gap={1}>
-                <Box key={`indicator-${row.name}`}><Text dimColor={!knownContext(row)} color={contextColor(row)}>{contextIndicator(row)}</Text></Box>
-                <Text bold>{row.name}</Text><Text dimColor>{modelLabel(row)}</Text>
-              </Box>
-              <Text color={row.status !== 'busy' && (interrupted(row.status) || interrupted(row.outcome)) ? 'yellow' : undefined}>{statusLabel(row)}</Text>
-            </Box>
-            {knownContext(row) ? <Box flexDirection="column">
-              <Box justifyContent="space-between" width="100%" gap={1}>
-                <Text>{Math.round(row.context!.percent!)}% used</Text>
-                <Text dimColor>{tokens(row.context!.used)} / {tokens(row.context!.window)}</Text>
-              </Box>
-              {e.surface === 'terminal' ? <Text color={contextColor(row)}>{contextBar(row)}</Text>
-                : <Box key={`bar-${row.name}`} width="100%" height={1} backgroundColor="gray">
-                  <Box width={barWidth(row.context!.percent!)} height={1} backgroundColor={contextColor(row)} />
-                </Box>}
-            </Box> : <Text dimColor>context —</Text>}
-            <Button key={`detail-${row.name}`} label={details.includes(row.name) ? 'Hide detail' : 'Show detail'}
-              onPress={() => { void toggleDetail($, row.name) }} />
-            {details.includes(row.name) && <Box flexDirection="column" gap={1}>
-              {!row.detail && <Text dimColor>Loading reply and activity…</Text>}
-              {row.detail && <Box flexDirection="column" gap={1}>
-                {row.status === 'busy' && <Text wrap="wrap">Working on: {row.detail.working_on || 'message unavailable'}</Text>}
-                <Text bold>{interrupted(row.detail.outcome) ? `No reply (turn ${row.detail.outcome})`
-                  : row.status === 'busy' ? 'Previous reply' : 'Latest reply'}{localTime(row.detail.reply_at) ? ` · ${localTime(row.detail.reply_at)}` : ''}</Text>
-                {row.detail.reply != null && <Text wrap="wrap">{moreReplies.includes(row.name) ? row.detail.reply : row.detail.reply.split('\n').slice(0, 12).join('\n')}</Text>}
-                {row.detail.reply && row.detail.reply.split('\n').length > 12 && <Button key={`reply-more-${row.name}`}
-                  label={moreReplies.includes(row.name) ? 'Less reply' : 'More reply'} onPress={() => { void toggleMore($, row.name, 'reply') }} />}
-                {row.detail.note && <Text dimColor>{row.detail.note}</Text>}
-                <Text bold>Recent activity</Text>
-                {(moreLogs.includes(row.name) ? row.detail.logs : row.detail.logs.slice(-15)).map(line => <Text wrap="wrap">{line}</Text>)}
-                {row.detail.logs.length > 15 && <Button key={`logs-more-${row.name}`}
-                  label={moreLogs.includes(row.name) ? 'Less activity' : 'More activity'} onPress={() => { void toggleMore($, row.name, 'log') }} />}
-                <Text dimColor>Activity is limited to the latest 8 KiB.</Text>
-              </Box>}
-              <Button key={`transcript-${row.name}`} label="Open transcript" onPress={() => { void openTranscript($, row.name) }} />
-            </Box>}
-            {row.watches.map(w => (
-              <Text dimColor>watched by {w.session_id === current.session ? 'this session' : `session ${w.session_id.slice(0, 8)}`} · {duration(w.elapsed_s)}{w.verified ? '' : ' · unverified'}</Text>
-            ))}
+        <Box justifyContent="space-between" alignItems="center">
+          <Box gap={1}>
+            <Button key="waiting" variant={showAll ? undefined : 'primary'} dimColor={showAll}
+              label={`Waiting on${waitingCount ? ` · ${waitingCount}` : ''}`} onPress={() => { void changeScope($, false) }} />
+            <Button key="all" variant={showAll ? 'primary' : undefined} dimColor={!showAll}
+              label="All" onPress={() => { void changeScope($, true) }} />
           </Box>
-        ))}
+          <Button key="close" plain dimColor label="Close" onPress={() => { stopPolling(); void $.ui.close({ id: PANE }) }} />
+        </Box>
+        {current.error && <Box marginTop={1}><Text color="error">{current.error}</Text></Box>}
+        {!current.error && rows.length === 0 && <Box marginTop={1}><Text dimColor>{showAll ? 'No pairs found.' : 'No recorded waits for this session. Choose All to see running pairs. Enable auto-watch on a current server to track waits here.'}</Text></Box>}
+        {section('Working', prominent.filter(row => row.status === 'busy'))}
+        {section('Needs attention', prominent.filter(row => row.status !== 'busy' && foreground(row)))}
+        {section('Recently finished', prominent.filter(row => row.status !== 'busy' && !foreground(row)))}
         {skipped.map(row => <Box key={`skipped-${row.name}`} gap={1} marginTop={1}>
-          <Text bold>{row.name}</Text><Text dimColor>{modelLabel(row)} · {statusLabel(row)}</Text>
+          <Text {...semi}>{row.name}</Text><Text {...cap} dimColor>{modelLabel(row)} · {statusLabel(row)}</Text>
         </Box>)}
-        {dormant.length > 0 && <Box flexDirection="column" marginTop={2} gap={1}>
-          <Button key="idle" label={`${showIdle ? '▾' : '▸'} Idle (${dormant.length})`}
+        {dormant.length > 0 && <Box flexDirection="column" marginTop={2}>
+          <Button key="idle" plain dimColor label={`${showIdle ? '▾' : '▸'} Idle (${dormant.length})`}
             onPress={() => { void toggleIdle($) }} />
-          {showIdle && dormant.map(row => <Box key={`idle-${row.name}`} gap={1}>
-            <Box key={`indicator-${row.name}`}><Text dimColor={!knownContext(row)} color={contextColor(row)}>{contextIndicator(row)}</Text></Box>
-            <Text bold wrap="truncate-end">{row.name}</Text><Text dimColor wrap="truncate-end">{modelLabel(row)} · {row.outcome === 'failed' || row.outcome === 'stopped' ? row.outcome : row.status}</Text>
-            <Text dimColor={!knownContext(row)} wrap="truncate-end" color={knownContext(row) ? contextColor(row) : undefined}>
+          {showIdle && dormant.map(row => <Box key={`idle-${row.name}`} gap={1} alignItems="center" paddingX={1}>
+            {indicator(row)}
+            <Text {...semi} wrap="truncate-end">{row.name}</Text>
+            <Text {...cap} dimColor wrap="truncate-end">{modelLabel(row)} · {row.outcome === 'failed' || row.outcome === 'stopped' ? row.outcome : row.status}</Text>
+            <Text {...cap} {...num} dimColor wrap="truncate-end">
               {knownContext(row) ? `${tokens(row.context!.used)} / ${tokens(row.context!.window)} · ${Math.round(row.context!.percent!)}%` : 'context —'}
             </Text>
           </Box>)}
         </Box>}
         {(current.budget_limited || rows.some(row => row.partial && (foreground(row) || recent(row)))) && <Box marginTop={2}>
-          <Text dimColor>{current.budget_limited ? current.notice || 'Details skipped (budget).' : 'Some working/recent pair details are unavailable within the read limits.'}</Text>
+          <Text {...cap} dimColor>{current.budget_limited ? current.notice || 'Details skipped (budget).' : 'Some working/recent pair details are unavailable within the read limits.'}</Text>
         </Box>}
       </Box>
     )

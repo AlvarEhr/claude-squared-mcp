@@ -136,7 +136,9 @@ def main() -> int:
                 print(f"FAIL {name}: exit {result.returncode}", flush=True)
 
     suites = len(commands)
-    cli = shutil.which("claude")
+    # The pane draws props only newer engines accept; point this at the
+    # desktop app's bundled CLI when the PATH one lags behind it.
+    cli = os.environ.get("CLAUDE_SQUARED_TEST_CLI") or shutil.which("claude")
     if cli:
         suites += 1
         print("\n=== pairs_pane_mod (local CLI; no model calls) ===", flush=True)
