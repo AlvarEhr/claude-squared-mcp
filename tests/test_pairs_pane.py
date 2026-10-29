@@ -616,6 +616,12 @@ class SnapshotTests(unittest.TestCase):
         ]), encoding="utf-8")
         detail = P.tool_detail(self.home, "helper", "T-3")
         self.assertEqual((detail["input"], detail["language"], detail["output"]), ("ls", "bash", "a.py"))
+        self.write("logs/helper/main.idx.json", {"T-3": {"tool_use_id": "toolu_9"}, "T-5": {"tool_use_id": "toolu_sub"}})
+        sub = transcript.parent / "s1" / "subagents" / "agent-1.jsonl"
+        sub.parent.mkdir(parents=True)
+        sub.write_text(json.dumps({"message": {"content": [{"type": "tool_use", "id": "toolu_sub", "name": "Read",
+                                                           "input": {"file_path": "x.py"}}]}}), encoding="utf-8")
+        self.assertIn("x.py", P.tool_detail(self.home, "helper", "T-5")["input"])
         self.assertIn("note", P.tool_detail(self.home, "helper", "T-4"))
         self.assertIn("note", P.tool_detail(self.home, "../x", "T-3"))
 

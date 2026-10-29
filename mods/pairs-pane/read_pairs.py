@@ -703,14 +703,32 @@ def tool_detail(home, name, tag):
             or not re.fullmatch(r"[A-Za-z0-9_-]+", session):
         return {"note": "Full detail isn't recorded for this call; the activity line is all there is."}
     path = root / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", cwd) / (session + ".jsonl")
+    # The pair's log interleaves its sub-agents' tool calls; theirs live in
+    # <session>/subagents/*.jsonl. Search the main transcript, then the
+    # sub-agent transcripts newest first, within one byte budget.
+    candidates = [path]
     try:
-        with path.open("rb") as stream:
-            size = stream.seek(0, 2)
-            stream.seek(max(0, size - DETAIL_SCAN))
-            data = stream.read(DETAIL_SCAN)
+        candidates += sorted((p for p in (path.parent / session / "subagents").glob("*.jsonl")),
+                             key=lambda p: p.stat().st_mtime, reverse=True)
     except OSError:
-        return {"note": "The transcript could not be read."}
+        pass
     needle = tool_id.encode("utf-8")
+    budget = DETAIL_SCAN * 2
+    data = b""
+    for candidate in candidates:
+        if budget <= 0:
+            break
+        try:
+            with candidate.open("rb") as stream:
+                size = stream.seek(0, 2)
+                stream.seek(max(0, size - min(budget, DETAIL_SCAN)))
+                chunk = stream.read(min(budget, DETAIL_SCAN))
+        except OSError:
+            continue
+        budget -= len(chunk)
+        if needle in chunk:
+            data = chunk
+            break
     found = {}
     for raw in data.splitlines():
         if needle not in raw:
