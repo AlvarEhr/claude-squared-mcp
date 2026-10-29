@@ -424,7 +424,7 @@ def subagent_activity(root, name, spec, ident):
     entry = found[ident]
     # The sub-agent's own transcript has real times and covers background
     # sub-agents, which never get an extracted log; the log is the fallback.
-    if path is not None:
+    if path is not None and path.is_file():
         lines = _jsonl_lines(path)
     elif extracted is not None:
         lines = tail(extracted, 32 * 1024)

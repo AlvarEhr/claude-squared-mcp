@@ -644,17 +644,28 @@ class SnapshotTests(unittest.TestCase):
             "[09:59:01] [system:task_started] local_agent (background) aaa111: Look around\n"
             "[10:00:02] [T-5] [<- sub-agent #1 returned] done\n"
             "[10:01:00] [T-6] [-> sub-agent #2: coder] launching: Fix it\n"
-            "[10:01:01] [system:task_started] local_agent (background) bbb222: Fix it\n", encoding="utf-8")
+            "[10:01:00] [T-7] [-> sub-agent #3: scout] launching: Map it\n"
+            "[10:01:01] [system:task_started] local_agent ccc333: Map it\n"
+            "[10:01:01] [system:task_started] local_agent (background) bbb222: Fix it\n"
+            "[10:01:01] [T-6] [<- sub-agent #2 returned] Async agent launched successfully.\n"
+            "[10:01:09] [system:task_notification] task ccc333 completed: done\n", encoding="utf-8")
         (subs / "agent-bbb222xyz.jsonl").write_text(json.dumps({"timestamp": "2026-10-29T10:01:05Z", "message": {
             "role": "assistant", "content": [{"type": "tool_use", "id": "toolu_live", "name": "Bash",
                                               "input": {"command": "pytest"}}]}}), encoding="utf-8")
         rows, _ = P.subagents(self.home, "helper")
-        self.assertEqual([(r["id"], r["status"]) for r in rows], [(2, "running"), (1, "done")])
+        # A background launch's immediate return leaves it running; starts
+        # logged out of order are matched by description.
+        self.assertEqual([(r["id"], r["status"]) for r in rows], [(2, "running"), (3, "done"), (1, "done")])
         spec = {"backend": "claude", "session_id": "s1", "cwd": "C:/w"}
         live = P.subagent_activity(self.home, "helper", spec, 2)
         self.assertIn("[toolu_live] [tool_use] Bash", live["logs"][-1])
         finished = P.subagent_activity(self.home, "helper", spec, 1)
+        self.assertIn("[toolu_done] [tool_use] Read", finished["logs"][-1])
+        saved = done.read_text(encoding="utf-8")
+        done.unlink()  # without its transcript, the extracted log is the fallback
+        finished = P.subagent_activity(self.home, "helper", spec, 1)
         self.assertEqual(finished["logs"][-1], "[10:00:01] [T-1] [sub-tool_result] line one / line two")
+        done.write_text(saved, encoding="utf-8")
         self.assertIn("a.py", P.tool_detail(self.home, "helper", "T-1", 1)["input"])
         self.assertIn("note", P.tool_detail(self.home, "helper", "T-1", 9))
 
