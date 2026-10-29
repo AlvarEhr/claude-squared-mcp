@@ -33,7 +33,7 @@ turns. No cross-process mailbox or new backend is introduced.
   result's consumed UUIDs and leaves stdin open for up to 40 seconds after the
   first result to observe a separate steered turn. Its summary lists result
   subtypes, UUIDs, and canary matches. Exit 0 means evidence was captured, not
-  that queued input was cancelled. This mode has **not been run**; the manager
+  that queued input was cancelled. This mode was run on 2026-10-29 (see below); the manager
   will use it to decide whether the conservative hard stop can be avoided.
 
 ## Bookkeeping and locks
@@ -90,7 +90,12 @@ Review verification on 2026-10-29 (isolated homes, system Python):
 
 The full offline runner was not repeated for this review. No live Claude/Codex
 model runs were performed by the implementer; the success-path probe was run
-by the manager, and the interrupt probe remains pending.
+by the manager. The interrupt probe was run by the manager too (2026-10-29, CLI
+2.1.296, Haiku): the interrupt result (`error_during_execution`) listed only the
+original message's UUID; the CLI then ran the steered message as its own turn
+(`success`, canary present). So an interrupt with a pending steer must retire the
+runtime, or that follow-up runs as an untracked turn after the stop. The kill
+policy stands, and `pair_stop` reports it as a hard stop.
 
 Windows test setup finding: a venv redirector's `Popen.pid` differed from its
 Python child's `os.getpid()` (verified with a stdlib-only subprocess probe).
