@@ -27,6 +27,11 @@ pip install -e .
 
 Requires Python ≥3.10 and at least one backend CLI: `claude` (Claude Code 2.1.117+ for `--session-id` support) and/or `codex` (the Codex CLI, 0.153+; the Desktop-managed build under `%LOCALAPPDATA%/OpenAI/Codex/bin/` is found automatically and followed across the Codex app's updates, or set `CLAUDE_PAIR_CODEX_PATH`).
 
+If a plan-billed Claude pair reports that the CLI is not logged in, the user
+must run `claude auth login` in a terminal. Pairs cannot sign in themselves.
+Expired OAuth failures include the CLI's explanation, rather than a truncated
+JSON blob. API-billed pairs retain their separate API-key/credit guidance.
+
 ## Install — two paths
 
 ### As a Claude Code CLI MCP server
@@ -561,7 +566,11 @@ without that evidence, the alias stays unversioned (for example, **Sol**).
 working), the current message's first line, and the latest 15 meaningful log
 lines, skipping TURN bookkeeping. Reply/log text wraps; **More reply** and
 **More activity** reveal the rest of the bounded content already loaded.
-Replies initially show 12 lines. Timestamps use local time. **Open transcript**
+Replies initially show 12 lines. Timestamps use the local time zone for each
+date, including DST; naive task timestamps are interpreted as UTC. Interrupted
+turns show **orphaned**, **failed**, **stopped**, or **crashed** and **No reply**,
+instead of treating an error message as a reply. Log lines follow physical file
+order across days. **Open transcript**
 shows user/assistant messages in the pane, with **Next page** for bounded
 64 KiB pages. Compressed/unavailable transcripts are reported, never restored.
 Queued work,

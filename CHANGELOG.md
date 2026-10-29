@@ -6,6 +6,17 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Claude CLI launch failures now lead with the JSON result's message. Expired
+  OAuth and other plan-login failures direct the user to `claude auth login`;
+  API-billing key/credit guidance is preserved. Covers create, clear, hard stop,
+  fork, send, print/stream-json and compaction. See
+  [failure-handling notes](docs/claude-cli-errors.md).
+- Pane headers and reply times agree across DST changes. Interrupted turns have
+  attention status and No reply labels. Physical log-tail ordering is regression
+  tested across days; an unavailable requested detail refresh clears cached lines.
+
 ### Changed
 
 - Pairs pane controls redraw cached content immediately, with serial background

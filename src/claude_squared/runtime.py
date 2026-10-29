@@ -96,6 +96,16 @@ def _book_cost(name: str, cost: float, billing: str) -> None:
     book_cost(name, cost, billing)
 
 
+def _runtime_cli_error(spec: PairSpec, fallback: str, stderr: str,
+                       exit_code: int | None = None) -> CLIError:
+    from claude_squared.adapters.claude import claude_failure_message
+    message = claude_failure_message(spec, "", stderr, fallback)
+    # Keep the supervisor prefix at position zero for wait.py exit-code dispatch.
+    if fallback.startswith(CRASHED_ERROR_PREFIX) and not message.startswith(CRASHED_ERROR_PREFIX):
+        message = CRASHED_ERROR_PREFIX + message
+    return CLIError(message, exit_code=exit_code)
+
+
 # ---------- Event-to-text formatting (shared between main + sub-agent logs) ----------
 
 class ToolCounter:
@@ -1805,7 +1815,7 @@ class PairRuntime:
                 )
                 self._record_lost_background(
                     "the pair's claude process exited while a self-woken turn was starting")
-                raise CLIError(
+                raise _runtime_cli_error(self.spec,
                     f"{CRASHED_ERROR_PREFIX}pair runtime exited during a self-woken turn "
                     f"(before this message was written)",
                     stderr=self._collect_stderr(),
@@ -2016,7 +2026,7 @@ class PairRuntime:
                     self.proc.stdin.write(payload.encode("utf-8"))
                     self.proc.stdin.flush()
                 except (BrokenPipeError, OSError, ValueError) as e:  # ValueError: a closed file
-                    raise CLIError(
+                    raise _runtime_cli_error(self.spec,
                         f"pair runtime stdin closed: {e}",
                         stderr=self._collect_stderr(),
                     )
@@ -2067,7 +2077,7 @@ class PairRuntime:
                             # lets wait.py dispatch "claude.exe died mid-turn"
                             # to exit code 6, distinct from generic work errors
                             # (exit 1). v0.9.8 Bug 4 + Bug 5 fix.
-                            raise CLIError(
+                            raise _runtime_cli_error(self.spec,
                                 f"{CRASHED_ERROR_PREFIX}pair runtime exited mid-turn (exit {code_str})",
                                 stderr=stderr_snapshot,
                                 exit_code=returncode,

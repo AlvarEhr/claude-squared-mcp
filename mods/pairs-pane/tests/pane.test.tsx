@@ -268,7 +268,7 @@ test('all view orders working then recent completions and collapses old idle pai
     .toEqual(['working', 'recent', 'older'])
   expect((await ui.find({ type: 'Text', text: /^Opus/ }))?.text).toBe('Opus 5.5')
   expect((await ui.find({ type: 'Text', text: /^6 Astra/ }))?.text).toBe('6 Astra')
-  expect((await ui.find({ type: 'Text', text: /^failed/ }))?.text).toContain('(12 min ago)')
+  expect((await ui.find({ type: 'Text', text: /^failed/ }))?.text).toContain('failed · ')
   expect((await ui.find({ type: 'Button', key: 'idle' }))?.text).toContain('Idle (1)')
   expect(await ui.find({ type: 'Button', key: 'refresh' })).toBeUndefined()
   await ui.press({ key: 'idle' })
@@ -477,5 +477,50 @@ test('context widget uses the pair alert level for bar and header indicator colo
   const compact = await ui.find({ key: 'indicator-idle-alert' })
   expect(compact?.text).toBe('●')
   expect(JSON.stringify(compact?.children)).toContain('"color":"red"')
+  await ui.unmount()
+})
+
+test('interrupted turns have attention status and no-reply labels with matching local times', async ($, on) => {
+  const clock = base(on)
+  const outcomes = ['orphaned', 'failed', 'stopped', 'crashed']
+  on('process.run', () => ({ value: { exitCode: 0, stdout: JSON.stringify({ rows: outcomes.map(outcome => ({
+    ...row(outcome, 'manager-session'), status: outcome, outcome,
+    finished_at: '2026-10-29T13:15:00+00:00', finished_ago_s: 60,
+    detail: { reply: null, reply_at: '2026-10-29T13:15:00', outcome, working_on: null, logs: [], note: null },
+  })) }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: false })
+  await clock.advance(1)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  for (const outcome of outcomes) {
+    await ui.press({ key: `detail-${outcome}` })
+    const status = await ui.find({ type: 'Text', text: new RegExp(`^${outcome} · `) })
+    const label = await ui.find({ type: 'Text', text: new RegExp(`^No reply \\(turn ${outcome}\\)`) })
+    expect(status?.props.color).toBe('yellow')
+    expect(status?.text.split(' · ')[1]).toBe(label?.text.split(' · ')[1])
+  }
+  expect(await ui.find({ type: 'Text', text: /Latest reply|ORPHANED:|idle · finished/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('expanded detail never retains an old log tail when its refresh is unavailable', async ($, on) => {
+  const clock = base(on)
+  let calls = 0
+  on('process.run', () => {
+    calls++
+    const detail = calls === 2 ? null : { ...row('scout').detail,
+      logs: calls === 1 ? ['[21:53:00] [T-562] older day'] : ['[14:10:00] [T-566] new day', '[14:10:01] [T-567] new day'] }
+    return { value: { exitCode: 0, stdout: JSON.stringify({ rows: [{ ...row('scout', 'manager-session'), detail }] }),
+      stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: false })
+  await clock.advance(1)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'detail-scout' })
+  expect((await ui.find({ type: 'Text', text: /T-562/ }))?.text).toContain('older day')
+  await clock.advance(1)
+  expect(await ui.find({ type: 'Text', text: /T-562/ })).toBeUndefined()
+  await clock.advance(5000)
+  const logs = await ui.findAll({ type: 'Text', text: /T-56[67]/ })
+  expect(logs.map(line => line.text)).toEqual(['[14:10:00] [T-566] new day', '[14:10:01] [T-567] new day'])
   await ui.unmount()
 })

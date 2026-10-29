@@ -431,7 +431,7 @@ def _key_rejected_help(name: str) -> str:
 def _billing_failure(spec: "PairSpec | None", text: str) -> str | None:
     """The clear message for a failed process of an API-billed pair whose
     output says the credits ran out or the key was rejected, else None.
-    Only for processes that already failed (non-zero exit)."""
+    Only for a failed process or an explicit CLI error result."""
     if spec is None or spec.billing != "api":
         return None
     if _CREDIT_RE.search(text):
@@ -443,25 +443,100 @@ def _billing_failure(spec: "PairSpec | None", text: str) -> str | None:
     return None
 
 
-def _failure_text(stdout: str, stderr: str) -> str:
-    """What a failed process said about itself: the LAST result event's text
-    (``--output-format json`` or stream-json), else stderr. Never the rest of
-    stdout — tool results there may quote anything (review: an
-    error_max_turns run that had quoted the key error read as a rejected key)."""
+def _failure_result(output: str) -> dict | None:
+    """Only terminal CLI envelopes, never assistant/tool text quoting an error."""
+    def terminal(value):
+        return (isinstance(value, dict) and not value.get("parent_tool_use_id")
+                and (value.get("type") == "result" or (not value.get("type") and
+                     ("loggedIn" in value or ("result" in value and
+                      ("is_error" in value or "terminal_reason" in value))))))
     try:
-        whole = json.loads(stdout)
+        whole = json.loads(output)
     except ValueError:
         whole = None
-    if isinstance(whole, dict) and whole.get("type") == "result":
-        return str(whole.get("result") or "")
-    for line in reversed(stdout.splitlines()):
+    if terminal(whole):
+        return whole
+    for line in reversed(output.splitlines()):
         try:
             event = json.loads(line)
         except ValueError:
             continue
-        if isinstance(event, dict) and event.get("type") == "result":
-            return str(event.get("result") or "")
-    return stderr
+        if terminal(event):
+            return event
+    return None
+
+
+def _failed_result(result: dict) -> bool:
+    return bool(result.get("is_error") or result.get("api_error_status") or result.get("loggedIn") is False
+                or str(result.get("subtype") or "").startswith("error")
+                or result.get("terminal_reason") == "api_error")
+
+
+def _result_text(event: dict) -> str:
+    if isinstance(event.get("result"), str) and event["result"].strip():
+        return event["result"].strip()
+    if event.get("loggedIn") is False:
+        return "loggedIn: false"
+    errors = event.get("errors")
+    if isinstance(errors, list) and errors:
+        return "\n".join(error for error in errors if isinstance(error, str))
+    return str(event.get("subtype") or event.get("terminal_reason") or "")
+
+
+def _failure_text(stdout: str, stderr: str) -> str:
+    """What a failed process said about itself: the LAST result event's text
+    (``--output-format json`` or stream-json), else plain diagnostic text.
+    Never other JSON events — tool results there may quote anything (review: an
+    error_max_turns run that had quoted the key error read as a rejected key)."""
+    event = _failure_result(stdout)
+    if event is None:
+        event = _failure_result(stderr)
+    if event is not None:
+        return _result_text(event)
+    # A raw JSON/JSONL stream is not an error headline. In particular, never
+    # search assistant/tool output for auth text (billing review, v0.18).
+    plain = []
+    for line in stderr.splitlines():
+        line = line.strip()
+        if not line or line.startswith(("{", "[{", '["')):
+            continue
+        try:
+            json.loads(line)
+        except ValueError:
+            plain.append(line)  # retain ordinary [tag] diagnostics
+    if plain:
+        return "\n".join(plain)
+    return stdout.strip() if not any(line.lstrip().startswith(("{", "[")) for line in stdout.splitlines()) else ""
+
+
+def _login_failure(spec: PairSpec | None, text: str, *, logged_out: bool = False) -> str | None:
+    if spec is not None and spec.billing == "api":
+        return None
+    if logged_out or re.search(r"failed to authenticate|oauth session expired|invalid api key|not logged in"
+                 r"|loggedIn[\"']?\s*:\s*false", text, re.IGNORECASE):
+        return (f"the claude CLI is not logged in ({text.strip()}) — the user must run "
+                "`claude auth login` in a terminal; pairs can't sign in themselves.")
+    return None
+
+
+def claude_failure_message(spec: PairSpec | None, stdout: str, stderr: str,
+                           fallback: str = "claude CLI failed without a result message") -> str:
+    """Human result first, shared by one-shots and runtime transport failures.
+
+    2026-10-29: manager verified expired OAuth returns exit 1 + api_error,
+    zero usage, and the actionable explanation in result, after long metadata.
+    """
+    text = _failure_text(stdout, stderr)
+    result = _failure_result(stdout) or _failure_result(stderr) or {}
+    billing = _billing_failure(spec, text)
+    if billing:
+        return f"{billing} The CLI said: {text}"
+    login = _login_failure(spec, text, logged_out=result.get("loggedIn") is False)
+    if login:
+        return login
+    if MODEL_UNAVAILABLE_MARKER in text.lower():
+        return f"{text}\n{_MODEL_UNAVAILABLE_HELP}"
+    return text or fallback
 
 
 def _credit_help(name: str) -> str:
@@ -1032,29 +1107,11 @@ class ClaudeAdapter(PairAdapter):
         except subprocess.TimeoutExpired as e:
             raise CommandTimeout(pair_name, timeout_seconds) from e
 
-        if proc.returncode != 0:
-            stderr_txt = proc.stderr.decode("utf-8", errors="replace")
-            stdout_txt = proc.stdout.decode("utf-8", errors="replace")
-            # v0.11.0: surface the "model is gone" case clearly. When a model is
-            # pulled / access is lost, the CLI exits 1 — but for --output-format
-            # json the error lands on STDOUT as a valid result JSON (is_error,
-            # api_error_status 404), with stderr EMPTY (verified the day Fable 5
-            # was pulled). So check BOTH streams for the marker, not just stderr.
-            combined = (stderr_txt + "\n" + stdout_txt).lower()
-            failure = _billing_failure(env_spec, _failure_text(stdout_txt, stderr_txt))
-            if failure:
-                raise CLIError(failure, stderr=stderr_txt or stdout_txt[:2000], exit_code=proc.returncode)
-            if MODEL_UNAVAILABLE_MARKER in combined:
-                raise CLIError(
-                    _MODEL_UNAVAILABLE_HELP,
-                    stderr=stderr_txt or stdout_txt[:2000],
-                    exit_code=proc.returncode,
-                )
-            raise CLIError(
-                f"claude CLI exited non-zero",
-                stderr=stderr_txt or stdout_txt[:2000],
-                exit_code=proc.returncode,
-            )
+        stdout_txt = proc.stdout.decode("utf-8", errors="replace")
+        stderr_txt = proc.stderr.decode("utf-8", errors="replace")
+        terminal = _failure_result(stdout_txt) or _failure_result(stderr_txt)
+        if proc.returncode != 0 or (terminal is not None and _failed_result(terminal)):
+            raise CLIError(claude_failure_message(env_spec, stdout_txt, stderr_txt), exit_code=proc.returncode)
         try:
             if connector_spec is not None and connectors.effective(connector_spec.mcp_whitelist):
                 events = []
@@ -1074,7 +1131,7 @@ class ClaudeAdapter(PairAdapter):
         except json.JSONDecodeError as e:
             raise CLIError(
                 f"could not parse claude CLI JSON output: {e}",
-                stderr=proc.stdout.decode("utf-8", errors="replace")[:2000],
+                stderr=_failure_text(stdout_txt, stderr_txt),
                 exit_code=proc.returncode,
             )
 
@@ -1113,14 +1170,11 @@ class ClaudeAdapter(PairAdapter):
         except subprocess.TimeoutExpired as e:
             raise CommandTimeout(spec.name, timeout_seconds) from e
 
-        if proc.returncode != 0:
-            stderr_txt = proc.stderr.decode("utf-8", errors="replace")
-            # v0.18.0: compaction / /context / pair_invoke on an API pair whose
-            # credits ran out or whose key was rejected say so, as _run_print does.
-            failure = _billing_failure(
-                spec, _failure_text(proc.stdout.decode("utf-8", errors="replace"), stderr_txt))
-            raise CLIError(failure or "claude CLI (stream-json) exited non-zero",
-                           stderr=stderr_txt, exit_code=proc.returncode)
+        stdout_txt = proc.stdout.decode("utf-8", errors="replace")
+        stderr_txt = proc.stderr.decode("utf-8", errors="replace")
+        terminal = _failure_result(stdout_txt) or _failure_result(stderr_txt)
+        if proc.returncode != 0 or (terminal is not None and _failed_result(terminal)):
+            raise CLIError(claude_failure_message(spec, stdout_txt, stderr_txt), exit_code=proc.returncode)
 
         events: list[dict] = []
         for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
@@ -1261,6 +1315,8 @@ class ClaudeAdapter(PairAdapter):
         #     and let the human interpret rather than hard-matching values.
         stop_reason = result_json.get("stop_reason")
         api_err = result_json.get("api_error_status")
+        login_failure = (_login_failure(spec, _result_text(result_json), logged_out=result_json.get("loggedIn") is False)
+                         if _failed_result(result_json) else None)
         safety_signal: str | None = None
         safety_kind: str | None = None
         if stop_reason == "refusal":
@@ -1298,6 +1354,9 @@ class ClaudeAdapter(PairAdapter):
             safety_signal = (f"{_key_rejected_help(spec.name)} The API said: "
                              f"{(result_json.get('result') or '').strip()[:160]!r}")
             safety_kind = "api_key_rejected"
+        elif login_failure:
+            safety_signal = login_failure
+            safety_kind = "error"
         elif _USAGE_LIMIT_RE.search(result_json.get("result") or ""):
             # v0.12.0: the CLI reports a usage-limit hit as subtype SUCCESS with
             # the limit notice as the result text (observed on par6, 2026-08-22:
@@ -1344,7 +1403,7 @@ class ClaudeAdapter(PairAdapter):
 
         return SendResult(
             name=spec.name,
-            response=result_json.get("result", ""),
+            response=login_failure or result_json.get("result", ""),
             session_id=result_json.get("session_id", spec.session_id),
             model_used=model_used,
             # v0.18.0: a warm runtime's total_cost_usd is a running total for

@@ -107,7 +107,7 @@ class SnapshotTests(unittest.TestCase):
     def test_orphaned_task_is_attention_not_a_live_turn(self):
         self.write("async/task.json", {"task_id": "task", "pair_name": "scout", "status": "running",
             "owner_pid": 999999999, "started_at": self.started})
-        self.assertEqual(P.snapshot(self.home)["rows"][0]["status"], "needs attention")
+        self.assertEqual(P.snapshot(self.home)["rows"][0]["status"], "orphaned")
 
     def test_invalid_records_and_registry_do_not_claim_idle(self):
         self.write("watches/invalid.json", {"version": 1, "pair": "../escape"})
@@ -399,6 +399,45 @@ class SnapshotTests(unittest.TestCase):
             self.assertIn("compressed", P.transcript_page(self.home, "scout")["note"])
             self.assertFalse(path.exists())
         self.assertEqual(database.read_bytes(), before)
+
+    def test_interrupted_turns_are_not_replies_and_naive_utc_is_normalized(self):
+        for status, error, expected in [("failed", "ORPHANED: owner exited", "orphaned"),
+                ("failed", "CRASHED: runtime exited", "crashed"), ("failed", "CLIError: failure", "failed"),
+                ("stopped", "user stopped the turn", "stopped")]:
+            at = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+            self.write("async/task.json", {"task_id": "task", "pair_name": "scout", "status": status,
+                "finished_at": at, "error": error})
+            data = P.snapshot(self.home, expanded=["scout"])
+            with self.subTest(expected=expected):
+                row = data["rows"][0]
+                self.assertEqual(row["status"], expected)
+                self.assertEqual(row["outcome"], expected)
+                self.assertEqual(row["detail"]["outcome"], expected)
+                self.assertIsNone(row["detail"]["reply"])
+                self.assertEqual(row["detail"]["reply_at"], row["finished_at"])
+                self.assertTrue(row["finished_at"].endswith("+00:00"))
+                self.assertNotIn(error, json.dumps(row))
+
+    def test_latest_physical_log_tail_crosses_days_and_refreshes_with_warm_task_cache(self):
+        self.activity()
+        self.write("async/task.json", {"task_id": "task", "pair_name": "scout", "status": "running",
+            "owner_pid": os.getpid(), "started_at": self.started})
+        log = self.pairs / "logs/scout/main.log"
+        log.parent.mkdir(parents=True)
+        log.write_text("[21:53:00] [T-561] older day\n[21:53:01] [T-562] older day\n", encoding="utf-8")
+        old = P.snapshot(self.home, expanded=["scout"])
+        with log.open("a", encoding="utf-8") as stream:
+            stream.write("[14:10:00] [T-566] latest day\n[14:10:01] [T-567] latest day\n")
+        new = P.snapshot(self.home, expanded=["scout"], cache=old["cache"])
+        self.assertEqual(new["rows"][0]["detail"]["logs"][-2:],
+            ["[14:10:00] [T-566] latest day", "[14:10:01] [T-567] latest day"])
+
+    def test_successful_reply_quoting_orphan_error_is_not_an_orphan(self):
+        self.write("async/task.json", {"task_id": "task", "pair_name": "scout", "status": "done",
+            "finished_at": self.started, "result": {"response": "ORPHANED: example error text"}})
+        row = P.snapshot(self.home, expanded=["scout"])["rows"][0]
+        self.assertEqual(row["status"], "idle")
+        self.assertEqual(row["detail"]["reply"], "ORPHANED: example error text")
 
 
 if __name__ == "__main__":

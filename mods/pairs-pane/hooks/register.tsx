@@ -1,6 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, Register } from 'claude-code'
 import type { PairRow, PairsView, TranscriptView } from '../types'
+import { localTime } from './time'
 
 const PANE = 'pairs'
 const view = atom({ plugin: 'pairs-pane', key: 'view' } as const,
@@ -15,12 +16,6 @@ const transcript = atom({ plugin: 'pairs-pane', key: 'transcript' } as const, nu
 function tokens(value: number | null | undefined): string {
   if (value == null) return '—'
   return value >= 1000000 ? `${Math.round(value / 100000) / 10}M` : value >= 1000 ? `${Math.round(value / 100) / 10}k` : String(value)
-}
-
-function localTime(at: string | null | undefined): string {
-  if (!at) return ''
-  const date = new Date(at)
-  return Number.isFinite(date.getTime()) ? date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false }) : ''
 }
 
 function duration(seconds: number | null): string {
@@ -62,7 +57,12 @@ function modelLabel(row: PairRow): string {
 }
 
 function foreground(row: PairRow): boolean {
-  return row.status === 'busy' || row.status === 'needs attention' || row.watches.length > 0
+  return row.status === 'busy' || row.status === 'needs attention' || row.status === 'orphaned'
+    || row.status === 'crashed' || row.watches.length > 0
+}
+
+function interrupted(outcome: string | null | undefined): boolean {
+  return ['orphaned', 'failed', 'stopped', 'crashed'].includes(outcome || '')
 }
 
 function recent(row: PairRow): boolean {
@@ -77,6 +77,10 @@ function orderRows(a: PairRow, b: PairRow): number {
 
 function statusLabel(row: PairRow): string {
   if (row.status === 'busy') return `working${row.elapsed_s == null ? '' : ` · ${duration(row.elapsed_s)}`}`
+  if (interrupted(row.status) || interrupted(row.outcome)) {
+    const at = localTime(row.finished_at)
+    return `${interrupted(row.status) ? row.status : row.outcome}${at ? ` · ${at}` : ''}`
+  }
   const status = row.status !== 'needs attention' && (row.outcome === 'failed' || row.outcome === 'stopped') ? row.outcome : row.status
   if (!row.finished_at || row.finished_ago_s == null) return status
   const at = localTime(row.finished_at)
@@ -154,7 +158,11 @@ async function refresh($: EngineInterface) {
     if (active && generation === currentGeneration) {
       readerCache = data.cache || {}
       const rows = (data.rows as PairRow[]).map(row => ({ ...row,
-        detail: row.detail || (previousView.home === home ? previousView.rows.find(old => old.name === row.name)?.detail : null) }))
+        // Keep collapsed detail for instant reopening, but a requested detail
+        // that could not be refreshed must never retain an old physical tail.
+        detail: row.detail || (!details.includes(row.name) && previousView.home === home
+          ? previousView.rows.find(old => old.name === row.name && old.finished_at === row.finished_at
+            && old.status === row.status && old.outcome === row.outcome)?.detail : null) }))
       const snapshot = { rows, error: data.error || null, notice: data.notice || null, session, home }
       scopeCache[String(showAll)] = snapshot
       if ((await read($, all)) === showAll && !(await read($, transcript))) await update($, view, () => snapshot)
@@ -302,7 +310,7 @@ export const register: Register = (on, configured) => {
                 <Box key={`indicator-${row.name}`}><Text dimColor={!knownContext(row)} color={contextColor(row)}>{contextIndicator(row)}</Text></Box>
                 <Text bold>{row.name}</Text><Text dimColor>{modelLabel(row)}</Text>
               </Box>
-              <Text color={row.status !== 'busy' && row.outcome === 'failed' ? 'red' : undefined}>{statusLabel(row)}</Text>
+              <Text color={row.status !== 'busy' && (interrupted(row.status) || interrupted(row.outcome)) ? 'yellow' : undefined}>{statusLabel(row)}</Text>
             </Box>
             {knownContext(row) ? <Box flexDirection="column">
               <Box justifyContent="space-between" width="100%" gap={1}>
@@ -320,7 +328,8 @@ export const register: Register = (on, configured) => {
               {!row.detail && <Text dimColor>Loading reply and activity…</Text>}
               {row.detail && <Box flexDirection="column" gap={1}>
                 {row.status === 'busy' && <Text wrap="wrap">Working on: {row.detail.working_on || 'message unavailable'}</Text>}
-                <Text bold>{row.status === 'busy' ? 'Previous reply' : 'Latest reply'}{localTime(row.detail.reply_at) ? ` · ${localTime(row.detail.reply_at)}` : ''}</Text>
+                <Text bold>{interrupted(row.detail.outcome) ? `No reply (turn ${row.detail.outcome})`
+                  : row.status === 'busy' ? 'Previous reply' : 'Latest reply'}{localTime(row.detail.reply_at) ? ` · ${localTime(row.detail.reply_at)}` : ''}</Text>
                 {row.detail.reply != null && <Text wrap="wrap">{moreReplies.includes(row.name) ? row.detail.reply : row.detail.reply.split('\n').slice(0, 12).join('\n')}</Text>}
                 {row.detail.reply && row.detail.reply.split('\n').length > 12 && <Button key={`reply-more-${row.name}`}
                   label={moreReplies.includes(row.name) ? 'Less reply' : 'More reply'} onPress={() => { void toggleMore($, row.name, 'reply') }} />}

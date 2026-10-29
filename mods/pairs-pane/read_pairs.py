@@ -132,6 +132,7 @@ def task_summaries(pairs, names, references, reader, reads, now, cache, show_all
                 continue
             summary = reader["_av_task_summary"](data)
             summary["filename"] = filename
+            summary["outcome"] = task_outcome(data)
             # Retain only the last reported context, never the model reply.
             result = data.get("result")
             if isinstance(result, dict) and isinstance(result.get("model_used"), str):
@@ -160,7 +161,7 @@ def safe_pair(name):
 
 
 def tail(path):
-    """Read at most 8 KiB even when the pair's log is many megabytes."""
+    """Physical tail only: HH:MM:SS labels cannot order lines across days."""
     try:
         with path.open("rb") as stream:
             stream.seek(0, 2)
@@ -177,6 +178,18 @@ def tail(path):
         return []
 
 
+def task_outcome(data):
+    status = data.get("status")
+    if status == "failed":
+        error = data.get("error") or ""
+        if isinstance(error, str):
+            if error.startswith("ORPHANED: "):
+                return "orphaned"
+            if error.startswith("CRASHED: "):
+                return "crashed"
+    return status
+
+
 def task_detail(pairs, tasks, reads, parse):
     completed = [t for t in tasks if t.get("status") != "running" and parse(t.get("finished_at"))]
     running = [t for t in tasks if t.get("status") == "running"]
@@ -189,14 +202,17 @@ def task_detail(pairs, tasks, reads, parse):
         data = reads.json(pairs / "async" / filename, TASK_LIMIT)
         return data if isinstance(data, dict) else {}
     data = payload(latest)
+    outcome = (latest.get("outcome") or latest.get("status")) if latest else None
     result = data.get("result")
     reply = result.get("response") if isinstance(result, dict) else None
-    if not isinstance(reply, str):
-        reply = data.get("error") if isinstance(data.get("error"), str) else None
+    if not isinstance(reply, str) or outcome in ("orphaned", "failed", "stopped", "crashed"):
+        reply = None  # supervision/error text is never a model reply
     message = payload(current).get("message")
-    return {"reply": reply, "reply_at": latest.get("finished_at") if latest else None,
+    at = parse(latest.get("finished_at")) if latest else None
+    return {"reply": reply, "reply_at": at.isoformat() if at else None, "outcome": outcome,
             "working_on": message.splitlines()[0] if isinstance(message, str) and message else None,
-            "logs": [], "note": None if reply is not None else "Latest reply unavailable within the read limits."}
+            "logs": [], "note": None if reply is not None or outcome in ("orphaned", "failed", "stopped", "crashed")
+            else "Latest reply unavailable within the read limits."}
 
 
 def context_fill(reader, view, spec, defaults):
@@ -353,11 +369,15 @@ def snapshot(home, session=None, show_all=True, expanded=(), cache=None):
         started = min(starts) if starts else parse(view.get("window_started_at"))
         context = view.get("context") or {}
         pair_tasks = [task for task in tasks if task.get("pair") == name]
-        completions = [(parse(item.get("ended_at") or item.get("finished_at")), item.get("status"))
+        completions = [(parse(item.get("ended_at") or item.get("finished_at")), item.get("outcome") or item.get("status"))
                        for item in view["window_turns"] + view["background_finished"] + pair_tasks
                        if item.get("status") != "running"]
         completions = [(at, status) for at, status in completions if at is not None]
-        finished, outcome = max(completions, key=lambda item: item[0]) if completions else (None, None)
+        finished, outcome = max(completions, key=lambda item: (item[0], item[1] in ("orphaned", "crashed"))) if completions else (None, None)
+        orphaned = any(t.get("state") == "orphaned" for t in view["running_tasks"])
+        status = "orphaned" if orphaned else "needs attention" if attention else view["verdict"]
+        if status in ("idle", "settling") and outcome in ("orphaned", "failed", "stopped", "crashed"):
+            status = outcome
         # Idle Claude runtimes can have no current context record. Reuse a
         # bounded stored SendResult, but never restore pre-compaction usage or
         # Codex cumulative usage. The merged view already keeps old owner reports.
@@ -386,9 +406,12 @@ def snapshot(home, session=None, show_all=True, expanded=(), cache=None):
         # A formerly expanded row may have aged into the collapsed Idle group
         # since the UI's previous snapshot. Gate detail using this snapshot too.
         detail = name in expanded and (not show_all or waiting or attention or view["verdict"] == "busy"
+                                      or status in ("orphaned", "crashed")
                                       or (finished and (now - finished).total_seconds() <= RECENT_SECONDS))
         details = task_detail(pairs, pair_tasks, reads, parse) if detail else None
         if details is not None:
+            if orphaned:
+                details.update(reply=None, outcome="orphaned", note=None)
             details["logs"] = tail(pairs / "logs" / name / "main.log")
             size = len(json.dumps(details).encode("utf-8"))
             if detail_bytes + size > 1024 * 1024:
@@ -403,7 +426,7 @@ def snapshot(home, session=None, show_all=True, expanded=(), cache=None):
         affected = affected or bool(details and details["note"])
         rows.append({
             "name": name, "backend": spec.get("backend") or context.get("backend") or "unknown",
-            "model": display_model(spec, view, pair_tasks, parse), "status": "needs attention" if attention else view["verdict"],
+            "model": display_model(spec, view, pair_tasks, parse), "status": status,
             "elapsed_s": max(0, (now - started).total_seconds()) if started else None,
             "finished_at": finished.isoformat() if finished else None,
             "finished_ago_s": max(0, (now - finished).total_seconds()) if finished else None,

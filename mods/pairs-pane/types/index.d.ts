@@ -5,7 +5,8 @@ export type PairWatch = {
 export type PairRow = {
   name: string; backend: string; model: string; status: string;
   elapsed_s: number | null;
-  detail?: { reply: string | null; reply_at: string | null; working_on: string | null; logs: string[]; note: string | null } | null;
+  detail?: { reply: string | null; reply_at: string | null; outcome?: string | null;
+    working_on: string | null; logs: string[]; note: string | null } | null;
   partial?: boolean;
   finished_at?: string | null; finished_ago_s?: number | null; outcome?: string | null;
   context: {

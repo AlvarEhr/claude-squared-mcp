@@ -63,7 +63,22 @@ indicator/counts; unknown fill has muted text and no bar. Idle Claude fallback
 reads already-budgeted activity/SendResult context,
 excluding known pre-compaction reports; it never uses cumulative result usage.
 Completion timestamps/outcomes come from activity history and task summaries,
-not log usage markers. Expanded log detail skips bookkeeping markers.
+not log usage markers. Failed task supervision prefixes distinguish orphaned
+and crashed from ordinary failed/stopped outcomes. These show attention status
+and No reply labels; error strings are never substituted for model replies.
+Successful replies quoting such prefixes remain replies.
+
+The 2026-10-29 screenshot's one-hour discrepancy came from naive UTC task times
+being passed straight to JavaScript Date (which treated them as local), while
+the header had an aware timestamp. Task reply times now normalize to aware UTC;
+the shared UI formatter also recognizes naive UTC and uses the real local zone
+per timestamp. Mod tests exercise Europe's 2026-10-25 DST transition explicitly.
+
+Expanded log detail skips bookkeeping markers and reads the physical last
+8 KiB, never sorting HH:MM:SS labels. A warm-cache regression appends lower clock
+times from a newer day and checks their physical order. The reader already used
+physical tails before this report; the UI now discards cached detail when a
+requested refresh returns none, or the row's outcome/status/completion changes.
 
 Task state has owner_pid but no manager-session identifier. Without watches,
 PID alone cannot safely supply the requested session fallback, so Waiting on
