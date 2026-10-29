@@ -69,7 +69,9 @@ A Pairs pane for the Claude desktop app, and auto-watch waits that survive a res
   avoiding false host-death detection on small/negative wall-clock shifts.
 - Pane detail reads prioritize working/recent pairs, so late-alphabet pairs no
   longer lose their reads to idle history. All known registry pairs remain visible
-  as compact rows when budgets run out, with an explicit notice.
+  as compact rows when budgets run out, with an explicit notice. Compact rows keep
+  an established idle status; unknown means discovery could not decide. Forgotten
+  activity directories appear only with evidence of busy or recently finished work.
 - Codex transcript lookup uses immutable SQLite reads to avoid creating WAL/SHM
   files. Claude login guidance requires failed CLI-envelope evidence; MCP auth
   diagnostics and successful replies quoting key errors are not login failures.

@@ -61,9 +61,14 @@ a bounded task set and bounded JSON reads. Limits live beside the reader:
 | Transcript | Explicit open/page only; 64 KiB per page, user/assistant text; no restore/decompression |
 
 Only matching session watches select pairs in the default view. All-pairs mode
-also lists registered/activity pairs. A stat-only activity pass plus bounded
+lists registry pairs, plus non-registry pairs with busy/recent completion evidence;
+old forgotten activity directories do not create idle or budget-skipped rows.
+A stat-only activity pass plus bounded
 task/watch discovery ranks busy pairs, watched pairs and recent activity before
-per-pair JSON reads. Old idle rows come directly from the registry. The 60-pair
+per-pair JSON reads. Old idle rows come directly from the registry and keep idle
+status when their per-pair scan is complete, even if unrelated task history hit
+a limit. Missing/incomplete discovery remains unknown; skipped detail alone
+does not change known status. The 60-pair
 regression puts the busy pair alphabetically last and verifies full detail with
 no idle activity reads. A separate exhausted-budget fixture retains all 70 names.
 Filtering precedes activity JSON and log reads. Expanded rows read latest finished/current task payloads within the same

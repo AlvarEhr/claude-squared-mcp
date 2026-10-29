@@ -479,6 +479,51 @@ class SnapshotTests(unittest.TestCase):
         self.assertFalse(data["budget_limited"])
         self.assertTrue(old.exists())  # the pane stays read-only
 
+    def test_registry_only_idle_rows_survive_unrelated_history_limits_without_unknowns(self):
+        registered = [f"registered-{i:02}" for i in range(52)]
+        forgotten = [f"forgotten-{i:02}" for i in range(37)]
+        self.write("registry.json", {"pairs": {name: {"backend": "claude", "model": "opus"} for name in registered}})
+        for name in registered + forgotten:
+            path = self.write(f"activity/{name}/123.json", {"version": 1, "state": "closed"})
+            os.utime(path, (1, 1))
+        self.write("async/oversized.json", {"result": "x" * P.TASK_LIMIT})
+        original = Path.open
+        def checked(path, *args, **kwargs):
+            self.assertNotIn("activity", path.parts, "idle rows must not load activity JSON")
+            return original(path, *args, **kwargs)
+        with patch.object(Path, "open", checked):
+            data = P.snapshot(self.home)
+        self.assertEqual({row["name"] for row in data["rows"]}, set(registered))
+        self.assertTrue(all(row["status"] == "idle" and row["compact"] for row in data["rows"]))
+        self.assertTrue(data["budget_limited"])
+
+    def test_nonregistry_rows_require_busy_or_recent_completion_evidence(self):
+        for name in ("forgotten-old", "forgotten-touched"):
+            path = self.write(f"activity/{name}/123.json", {"version": 1, "state": "closed"})
+            if name == "forgotten-old":
+                os.utime(path, (1, 1))
+        self.write("async/running.json", {"task_id": "running", "pair_name": "forgotten-busy", "status": "running",
+            "owner_pid": os.getpid(), "started_at": self.now.isoformat()})
+        self.write("async/finished.json", {"task_id": "finished", "pair_name": "forgotten-recent", "status": "done",
+            "finished_at": self.started, "result": {"response": "Done"}})
+        data = P.snapshot(self.home)
+        self.assertEqual({row["name"] for row in data["rows"]}, {"scout", "forgotten-busy", "forgotten-recent"})
+        self.assertEqual(next(row for row in data["rows"] if row["name"] == "forgotten-busy")["status"], "busy")
+
+    def test_skipped_compact_details_do_not_change_an_established_idle_status(self):
+        completed = self.write("async/finished.json", {"task_id": "finished", "pair_name": "scout", "status": "done",
+            "finished_at": self.started})
+        with patch.object(P, "ROW_BUDGET", 0):
+            row = P.snapshot(self.home)["rows"][0]
+        self.assertTrue(row["details_skipped"])
+        self.assertEqual(row["status"], "idle")
+        completed.unlink()
+        self.activity()  # fresh activity alone cannot settle status without a read
+        with patch.object(P, "ROW_BUDGET", 0):
+            row = P.snapshot(self.home)["rows"][0]
+        self.assertTrue(row["details_skipped"])
+        self.assertEqual(row["status"], "unknown")
+
     def test_interrupted_turns_are_not_replies_and_naive_utc_is_normalized(self):
         for status, error, expected in [("failed", "ORPHANED: owner exited", "orphaned"),
                 ("failed", "CRASHED: runtime exited", "crashed"), ("failed", "CLIError: failure", "failed"),

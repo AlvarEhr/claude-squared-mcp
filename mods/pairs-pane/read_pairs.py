@@ -178,9 +178,9 @@ def summarize_task(data, filename, reader):
     return summary
 
 
-def compact_row(name, spec, watches=(), skipped=False, busy=False):
+def compact_row(name, spec, watches=(), skipped=False, busy=False, undecided=False):
     return {"name": name, "backend": spec.get("backend") or "unknown", "model": spec.get("model") or "unknown",
-            "status": "busy" if busy else "unknown" if skipped else "idle", "elapsed_s": None,
+            "status": "busy" if busy else "unknown" if undecided else "idle", "elapsed_s": None,
             "finished_at": None, "finished_ago_s": None, "outcome": None, "detail": None,
             "context": {"used": None, "window": None, "percent": None, "alert_at": None, "above_alert": False},
             "watches": list(watches), "partial": skipped, "details_skipped": skipped, "compact": True}
@@ -405,6 +405,8 @@ def snapshot(home, session=None, show_all=True, expanded=(), cache=None):
     cutoff = now.timestamp() - RECENT_SECONDS
     recent_tasks = {name for name, items in tasks_by_pair.items()
                     if any(parse(t.get("finished_at")) and parse(t["finished_at"]).timestamp() >= cutoff for t in items)}
+    if show_all:
+        names = list(set(names) | busy | recent_tasks)
     selected = busy | set(watches) | recent_tasks | {name for name in names if hints.get(name, 0) >= cutoff}
     names.sort(key=lambda name: (0 if name in busy else 1 if name in watches else 2 if name in selected else 3,
                                   -hints.get(name, 0), name))
@@ -418,17 +420,24 @@ def snapshot(home, session=None, show_all=True, expanded=(), cache=None):
         spec = specs.get(name) if isinstance(specs.get(name), dict) else {}
         waiting = watches.get(name, [])
         if name not in selected:
-            skipped = (name not in hints or reads.task_discovery_limited
+            if name not in specs:
+                continue  # forgotten pairs' old activity directories are not idle pairs
+            # A global task-history cap does not invalidate a complete, old
+            # per-pair activity scan. With no such evidence, retain unknown.
+            undecided = (name not in hints or (reads.task_discovery_limited and not candidates.get(name))
                        or str(pairs / "activity" / name) in reads.issues)
-            rows.append(compact_row(name, spec, waiting, skipped=skipped))
+            rows.append(compact_row(name, spec, waiting, skipped=undecided, undecided=undecided))
             continue
+        nonregistry_work = name in busy or name in recent_tasks
         paths = candidates.get(name, [])
         meta = pairs / "activity" / name / "pair.json"
         required = sum(1 for path in paths + [meta] if path not in reads.memo and path.is_file())
         if (detailed >= ROW_BUDGET or reads.files + required > FILE_BUDGET or reads.bytes >= BYTE_BUDGET
                 or str(pairs / "activity" / name) in reads.issues):
             reads.budget_limited = True
-            rows.append(compact_row(name, spec, waiting, skipped=True, busy=name in busy))
+            if name in specs or nonregistry_work:
+                rows.append(compact_row(name, spec, waiting, skipped=True, busy=name in busy,
+                                        undecided=name not in recent_tasks or reads.task_discovery_limited))
             continue
         detailed += 1
         owner_files[name] = paths
@@ -463,12 +472,11 @@ def snapshot(home, session=None, show_all=True, expanded=(), cache=None):
                 except OSError:
                     pass
         if any(reads.memo.get(path) is None and str(path) in reads.issues for path in paths + [meta]):
-            rows.append(compact_row(name, spec, waiting, skipped=True, busy=name in busy))
+            if name in specs or nonregistry_work:
+                rows.append(compact_row(name, spec, waiting, skipped=True, busy=name in busy, undecided=True))
             continue
         view = view_fn(pairs, name, now=now)
         attention = any(t.get("state") in ("orphaned", "finished_detached") for t in view["running_tasks"])
-        if view["verdict"] == "idle" and not waiting and not attention and name not in specs:
-            continue
         starts = [parse(item.get("started_at")) for key in ("turns", "running_tasks", "background")
                   for item in view[key]]
         starts += [parse(item.get("since")) for item in view["wake_pending"]]
@@ -481,6 +489,8 @@ def snapshot(home, session=None, show_all=True, expanded=(), cache=None):
                        if item.get("status") != "running"]
         completions = [(at, status) for at, status in completions if at is not None]
         finished, outcome = max(completions, key=lambda item: (item[0], item[1] in ("orphaned", "crashed"))) if completions else (None, None)
+        if name not in specs and view["verdict"] != "busy" and not (finished and finished.timestamp() >= cutoff):
+            continue
         orphaned = any(t.get("state") == "orphaned" for t in view["running_tasks"])
         status = "orphaned" if orphaned else "needs attention" if attention else view["verdict"]
         if status in ("idle", "settling") and outcome in ("orphaned", "failed", "stopped", "crashed"):
