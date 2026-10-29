@@ -103,6 +103,10 @@ def main() -> int:
         "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
         "-p", "test_task_retention.py", "-v",
     ]))
+    commands.append(("steer", [
+        "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
+        "-p", "test_steer.py", "-v",
+    ]))
     scratch = ROOT / ".test-homes"
     scratch.mkdir(exist_ok=True)
     failures = []

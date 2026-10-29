@@ -439,6 +439,13 @@ class TurnLogScope:
         # interrupted at most once, and never after its result was attributed.
         self.task_id: str | None = None
         self.interrupt_sent: bool = False
+        self.input_sent = False
+        self.pending_steers: set[str] = set()
+        self.steer_count = 0
+        self.steer_cost_usd = 0.0
+        self.steer_duration_ms = 0
+        self.steer_denials: list[dict] = []
+        self.steer_error: str | None = None
 
 
 class PairRuntime:
@@ -456,6 +463,10 @@ class PairRuntime:
         self._cost_seen = 0.0
         self.last_activity: datetime = datetime.utcnow()
         self.send_lock = threading.Lock()
+        # Serialize stdin frames, not whole turns. Never hold _scope_lock
+        # across a pipe write: a large message must not block the reader.
+        self._input_lock = threading.Lock()
+        self._steer_supported = False
         self.started_at: datetime | None = None
         self._stdout_q: queue.Queue[str] = queue.Queue()
         self._stderr_buf: list[str] = []
@@ -748,6 +759,7 @@ class PairRuntime:
         # anything is spawned (never a silent fall back to the plan).
         env = self.adapter._spawn_env(self.spec)  # noqa: SLF001
         self._init_event = None
+        self._steer_supported = False
         cli = _claude_executable()
         args = [cli] + self.adapter._common_create_args(self.spec)  # noqa: SLF001
         args += [
@@ -928,29 +940,36 @@ class PairRuntime:
         to ``stop()`` for a tree-kill.
 
         Must be called WHILE the runtime is alive and (typically) mid-turn.
-        Caller is responsible for any per-pair locking; we serialize on
-        ``self.send_lock`` so we don't race with an in-flight ``send()``.
+        Caller is responsible for task selection. The short input lock keeps
+        the interrupt frame separate from sends and steering messages.
         """
         if not self.is_alive() or self.proc is None or self.proc.stdin is None:
             return False
-        claim = self._claim_interrupt()
-        if claim is None:
-            # Nothing left to interrupt — the turn's result is already
-            # attributed (or no turn is open). Count that as acknowledged so
-            # the caller doesn't escalate to a tree-kill over a finished turn.
+        with self._scope_lock:
+            selected = self._current_scope or self._implicit_scope
+        if selected is None:
             return True
-        if claim:
-            request_id = f"req_int_{int(time.time())}_{os.urandom(3).hex()}"
-            payload = json.dumps({
-                "type": "control_request",
-                "request_id": request_id,
-                "request": {"subtype": "interrupt"},
-            }) + "\n"
-            try:
-                self.proc.stdin.write(payload.encode("utf-8"))
-                self.proc.stdin.flush()
-            except (BrokenPipeError, OSError):
+        with self._input_lock:
+            proc = self.proc
+            if proc is None or proc.stdin is None:
                 return False
+            claim = self._claim_interrupt(expected_scope=selected)
+            if claim is None:
+                # A result may have arrived while a steer held the input lock.
+                # Recheck after acquiring it; never interrupt a finished turn.
+                return True
+            if claim:
+                request_id = f"req_int_{int(time.time())}_{os.urandom(3).hex()}"
+                payload = json.dumps({
+                    "type": "control_request",
+                    "request_id": request_id,
+                    "request": {"subtype": "interrupt"},
+                }) + "\n"
+                try:
+                    proc.stdin.write(payload.encode("utf-8"))
+                    proc.stdin.flush()
+                except (BrokenPipeError, OSError, ValueError):
+                    return False
         # else: the worker's should_stop poll already wrote the interrupt for
         # this turn — don't write a second one; just wait for the ack below.
         # Wait for a RESULT event (any subtype — typically error_during_execution).
@@ -1137,6 +1156,11 @@ class PairRuntime:
         # kept working for 10 min after a result with no init in between).
         ev_type = ev.get("type")
         top_level = not ev.get("parent_tool_use_id")
+        # CLI schema inspected 2026-10-29: these are the client UUIDs actually
+        # consumed, including follow-ups folded in between tool rounds. Older
+        # CLIs cannot safely distinguish a late steer from the original reply.
+        if top_level and ev_type in ("assistant", "result") and isinstance(ev.get("user_message_uuids"), list):
+            self._steer_supported = True
         if ev_type == "system" and ev.get("subtype") == "init" and top_level:
             self._init_event = ev
             # v0.16.0: CLI 2.1.280 emits an init ahead of every queued turn,
@@ -1620,7 +1644,7 @@ class PairRuntime:
             pass
         return True
 
-    def _after_result(self, ev: dict) -> None:
+    def _after_result(self, ev: dict) -> bool | None:
         """Reader thread, on EVERY result event. Solicited → snapshot the exact
         log range for send(). Otherwise → close the self-woken turn (or record
         an unattributed completion). Never CREATES state on the result path."""
@@ -1649,8 +1673,28 @@ class PairRuntime:
             self._wake_at = None  # any result ends what a wake announced
             solicited = self._current_scope
             if solicited is not None:
+                if solicited.steer_count:
+                    consumed = ev.get("user_message_uuids") or []
+                    solicited.pending_steers.difference_update(
+                        value for value in consumed if isinstance(value, str))
+                    solicited.steer_cost_usd += ev["_turn_cost_usd"]
+                    solicited.steer_duration_ms += ev.get("duration_ms") or 0
+                    solicited.steer_denials.extend(ev.get("permission_denials") or [])
+                    if solicited.pending_steers and not (
+                            solicited.interrupt_sent or ev.get("is_error")
+                            or ev.get("subtype") != "success"):
+                        # The CLI may finish its original turn before taking a
+                        # late follow-up. Keep the SAME task/activity open until
+                        # a result accounts for every message we wrote.
+                        return False
+                    ev["_turn_cost_usd"] = solicited.steer_cost_usd
+                    ev["duration_ms"] = solicited.steer_duration_ms
+                    ev["permission_denials"] = solicited.steer_denials
                 solicited.result_snapshot = {
                     "turn_cost_usd": ev["_turn_cost_usd"],
+                    "duration_ms": ev.get("duration_ms"),
+                    "permission_denials": ev.get("permission_denials"),
+                    "steer_abort": bool(solicited.pending_steers),
                     "end_line": solicited.end_line,
                     "subagent_logs": list(solicited.subagent_logs),
                     "background_launches": list(solicited.background_launches),
@@ -1663,8 +1707,10 @@ class PairRuntime:
             subtype = ev.get("subtype") or ""
             self._turn_closed(
                 solicited.task_id, preview=str(ev.get("result") or ""),
-                status="done" if subtype == "success" else (
-                    "stopped" if solicited.interrupt_sent else subtype or "failed"))
+                status=("stopped" if solicited.interrupt_sent else "failed")
+                if solicited.pending_steers else (
+                    "done" if subtype == "success" else (
+                        "stopped" if solicited.interrupt_sent else subtype or "failed")))
             self._last_turn_summary = None
             return None
         self._close_implicit_turn(ev, scope, task)
@@ -1918,7 +1964,7 @@ class PairRuntime:
             return (scope is not None and scope.result_snapshot is None
                     and not getattr(scope, "task_id", None))
 
-    def _claim_interrupt(self) -> bool | None:
+    def _claim_interrupt(self, expected_scope: TurnLogScope | None = None) -> bool | None:
         """Decide whether an interrupt may be written for the turn in progress.
 
         Returns True when the caller should write it (first claim on a live
@@ -1932,6 +1978,8 @@ class PairRuntime:
         """
         with self._scope_lock:
             scope = self._current_scope if self._current_scope is not None else self._implicit_scope
+            if expected_scope is not None and scope is not expected_scope:
+                return None  # a queued successor opened while stdin was busy
             if scope is None or scope.result_snapshot is not None:
                 return None
             if getattr(scope, "interrupt_sent", False):
@@ -1940,6 +1988,52 @@ class PairRuntime:
             return True
 
     # ---- send ----
+
+    def steer(self, message: str) -> tuple[str | None, str]:
+        """Write into a solicited turn, returning its existing task ID.
+
+        A None ID means nothing was written; the caller may use normal FIFO.
+        No pair/send/promote lock: those are held for the turn's lifetime.
+        Reserve the UUID under scope before writing so a racing result cannot
+        finish the task and let a queued send steal the follow-up's reply.
+        """
+        with self._input_lock:
+            with self._scope_lock:
+                scope = self._current_scope
+                if (scope is None or scope.result_snapshot is not None
+                        or not scope.input_sent or not scope.task_id):
+                    return None, "No steerable send is running in this MCP process"
+                if scope.interrupt_sent:
+                    return None, "The running turn is stopping"
+                if not self._steer_supported:
+                    return None, "This runtime has not reported message correlation support"
+                if scope.steer_count >= 63:
+                    return None, "This turn reached the CLI's 64-message correlation limit"
+                proc = self.proc
+                if proc is None or proc.poll() is not None or proc.stdin is None:
+                    return None, "The warm runtime is no longer alive"
+                message_id = str(uuid.uuid4())
+                scope.pending_steers.add(message_id)
+                scope.steer_count += 1
+                task_id = scope.task_id
+            payload = json.dumps({"type": "user", "uuid": message_id,
+                                  "message": {"role": "user", "content": message}}) + "\n"
+            # Publish before writing: a very fast reply may close the activity
+            # turn immediately after flush. Reserved input already protects it.
+            self._activity.note_steer(task_id, message_id, message, gen=self._gen)
+            self._append_main_log_line(
+                f"[{datetime.now().strftime('%H:%M:%S')}] [steer {message_id}] {message}")
+            try:
+                proc.stdin.write(payload.encode("utf-8"))
+                proc.stdin.flush()
+            except (OSError, ValueError) as exc:
+                # A partial write is ambiguous. Never silently queue/retry it.
+                with self._scope_lock:
+                    scope.steer_error = str(exc)
+                raise _runtime_cli_error(self.spec,
+                    f"Steer delivery uncertain: {exc}. Inspect pair_log/pair_status before retrying; "
+                    "pair_stop can end the original task.", stderr=self._collect_stderr()) from exc
+            return task_id, "Follow-up written to the running Claude turn"
 
     def _write_interrupt_nowait(self) -> None:
         """Write the CLI's in-band ``control_request: interrupt`` to stdin and
@@ -1954,19 +2048,27 @@ class PairRuntime:
         never blocks (pipe buffer), so there's no deadlock the other way."""
         if not self.is_alive() or self.proc is None or self.proc.stdin is None:
             return
-        if self._claim_interrupt() is not True:
-            return  # already interrupted, or the result is already in
-        request_id = f"req_int_{int(time.time())}_{os.urandom(3).hex()}"
-        payload = json.dumps({
-            "type": "control_request",
-            "request_id": request_id,
-            "request": {"subtype": "interrupt"},
-        }) + "\n"
-        try:
-            self.proc.stdin.write(payload.encode("utf-8"))
-            self.proc.stdin.flush()
-        except (BrokenPipeError, OSError):
-            pass
+        with self._scope_lock:
+            selected = self._current_scope or self._implicit_scope
+        if selected is None:
+            return
+        with self._input_lock:
+            proc = self.proc
+            if proc is None or proc.stdin is None:
+                return
+            if self._claim_interrupt(expected_scope=selected) is not True:
+                return  # already interrupted, or the result is already in
+            request_id = f"req_int_{int(time.time())}_{os.urandom(3).hex()}"
+            payload = json.dumps({
+                "type": "control_request",
+                "request_id": request_id,
+                "request": {"subtype": "interrupt"},
+            }) + "\n"
+            try:
+                proc.stdin.write(payload.encode("utf-8"))
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
 
     def send(self, message: str, timeout_seconds: int | None = 300,
              on_event: Callable[[dict], None] | None = None,
@@ -2012,6 +2114,7 @@ class PairRuntime:
 
             payload = json.dumps({
                 "type": "user",
+                "uuid": str(uuid.uuid4()),
                 "message": {"role": "user", "content": message},
             }) + "\n"
             # Scope cleanup is via the outer try/finally below — every exit path
@@ -2023,8 +2126,11 @@ class PairRuntime:
             # from the v0.9.8 design pass.
             try:
                 try:
-                    self.proc.stdin.write(payload.encode("utf-8"))
-                    self.proc.stdin.flush()
+                    with self._input_lock:
+                        self.proc.stdin.write(payload.encode("utf-8"))
+                        self.proc.stdin.flush()
+                        with self._scope_lock:
+                            self._current_scope.input_sent = True
                 except (BrokenPipeError, OSError, ValueError) as e:  # ValueError: a closed file
                     raise _runtime_cli_error(self.spec,
                         f"pair runtime stdin closed: {e}",
@@ -2038,6 +2144,13 @@ class PairRuntime:
                 end: float | None = (time.monotonic() + timeout_seconds) if timeout_seconds is not None else None
                 _last_stop_check = 0.0
                 while end is None or time.monotonic() < end:
+                    with self._scope_lock:
+                        steer_error = self._current_scope.steer_error
+                    if steer_error is not None:
+                        self.stop(reason="steer stdin write failed; delivery uncertain")
+                        raise _runtime_cli_error(self.spec,
+                            "Steer delivery uncertain; runtime stopped to discard partial input. "
+                            "Inspect pair_log before retrying.", stderr=self._collect_stderr())
                     # v0.10.0 terminal stop: poll the should_stop marker check at
                     # most ~once/sec. On a hit, write the interrupt without
                     # waiting (the loop below catches the ack). should_stop has
@@ -2107,7 +2220,19 @@ class PairRuntime:
                             # result was attributed) — by now a self-woken
                             # continuation may already have moved the live fields.
                             snap = scope.result_snapshot or {}
+                            if snap.get("steer_abort"):
+                                # An interrupt/error need not consume queued CLI
+                                # input. Discard it before releasing the pair lock
+                                # so it cannot run as an untracked later turn.
+                                self.stop(reason="turn ended before consuming all steers")
+                                raise _runtime_cli_error(self.spec,
+                                    "Turn stopped/failed before all steers were consumed; "
+                                    "runtime stopped to discard pending input (including background work). "
+                                    "Inspect pair_log before retrying.", stderr=self._collect_stderr())
                             ev["_turn_cost_usd"] = snap.get("turn_cost_usd")
+                            if scope.steer_count:
+                                ev["duration_ms"] = snap.get("duration_ms")
+                                ev["permission_denials"] = snap.get("permission_denials")
                             ev["_log_scope"] = {
                                 "log_path": str(scope.main_log_path),
                                 "start_line": scope.start_line,

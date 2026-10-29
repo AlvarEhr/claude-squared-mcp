@@ -285,6 +285,32 @@ on Codex).
 
 ## Async handles
 
+### Steering a running pair (0.22.0)
+
+`pair_send_async(name="scout", message="Focus on the failing test first", steer=True)`
+writes a follow-up into a running **Claude warm-runtime send owned by this MCP
+process**. It returns the existing task ID; the task and its activity window stay
+open, so existing `wait.py` and auto-watch watchers keep following the work.
+The CLI takes the message at its next input boundary. If it finishes the original
+turn first, the same task waits for the follow-up's result. The final task reply is
+the latest result; earlier replies remain in `pair_log` and the transcript.
+
+Idle pairs use a normal async send. Codex steering is not supported yet: its
+`exec` backend has no live input channel. Codex, sends owned by another MCP
+process, one-shot override sends, self-woken turns, and Claude CLIs without
+message correlation support explicitly report **queued as a normal send**.
+Ordinary sends remain FIFO. Steering cannot change the running model, effort,
+permissions or timeout: omit per-call overrides and `hard_timeout_seconds`.
+
+Steering messages appear as `[steer <message-id>]` in `main.log`. Activity files
+annotate the existing `turn` with `steer_count` and
+`last_steer: {message_id, at, preview}` (also retained in `window_turns`). No second
+task is created. If interrupted or failed before all steering input is consumed,
+the runtime is stopped to discard that input; this also ends its background work.
+An uncertain stdin write fails explicitly and is never automatically retried.
+
+### Task retention and waiting
+
 The server checks task-result retention at startup and at most once daily
 across server processes. Unreferenced terminal task JSON older than **14 days**
 (both completion time and file mtime) may be pruned. Running, queued, unresolved

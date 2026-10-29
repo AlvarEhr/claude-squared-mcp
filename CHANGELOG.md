@@ -6,6 +6,18 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### 0.22.0 — Added
+
+- `pair_send_async(..., steer=True)` can deliver follow-ups during a Claude
+  warm-runtime send in the same MCP process. It retains the current task ID
+  and activity window; UUID correlation keeps a late follow-up's result from
+  being attributed to a queued send. Activity includes `steer_count` and
+  `last_steer`; logs record each message. Idle pairs send normally. Codex,
+  foreign-owned/one-shot/self-woken turns and CLIs without correlation support
+  explicitly fall back to normal FIFO. Overrides and timeouts with steering
+  are refused. Live transport verification remains a release check; an opt-in
+  Haiku probe is provided in `scripts/probe_claude_steer.py`.
+
 ## [0.21.0] — 2026-10-26
 
 A Pairs pane for the Claude desktop app, and auto-watch waits that survive a restart.

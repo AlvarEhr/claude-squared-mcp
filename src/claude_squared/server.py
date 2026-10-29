@@ -2151,7 +2151,7 @@ def _watcher_cmd(ref: str) -> str:
 
 
 def _format_async_handle(task_id: str, why: str, pair_name: str | None = None,
-                         tool: str = "pair_send_async") -> str:
+                         tool: str = "pair_send_async", exact_task: bool = False) -> str:
     """Terse runtime hint when an operation degrades to async.
 
     Returns the task_id and poll hints. With the opt-in hook configured, tell
@@ -2179,12 +2179,14 @@ def _format_async_handle(task_id: str, why: str, pair_name: str | None = None,
     # mistype. wait.py and pair_poll both resolve a name → the pair's latest
     # task. The exact task id is still printed on the "Async task:" line for the
     # rare case an agent needs to target an older task explicitly.
-    poll_ref = pair_name if pair_name else task_id
-    wait_cmd = _watcher_cmd(poll_ref)
+    # Steering names that exact task: a later FIFO waiter may already be the
+    # latest. The watcher still follows the pair through all queued work.
+    poll_ref = task_id if exact_task else (pair_name or task_id)
+    wait_cmd = _watcher_cmd(pair_name or task_id)
     name_hint = (
         f"  (name '{pair_name}' resolves to its LATEST task everywhere here; "
         f"use the task id above to target an older one)\n"
-        if pair_name else ""
+        if pair_name and not exact_task else ""
     )
     follow_hint = (
         "  (by name it follows the pair until idle — background work and self-woken turns "
@@ -2755,6 +2757,7 @@ def pair_send_async(
     override_model: str | None = None,
     override_effort: str | None = None,
     override_permission_mode: str | None = None,
+    steer: bool = False,
 ) -> str:
     """Send a message to a pair asynchronously. Returns task_id immediately.
 
@@ -2769,6 +2772,11 @@ def pair_send_async(
     was killed (README "wait.py").
 
     Args:
+        steer: Try to deliver this follow-up during the running Claude send
+            owned by this MCP process, retaining its task ID. No overrides or
+            hard timeout allowed with steer. Idle pairs use a normal send.
+            Codex, foreign-owned/one-shot/self-woken turns and older Claude
+            runtimes fall back to FIFO with an explicit queued notice.
         hard_timeout_seconds: Auto-kill ceiling for the underlying claude
             operation. **Default None (no ceiling) — STRONGLY recommended for
             most uses.** This is NOT your "patience" — async sends don't have
@@ -2789,7 +2797,28 @@ def pair_send_async(
     per-pair lock.
     """
     # Sanity: pair must exist before we spawn a worker
-    _check_model_backend(reg_mod.get_pair(name), override_model)
+    spec = reg_mod.get_pair(name)
+    _check_model_backend(spec, override_model)
+    steer_note = ""
+    if steer:
+        if not message.strip():
+            raise PairError("A steering message must not be empty.")
+        if any(value is not None for value in (
+                hard_timeout_seconds, override_model, override_effort, override_permission_mode)):
+            raise PairError("steer=True cannot change a running turn's model, effort, permissions or timeout; "
+                            "omit overrides, or use a normal send.")
+        reason = "Steering is not supported on Codex yet"
+        if spec.backend == "claude":
+            rt = runtime_mod.registry().get_or_none(name)
+            reason = "No warm Claude runtime owned by this MCP process"
+            if rt is not None and rt.spec.session_id == spec.session_id:
+                task_id, reason = rt.steer(message)
+                if task_id is not None:
+                    return _format_async_handle(task_id,
+                        f"{reason} for pair '{name}'; continuing the existing task. "
+                        "Delivery occurs at a CLI boundary; a late follow-up may continue after its first result.",
+                        pair_name=name, exact_task=True)
+        steer_note = f"{reason}; queued as a normal send (starts normally if idle).\n"
 
     runner = _build_send_runner(
         name, message,
@@ -2806,7 +2835,7 @@ def pair_send_async(
         ),
     )
     state = async_tasks.start_task(name, message, runner, queued=True)
-    return _format_async_handle(state.task_id, f"Started async task for pair '{name}'.", pair_name=name)
+    return _format_async_handle(state.task_id, steer_note + f"Started async task for pair '{name}'.", pair_name=name)
 
 
 def _read_current_or_last_turn_log(

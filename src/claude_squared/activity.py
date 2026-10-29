@@ -881,6 +881,18 @@ class ActivityWriter:
             self._mark(_URGENT)
         _poke()
 
+    def note_steer(self, task_id: str, message_id: str, message: str, *, gen: str) -> None:
+        """Annotate the existing turn; a steer never opens a second task/window."""
+        with self._lock:
+            turn = self._state["turn"]
+            if not turn or turn.get("task_id") != task_id or not self._gen_ok(turn, gen):
+                return
+            turn["steer_count"] = turn.get("steer_count", 0) + 1
+            turn["last_steer"] = {"message_id": message_id, "at": _av_iso(_av_now()),
+                                  "preview": message[:PREVIEW_CHARS]}
+            self._mark(_URGENT)
+        _poke()
+
     def _close_turn_locked(self, task_id, status, preview, triage_pending, now) -> dict:
         st = self._state
         turn = st["turn"] or {}
@@ -895,6 +907,8 @@ class ActivityWriter:
             "triage": {"state": "pending"} if triage_pending else None,
         }
         st["window_turns"].append(entry)
+        if turn.get("steer_count"):
+            entry.update(steer_count=turn["steer_count"], last_steer=turn["last_steer"])
         self._cap(st["window_turns"], WINDOW_TURNS_CAP)
         st["turn"] = None
         st["last_transition_at"] = _av_iso(now)
