@@ -173,6 +173,37 @@ test('activity lines parse Claude and Codex kinds, failures and bare lines', asy
     .toBe('.venv\\Scripts\\python.exe x.py')
 })
 
+test('clicking an activity entry loads that call in full and clicking again closes it', async ($, on) => {
+  const clock = base(on)
+  const requests: any[] = []
+  on('process.run', (_, e) => {
+    const request = JSON.parse(e.init?.stdin || '{}')
+    requests.push(request)
+    const data = request.tool ? { tool: { input: 'pytest -q', language: 'powershell', output: '1 failed', status: 'exit 1' } }
+      : { rows: [{ ...row('scout', 'manager-session'), detail: { ...row('scout').detail,
+        logs: ['[19:44:01] [T-7] [tool_use] command_execution(pytest -q)', '[19:44:09] [text] All done'] } }] }
+    return { value: { exitCode: 0, stdout: JSON.stringify(data), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: false })
+  await clock.advance(1)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'detail-scout' })
+  await clock.advance(1)
+  expect(await ui.find({ type: 'Code' })).toBeUndefined()
+  await ui.press({ key: 'entry-scout-1' })
+  expect(requests.at(-1)?.tool).toEqual({ pair: 'scout', tag: 'T-7' })
+  const blocks = await ui.findAll({ type: 'Code' })
+  expect(blocks.map(block => block.props.source)).toEqual(['pytest -q', '1 failed'])
+  expect((await ui.find({ type: 'Text', text: /^Output/ }))?.props.color).toBe('error')
+  const reads = requests.length
+  await ui.press({ key: 'entry-scout-0' })
+  expect(requests.length).toBe(reads) // a plain line opens locally
+  expect(await ui.find({ type: 'Code' })).toBeUndefined()
+  await ui.press({ key: 'entry-scout-0' })
+  expect(await ui.findAll({ type: 'Text', text: /^All done$/ })).toHaveLength(1)
+  await ui.unmount()
+})
+
 test('clearing the session clears the view and ends polling', async ($, on) => {
   const clock = base(on)
   let calls = 0

@@ -1,6 +1,6 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, Register } from 'claude-code'
-import type { PairRow, PairsView, TranscriptView } from '../types'
+import type { EntryView, PairRow, PairsView, TranscriptView } from '../types'
 import { localTime } from './time'
 
 const PANE = 'pairs'
@@ -12,6 +12,7 @@ const idle = atom({ plugin: 'pairs-pane', key: 'idle' } as const, false)
 const replies = atom({ plugin: 'pairs-pane', key: 'replies' } as const, [] as string[])
 const logs = atom({ plugin: 'pairs-pane', key: 'logs' } as const, [] as string[])
 const transcript = atom({ plugin: 'pairs-pane', key: 'transcript' } as const, null as TranscriptView | null)
+const entry = atom({ plugin: 'pairs-pane', key: 'entry' } as const, null as EntryView | null)
 
 function tokens(value: number | null | undefined): string {
   if (value == null) return '—'
@@ -136,7 +137,7 @@ function clip(lines: string[]): string {
   return head.join('\n') + (fences % 2 ? '\n```' : '') + (lines.length > 12 ? '\n\n…' : '')
 }
 
-type LogEntry = { at: string; kind: string; text: string; color?: string; dim?: boolean; quiet?: boolean }
+type LogEntry = { at: string; kind: string; text: string; color?: string; dim?: boolean; quiet?: boolean; tag?: string }
 
 // Codex item types, named as a reader would say them.
 const CODEX_TOOLS: Record<string, string> = {
@@ -151,8 +152,9 @@ function tidy(text: string): string {
 
 // main.log lines read "[HH:MM:SS] [T-n] [kind] text"; time, turn and kind are each optional.
 export function parseLog(line: string): LogEntry {
-  const entry = parseRaw(line)
-  return { ...entry, text: tidy(entry.text) }
+  const parsed = parseRaw(line)
+  const tag = /^(?:\[\d\d:\d\d:\d\d\]\s*)?\[(T-\d+)\]/.exec(line)?.[1]
+  return { ...parsed, text: tidy(parsed.text), ...(tag ? { tag } : {}) }
 }
 
 function parseRaw(line: string): LogEntry {
@@ -314,6 +316,24 @@ async function openTranscript($: EngineInterface, name: string, offset = 0) {
   requestRefresh($)
 }
 
+// One activity entry open at a time; a tool call's full input and output
+// are read only when it is opened.
+async function toggleEntry($: EngineInterface, pair: string, key: string, tag: string | null) {
+  const current = await read($, entry)
+  if (current?.pair === pair && current.key === key) { await update($, entry, () => null); return }
+  await update($, entry, () => ({ pair, key, tag, loading: !!tag }))
+  if (!tag) return
+  let detail: Partial<EntryView> = { note: 'Detail unavailable.' }
+  try {
+    const home = cacheHome || String(options.claudeHome || '') || await $.env.get('CLAUDE_HOME')
+      || `${await $.env.get('USERPROFILE') || await $.env.get('HOME')}/.claude`
+    const result = await $.process.run([String(options.python || 'python'), '-B', `${$.plugin.root}/read_pairs.py`, '--home', home],
+      { timeoutMs: 5000, stdin: JSON.stringify({ tool: { pair, tag } }) })
+    if (result.exitCode === 0 && !result.isStdoutTruncated) detail = JSON.parse(result.stdout).tool || detail
+  } catch { /* the note above stands */ }
+  await update($, entry, value => value?.pair === pair && value.key === key ? { ...value, ...detail, loading: false } : value)
+}
+
 async function closeTranscript($: EngineInterface) {
   await update($, transcript, () => null)
   requestRefresh($)
@@ -347,6 +367,7 @@ export const register: Register = (on, configured) => {
     await update($, replies, () => [])
     await update($, logs, () => [])
     await update($, transcript, () => null)
+    await update($, entry, () => null)
     await update($, view, () => ({ rows: [], error: null, notice: null, session: '', home: '' }))
     return next(e)
   })
@@ -357,6 +378,7 @@ export const register: Register = (on, configured) => {
     const desktop = e.surface !== 'terminal'
     const Svg = desktop ? resolved.Svg : undefined
     const Markdown = desktop ? resolved.Markdown : undefined
+    const Code = desktop ? resolved.Code : undefined
     // Type sizes, weights and tabular digits are drawn by the desktop surface
     // alone; older terminal engines refuse the props outright.
     const cap = desktop ? { size: 'caption' as const } : {}
@@ -371,6 +393,7 @@ export const register: Register = (on, configured) => {
     const moreReplies = await read($, replies)
     const moreLogs = await read($, logs)
     const page = await read($, transcript)
+    const opened = await read($, entry)
     // A pane opened before any surface attached stopped polling; the first
     // drawing after a surface places it starts the reads again.
     if (wanted && !cancel) { start($); requestRefresh($) }
@@ -398,6 +421,22 @@ export const register: Register = (on, configured) => {
       ? <Svg source={ring(row)} alt={knownContext(row) ? `${Math.round(row.context!.percent!)}% of context used` : 'context unknown'} width={14} height={14} />
       : <Text dimColor={!knownContext(row)} color={contextColor(row)}>{contextIndicator(row)}</Text>}</Box>
 
+    const block = (source: string, language?: string) => Code
+      ? <Code source={source} language={language} />
+      : <Text {...cap} wrap="wrap">{source}</Text>
+
+    // An opened entry: a tool call's full input and output, or a long line in full.
+    const entryDetail = (item: LogEntry, shown: EntryView) => <Box flexDirection="column" gap={1} marginTop={1} marginBottom={1} paddingLeft={2}>
+      {shown.loading && <Text {...cap} dimColor>Loading…</Text>}
+      {!shown.loading && !shown.tag && <Text {...cap} wrap="wrap">{item.text}</Text>}
+      {!shown.loading && shown.tag && shown.input == null && <Text {...cap} wrap="wrap">{item.text}</Text>}
+      {shown.note && <Text {...cap} dimColor>{shown.note}</Text>}
+      {shown.input ? block(shown.input, shown.language) : null}
+      {shown.output || shown.status ? <Text {...cap} {...semi} dimColor color={shown.status && /error|failed|exit [1-9]/.test(shown.status) ? 'error' : undefined}>
+        Output{shown.status ? ` · ${shown.status}` : ''}</Text> : null}
+      {shown.output ? block(shown.output) : null}
+    </Box>
+
     const activity = (row: PairRow) => {
       // Newest first, one line each: new entries land on top instead of
       // pushing the list around as the log grows.
@@ -406,10 +445,19 @@ export const register: Register = (on, configured) => {
       const open = moreLogs.includes(row.name)
       return <Box flexDirection="column">
         {(open ? entries : entries.slice(0, 8)).map((item, index) => {
-          return <Box key={`log-${row.name}-${index}`} gap={1} minWidth={0}>
-            <Text {...cap} {...mono} dimColor>{item.at || '--:--'}</Text>
-            <Text {...cap} {...semi} color={item.color} dimColor={item.dim}>{item.kind}</Text>
-            <Box flexShrink={1} flexGrow={1} minWidth={0} overflow="hidden"><Text {...cap} dimColor={item.dim} wrap="truncate-end">{item.text}</Text></Box>
+          const key = `${item.tag || item.at}|${item.kind}|${item.text.slice(0, 60)}`
+          const shown = opened?.pair === row.name && opened.key === key ? opened : null
+          return <Box key={`log-${row.name}-${index}`} flexDirection="column" minWidth={0}>
+            <Box gap={1} minWidth={0}>
+              <Text {...cap} {...mono} dimColor>{item.at || '--:--'}</Text>
+              <Text {...cap} {...semi} color={item.color} dimColor={item.dim}>{item.kind}</Text>
+              <Box flexShrink={1} flexGrow={1} minWidth={0} overflow="hidden">
+                <Button key={`entry-${row.name}-${index}`} plain onPress={() => { void toggleEntry($, row.name, key, item.tag || null) }}>
+                  <Text {...cap} dimColor={item.dim && !shown} wrap="truncate-end">{item.text}</Text>
+                </Button>
+              </Box>
+            </Box>
+            {shown && entryDetail(item, shown)}
           </Box>
         })}
         {entries.length === 0 && <Text {...cap} dimColor>No activity logged yet.</Text>}

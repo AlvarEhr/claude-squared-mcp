@@ -600,6 +600,25 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(row["status"], "idle")
         self.assertEqual(row["detail"]["reply"], "ORPHANED: example error text")
 
+    def test_tool_detail_reads_codex_items_and_claude_transcripts_on_request(self):
+        self.write("logs/scout/codex-tool-items/T-7.json", {"tag": "T-7", "tool_name": "command_execution",
+            "completed": {"type": "command_execution", "command": "pytest -q", "aggregated_output": "1 failed",
+                          "exit_code": 1}})
+        detail = P.tool_detail(self.home, "scout", "T-7")
+        self.assertEqual((detail["input"], detail["output"], detail["status"]), ("pytest -q", "1 failed", "exit 1"))
+        self.write("registry.json", {"pairs": {"helper": {"backend": "claude", "session_id": "s1", "cwd": "C:/w"}}})
+        self.write("logs/helper/main.idx.json", {"T-3": {"tool_use_id": "toolu_9"}})
+        transcript = self.home / "projects" / "C--w" / "s1.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text("\n".join(json.dumps(line) for line in [
+            {"message": {"content": [{"type": "tool_use", "id": "toolu_9", "name": "Bash", "input": {"command": "ls"}}]}},
+            {"message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_9", "content": "a.py"}]}},
+        ]), encoding="utf-8")
+        detail = P.tool_detail(self.home, "helper", "T-3")
+        self.assertEqual((detail["input"], detail["language"], detail["output"]), ("ls", "bash", "a.py"))
+        self.assertIn("note", P.tool_detail(self.home, "helper", "T-4"))
+        self.assertIn("note", P.tool_detail(self.home, "../x", "T-3"))
+
 
 if __name__ == "__main__":
     unittest.main()

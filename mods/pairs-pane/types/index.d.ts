@@ -17,12 +17,15 @@ export type PairRow = {
   watches: PairWatch[];
 }
 export type PairsView = { rows: PairRow[]; error: string | null; notice: string | null; session: string; home: string; budget_limited?: boolean }
+export type EntryView = { pair: string; key: string; tag: string | null; loading: boolean;
+  input?: string; output?: string; language?: string; status?: string | null; note?: string | null }
 export type TranscriptView = { pair: string; offset: number; next: number | null; loading: boolean;
   lines: { role: string; at: string; text: string }[]; note: string | null }
 
 declare module 'claude-code' {
   interface PluginState {
     'pairs-pane': { view: PairsView; all: boolean; expanded: string[]; idle: boolean;
-      replies: string[]; logs: string[]; transcript: TranscriptView | null }
+      replies: string[]; logs: string[]; transcript: TranscriptView | null;
+      entry: EntryView | null }
   }
 }

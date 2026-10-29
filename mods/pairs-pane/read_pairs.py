@@ -663,6 +663,81 @@ def transcript_page(home, name, offset=0):
             "offset": offset, "bytes": len(data)}
 
 
+DETAIL_CHARS = 6000
+DETAIL_SCAN = 16 * 1024 * 1024
+
+
+def _clip(text):
+    text = text if isinstance(text, str) else json.dumps(text, indent=2, ensure_ascii=False)
+    return text if len(text) <= DETAIL_CHARS else text[:DETAIL_CHARS] + f"\n… ({len(text) - DETAIL_CHARS:,} more characters)"
+
+
+def tool_detail(home, name, tag):
+    """One tool call's full input and output, read only when its activity line is opened."""
+    root = Path(home).expanduser().resolve()
+    if not safe_pair(name) or not isinstance(tag, str) or not re.fullmatch(r"T-\d+", tag):
+        return {"note": "No tool call to show."}
+    reads = Reads()
+    logs = root / "pairs" / "logs" / name
+    item = reads.json(logs / "codex-tool-items" / f"{tag}.json", TASK_LIMIT)
+    if isinstance(item, dict):
+        event = item.get("completed") or item.get("started") or {}
+        kind = item.get("tool_name") or event.get("type")
+        if kind == "command_execution":
+            code = event.get("exit_code")
+            return {"input": _clip(event.get("command") or ""), "language": "powershell",
+                    "output": _clip(event.get("aggregated_output") or ""),
+                    "status": None if code is None else f"exit {code}"}
+        if kind == "file_change":
+            return {"input": "\n".join(f"{c.get('kind', '?')}  {c.get('path', '?')}" for c in event.get("changes") or []
+                                       if isinstance(c, dict)), "output": "", "status": event.get("status")}
+        rest = {k: v for k, v in event.items() if k not in ("id", "type", "status")}
+        return {"input": _clip(rest), "language": "json", "output": "", "status": event.get("status")}
+    index = reads.json(logs / "main.idx.json", 4 * 1024 * 1024)
+    entry = index.get(tag) if isinstance(index, dict) else None
+    tool_id = entry.get("tool_use_id") if isinstance(entry, dict) else None
+    registry = reads.json(root / "pairs" / "registry.json", 2 * 1024 * 1024) or {}
+    spec = registry.get("pairs", {}).get(name, {})
+    session, cwd = spec.get("session_id"), spec.get("cwd")
+    if not isinstance(tool_id, str) or not isinstance(session, str) or not isinstance(cwd, str) \
+            or not re.fullmatch(r"[A-Za-z0-9_-]+", session):
+        return {"note": "Full detail isn't recorded for this call; the activity line is all there is."}
+    path = root / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", cwd) / (session + ".jsonl")
+    try:
+        with path.open("rb") as stream:
+            size = stream.seek(0, 2)
+            stream.seek(max(0, size - DETAIL_SCAN))
+            data = stream.read(DETAIL_SCAN)
+    except OSError:
+        return {"note": "The transcript could not be read."}
+    needle = tool_id.encode("utf-8")
+    found = {}
+    for raw in data.splitlines():
+        if needle not in raw:
+            continue
+        try:
+            content = (json.loads(raw).get("message") or {}).get("content")
+        except ValueError:
+            continue
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and block.get("id") == tool_id:
+                found["input"] = block.get("input")
+            elif block.get("type") == "tool_result" and block.get("tool_use_id") == tool_id:
+                result = block.get("content")
+                found["output"] = result if isinstance(result, str) else "\n".join(
+                    part.get("text", "") for part in result or [] if isinstance(part, dict))
+                found["status"] = "error" if block.get("is_error") else None
+    if not found:
+        return {"note": "This call is older than the part of the transcript the pane reads."}
+    tool_input = found.get("input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    return {"input": _clip(command if isinstance(command, str) else tool_input or ""),
+            "language": "bash" if isinstance(command, str) else "json",
+            "output": _clip(found.get("output") or ""), "status": found.get("status")}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--home", required=True)
@@ -678,6 +753,9 @@ def main():
         if isinstance(request.get("transcript"), dict):
             target = request["transcript"]
             result = {"transcript": transcript_page(args.home, target.get("pair"), target.get("offset", 0))}
+        elif isinstance(request.get("tool"), dict):
+            target = request["tool"]
+            result = {"tool": tool_detail(args.home, target.get("pair"), target.get("tag"))}
         else:
             result = snapshot(args.home, session=request.get("session"), show_all=request.get("all", True),
                               expanded=request.get("expanded", []), cache=request.get("cache"))
