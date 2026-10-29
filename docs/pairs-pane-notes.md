@@ -24,10 +24,13 @@
   a live-hook/dead-host record and allow the old owner time to release it.
   Legacy records and unidentified ancestry retain PID-only behavior. Tests use
   only their own fixture host/hook PIDs, never image-name process control.
-- The `--immediate` SessionStart probe uses a completed-work fixture before
+- **2026-10-29, manager live probe:** `--immediate` passed with Desktop's CLI
+  **2.1.308**, waking in **5.39 seconds** with no user message after resume.
+  The probe uses a completed-work fixture before
   resume and writes zero user messages after resume. It records launch/input
-  count and requires WOKEN within `--wake-seconds` (30 by default). Its generated
-  hook is tested offline; the transport probe remains for the manager to run.
+  count and requires WOKEN within `--wake-seconds` (30 by default). This result
+  was reported by the manager, not run by the implementer. In the Desktop
+  real-MCP check, verify `host_pid` is the session CLI, not the Desktop app.
 
 ## Snapshot contract
 
@@ -154,6 +157,11 @@ reads three times (also under the gate), retries publication PermissionError,
 queues a result even for worker BaseException, and names cancelled unfinished
 waits in the first wake. The offline runner now includes plugin validate/test
 when the CLI is available, otherwise reports a clean skip.
+Recovery scans this session's records before reading the registry; no recoverable
+records or a missing registry is silent. Corrupt registries only warn when work
+needs recovery. Host birth-time comparison uses wait.py's one-sided
+`_AV_START_TOLERANCE_S` rule, tolerating small/negative Linux btime shifts rather
+than exiting a live hook on a wall-clock adjustment.
 
 ## Watch retirement
 

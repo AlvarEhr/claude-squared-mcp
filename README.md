@@ -545,11 +545,14 @@ python tests/smoke_live_sessionstart.py --live --immediate --claude /path/to/des
 
 This mode uses an already-completed work fixture and two small Haiku turns.
 It requires WOKEN within 30 seconds of resume (adjust with `--wake-seconds`).
-It has not yet been live-verified. A newly armed watcher records its native
+The manager verified this mode with Desktop's CLI **2.1.308**: it woke after
+**5.39 seconds**, with no user message after resume. A newly armed watcher records its native
 Claude ancestor when identifiable; if that PID exits or is reused, the watcher
 exits quietly, releases its lock and leaves its record for recovery. Old records
 or unidentifiable ancestry retain PID-only detection. Records older than seven
 days are skipped by mtime; recovery may clean them, while the pane stays read-only.
+In the Desktop real-MCP check, verify the record's `host_pid` identifies the
+session CLI process, not the Desktop application process.
 
 Use `--claude /path/to/claude.exe` to select Desktop's bundled CLI. Evidence
 stays under `.test-homes`; the probe does not edit user settings. Interrupted

@@ -773,6 +773,47 @@ class HookTests(unittest.TestCase):
         self.assertIn("IMMEDIATE-MARKER", errors.getvalue())
         self.assertTrue((self.home / "hook-finished.json").exists())
 
+    def test_empty_recovery_is_silent_without_registry_at_start_and_poll(self):
+        registry = self.pairs / "registry.json"
+        registry.unlink()
+        payloads = [{"hook_event_name": "SessionStart", "source": source, "session_id": "manager-session"}
+                    for source in H.START_SOURCES] + [event("pair_poll", "done")]
+        for with_record in (False, True):
+            if with_record:
+                self.recovery_record()
+            for payload in payloads:
+                with self.subTest(with_record=with_record, payload=payload):
+                    args = ("--resume",) if payload["hook_event_name"] == "SessionStart" else ()
+                    self.assertEqual(self.finish(self.start(payload, *args)), (0, "", ""))
+
+    def test_corrupt_registry_is_not_read_without_recoverable_session_records(self):
+        (self.pairs / "registry.json").write_text("broken", encoding="utf-8")
+        self.recovery_record(session="another-manager")
+        W.install_wait_script(self.pairs / "wait.py")
+        self.recovery_record(hook_pid=os.getpid(), started_at=datetime.now(timezone.utc).isoformat())
+        output = io.StringIO()
+        with patch.object(H, "_registry_entries", side_effect=AssertionError("unneeded registry read")), \
+                patch("sys.stderr", output):
+            self.assertEqual(H.resume_watches({"hook_event_name": "SessionStart", "source": "resume",
+                "session_id": "manager-session"}, self.pairs), 0)
+            self.assertEqual(H.resume_watches(event("pair_poll", "done"), self.pairs), 0)
+        self.assertEqual(output.getvalue(), "")
+
+    def test_host_start_shift_uses_waiters_one_sided_tolerance(self):
+        W.install_wait_script(self.pairs / "wait.py")
+        reader = runpy.run_path(str(self.pairs / "wait.py"))
+        expected = 10000.0
+        host = {"host_pid": 123, "host_started_at": expected}
+        tolerance = reader["_AV_START_TOLERANCE_S"]
+        for shift in (-3600, -.5, 0, .5, tolerance):
+            with self.subTest(shift=shift), patch.dict(reader, {"_av_proc": lambda pid: (True, expected + shift)}):
+                self.assertFalse(H._host_dead(host, reader))
+                H._host_check(host, reader)
+        with patch.dict(reader, {"_av_proc": lambda pid: (True, expected + tolerance + .1)}):
+            self.assertTrue(H._host_dead(host, reader))
+        with patch.dict(reader, {"_av_proc": lambda pid: (False, None)}):
+            self.assertTrue(H._host_dead(host, reader))
+
 
 if __name__ == "__main__":
     unittest.main()

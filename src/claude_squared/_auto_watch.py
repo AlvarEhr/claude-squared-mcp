@@ -151,7 +151,9 @@ def _host_dead(record, reader):
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or not isinstance(expected, (int, float)):
         return False  # old records and unidentifiable ancestry retain PID-only recovery
     alive, born = reader["_av_proc"](pid)
-    return alive is False or (born is not None and abs(born - expected) > .01)
+    # Linux btime can shift with the wall clock. Match wait.py's one-sided
+    # owner check instead of mistaking a small/negative shift for PID reuse.
+    return alive is False or (born is not None and born > expected + reader["_AV_START_TOLERANCE_S"])
 
 
 def _host_check(host, reader):
@@ -600,13 +602,6 @@ def resume_watches(payload, pairs, timeout=WAIT_TIMEOUT_SECONDS):
     session = payload.get("session_id")
     if not isinstance(session, str) or not session:
         return 0
-    entries = _registry_entries(pairs)
-    if entries is None:
-        print("claude-squared auto-watch recovery: registry unavailable after three reads; "
-              "records retained for retry.", file=sys.stderr)
-        return 2
-    if isinstance(entries, dict) and any(isinstance(p, dict) and p.get("session_id") == session for p in entries.values()):
-        return 0
     candidates = []
     reader = None
     try:
@@ -622,10 +617,29 @@ def resume_watches(payload, pairs, timeout=WAIT_TIMEOUT_SECONDS):
                 continue
             if path.name != _watch_key(session, name) + ".json":
                 continue
-            if reader is None:
-                reader = runpy.run_path(str(pairs / "wait.py"))
-            if _dead_record(record, reader, path):
-                candidates.append(record)
+            candidates.append(record)
+        if not candidates:
+            return 0
+        # Hooks may be configured before the first pair_create has ever made
+        # a registry. No records for this session means no registry read; a
+        # missing registry means no pairs, even if stale records remain.
+        registry_path = pairs / "registry.json"
+        if not registry_path.exists():
+            return 0
+        reader = runpy.run_path(str(pairs / "wait.py"))
+        candidates = [record for record in candidates if _dead_record(
+            record, reader, pairs / "watches" / (_watch_key(session, record["pair"]) + ".json"))]
+        if not candidates:
+            return 0
+        entries = _registry_entries(pairs)
+        if entries is None:
+            if not registry_path.exists():
+                return 0
+            print("claude-squared auto-watch recovery: registry unavailable after three reads; "
+                  "records retained for retry.", file=sys.stderr)
+            return 2
+        if any(isinstance(p, dict) and p.get("session_id") == session for p in entries.values()):
+            return 0
     except Exception as exc:
         print(f"claude-squared auto-watch recovery could not read its state: {exc}. "
               "Records retained; inspect pair_poll and retry recovery.", file=sys.stderr)

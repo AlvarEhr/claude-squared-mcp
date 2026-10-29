@@ -44,7 +44,6 @@ A Pairs pane for the Claude desktop app, and auto-watch waits that survive a res
   turn. Warm sends retain labelled `safety_signal` results.
 - The offline runner includes local pane plugin validation/tests when `claude`
   is on PATH, and skips them cleanly otherwise; no model calls.
-
 - Pairs pane controls redraw cached content immediately, with serial background
   refreshes every five seconds. Expanded rows show the latest/previous reply,
   current message and wrapped log lines, with local More controls and an explicit
@@ -63,15 +62,17 @@ A Pairs pane for the Claude desktop app, and auto-watch waits that survive a res
   preserves recovery records. Recovery retries registry reads, always collects
   worker exceptions, names waits left unarmed after the first outcome, and skips
   records older than seven days without parsing them. Publication retries transient
-  Windows permission failures. An immediate/no-user-message resume probe is provided.
-
+  Windows permission failures. The manager verified the immediate/no-user-message
+  resume probe with Desktop CLI 2.1.308: wake after 5.39 seconds.
+- Recovery stays silent without this session's recoverable records or a pair
+  registry. Host identity checks use wait.py's one-sided start-time tolerance,
+  avoiding false host-death detection on small/negative wall-clock shifts.
 - Pane detail reads prioritize working/recent pairs, so late-alphabet pairs no
   longer lose their reads to idle history. All known registry pairs remain visible
   as compact rows when budgets run out, with an explicit notice.
 - Codex transcript lookup uses immutable SQLite reads to avoid creating WAL/SHM
   files. Claude login guidance requires failed CLI-envelope evidence; MCP auth
   diagnostics and successful replies quoting key errors are not login failures.
-
 - Claude CLI launch failures now lead with the JSON result's message. Expired
   OAuth and other plan-login failures direct the user to `claude auth login`;
   API-billing key/credit guidance is preserved. Covers create, clear, hard stop,
