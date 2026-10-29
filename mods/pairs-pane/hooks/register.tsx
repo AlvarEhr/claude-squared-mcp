@@ -136,15 +136,26 @@ function clip(lines: string[]): string {
   return head.join('\n') + (fences % 2 ? '\n```' : '') + (lines.length > 12 ? '\n\n…' : '')
 }
 
-type LogEntry = { at: string; kind: string; text: string; color?: string; dim?: boolean }
+type LogEntry = { at: string; kind: string; text: string; color?: string; dim?: boolean; quiet?: boolean }
 
-// main.log lines read "[HH:MM:SS] [T-n] [kind] text"; time, turn and kind are each optional.
 // Codex item types, named as a reader would say them.
 const CODEX_TOOLS: Record<string, string> = {
   command_execution: 'shell', file_change: 'edit', collab_tool_call: 'agent', mcp_tool_call: 'mcp', web_search: 'search',
 }
 
+// Log text flattens newlines to " / " and keeps JSON escapes; drop rules and doubled backslashes.
+function tidy(text: string): string {
+  return text.replace(/\\\\/g, '\\').replace(/(?:\s*\/\s*)?[-=.~_*]{4,}(?:\s*\/)?/g, ' ')
+    .replace(/(?:\s\/\s*){2,}/g, ' / ').replace(/\s+/g, ' ').replace(/^\s*\/\s*|\s*\/\s*$/g, '').trim()
+}
+
+// main.log lines read "[HH:MM:SS] [T-n] [kind] text"; time, turn and kind are each optional.
 export function parseLog(line: string): LogEntry {
+  const entry = parseRaw(line)
+  return { ...entry, text: tidy(entry.text) }
+}
+
+function parseRaw(line: string): LogEntry {
   const match = /^(?:\[(\d\d:\d\d):\d\d\]\s*)?(?:\[T-\d+\]\s*)?(?:\[([a-z_]+(?::[a-z_]+)?)( ERR)?\]\s*)?([\s\S]*)$/.exec(line)
   if (!match) return { at: '', kind: '', text: line }
   const [, at = '', kind = '', failed, body = ''] = match
@@ -155,7 +166,7 @@ export function parseLog(line: string): LogEntry {
   }
   if (kind === 'tool_result') return failed
     ? { at, kind: '↳ failed', text: body.replace(/^exit \d+\s*/, ''), color: 'error' }
-    : { at, kind: '↳', text: body.replace(/^exit 0\s*/, ''), dim: true }
+    : { at, kind: '↳', text: body.replace(/^exit 0\s*/, ''), dim: true, quiet: true }
   if (kind === 'error') return { at, kind: 'error', text: body, color: 'error' }
   if (kind === 'thinking' || kind === 'summary') return { at, kind: 'thinking', text: body, dim: true }
   if (kind === 'text') return { at, kind: 'says', text: body, color: 'claude' }
@@ -390,20 +401,20 @@ export const register: Register = (on, configured) => {
     const activity = (row: PairRow) => {
       // Newest first, one line each: new entries land on top instead of
       // pushing the list around as the log grows.
-      const entries = row.detail!.logs.slice().reverse()
+      // Successful tool results only repeat the call above them; failures stay.
+      const entries = row.detail!.logs.slice().reverse().map(parseLog).filter(item => !item.quiet && (item.text || item.kind))
       const open = moreLogs.includes(row.name)
       return <Box flexDirection="column">
-        {(open ? entries : entries.slice(0, 8)).map((line, index) => {
-          const item = parseLog(line)
+        {(open ? entries : entries.slice(0, 8)).map((item, index) => {
           return <Box key={`log-${row.name}-${index}`} gap={1} minWidth={0}>
             <Text {...cap} {...mono} dimColor>{item.at || '--:--'}</Text>
             <Text {...cap} {...semi} color={item.color} dimColor={item.dim}>{item.kind}</Text>
-            <Box flexShrink={1} flexGrow={1} minWidth={0} overflow="hidden"><Text {...cap} dimColor={item.dim} wrap={open ? 'wrap' : 'truncate-end'}>{item.text}</Text></Box>
+            <Box flexShrink={1} flexGrow={1} minWidth={0} overflow="hidden"><Text {...cap} dimColor={item.dim} wrap="truncate-end">{item.text}</Text></Box>
           </Box>
         })}
         {entries.length === 0 && <Text {...cap} dimColor>No activity logged yet.</Text>}
         {entries.length > 8 && <Button key={`logs-more-${row.name}`} plain dimColor
-          label={open ? 'Show less' : `Show all ${entries.length}`} onPress={() => { void toggleMore($, row.name, 'log') }} />}
+          label={open ? 'Show fewer' : `Show ${entries.length - 8} more`} onPress={() => { void toggleMore($, row.name, 'log') }} />}
       </Box>
     }
 

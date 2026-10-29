@@ -167,6 +167,10 @@ test('activity lines parse Claude and Codex kinds, failures and bare lines', asy
   expect(parseLog('[19:44:04] [summary] Planning')).toMatchObject({ kind: 'thinking', dim: true })
   expect(parseLog('[19:44:05] [system:task_started] local_bash')).toMatchObject({ kind: 'task started' })
   expect(parseLog('plain line')).toMatchObject({ at: '', kind: '', text: 'plain line' })
+  expect(parseLog('[19:48:00] [T-1] [tool_result] exit 0 ......... / ------------------------- / Ran 11 tests / OK'))
+    .toMatchObject({ quiet: true, text: 'Ran 11 tests / OK' })
+  expect(parseLog('[19:48:01] [T-2] [tool_use] command_execution(.venv\\\\Scripts\\\\python.exe x.py)').text)
+    .toBe('.venv\\Scripts\\python.exe x.py')
 })
 
 test('clearing the session clears the view and ends polling', async ($, on) => {
@@ -446,7 +450,7 @@ test('expanded reply and log controls are local; transcript pages load only on r
   await ui.press({ key: 'logs-more-scout' })
   expect(calls).toBe(before)
   expect((await ui.find({ key: 'reply-scout' }))?.props.text).toBe(reply)
-  expect((await ui.find({ type: 'Text', text: /log line 0 / }))?.text).toBe(activity[0].replace('[21:30:00] ', ''))
+  expect((await ui.find({ type: 'Text', text: /log line 0 / }))?.text).toBe(activity[0].replace('[21:30:00] ', '').trim())
   expect((await ui.find({ type: 'Text', text: /121k/ }))?.text).toBe('15% used · 121k / 828k')
   expect(await ui.find({ type: 'Text', text: /PID|task-id|turn open/ })).toBeUndefined()
   await ui.press({ key: 'transcript-scout' })
