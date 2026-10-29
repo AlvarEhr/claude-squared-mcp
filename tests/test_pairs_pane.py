@@ -479,7 +479,9 @@ class SnapshotTests(unittest.TestCase):
         forgotten = [f"forgotten-{i:02}" for i in range(37)]
         self.write("registry.json", {"pairs": {name: {"backend": "claude", "model": "opus"} for name in registered}})
         for name in registered + forgotten:
-            path = self.write(f"activity/{name}/123.json", {"version": 1, "state": "closed"})
+            # A PID no OS assigns (macOS caps at 99,999; Linux at 4,194,304): PID 123
+            # was a live system process on macOS runners, so its file was read.
+            path = self.write(f"activity/{name}/99999999.json", {"version": 1, "state": "closed"})
             os.utime(path, (1, 1))
         self.write("async/oversized.json", {"result": "x" * P.TASK_LIMIT})
         original = Path.open
