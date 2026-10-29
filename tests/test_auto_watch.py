@@ -363,6 +363,18 @@ class HookTests(unittest.TestCase):
         self.assertEqual(self.script.read_text(encoding="utf-8"),
                          Path(H.__file__).read_text(encoding="utf-8"))
 
+    def test_server_restores_a_script_another_install_replaced(self):
+        installed = Path(os.environ["CLAUDE_HOME"]) / "pairs" / "auto_watch.py"
+        # A child process: importing the server starts its own machinery.
+        code = ("from pathlib import Path; from claude_squared import server; "
+                "Path(server._AUTO_WATCH_SCRIPT_PATH).write_text('# older hook', encoding='utf-8'); "
+                "print(server._current_auto_watch_script())")
+        result = subprocess.run([sys.executable, "-B", "-c", code], capture_output=True, text=True,
+                                timeout=60, env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(Path(result.stdout.strip()), installed.resolve())
+        self.assertEqual(installed.read_text(encoding="utf-8"), Path(H.__file__).read_text(encoding="utf-8"))
+
     def test_settings_detection_and_hints(self):
         config = self.home / "settings.json"
         data = settings(self.script)

@@ -91,6 +91,23 @@ except OSError:
     _AUTO_WATCH_SCRIPT_PATH = None
 
 
+def _current_auto_watch_script():
+    """Reinstall the hook script if another install replaced it since startup.
+
+    ~/.claude/pairs/auto_watch.py is shared by every claude-squared server on
+    the machine, and an older checkout's server rewrites it with its own
+    version when it starts (2026-10-29: a Codex-app registration silently
+    dropped watch records and restart recovery). The hook runs after the
+    tool returns, so checking here keeps this session's hook current.
+    """
+    global _AUTO_WATCH_SCRIPT_PATH
+    try:
+        _AUTO_WATCH_SCRIPT_PATH = install_auto_watch_script(reg_mod.pairs_dir() / "auto_watch.py")
+    except OSError:
+        pass
+    return _AUTO_WATCH_SCRIPT_PATH
+
+
 # Server-side cap on how long pair_send will hold the JSON-RPC call before
 # returning an async handle. Bounded by the MCP host's RPC timeout (typically
 # ~60s on Claude Desktop); below that ceiling so our graceful "still running"
@@ -318,7 +335,7 @@ def _fmt_send_result(r: SendResult, tool: str | None = None) -> str:
         _desc = ", ".join(f"{n} {k}" for k, n in _kinds.items())
         watch_hint = (
             "auto-watch hook armed — don't start wait.py"
-            if tool and auto_watch_configured(_AUTO_WATCH_SCRIPT_PATH, tool) else
+            if tool and auto_watch_configured(_current_auto_watch_script(), tool) else
             f'Bash(run_in_background=True, command="{_watcher_cmd(r.name)}") '
             "follows the pair until it is idle"
         )
@@ -2193,7 +2210,7 @@ def _format_async_handle(task_id: str, why: str, pair_name: str | None = None,
         "included; add --each-turn to return after the next turn instead)\n"
         if pair_name else ""
     )
-    if pair_name and auto_watch_configured(_AUTO_WATCH_SCRIPT_PATH, tool):
+    if pair_name and auto_watch_configured(_current_auto_watch_script(), tool):
         return (
             f"{why}\nAsync task: {task_id}\n"
             f"  pair_poll('{poll_ref}', with_turn_log=True)  # read the result on wake\n"
