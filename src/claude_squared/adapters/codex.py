@@ -1784,6 +1784,17 @@ def _reverse_complete_lines(stream, chunk_size: int = 64 * 1024):
         yield b"".join(reversed(fragments))
 
 
+def current_context_tokens(info: dict[str, Any]) -> int:
+    """Latest context size; thread-lifetime usage is NEVER a context size.
+
+    Codex 0.162 compaction emits input/output=0 but last.total_tokens contains
+    the compacted context estimate. Prefer that over the cumulative total.
+    """
+    last = info.get("last_token_usage") or {}
+    return int(last.get("total_tokens") or
+               (int(last.get("input_tokens") or 0) + int(last.get("output_tokens") or 0)))
+
+
 def read_last_token_count(rollout: Path | None) -> dict[str, Any] | None:
     """The LAST ``token_count`` event_msg payload in a rollout: carries
     ``info.total_token_usage``, ``info.last_token_usage``,

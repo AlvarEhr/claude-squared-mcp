@@ -285,6 +285,22 @@ on Codex).
 
 ## Async handles
 
+**Codex Desktop:** the completion adapter automatically arms for a verified local
+Desktop manager already using full access and approval policy `never`. Detection
+is per caller; Claude sessions and CLI/unverified callers retain their existing
+auto-watch hook or wait.py guidance. `CLAUDE_PAIR_CODEX_COMPLETION=off` disables
+callbacks; `=desktop` remains an explicit opt-in with refusal diagnostics.
+The returned handle says when a callback is armed. A steer that reuses a running
+task does not arm another notification. A terminal watcher alone does not wake
+an idle Codex chat. The adapter handles large transcripts with bounded inspection
+memory and validates the live protocol across app updates. See
+[setup, restrictions and tested behavior](docs/codex-completion-adapter-2026-10.md).
+
+**Retiring `codex_squared`:** use the unified `pair` Codex entry. Put
+`CLAUDE_PAIR_CODEX_COMPLETION=desktop` (or `off`) in its existing env table if
+wanted; unset means auto-detection. Remove the separate `codex_squared` entry
+and start fresh Codex chats. Existing chats keep their loaded servers.
+
 ### Steering a running pair (0.22.0)
 
 `pair_send_async(name="scout", message="Focus on the failing test first", steer=True)`
@@ -901,7 +917,7 @@ Mutable via `pair_update(allowed_invocations=...)` **without runtime eviction** 
 - **Dynamic model availability.** The Claude CLI is the authority for Claude ids (unknown families pass through); `~/.codex/models_cache.json` is the authority for Codex (default choice, aliases, effort levels, windows, deprecations) — nothing model-specific is hardcoded beyond the never-default policy.
 - **Path encoding** for `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` lookups uses a single source: `cli_paths.encode_cwd_for_project()`.
 - **CCD/Cowork users**: this MCP is intended to be loaded by vanilla `claude` CLI sessions. The CCD harness loads MCPs differently and may or may not surface these tools.
-- **Further reading**: `docs/design-2026-05.md` (the original design plan, historical) and `docs/codex-maintenance-2026-09-08.md` (the Codex agent's account of the 0.14.0 maintenance branch, including the Desktop-callback prototype under `experiments/`).
+- **Further reading**: `docs/design-2026-05.md` (the original design plan, historical), `docs/codex-maintenance-2026-09-08.md` (the 0.14.0 maintenance branch and Desktop-callback prototype), and [Codex completion-adapter work record](docs/codex-completion-adapter-2026-10.md) (implementation, pinned clone setup and October 7 native lifecycle findings/fixes).
 
 ## Limits / known issues
 

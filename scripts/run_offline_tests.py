@@ -67,6 +67,10 @@ def main() -> int:
         "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
         "-p", "test_build_script.py", "-v",
     ]))
+    commands.append(("completion", [
+        "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
+        "-p", "test_completion.py", "-v",
+    ]))
     commands.append(("pair_options", [
         "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
         "-p", "test_pair_options.py", "-v",

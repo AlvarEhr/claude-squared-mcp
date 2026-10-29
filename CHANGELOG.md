@@ -8,6 +8,16 @@ All notable changes to this project are documented here. Format follows
 
 ### 0.22.0 — Added
 
+- Unified Codex Desktop completion callbacks and Claude auto-watch in the `pair`
+  MCP. With `CLAUDE_PAIR_CODEX_COMPLETION` unset, callbacks arm only for verified
+  local Codex Desktop managers already using full access and approval policy
+  `never`; other callers keep their hook/wait.py guidance. `off` disables
+  callbacks and `desktop` remains explicit opt-in. Successful steers reuse
+  existing tasks without arming a second notification. To retire the separate
+  `codex_squared` registration, optionally put the env setting on Codex's `pair`
+  entry, remove `codex_squared`, and start fresh Codex chats. See the
+  [completion adapter notes](docs/codex-completion-adapter-2026-10.md).
+
 - `pair_send_async(..., steer=True)` can deliver follow-ups during a Claude
   warm-runtime send in the same MCP process. It retains the current task ID
   and activity window; UUID correlation keeps a late follow-up's result from
