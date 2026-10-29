@@ -390,7 +390,9 @@ def arm(task, ctx, prepared=None):
                 _save(path, r)
         start()
         _wake.set()
-        return "Codex completion notification armed (" + r["id"][:8] + "); no terminal watcher needed."
+        # A lost notice must not leave the manager silently waiting: name the recovery.
+        return ("Codex completion notification armed (" + r["id"][:8] + "); no terminal watcher needed. "
+                "If no notice arrives, pair_poll(" + json.dumps(task.task_id) + ") reads the result.")
     except Exception as exc:
         # Notification failure must NEVER cancel or hide pair work.
         logger.warning("Completion notification not armed for %s: %s", task.task_id, exc)
