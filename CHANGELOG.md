@@ -6,35 +6,6 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
-### Fixed
-
-- Pane detail reads prioritize working/recent pairs, so late-alphabet pairs no
-  longer lose their reads to idle history. All known registry pairs remain visible
-  as compact rows when budgets run out, with an explicit notice.
-- Codex transcript lookup uses immutable SQLite reads to avoid creating WAL/SHM
-  files. Claude login guidance requires failed CLI-envelope evidence; MCP auth
-  diagnostics and successful replies quoting key errors are not login failures.
-
-- Claude CLI launch failures now lead with the JSON result's message. Expired
-  OAuth and other plan-login failures direct the user to `claude auth login`;
-  API-billing key/credit guidance is preserved. Covers create, clear, hard stop,
-  fork, send, print/stream-json and compaction. See
-  [failure-handling notes](docs/claude-cli-errors.md).
-- Pane headers and reply times agree across DST changes. Interrupted turns have
-  attention status and No reply labels. Physical log-tail ordering is regression
-  tested across days; an unavailable requested detail refresh clears cached lines.
-
-### Changed
-
-- Pairs pane controls redraw cached content immediately, with serial background
-  refreshes every five seconds. Expanded rows show the latest/previous reply,
-  current message and wrapped log lines, with local More controls and an explicit
-  paged transcript viewer. Context uses a Desktop-style percent/count header,
-  thin bar and filling-circle name indicator. Colours follow
-  the pair's alert level: blue, yellow from 80%, red at/above the threshold.
-- Skipping old task history no longer labels finished pairs unknown. Read-limit
-  notices appear as a dim footnote only for affected working/recent rows.
-
 ## [0.21.0] — 2026-10-26
 
 A Pairs pane for the Claude desktop app, and auto-watch waits that survive a restart.
@@ -65,8 +36,50 @@ A Pairs pane for the Claude desktop app, and auto-watch waits that survive a res
   CLI 2.1.308 that resume preserves the session ID and SessionStart asyncRewake
   wakes an idle stream-json manager.
 
+### Changed
+
+- Explicit `is_error` results with exit code zero now fail one-shot Claude
+  operations with the CLI's message, including usage-limit/transient failures.
+  This prevents create/clear/fork from reporting a session as ready after a failed
+  turn. Warm sends retain labelled `safety_signal` results.
+- The offline runner includes local pane plugin validation/tests when `claude`
+  is on PATH, and skips them cleanly otherwise; no model calls.
+
+- Pairs pane controls redraw cached content immediately, with serial background
+  refreshes every five seconds. Expanded rows show the latest/previous reply,
+  current message and wrapped log lines, with local More controls and an explicit
+  paged transcript viewer. Context uses a Desktop-style percent/count header,
+  thin bar and filling-circle name indicator. Colours follow
+  the pair's alert level: blue, yellow from 80%, red at/above the threshold.
+- Skipping old task history no longer labels finished pairs unknown. Read-limit
+  notices appear as a dim footnote only for affected working/recent rows.
+
 ### Fixed
 
+- Runtime crash/stdin-closed headlines survive ordinary stderr; diagnostics are
+  capped at 1,500 characters. Only recognized auth/billing/model diagnoses can
+  replace the headline. Warm plan 401/authentication errors receive login guidance.
+- Auto-watch detects native Claude ancestor death/PID reuse, exits quietly and
+  preserves recovery records. Recovery retries registry reads, always collects
+  worker exceptions, names waits left unarmed after the first outcome, and skips
+  records older than seven days without parsing them. Publication retries transient
+  Windows permission failures. An immediate/no-user-message resume probe is provided.
+
+- Pane detail reads prioritize working/recent pairs, so late-alphabet pairs no
+  longer lose their reads to idle history. All known registry pairs remain visible
+  as compact rows when budgets run out, with an explicit notice.
+- Codex transcript lookup uses immutable SQLite reads to avoid creating WAL/SHM
+  files. Claude login guidance requires failed CLI-envelope evidence; MCP auth
+  diagnostics and successful replies quoting key errors are not login failures.
+
+- Claude CLI launch failures now lead with the JSON result's message. Expired
+  OAuth and other plan-login failures direct the user to `claude auth login`;
+  API-billing key/credit guidance is preserved. Covers create, clear, hard stop,
+  fork, send, print/stream-json and compaction. See
+  [failure-handling notes](docs/claude-cli-errors.md).
+- Pane headers and reply times agree across DST changes. Interrupted turns have
+  attention status and No reply labels. Physical log-tail ordering is regression
+  tested across days; an unavailable requested detail refresh clears cached lines.
 - Pane refreshes no longer parse unbounded historical task payloads. Recent
   and known-running metadata has byte/count limits and a compact summary cache;
   omitted data is explicitly partial/unknown.

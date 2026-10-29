@@ -26,6 +26,7 @@ ROW_BUDGET = 64
 WATCH_BUDGET = 24
 TASK_READ_BUDGET = 48
 RECENT_SECONDS = 2 * 60 * 60
+WATCH_MAX_AGE = 7 * 24 * 3600
 
 
 class Reads:
@@ -359,7 +360,9 @@ def snapshot(home, session=None, show_all=True, expanded=(), cache=None):
         if path.suffix != ".json":
             continue
         try:
-            watch_paths.append((entry.stat().st_mtime, path))
+            modified = entry.stat().st_mtime
+            if modified >= now.timestamp() - WATCH_MAX_AGE:
+                watch_paths.append((modified, path))
         except OSError:
             pass
     if len(watch_paths) > WATCH_BUDGET:

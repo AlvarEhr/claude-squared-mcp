@@ -15,6 +15,19 @@
 - Quench reproduced duplicate recovery wakes by holding a Windows watch file
   open. A regression now holds a real handle without delete sharing, completes
   the watch, and verifies both SessionStart and pair_poll recovery are silent.
+- **2026-10-29, manager observation:** a Desktop restart at 14:14 removed the old
+  auto-watch hook; a later send armed a new one. This is one observed restart,
+  not proof every host kills every hook. Newly published records carry the
+  native Claude ancestor's PID/birth time when discoverable. Normal/recovered
+  wait sleeps check it at least every 250 ms; death/reuse exits quietly, keeps
+  the record, and releases the kernel owner lock. Recovery can recognize such
+  a live-hook/dead-host record and allow the old owner time to release it.
+  Legacy records and unidentified ancestry retain PID-only behavior. Tests use
+  only their own fixture host/hook PIDs, never image-name process control.
+- The `--immediate` SessionStart probe uses a completed-work fixture before
+  resume and writes zero user messages after resume. It records launch/input
+  count and requires WOKEN within `--wake-seconds` (30 by default). Its generated
+  hook is tested offline; the transport probe remains for the manager to run.
 
 ## Snapshot contract
 
@@ -133,6 +146,14 @@ rollout search or model call. Missing/compressed files and oversized JSONL
 records have visible explanations. Pages cover user/assistant text; tool and
 metadata records are skipped. Log timestamps are already local (runtime.py's
 datetime.now); ISO reply/transcript times are formatted locally in the mod.
+
+Recovery and pane skip watch JSON older than the seven-day hook timeout by
+mtime before opening it; recovery best-effort removes those expired records
+and their receipts, while the pane never writes. Recovery retries registry
+reads three times (also under the gate), retries publication PermissionError,
+queues a result even for worker BaseException, and names cancelled unfinished
+waits in the first wake. The offline runner now includes plugin validate/test
+when the CLI is available, otherwise reports a clean skip.
 
 ## Watch retirement
 

@@ -144,6 +144,36 @@ class ClaudeErrors(unittest.TestCase):
         self.assertTrue(str(error).startswith("CRASHED: "))
         self.assert_login(str(error))
 
+    def test_runtime_keeps_transport_headline_and_caps_plain_diagnostics(self):
+        stderr = "ordinary warning\n" * 10000
+        for headline in ("CRASHED: pair runtime exited mid-turn (exit 7)", "pair runtime stdin closed: broken pipe"):
+            text = str(RT._runtime_cli_error(self.spec, headline, stderr, 7))
+            self.assertTrue(text.startswith(headline))
+            self.assertIn("CLI diagnostic: ordinary warning", text)
+            self.assertLess(len(text), 2000)
+        self.assertLessEqual(len(C._failure_text("", "x" * 100000)), C.CLI_DIAGNOSTIC_LIMIT)
+        event = dict(EXPIRED, result=MESSAGE + "x" * 100000)
+        self.assertLess(len(C.claude_failure_message(self.spec, json.dumps(event), "")), 2000)
+
+    def test_warm_plan_auth_variants_are_not_transient_errors(self):
+        variants = [{"api_error_status": 401, "result": "Access denied"},
+                    {"error": {"type": "authentication_error", "message": "Session rejected"}},
+                    {"is_error": True, "result": "OAuth token has expired"}]
+        with patch.object(self.adapter, "_read_last_turn_context_fill", return_value=None):
+            for event in variants:
+                result = self.adapter._build_send_result(self.spec, {"type": "result", **event})
+                self.assertIn("claude auth login", result.response)
+                self.assertNotIn("transient overload", result.safety_signal)
+
+    def test_exit_zero_error_results_fail_one_shots_with_the_actual_message(self):
+        for message in ("You've hit your session limit", "Server overloaded; retry later"):
+            self.run.return_value = SimpleNamespace(returncode=0, stdout=json.dumps({
+                "type": "result", "is_error": True, "result": message}).encode(), stderr=b"")
+            for operation in (lambda: self.adapter.create(self.spec), lambda: self.adapter.compact(self.spec)):
+                with self.assertRaises(CLIError) as caught:
+                    operation()
+                self.assertTrue(str(caught.exception).startswith(message))
+
 
 if __name__ == "__main__":
     unittest.main()

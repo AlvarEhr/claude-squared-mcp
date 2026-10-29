@@ -39,6 +39,126 @@ def _read(path):
         return None
 
 
+def _registry_entries(pairs):
+    for attempt in range(3):
+        registry = _read(pairs / "registry.json")
+        entries = registry.get("pairs") if isinstance(registry, dict) else None
+        if isinstance(entries, dict):
+            return entries
+        if attempt < 2:
+            time.sleep(.05)
+    return None
+
+
+def _expired_record(path, cleanup=False):
+    try:
+        expired = path.stat().st_mtime < time.time() - HOOK_TIMEOUT_SECONDS
+    except OSError:
+        return False
+    if expired and cleanup:
+        gate = None
+        try:
+            directory = path.parent.parent / "auto_watch"
+            directory.mkdir(parents=True, exist_ok=True)
+            gate = _Lock(directory / (path.stem + ".gate"))
+            if gate.acquire():
+                # A sender may have replaced this path since the stat-only
+                # scan. Serialize cleanup with publication and recheck mtime.
+                expired = path.stat().st_mtime < time.time() - HOOK_TIMEOUT_SECONDS
+                if expired:
+                    path.unlink()
+                    path.with_suffix(".done").unlink()
+        except OSError:
+            pass
+        finally:
+            if gate is not None:
+                gate.close()
+    return expired
+
+
+class _HostGone(BaseException):
+    pass
+
+
+def _process_parent(pid):
+    """Process identity metadata only; no command lines or process control."""
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        class Entry(ctypes.Structure):
+            _fields_ = [("size", wintypes.DWORD), ("usage", wintypes.DWORD), ("pid", wintypes.DWORD),
+                        ("heap", ctypes.c_size_t), ("module", wintypes.DWORD), ("threads", wintypes.DWORD),
+                        ("parent", wintypes.DWORD), ("priority", wintypes.LONG), ("flags", wintypes.DWORD),
+                        ("exe", wintypes.WCHAR * 260)]
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel.Process32FirstW.argtypes = kernel.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(Entry)]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.CreateToolhelp32Snapshot(2, 0)
+        if handle == ctypes.c_void_p(-1).value:
+            return None
+        try:
+            entry = Entry()
+            entry.size = ctypes.sizeof(entry)
+            present = kernel.Process32FirstW(handle, ctypes.byref(entry))
+            while present:
+                if entry.pid == pid:
+                    return entry.parent, entry.exe
+                present = kernel.Process32NextW(handle, ctypes.byref(entry))
+        finally:
+            kernel.CloseHandle(handle)
+    elif sys.platform.startswith("linux"):
+        try:
+            text = Path(f"/proc/{pid}/stat").read_text()
+            return int(text[text.rfind(")") + 2:].split()[1]), Path(f"/proc/{pid}/comm").read_text().strip()
+        except (OSError, ValueError, IndexError):
+            pass
+    else:
+        import subprocess
+        try:
+            result = subprocess.run(["ps", "-p", str(pid), "-o", "ppid=", "-o", "comm="],
+                                    capture_output=True, text=True, timeout=2)
+            parent, executable = result.stdout.strip().split(None, 1)
+            return int(parent), Path(executable).name
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+    return None
+
+
+def _host_identity(reader):
+    pid = os.getppid()
+    seen = set()
+    for _ in range(16):
+        if pid <= 1 or pid in seen:
+            break
+        seen.add(pid)
+        info = _process_parent(pid)
+        if info is None:
+            break
+        parent, executable = info
+        if executable.lower() in ("claude", "claude.exe"):
+            alive, born = reader["_av_proc"](pid)
+            if alive is True and born is not None:
+                return {"host_pid": pid, "host_started_at": born}
+            break
+        pid = parent
+    return {}
+
+
+def _host_dead(record, reader):
+    pid, expected = record.get("host_pid"), record.get("host_started_at")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or not isinstance(expected, (int, float)):
+        return False  # old records and unidentifiable ancestry retain PID-only recovery
+    alive, born = reader["_av_proc"](pid)
+    return alive is False or (born is not None and abs(born - expected) > .01)
+
+
+def _host_check(host, reader):
+    if host and _host_dead(host, reader):
+        raise _HostGone()
+
+
 def _without_reply(text):
     # A handoff embeds the target's formatted reply after "Probe reply:",
     # unlike pair_send's top-level reply. Strip either form before looking
@@ -122,13 +242,7 @@ def _target(payload, pairs):
             raise OSError("could not resolve the handoff target from its task handle")
     # Windows readers can briefly miss an atomic registry replacement. A
     # handle already promised a watcher: fail visibly if the retry fails too.
-    for attempt in range(3):
-        registry = _read(pairs / "registry.json")
-        entries = registry.get("pairs") if isinstance(registry, dict) else None
-        if isinstance(entries, dict):
-            break
-        if attempt < 2:
-            time.sleep(.05)
+    entries = _registry_entries(pairs)
     if not isinstance(entries, dict):
         raise OSError("could not read the pair registry; use pair_poll and arm wait.py manually")
     # Older pair runtimes predate PAIR_ENV, but still have registered sessions.
@@ -194,7 +308,7 @@ class _Lock:
             return self.file.read()
 
 
-def _wait(pairs, name, timeout):
+def _wait(pairs, name, timeout, host=None, reader=None):
     # Run in THIS process, not a child: a hook killed by its host must not
     # leave an orphan wait.py holding the dedupe lock for the next seven days.
     pairs = pairs.resolve()
@@ -211,6 +325,14 @@ def _wait(pairs, name, timeout):
         sys.argv = [str(script), name, "--timeout", str(max(0, timeout))]
         with redirect_stdout(output), redirect_stderr(output):
             watcher = runpy.run_path(str(script))
+            if host:
+                def sleep(seconds):
+                    until = time.monotonic() + seconds
+                    while time.monotonic() < until:
+                        _host_check(host, reader)
+                        time.sleep(min(.25, max(0, until - time.monotonic())))
+                watcher["main"].__globals__["time"] = SimpleNamespace(**{**vars(time), "sleep": sleep})
+                _host_check(host, reader)
             code = watcher["main"](sys.argv[1:])
     finally:
         sys.argv = argv
@@ -221,7 +343,7 @@ def _wait(pairs, name, timeout):
     return code, output.getvalue()
 
 
-def _publish_watch(pairs, key, session, name, payload):
+def _publish_watch(pairs, key, session, name, payload, host=None):
     """Best-effort pane discovery, written only by the dedupe lock's owner.
 
     Hashing the session/pair also keeps arbitrary session names out of paths.
@@ -236,9 +358,17 @@ def _publish_watch(pairs, key, session, name, payload):
             "version": 1, "pair": name, "session_id": session,
             "cwd": payload.get("cwd") if isinstance(payload.get("cwd"), str) else None,
             "started_at": datetime.now(timezone.utc).isoformat(), "hook_pid": os.getpid(),
+            **(host or {}),
         }
-        tmp.write_text(json.dumps(data), encoding="utf-8")
-        tmp.replace(target)
+        for attempt in range(3):
+            try:
+                tmp.write_text(json.dumps(data), encoding="utf-8")
+                tmp.replace(target)
+                break
+            except PermissionError:
+                if attempt == 2:
+                    raise
+                time.sleep(.05)
         return target, data
     except OSError:
         return None  # a display failure must not lose the completion wake
@@ -303,14 +433,14 @@ def _dead_record(record, reader, path):
     started = reader["_av_parse"](record.get("started_at"))
     pid = record.get("hook_pid")
     return (started is not None and isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
-            and not reader["_av_task_owner_alive"](pid, started))
+            and (not reader["_av_task_owner_alive"](pid, started) or _host_dead(record, reader)))
 
 
 class _RecoveryCancelled(BaseException):
     pass
 
 
-def _recovery_wait(pairs, name, timeout, cancel):
+def _recovery_wait(pairs, name, timeout, cancel, host=None, reader=None):
     """A separate wait.py namespace per recovered pair, within this hook PID.
 
     No child watcher survives a killed hook. Thread-local output, argv and
@@ -325,8 +455,11 @@ def _recovery_wait(pairs, name, timeout, cancel):
     argv = [str(script), name, "--timeout", str(max(0, timeout))]
 
     def sleep(seconds):
-        if cancel.wait(seconds):
-            raise _RecoveryCancelled()
+        until = time.monotonic() + seconds
+        while time.monotonic() < until:
+            if cancel.wait(min(.25, max(0, until - time.monotonic()))):
+                raise _RecoveryCancelled()
+            _host_check(host, reader)
 
     def emit(*args, **kwargs):
         kwargs["file"] = output
@@ -342,6 +475,7 @@ def _recovery_wait(pairs, name, timeout, cancel):
     })
     if cancel.is_set():
         raise _RecoveryCancelled()
+    _host_check(host, reader)
     return watcher["main"](argv[1:]), output.getvalue()
 
 
@@ -358,6 +492,13 @@ def watch(payload, pairs, timeout=WAIT_TIMEOUT_SECONDS, *, recover=None, reader=
         if target is None:
             return 0
         session, name = target
+        if reader is None:
+            reader = runpy.run_path(str(pairs / "wait.py")) if (pairs / "wait.py").is_file() else {}
+        try:
+            host = _host_identity(reader) if "_av_proc" in reader else {}
+        except Exception:
+            host = {}  # process metadata can be unavailable on restricted hosts
+        _host_check(host, reader)
         directory = pairs / "auto_watch"
         directory.mkdir(parents=True, exist_ok=True)
         key = _watch_key(session, name)
@@ -369,18 +510,22 @@ def watch(payload, pairs, timeout=WAIT_TIMEOUT_SECONDS, *, recover=None, reader=
             # Recheck under the same gate used by PostToolUse. Another restart
             # or send may already have taken ownership since the initial scan.
             previous = pairs / "watches" / (key + ".json")
+            if _expired_record(previous, cleanup=True):
+                return 0
             current = _read(previous)
             if current != recover or not _dead_record(current, reader, previous):
                 return 0
-        if not owner.acquire():
+        if not owner.acquire(3 if recover and _host_dead(recover, reader) else 0):
+            if recover and _host_dead(recover, reader):
+                raise OSError("the old hook's host is gone but its owner lock has not released; "
+                              "recovery record retained for retry")
             if not recover:
                 gate.revision(uuid.uuid4().hex.encode("ascii"))
             return 0
         revision = uuid.uuid4().hex.encode("ascii")
         gate.revision(revision)
         if recover:
-            registry = _read(pairs / "registry.json")
-            entries = registry.get("pairs") if isinstance(registry, dict) else None
+            entries = _registry_entries(pairs)
             if not isinstance(entries, dict):
                 raise OSError("registry unavailable; recovery record retained for retry")
             if name not in entries:
@@ -390,15 +535,16 @@ def watch(payload, pairs, timeout=WAIT_TIMEOUT_SECONDS, *, recover=None, reader=
                 print(f"claude-squared auto-watch recovery: pair '{name}' is gone from the registry "
                       "(possibly forgotten while the session was down); clearing its stale watch record.", file=output)
                 return 2
-        published = _publish_watch(pairs, key, session, name, payload)
+        published = _publish_watch(pairs, key, session, name, payload, host)
         if published:
             record, record_data = published
         elif recover:
             record, record_data = previous, recover
         gate.release()
         while True:
-            code, message = (_recovery_wait(pairs, name, deadline - time.monotonic(), cancel)
-                             if recover else _wait(pairs, name, deadline - time.monotonic()))
+            code, message = (_recovery_wait(pairs, name, deadline - time.monotonic(), cancel, host, reader)
+                             if recover else _wait(pairs, name, deadline - time.monotonic(), host, reader))
+            _host_check(host, reader)
             if not gate.acquire(5):
                 raise OSError("could not finish watcher coordination")
             # A send can land between wait.py's final idle read and this hook's
@@ -416,6 +562,8 @@ def watch(payload, pairs, timeout=WAIT_TIMEOUT_SECONDS, *, recover=None, reader=
                       "command above in background Bash.", file=output)
             finished = True
             return 2
+    except _HostGone:
+        return 0  # retain the record, release the owner, and never wake a new host
     except Exception as exc:
         target_hint = f" for '{name}'" if name != "(unresolved)" else ""
         recovery = (f"Check pair_poll('{name}') and re-arm wait.py manually."
@@ -452,14 +600,19 @@ def resume_watches(payload, pairs, timeout=WAIT_TIMEOUT_SECONDS):
     session = payload.get("session_id")
     if not isinstance(session, str) or not session:
         return 0
-    registry = _read(pairs / "registry.json")
-    entries = registry.get("pairs", {}) if isinstance(registry, dict) else {}
+    entries = _registry_entries(pairs)
+    if entries is None:
+        print("claude-squared auto-watch recovery: registry unavailable after three reads; "
+              "records retained for retry.", file=sys.stderr)
+        return 2
     if isinstance(entries, dict) and any(isinstance(p, dict) and p.get("session_id") == session for p in entries.values()):
         return 0
     candidates = []
     reader = None
     try:
         for path in (pairs / "watches").glob("*.json"):
+            if _expired_record(path, cleanup=True):
+                continue
             record = _read(path)
             if not isinstance(record, dict) or record.get("session_id") != session:
                 continue
@@ -484,36 +637,53 @@ def resume_watches(payload, pairs, timeout=WAIT_TIMEOUT_SECONDS):
 
     def run(record):
         output = io.StringIO()
+        code = 2
+        unwatched = False
         try:
             code = watch(payload, pairs, timeout, recover=record, reader=reader, cancel=cancel, output=output)
         except _RecoveryCancelled:
             code = 0  # its record remains, to be re-armed by the next pair_poll
-        except Exception as exc:
+            unwatched = True
+        except BaseException as exc:
             code = 2
-            output.write(f"Recovery watcher failed for '{record['pair']}': {exc}; inspect pair_poll.\n")
-        results.put((code, output.getvalue()))
+            output.write(f"Recovery watcher failed for '{record['pair']}': {type(exc).__name__}: {str(exc)[:1500]}; inspect pair_poll.\n")
+        finally:
+            try:
+                message = output.getvalue()
+            except BaseException:
+                message = f"Recovery watcher failed for '{record['pair']}'; output unavailable.\n"
+            results.put((record["pair"], code, message, unwatched))
 
     threads = [threading.Thread(target=run, args=(record,), daemon=True) for record in candidates]
     for thread in threads:
         thread.start()
     remaining = len(threads)
     messages = []
+    unwatched_names = set()
     while remaining:
-        code, message = results.get()
+        name, code, message, unwatched = results.get()
+        if unwatched:
+            unwatched_names.add(name)
         remaining -= 1
         if code == 2:
             messages.append(message)
             break
     cancel.set()
     joined_by = time.monotonic() + 5
-    for thread in threads:
+    for record, thread in zip(candidates, threads):
         thread.join(timeout=max(0, joined_by - time.monotonic()))
+        if thread.is_alive():
+            unwatched_names.add(record["pair"])
     while not results.empty():
-        code, message = results.get_nowait()
+        name, code, message, unwatched = results.get_nowait()
+        if unwatched:
+            unwatched_names.add(name)
         if code == 2:
             messages.append(message)
     if messages:
         print("Recovered auto-watch outcome(s):\n" + "\n".join(messages), file=sys.stderr)
+        if unwatched_names:
+            print("Still-unwatched recovered pairs: " + ", ".join(sorted(unwatched_names)) + ".", file=sys.stderr)
         print("Read the outcome with pair_poll. Any unfinished recovered waits will re-arm "
               "automatically after that poll; do not re-send the original work.", file=sys.stderr)
         return 2

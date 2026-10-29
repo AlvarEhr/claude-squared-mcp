@@ -11,6 +11,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -274,17 +275,17 @@ class HookTests(unittest.TestCase):
         self.assertIn(name, result.stderr.decode("utf-8"))
 
     def blocking_stub(self):
-        self.stub("from pathlib import Path\nimport time\n"
+        self.stub("from pathlib import Path\nimport time,os\n"
                   "def main(argv):\n"
                   " p = Path(__file__).parent\n"
-                  " with (p / 'started').open('a') as f: f.write('start\\n')\n"
+                  " (p / ('started-' + str(os.getpid()))).touch()\n"
                   " while not (p / 'release').exists(): time.sleep(.02)\n"
                   " print('completed')\n return 0\n")
 
     def test_live_dedupe_and_session_pair_scope(self):
         self.blocking_stub()
         first = self.start({**event(), "cwd": str(self.home / "manager-project")})
-        self.await_file("started")
+        self.await_file("started-" + str(first.pid))
         files = list((self.pairs / "watches").glob("*.json"))
         self.assertEqual(len(files), 1)
         record = json.loads(files[0].read_text(encoding="utf-8"))
@@ -301,9 +302,16 @@ class HookTests(unittest.TestCase):
         independent_pair = self.start(event(name="other"))
         # Two fresh interpreters must start; slow CI runners took >5 s.
         deadline = time.monotonic() + 20
-        while len((self.pairs / "started").read_text().splitlines()) < 3:
+        # Per-PID markers avoid concurrent Windows appenders losing a line in
+        # a shared readiness file. Each marker proves a distinct wait started.
+        while not all((self.pairs / ("started-" + str(child.pid))).exists()
+                      for child in (independent_session, independent_pair)):
+            for child in (independent_session, independent_pair):
+                if child.poll() is not None:
+                    self.fail(f"independent watcher exited before waiting: {self.finish(child)}")
             self.assertLess(time.monotonic(), deadline)
             time.sleep(.02)
+        self.assertEqual(len(list(self.pairs.glob("started-*"))), 3)
         (self.pairs / "release").touch()
         for child in (first, independent_session, independent_pair):
             self.assertEqual(self.finish(child)[0], 2)
@@ -324,7 +332,7 @@ class HookTests(unittest.TestCase):
     def test_killed_watcher_releases_kernel_lock(self):
         self.blocking_stub()
         first = self.start(event())
-        self.await_file("started")
+        self.await_file("started-" + str(first.pid))
         first.terminate()  # only the process started by this test
         first.communicate(timeout=10)
         self.assertEqual(len(list((self.pairs / "watches").glob("*.json"))), 1)
@@ -494,6 +502,7 @@ class HookTests(unittest.TestCase):
         self.assertIn("pair 'scout', wait.py exit 0", err)
         self.assertFalse(done.exists())
         self.assertTrue(busy.exists())
+        self.assertIn("Still-unwatched recovered pairs: other", err)
         # Reading the result re-arms the remaining pair without a Bash step.
         follow = self.start({**event("pair_poll", "done"), "tool_input": {"task_id": "scout"}})
         self.await_recovery_owner(busy, follow.pid)
@@ -628,6 +637,141 @@ class HookTests(unittest.TestCase):
             self.assertEqual(self.finish(self.start(event("pair_poll", "done"))), (0, "", ""))
         finally:
             kernel.CloseHandle(handle)
+
+
+    def test_recovery_registry_retries_and_baseexception_always_reports(self):
+        W.install_wait_script(self.pairs / "wait.py")
+        path = self.recovery_record()
+        self.recovery_task(status="done")
+        original = H._read
+        attempts = []
+        def retry(file):
+            if file.name == "registry.json":
+                attempts.append(file)
+                if len(attempts) <= 2:
+                    return None
+            return original(file)
+        payload = {"hook_event_name": "SessionStart", "source": "resume", "session_id": "manager-session"}
+        with patch.object(H, "_read", side_effect=retry), patch("sys.stderr", io.StringIO()):
+            self.assertEqual(H.resume_watches(payload, self.pairs), 2)
+        self.assertGreaterEqual(len(attempts), 3)
+        self.recovery_record()
+        result = []
+        errors = io.StringIO()
+        with patch.object(H, "watch", side_effect=SystemExit(17)), patch("sys.stderr", errors):
+            worker = threading.Thread(target=lambda: result.append(H.resume_watches(payload, self.pairs)), daemon=True)
+            worker.start()
+            worker.join(3)
+            self.assertFalse(worker.is_alive(), "BaseException left recovery waiting for a missing result")
+        self.assertEqual(result, [2])
+        self.assertIn("SystemExit", errors.getvalue())
+        self.assertTrue(path.exists())
+
+    def test_publish_retries_permission_error_and_expiry_does_not_read_json(self):
+        original = Path.replace
+        attempts = []
+        def replace(path, target):
+            attempts.append(path)
+            if len(attempts) < 3:
+                raise PermissionError("atomic replacement temporarily held")
+            return original(path, target)
+        key = H._watch_key("manager-session", "scout")
+        with patch.object(Path, "replace", replace):
+            published = H._publish_watch(self.pairs, key, "manager-session", "scout", {})
+        self.assertIsNotNone(published)
+        self.assertEqual(len(attempts), 3)
+        path = published[0]
+        os.utime(path, (time.time() - H.HOOK_TIMEOUT_SECONDS - 1,) * 2)
+        original_read = H._read
+        def read(file):
+            self.assertNotEqual(file, path, "expired record JSON must not be read")
+            return original_read(file)
+        with patch.object(H, "_read", side_effect=read):
+            self.assertEqual(H.resume_watches({"hook_event_name": "SessionStart", "source": "resume",
+                "session_id": "manager-session"}, self.pairs), 0)
+        self.assertFalse(path.exists())
+
+    def test_host_identity_uses_ancestry_and_live_hook_with_dead_host_is_recoverable(self):
+        W.install_wait_script(self.pairs / "wait.py")
+        reader = runpy.run_path(str(self.pairs / "wait.py"))
+        parent = os.getppid()
+        with patch.object(H, "_process_parent", side_effect=[(parent + 1, "shell.exe"), (1, "claude.exe")]), \
+                patch.dict(reader, {"_av_proc": lambda pid: (True, 123.0)}):
+            self.assertEqual(H._host_identity(reader), {"host_pid": parent + 1, "host_started_at": 123.0})
+        path = self.recovery_record(hook_pid=os.getpid(), started_at=datetime.now(timezone.utc).isoformat(),
+                                    host_pid=999999999, host_started_at=123.0)
+        self.assertTrue(H._dead_record(H._read(path), reader, path))
+        info = H._process_parent(os.getpid())
+        self.assertIsNotNone(info)
+        self.assertEqual(info[0], os.getppid())
+
+    def test_surviving_hook_exits_quietly_when_its_host_dies_and_can_be_recovered(self):
+        W.install_wait_script(self.pairs / "wait.py")
+        self.recovery_task()
+        host = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], env=self.env)
+        def cleanup_host():
+            if host.poll() is None:
+                host.terminate()  # only this test's exact child PID
+            host.wait(timeout=10)
+        self.addCleanup(cleanup_host)
+        reader = runpy.run_path(str(self.pairs / "wait.py"))
+        alive, born = reader["_av_proc"](host.pid)
+        self.assertTrue(alive)
+        identity = {"host_pid": host.pid, "host_started_at": born}
+        wrapper = self.pairs / "host-fixture.py"
+        wrapper.write_text("import runpy,sys\n"
+            f"d=runpy.run_path({str(self.script)!r})\n"
+            f"d['watch'].__globals__['_host_identity']=lambda reader: {identity!r}\n"
+            "from pathlib import Path\nimport time\n"
+            "original=d['watch'].__globals__['_host_check']\n"
+            "def guard(host, reader):\n"
+            " try: original(host, reader)\n"
+            " except d['_HostGone']:\n"
+            "  Path(__file__).with_name('host-gone').touch()\n"
+            "  while not Path(__file__).with_name('release-host').exists(): time.sleep(.02)\n"
+            "  raise\n"
+            "d['watch'].__globals__['_host_check']=guard\n"
+            "sys.exit(d['main']())\n", encoding="utf-8")
+        script, self.script = self.script, wrapper
+        try:
+            hook = self.start(event())
+        finally:
+            self.script = script
+        key = H._watch_key("manager-session", "scout")
+        self.await_file("watches/" + key + ".json")
+        host.terminate()
+        host.wait(timeout=10)
+        self.await_file("host-gone")
+        record = self.pairs / "watches" / (key + ".json")
+        self.assertTrue(record.exists())
+        self.assertFalse(record.with_suffix(".done").exists())
+        resumed = self.start_recovery()
+        gate = H._Lock(self.pairs / "auto_watch" / (key + ".gate"))
+        self.addCleanup(gate.close)
+        deadline = time.monotonic() + 5
+        while gate.acquire():
+            gate.release()
+            if time.monotonic() > deadline:
+                self.fail("recovery did not wait for the surviving hook's owner lock")
+            time.sleep(.02)
+        (self.pairs / "release-host").touch()
+        self.assertEqual(self.finish(hook), (0, "", ""))
+        self.await_recovery_owner(record, resumed.pid)
+        self.recovery_task(status="done")
+        self.assertEqual(self.finish(resumed)[0], 2)
+
+    def test_immediate_probe_hook_uses_already_completed_fixture_without_delay(self):
+        import smoke_live_sessionstart as probe
+        (self.home / "finished-work.json").write_text('{"status":"done"}', encoding="utf-8")
+        source = probe.hook_source("IMMEDIATE-MARKER", 99, True)
+        errors = io.StringIO()
+        with patch("sys.stdin", io.StringIO('{"source":"resume","session_id":"fixture"}')), \
+                patch("sys.stderr", errors), patch.object(time, "sleep", side_effect=AssertionError("must be immediate")):
+            with self.assertRaises(SystemExit) as caught:
+                exec(compile(source, "hook.py", "exec"), {"__file__": str(self.home / "hook.py")})
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("IMMEDIATE-MARKER", errors.getvalue())
+        self.assertTrue((self.home / "hook-finished.json").exists())
 
 
 if __name__ == "__main__":

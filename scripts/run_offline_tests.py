@@ -7,6 +7,7 @@ The explicit allow-list excludes smoke scripts that invoke live models.
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -130,7 +131,27 @@ def main() -> int:
                 failures.append(name)
                 print(f"FAIL {name}: exit {result.returncode}", flush=True)
 
-    print(f"\nOffline suites: {len(commands) - len(failures)} passed, {len(failures)} failed", flush=True)
+    suites = len(commands)
+    cli = shutil.which("claude")
+    if cli:
+        suites += 1
+        print("\n=== pairs_pane_mod (local CLI; no model calls) ===", flush=True)
+        with tempfile.TemporaryDirectory(prefix="cs-offline-mod-", dir=scratch, ignore_cleanup_errors=True) as tmp:
+            env = {**os.environ, "CLAUDE_CONFIG_DIR": tmp, "CLAUDE_HOME": tmp,
+                   "CODEX_HOME": str(Path(tmp) / "codex"), "TEMP": tmp, "TMP": tmp, "TMPDIR": tmp}
+            try:
+                for action in ("validate", "test"):
+                    result = subprocess.run([cli, "plugin", action, str(ROOT / "mods" / "pairs-pane")],
+                                            cwd=ROOT, env=env, timeout=120, check=False)
+                    if result.returncode:
+                        failures.append("pairs_pane_mod")
+                        break
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                failures.append("pairs_pane_mod")
+                print(f"FAIL pairs_pane_mod: {exc}", file=sys.stderr)
+    else:
+        print("SKIP pairs_pane_mod: claude is not on PATH (no model calls required).", flush=True)
+    print(f"\nOffline suites: {suites - len(failures)} passed, {len(failures)} failed", flush=True)
     if failures:
         print("Failed: " + ", ".join(failures), file=sys.stderr)
     return 1 if failures else 0

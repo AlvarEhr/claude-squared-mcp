@@ -21,6 +21,20 @@ process exited nonzero. Assistant/tool events quoting errors are excluded.
 Generic result text comes before the exit code;
 raw JSON envelopes are not used as the error headline.
 
+Runtime pipe/crash failures preserve their transport headline and append at
+most 1,500 characters of ordinary CLI diagnostic text. Only recognized
+auth/billing/model diagnoses can replace that headline; the supervisor prefix
+still stays at position zero. JSON result and plain diagnostics are bounded
+before entering task errors/wakes. Structured plan HTTP 401,
+`authentication_error`, and failed `OAuth token has expired` results are login
+failures, not transient overloads. Plain stderr alone still does not prove
+Claude auth failure (the deliberate quench fix for MCP false positives).
+
+One-shot exit-zero `is_error` envelopes deliberately raise CLIError too. This
+includes usage-limit/transient failures and prevents lifecycle tools from
+claiming ready/new sessions after failed turns. Warm send results keep their
+existing labelled safety signals. Both contracts have offline coverage.
+
 Plan-billed authentication failures say the CLI is not logged in, include its
 message, and direct the **user** to `claude auth login` in a terminal. No auth
 status command, credential read, login attempt, or retry is added. API-billed

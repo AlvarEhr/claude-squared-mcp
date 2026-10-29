@@ -501,16 +501,18 @@ does not edit user settings.
 ### Recovering waits after a restart
 
 `auto_watch.py --resume` handles `SessionStart`. It finds this session's watch
-records whose hook PID is dead (including detected PID reuse), rechecks each
+records whose hook PID is dead (including detected PID reuse), or whose
+identified Claude host is gone. It rechecks each
 record under the existing dedupe lock, and resumes `wait.py` with the same
 Claude home. Work finished while the manager was down produces an immediate
 outcome; a forgotten pair produces an explanation and removes its stale record.
-Live watchers are left alone, including on repeated `clear` or `compact`
+Healthy live watchers are left alone, including on repeated `clear` or `compact`
 events. Recovery never re-sends or stops pair work.
 
 **Several recovered pairs:** a hook process can deliver only one exit wake.
 Recovery waits concurrently and wakes on the first outcome, so a completed
-pair is not hidden behind a long-running one. Unfinished records are retained.
+pair is not hidden behind a long-running one. Unfinished records are retained
+and still-unwatched pairs are named in the wake message.
 Read the reported result with `pair_poll`; its updated PostToolUse hook then
 automatically re-arms the remaining records. This requires both entries in
 the updated settings snippet. Until that poll, the unfinished recovery records
@@ -534,6 +536,20 @@ the hook's `source`, resumed `session_id`, and wake timing:
 ```bash
 python tests/smoke_live_sessionstart.py --live
 ```
+
+To test an immediate completion wake with **no user message after resume**:
+
+```bash
+python tests/smoke_live_sessionstart.py --live --immediate --claude /path/to/desktop/claude
+```
+
+This mode uses an already-completed work fixture and two small Haiku turns.
+It requires WOKEN within 30 seconds of resume (adjust with `--wake-seconds`).
+It has not yet been live-verified. A newly armed watcher records its native
+Claude ancestor when identifiable; if that PID exits or is reused, the watcher
+exits quietly, releases its lock and leaves its record for recovery. Old records
+or unidentifiable ancestry retain PID-only detection. Records older than seven
+days are skipped by mtime; recovery may clean them, while the pane stays read-only.
 
 Use `--claude /path/to/claude.exe` to select Desktop's bundled CLI. Evidence
 stays under `.test-homes`; the probe does not edit user settings. Interrupted
@@ -660,8 +676,8 @@ Python 3.7+ must be available to the host. In `/config`, the plugin exposes
 `CLAUDE_HOME`, then `~/.claude`. If only the MCP server has a custom
 `CLAUDE_HOME`, set the same directory in the plugin's option.
 
-The mod API is early access. Validated and tested with the local CLI's
-function-hook test harness; actual Desktop painting still needs a user check.
+The mod API is early access. Alvar confirmed the pane loads and renders in
+Desktop; automated checks use the local CLI's function-hook test harness.
 The API has no direct PID-liveness query, so the pane uses the read-only
 Python helper through `$.process.run`. A host that refuses that call cannot
 provide the pane's live view. Without an attached surface, `/pairs` reports

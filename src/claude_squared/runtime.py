@@ -99,7 +99,7 @@ def _book_cost(name: str, cost: float, billing: str) -> None:
 def _runtime_cli_error(spec: PairSpec, fallback: str, stderr: str,
                        exit_code: int | None = None) -> CLIError:
     from claude_squared.adapters.claude import claude_failure_message
-    message = claude_failure_message(spec, "", stderr, fallback)
+    message = claude_failure_message(spec, "", stderr, fallback, preserve_headline=True)
     # Keep the supervisor prefix at position zero for wait.py exit-code dispatch.
     if fallback.startswith(CRASHED_ERROR_PREFIX) and not message.startswith(CRASHED_ERROR_PREFIX):
         message = CRASHED_ERROR_PREFIX + message

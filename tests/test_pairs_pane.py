@@ -464,6 +464,21 @@ class SnapshotTests(unittest.TestCase):
         self.assertTrue(data["rows"][0]["details_skipped"])
         self.assertTrue(data["budget_limited"])
 
+    def test_expired_watch_records_are_skipped_by_mtime_without_reading(self):
+        old = self.watch("expired")
+        old.write_text("not JSON" * 100000, encoding="utf-8")
+        os.utime(old, (self.now.timestamp() - P.WATCH_MAX_AGE - 1,) * 2)
+        self.watch("current")
+        original = Path.open
+        def checked(path, *args, **kwargs):
+            self.assertNotEqual(path, old)
+            return original(path, *args, **kwargs)
+        with patch.object(Path, "open", checked):
+            data = P.snapshot(self.home)
+        self.assertEqual(len(data["rows"][0]["watches"]), 1)
+        self.assertFalse(data["budget_limited"])
+        self.assertTrue(old.exists())  # the pane stays read-only
+
     def test_interrupted_turns_are_not_replies_and_naive_utc_is_normalized(self):
         for status, error, expected in [("failed", "ORPHANED: owner exited", "orphaned"),
                 ("failed", "CRASHED: runtime exited", "crashed"), ("failed", "CLIError: failure", "failed"),

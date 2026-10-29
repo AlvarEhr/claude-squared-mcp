@@ -466,21 +466,36 @@ def _failure_result(output: str) -> dict | None:
     return None
 
 
+CLI_DIAGNOSTIC_LIMIT = 1500
+
+
+def _authentication_error(result: dict) -> bool:
+    error = result.get("error")
+    return (result.get("api_error_status") in (401, "401")
+            or (isinstance(error, dict) and error.get("type") == "authentication_error")
+            or result.get("error_type") == "authentication_error")
+
+
 def _failed_result(result: dict) -> bool:
     return bool(result.get("is_error") or result.get("api_error_status") or result.get("loggedIn") is False
                 or str(result.get("subtype") or "").startswith("error")
-                or result.get("terminal_reason") == "api_error")
+                or result.get("terminal_reason") == "api_error" or _authentication_error(result))
 
 
 def _result_text(event: dict) -> str:
     if isinstance(event.get("result"), str) and event["result"].strip():
-        return event["result"].strip()
+        return event["result"].strip()[:CLI_DIAGNOSTIC_LIMIT]
     if event.get("loggedIn") is False:
         return "loggedIn: false"
     errors = event.get("errors")
     if isinstance(errors, list) and errors:
-        return "\n".join(error for error in errors if isinstance(error, str))
-    return str(event.get("subtype") or event.get("terminal_reason") or "")
+        return "\n".join(error[:CLI_DIAGNOSTIC_LIMIT] for error in errors[:10] if isinstance(error, str))[:CLI_DIAGNOSTIC_LIMIT]
+    error = event.get("error")
+    if isinstance(error, dict):
+        return str(error.get("message") or error.get("type") or "")[:CLI_DIAGNOSTIC_LIMIT]
+    if _authentication_error(event):
+        return "authentication_error (HTTP 401)"
+    return str(event.get("subtype") or event.get("terminal_reason") or "")[:CLI_DIAGNOSTIC_LIMIT]
 
 
 def _failure_text(stdout: str, stderr: str) -> str:
@@ -503,10 +518,12 @@ def _failure_text(stdout: str, stderr: str) -> str:
         try:
             json.loads(line)
         except ValueError:
-            plain.append(line)  # retain ordinary [tag] diagnostics
+            plain.append(line[:CLI_DIAGNOSTIC_LIMIT])  # retain ordinary [tag] diagnostics
+            if sum(len(item) for item in plain) >= CLI_DIAGNOSTIC_LIMIT:
+                break
     if plain:
-        return "\n".join(plain)
-    return stdout.strip() if not any(line.lstrip().startswith(("{", "[")) for line in stdout.splitlines()) else ""
+        return "\n".join(plain)[:CLI_DIAGNOSTIC_LIMIT]
+    return stdout.strip()[:CLI_DIAGNOSTIC_LIMIT] if not any(line.lstrip().startswith(("{", "[")) for line in stdout.splitlines()) else ""
 
 
 def _login_failure(spec: PairSpec | None, result: dict | None) -> str | None:
@@ -515,7 +532,7 @@ def _login_failure(spec: PairSpec | None, result: dict | None) -> str | None:
     if not result or result.get("parent_tool_use_id") or not _failed_result(result):
         return None
     text = _result_text(result).strip()
-    auth = r"(?:failed to authenticate|oauth session expired|invalid api key|not logged in)\b"
+    auth = r"(?:failed to authenticate|oauth (?:session|token)(?: has)? expired|invalid api key|not logged in)\b"
     usage = result.get("usage")
     zero_usage = (isinstance(usage, dict) and bool(usage)
                   and all(isinstance(value, (int, float)) and not isinstance(value, bool) and value == 0
@@ -525,7 +542,7 @@ def _login_failure(spec: PairSpec | None, result: dict | None) -> str | None:
     # failed terminal envelope is evidence; a nonzero process exit alone isn't.
     if re.match(r"(?:\[?MCP\b|\[?tool\b|the tool\b)", text, re.IGNORECASE):
         return None
-    if (result.get("loggedIn") is False
+    if (result.get("loggedIn") is False or _authentication_error(result)
             or (result.get("is_error") is True and re.match(auth, text, re.IGNORECASE))
             or (result.get("terminal_reason") == "api_error" and zero_usage
                 and re.search(auth, text, re.IGNORECASE))):
@@ -535,7 +552,8 @@ def _login_failure(spec: PairSpec | None, result: dict | None) -> str | None:
 
 
 def claude_failure_message(spec: PairSpec | None, stdout: str, stderr: str,
-                           fallback: str = "claude CLI failed without a result message") -> str:
+                           fallback: str = "claude CLI failed without a result message", *,
+                           preserve_headline: bool = False) -> str:
     """Human result first, shared by one-shots and runtime transport failures.
 
     2026-10-29: manager verified expired OAuth returns exit 1 + api_error,
@@ -553,6 +571,8 @@ def claude_failure_message(spec: PairSpec | None, stdout: str, stderr: str,
         return login
     if (result is None or _failed_result(result)) and MODEL_UNAVAILABLE_MARKER in text.lower():
         return f"{text}\n{_MODEL_UNAVAILABLE_HELP}"
+    if preserve_headline and text:
+        return f"{fallback}\nCLI diagnostic: {text}"
     return text or fallback
 
 
