@@ -15,8 +15,11 @@ All notable changes to this project are documented here. Format follows
   `last_steer`; logs record each message. Idle pairs send normally. Codex,
   foreign-owned/one-shot/self-woken turns and CLIs without correlation support
   explicitly fall back to normal FIFO. Overrides and timeouts with steering
-  are refused. Live transport verification remains a release check; an opt-in
-  Haiku probe is provided in `scripts/probe_claude_steer.py`.
+  are refused. The manager confirmed mid-turn delivery on CLI 2.1.296; an opt-in
+  Haiku probe is provided in `scripts/probe_claude_steer.py`. Its `--interrupt`
+  mode remains unrun. A stop that must discard unconsumed steering input reports
+  the hard stop and background losses; a turn ending before delivery gives an
+  explicit resend hint.
 
 ## [0.21.0] — 2026-10-26
 

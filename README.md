@@ -301,12 +301,19 @@ process, one-shot override sends, self-woken turns, and Claude CLIs without
 message correlation support explicitly report **queued as a normal send**.
 Ordinary sends remain FIFO. Steering cannot change the running model, effort,
 permissions or timeout: omit per-call overrides and `hard_timeout_seconds`.
+On the verified Claude CLI (2.1.296), the first turn after each spawn/respawn
+cannot be steered: correlation support is learned from its first result, so
+follow-ups during that turn queue normally. Steering does not restart or extend
+the original send's hard timeout; that deadline still bounds the whole task.
+The synchronous `timeout_seconds` remains only a wait limit.
 
 Steering messages appear as `[steer <message-id>]` in `main.log`. Activity files
 annotate the existing `turn` with `steer_count` and
 `last_steer: {message_id, at, preview}` (also retained in `window_turns`). No second
 task is created. If interrupted or failed before all steering input is consumed,
 the runtime is stopped to discard that input; this also ends its background work.
+`pair_stop` reports the hard stop and recorded background losses (or says the
+hard stop is still in progress), rather than claiming the runtime stays alive.
 An uncertain stdin write fails explicitly and is never automatically retried.
 
 ### Task retention and waiting

@@ -187,6 +187,98 @@ class SteerTests(unittest.TestCase):
             tool(S.pair_send_async)(self.spec.name, "follow-up", steer=True)
         self.assertEqual(self.scope.steer_error, "closed")
 
+    def test_ended_turn_between_reservation_and_write_is_not_delivered(self):
+        pipe = self.rt.proc.stdin
+        def retire(line):
+            self.rt._reader_gen += 1
+            self.rt.proc = None
+        with patch.object(self.rt, "_append_main_log_line", side_effect=retire), \
+                patch.object(AT, "start_task", side_effect=AssertionError("No automatic resend")), \
+                self.assertRaises(CLIError) as caught:
+            tool(S.pair_send_async)(self.spec.name, "follow-up", steer=True)
+        self.assertIn("Turn ended before the follow-up was delivered; send it normally", str(caught.exception))
+        self.assertNotIn("pair_stop", str(caught.exception))
+        self.assertEqual(pipe.getvalue(), b"")
+        self.assertFalse(self.scope.pending_steers)
+
+    def test_retired_runtime_write_failure_reports_undelivered(self):
+        def fail(data):
+            self.rt._reader_gen += 1
+            raise BrokenPipeError("retired")
+        self.rt.proc.stdin = Mock(write=Mock(side_effect=fail), closed=False)
+        with self.assertRaises(CLIError) as caught:
+            self.rt.steer("follow-up")
+        self.assertIn("send it normally", str(caught.exception))
+        self.assertFalse(self.scope.pending_steers)
+
+    def test_retirement_after_write_is_uncertain_not_success(self):
+        def retire():
+            self.rt._reader_gen += 1
+        self.rt.proc.stdin = Mock(flush=Mock(side_effect=retire), closed=False)
+        with self.assertRaises(CLIError) as caught:
+            self.rt.steer("follow-up")
+        self.assertIn("delivery uncertain", str(caught.exception))
+        self.assertNotIn("send it normally", str(caught.exception))
+
+    def _stop_task(self):
+        task = AT.register_external_task(self.spec.name, "ordinary send")
+        self.scope.task_id = task.task_id
+        self.addCleanup(AT.finalize_external_task, task, status="stopped")
+        return task
+
+    def _fake_hard_stop(self, **kwargs):
+        self.rt.proc = None
+        self.rt.last_lost_background = [{"task_id": "background", "kind": "bash"}]
+        return "tree-killed"
+
+    def test_pair_stop_reports_worker_hard_stop_and_background_loss(self):
+        self._stop_task()
+        self.rt.steer("pending")
+        def interrupt(data):
+            self.assertEqual(json.loads(data)["request"]["subtype"], "interrupt")
+            self.result(["original"], is_error=True)
+            self.rt._stop_for_steer(self.scope, "unconsumed input")
+        self.rt.proc.stdin = Mock(write=Mock(side_effect=interrupt))
+        with patch.object(self.rt, "stop", side_effect=self._fake_hard_stop) as stop:
+            reply = tool(S.pair_stop)(self.spec.name)
+        self.assertIn("hard stop: tree-killed", reply)
+        self.assertIn("1 background task(s) lost", reply)
+        self.assertNotIn("pair stays alive", reply)
+        self.assertNotIn("did not ack", reply)
+        stop.assert_called_once()
+
+    def test_pair_stop_reports_discard_completed_before_runtime_inspection(self):
+        self._stop_task()
+        self.rt.steer("pending")
+        def cancel(task_id):
+            self.scope.interrupt_sent = True
+            self.result(["original"], is_error=True)
+            self.rt._stop_for_steer(self.scope, "unconsumed input")
+            return True
+        with patch.object(self.rt, "stop", side_effect=self._fake_hard_stop), \
+                patch.object(AT, "request_task_stop", side_effect=cancel):
+            reply = tool(S.pair_stop)(self.spec.name)
+        self.assertIn("hard stop: tree-killed", reply)
+        self.assertIn("1 background task(s) lost", reply)
+        self.assertNotIn("runtime left alive", reply)
+
+    def test_interrupt_reports_pending_hard_stop_without_claiming_completion(self):
+        self.rt.steer("pending")
+        self.scope.interrupt_sent = True
+        self.result(["original"], is_error=True)
+        report = self.rt.send_interrupt(wait_for_result_seconds=.01)
+        self.assertIn("hard stop in progress", report)
+        self.assertNotIn("tree-killed", report)
+        self.assertIsNone(self.rt.steer_stop_report({"other-task"}))
+
+    def test_interrupt_with_consumed_steer_preserves_soft_stop(self):
+        self.rt.steer("pending")
+        mid = self.frame()["uuid"]
+        self.rt.proc.stdin = Mock(write=Mock(side_effect=lambda data: self.result([mid], is_error=True)))
+        with patch.object(self.rt, "stop", side_effect=AssertionError("No hard stop")):
+            self.assertIs(self.rt.send_interrupt(wait_for_result_seconds=.1), True)
+        self.assertIsNone(self.rt.steer_stop_report({self.scope.task_id}))
+
     def test_interrupt_with_unconsumed_steer_requires_discarding_input(self):
         self.rt.steer("pending")
         self.scope.interrupt_sent = True

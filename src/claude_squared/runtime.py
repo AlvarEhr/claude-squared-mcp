@@ -446,6 +446,8 @@ class TurnLogScope:
         self.steer_duration_ms = 0
         self.steer_denials: list[dict] = []
         self.steer_error: str | None = None
+        self.steer_stop_done = threading.Event()
+        self.steer_stop_outcome: str | None = None
 
 
 class PairRuntime:
@@ -467,6 +469,7 @@ class PairRuntime:
         # across a pipe write: a large message must not block the reader.
         self._input_lock = threading.Lock()
         self._steer_supported = False
+        self._last_steer_stop_scope: TurnLogScope | None = None
         self.started_at: datetime | None = None
         self._stdout_q: queue.Queue[str] = queue.Queue()
         self._stderr_buf: list[str] = []
@@ -920,7 +923,7 @@ class PairRuntime:
     def is_alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
-    def send_interrupt(self, *, wait_for_result_seconds: float = 2.5) -> bool:
+    def send_interrupt(self, *, wait_for_result_seconds: float = 2.5) -> bool | str:
         """Send the claude CLI's in-band ``control_request: interrupt`` over stdin.
 
         This is the equivalent of pressing the UI stop button: the CLI cancels the
@@ -938,6 +941,8 @@ class PairRuntime:
         ``wait_for_result_seconds`` of the request (interrupt acknowledged).
         Returns False if no result event arrived in time — caller should escalate
         to ``stop()`` for a tree-kill.
+        Returns a descriptive string if unconsumed steering input requires a
+        hard stop. The caller must report it instead of claiming the pair survived.
 
         Must be called WHILE the runtime is alive and (typically) mid-turn.
         Caller is responsible for task selection. The short input lock keeps
@@ -949,15 +954,13 @@ class PairRuntime:
             selected = self._current_scope or self._implicit_scope
         if selected is None:
             return True
+        deadline = time.monotonic() + wait_for_result_seconds
+        seq0 = self._result_seq
         with self._input_lock:
             proc = self.proc
             if proc is None or proc.stdin is None:
                 return False
             claim = self._claim_interrupt(expected_scope=selected)
-            if claim is None:
-                # A result may have arrived while a steer held the input lock.
-                # Recheck after acquiring it; never interrupt a finished turn.
-                return True
             if claim:
                 request_id = f"req_int_{int(time.time())}_{os.urandom(3).hex()}"
                 payload = json.dumps({
@@ -978,21 +981,59 @@ class PairRuntime:
         # The pre-v0.12.0 heuristic — "main.log grew by a line" — returned True
         # unconditionally during a self-woken turn (which logs continuously),
         # so pair_stop reported "interrupt acked" even when the CLI dropped it.
-        deadline = time.monotonic() + wait_for_result_seconds
-        seq0 = self._result_seq
-        while time.monotonic() < deadline:
+        while True:
+            with self._scope_lock:
+                snap = selected.result_snapshot
+                discarding = bool((snap or {}).get("steer_abort") or selected.steer_error is not None)
+            if discarding:
+                # The reader publishes the decision before the worker kills.
+                # A result ACK alone must never claim background work survived.
+                selected.steer_stop_done.wait(max(0, deadline - time.monotonic()))
+                return self._steer_stop_description(selected)
+            if claim is None:
+                return True  # selected turn ended while stdin was busy
             if not self.is_alive():
                 # Subprocess died — interrupt may have triggered crash, not graceful
                 return False
-            if self._result_seq > seq0:
+            if self._result_seq > seq0 and (not selected.steer_count or snap is not None):
                 # The ack result arrived; let it settle one tick so the turn
                 # marker / task finalization land before the caller reports.
                 time.sleep(0.3)
                 return True
+            if time.monotonic() >= deadline:
+                break
             time.sleep(0.1)
         # Timed out waiting for a result — interrupt may not have been received
         # OR the runtime is in a non-responsive state (true wedge).
         return False
+
+    @staticmethod
+    def _steer_stop_description(scope: TurnLogScope) -> str:
+        return scope.steer_stop_outcome or (
+            "hard stop in progress to discard unconsumed steering input; "
+            "the runtime and its background work are being terminated")
+
+    def steer_stop_report(self, task_ids: set[str]) -> str | None:
+        """Selected-task outcome, including a worker that stopped before pair_stop inspected it."""
+        with self._scope_lock:
+            scope = self._last_steer_stop_scope
+            if scope is None or scope.task_id not in task_ids:
+                return None
+            return self._steer_stop_description(scope)
+
+    def _stop_for_steer(self, scope: TurnLogScope, reason: str) -> None:
+        with self._scope_lock:
+            self._last_steer_stop_scope = scope
+        try:
+            outcome = self.stop(reason=reason)
+            scope.steer_stop_outcome = (
+                f"hard stop: {outcome} runtime to discard unconsumed steering input; "
+                f"{len(self.last_lost_background)} background task(s) lost")
+        except Exception as exc:
+            scope.steer_stop_outcome = f"hard stop failed while discarding steering input: {exc}"
+            raise
+        finally:
+            scope.steer_stop_done.set()
 
     def stop(self, reason: str | None = None) -> str:
         """Tear down the runtime subprocess. Tree-kills descendants so the pair's
@@ -1699,6 +1740,8 @@ class PairRuntime:
                     "subagent_logs": list(solicited.subagent_logs),
                     "background_launches": list(solicited.background_launches),
                 }
+                if solicited.pending_steers:
+                    self._last_steer_stop_scope = solicited
             else:
                 scope, task = self._implicit_scope, self._implicit_task
                 self._implicit_scope = None
@@ -2016,6 +2059,7 @@ class PairRuntime:
                 scope.pending_steers.add(message_id)
                 scope.steer_count += 1
                 task_id = scope.task_id
+                reader_gen = self._reader_gen
             payload = json.dumps({"type": "user", "uuid": message_id,
                                   "message": {"role": "user", "content": message}}) + "\n"
             # Publish before writing: a very fast reply may close the activity
@@ -2023,16 +2067,39 @@ class PairRuntime:
             self._activity.note_steer(task_id, message_id, message, gen=self._gen)
             self._append_main_log_line(
                 f"[{datetime.now().strftime('%H:%M:%S')}] [steer {message_id}] {message}")
+            with self._scope_lock:
+                ended = (reader_gen != self._reader_gen or self.proc is not proc
+                         or self._current_scope is not scope or scope.result_snapshot is not None)
+                if ended:
+                    scope.pending_steers.discard(message_id)
+            if ended or proc.poll() is not None or getattr(proc.stdin, "closed", False) is True:
+                raise _runtime_cli_error(self.spec,
+                    "Turn ended before the follow-up was delivered; send it normally.",
+                    stderr=self._collect_stderr())
+            wrote = False
             try:
                 proc.stdin.write(payload.encode("utf-8"))
+                wrote = True
                 proc.stdin.flush()
             except (OSError, ValueError) as exc:
+                if not wrote and (reader_gen != self._reader_gen or self.proc is not proc
+                                  or proc.poll() is not None or getattr(proc.stdin, "closed", False) is True):
+                    with self._scope_lock:
+                        scope.pending_steers.discard(message_id)
+                    raise _runtime_cli_error(self.spec,
+                        "Turn ended before the follow-up was delivered; send it normally.",
+                        stderr=self._collect_stderr()) from exc
                 # A partial write is ambiguous. Never silently queue/retry it.
                 with self._scope_lock:
                     scope.steer_error = str(exc)
+                    self._last_steer_stop_scope = scope
                 raise _runtime_cli_error(self.spec,
-                    f"Steer delivery uncertain: {exc}. Inspect pair_log/pair_status before retrying; "
-                    "pair_stop can end the original task.", stderr=self._collect_stderr()) from exc
+                    f"Steer delivery uncertain: {exc}. Inspect pair_log before retrying.",
+                    stderr=self._collect_stderr()) from exc
+            if reader_gen != self._reader_gen and message_id in scope.pending_steers:
+                raise _runtime_cli_error(self.spec,
+                    "Turn ended while delivering the follow-up; delivery uncertain. Inspect pair_log before retrying.",
+                    stderr=self._collect_stderr())
             return task_id, "Follow-up written to the running Claude turn"
 
     def _write_interrupt_nowait(self) -> None:
@@ -2147,7 +2214,7 @@ class PairRuntime:
                     with self._scope_lock:
                         steer_error = self._current_scope.steer_error
                     if steer_error is not None:
-                        self.stop(reason="steer stdin write failed; delivery uncertain")
+                        self._stop_for_steer(self._current_scope, "steer stdin write failed; delivery uncertain")
                         raise _runtime_cli_error(self.spec,
                             "Steer delivery uncertain; runtime stopped to discard partial input. "
                             "Inspect pair_log before retrying.", stderr=self._collect_stderr())
@@ -2224,7 +2291,7 @@ class PairRuntime:
                                 # An interrupt/error need not consume queued CLI
                                 # input. Discard it before releasing the pair lock
                                 # so it cannot run as an untracked later turn.
-                                self.stop(reason="turn ended before consuming all steers")
+                                self._stop_for_steer(scope, "turn ended before consuming all steers")
                                 raise _runtime_cli_error(self.spec,
                                     "Turn stopped/failed before all steers were consumed; "
                                     "runtime stopped to discard pending input (including background work). "

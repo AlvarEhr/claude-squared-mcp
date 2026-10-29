@@ -5345,6 +5345,8 @@ def pair_stop(
     the next send. No process kill, no orphaned child processes — claude.exe
     cleans up its own tool subprocesses. The runtime is preserved; the pair
     is immediately ready for ``pair_send`` again.
+    If a result leaves steering input unconsumed, the runtime is hard-stopped
+    to discard it, including background work; the response reports that outcome.
 
     Args:
         name: Pair to stop.
@@ -5441,13 +5443,18 @@ def pair_stop(
             active = runtime_obj.active_task_ids()
             untracked = runtime_obj.has_untracked_turn()
             interrupt_current = bool(active & local_ids) or untracked
+            steer_hard_stop = False
             if interrupt_current and not force:
-                if runtime_obj.send_interrupt(wait_for_result_seconds=3.0):
+                interrupted = runtime_obj.send_interrupt(wait_for_result_seconds=3.0)
+                if isinstance(interrupted, str):
+                    actions.append(interrupted)
+                    steer_hard_stop = True
+                elif interrupted:
                     actions.append("sent in-band interrupt (pair stays alive)")
                 else:
                     actions.append("in-band interrupt did not ack within 3s")
                     force = True
-            if not force:
+            if not force and not steer_hard_stop:
                 # A soft interrupt stops only the in-flight turn: background
                 # Bash / agents survive it and still wake the pair (verified
                 # 2026-09-25, CLI 2.1.280).
@@ -5456,7 +5463,10 @@ def pair_stop(
                     actions.append(
                         f"{len(surviving)} background task(s) still running and will wake the pair "
                         f"({_describe_background(surviving)}); pair_stop(force=True) kills them")
-            if force:
+            discard_report = getattr(runtime_obj, "steer_stop_report", lambda ids: None)(local_ids)
+            if isinstance(discard_report, str):
+                steer_hard_stop = True
+            if force and not steer_hard_stop:
                 # Identity-checked eviction: only the runtime captured above,
                 # never a replacement (evict_if_current). Allowed when nothing
                 # was selected (explicit force on an idle/wedged runtime), when
@@ -5473,6 +5483,17 @@ def pair_stop(
                             actions.append(_lost_note(_killed))
                 else:
                     actions.append("selected turn already ended; runtime left alive for its successor")
+
+        # The worker may finish its discard before stop reaches the runtime,
+        # or during the interrupt ACK wait. Match only the selected task IDs.
+        report = getattr(runtime_obj, "steer_stop_report", lambda ids: None)(local_ids)
+        if isinstance(report, str):
+            actions = [a for a in actions if not (
+                a.startswith("hard stop") or a == "sent in-band interrupt (pair stays alive)"
+                or a == "in-band interrupt did not ack within 3s"
+                or a == "selected turn already ended; runtime left alive for its successor"
+                or "background task(s) still running and will wake the pair" in a)]
+            actions.append(report)
 
     if hard and foreign_implicit:
         actions.append("hard reset skipped: self-woken work must first be stopped by its owner")
