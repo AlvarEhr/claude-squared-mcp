@@ -7,6 +7,7 @@ No process is stopped, and no registry/task/activity/watch file is changed.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import heapq
 import json
 import os
@@ -235,22 +236,180 @@ def safe_pair(name):
             and not any(c in name for c in "/\\:\0"))
 
 
-def tail(path):
-    """Physical tail only: HH:MM:SS labels cannot order lines across days."""
+def tail(path, size=8192):
+    """Physical tail only: HH:MM:SS labels cannot order lines across days.
+
+    A log entry can span lines (a multi-line tool result); continuation lines
+    are folded into their entry with " / ", as single-line entries already are.
+    """
     try:
         with path.open("rb") as stream:
             stream.seek(0, 2)
-            offset = max(0, stream.tell() - 8192)
+            offset = max(0, stream.tell() - size)
             stream.seek(offset)
-            data = stream.read(8192)
+            data = stream.read(size)
         lines = data.decode("utf-8", "replace").splitlines()
         if offset:
             lines = lines[1:]
-        lines = [re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line).rstrip() for line in lines]
-        return ["".join(c if c.isprintable() else " " for c in line) for line in lines
-                if line and not re.match(r"^(?:\[\d{2}:\d{2}:\d{2}\]\s*)?=== ", line)]
+        entries = []
+        for line in lines:
+            line = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line).rstrip()
+            line = "".join(c if c.isprintable() else " " for c in line)
+            if not line.strip() or re.match(r"^(?:\[\d{2}:\d{2}:\d{2}\]\s*)?=== ", line):
+                continue
+            if line.startswith("["):
+                entries.append(line)
+            elif entries:  # a continuation; one before the first entry was cut by the tail
+                entries[-1] += " / " + line.strip()
+        return entries
     except OSError:
         return []
+
+
+SUB_LAUNCH = re.compile(r"^\[(\d\d:\d\d):\d\d\] \[T-\d+\] \[-> sub-agent #(\d+): ([^\]]+)\] launching: ?(.*)$")
+SUB_RETURN = re.compile(r"^\[\d\d:\d\d:\d\d\] \[T-\d+\] \[<- sub-agent #(\d+) returned\]")
+SUB_STARTED = re.compile(r"^\[\d\d:\d\d:\d\d\] \[system:task_started\] local_agent \(\w+\) ([0-9a-f]{6,}): ?(.*)$")
+SUB_SCAN = 256 * 1024
+
+
+def _subagent_dir(root, spec):
+    session, cwd = spec.get("session_id"), spec.get("cwd")
+    if not isinstance(session, str) or not isinstance(cwd, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", session):
+        return None
+    return root / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", cwd) / session / "subagents"
+
+
+def subagents(root, name):
+    """A Claude pair's sub-agents, running first then newest: launches and
+    returns from the main log's recent tail, finished ones from their logs."""
+    logs = root / "pairs" / "logs" / name
+    found = {}
+    try:
+        names = [entry.name for entry in os.scandir(logs)]
+    except OSError:
+        names = []
+    for filename in names:
+        match = re.fullmatch(r"subagent-(\d+)-(.+)\.log", filename)
+        if match:
+            ident = int(match.group(1))
+            found[ident] = {"id": ident, "type": match.group(2), "description": "", "status": "done", "at": None}
+    try:
+        with (logs / "main.log").open("rb") as stream:
+            size = stream.seek(0, 2)
+            stream.seek(max(0, size - SUB_SCAN))
+            text = stream.read(SUB_SCAN).decode("utf-8", "replace")
+    except OSError:
+        text = ""
+    last = None
+    for line in text.splitlines():
+        launch = SUB_LAUNCH.match(line)
+        if launch:
+            ident = int(launch.group(2))
+            entry = found.setdefault(ident, {"id": ident, "type": launch.group(3), "status": "running"})
+            entry.update(description=launch.group(4).strip(), at=launch.group(1))
+            last = entry
+            continue
+        started = SUB_STARTED.match(line)
+        if started and last is not None and "agent" not in last:
+            last["agent"] = started.group(1)
+            continue
+        returned = SUB_RETURN.match(line)
+        if returned and int(returned.group(1)) in found:
+            found[int(returned.group(1))]["status"] = "done"
+    rows = sorted(found.values(), key=lambda e: (e["status"] != "running", -e["id"]))
+    return [{k: v for k, v in e.items() if k != "agent"} for e in rows[:12]], found
+
+
+def _local(stamp):
+    try:
+        return datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).astimezone().strftime("%H:%M:%S")
+    except (TypeError, ValueError):
+        return "--:--:--"
+
+
+def sub_transcript(root, name, spec, ident, found):
+    """The sub-agent's own transcript, named in its extracted log's header or,
+    while it runs, found by the agent id its launch reported. Only paths inside
+    the pair's own subagents directory are accepted."""
+    entry = found.get(ident) or {}
+    directory = _subagent_dir(root, spec)
+    extracted = root / "pairs" / "logs" / name / f"subagent-{ident}-{entry.get('type', '')}.log"
+    if extracted.is_file():
+        try:
+            with extracted.open("r", encoding="utf-8", errors="replace") as stream:
+                head = stream.read(4096)
+            match = re.search(r"=== source jsonl: (.+?\.jsonl) ===", head)
+            path = Path(match.group(1)) if match else None
+            if path is not None and directory is not None and path.parent.resolve() == directory.resolve():
+                return path, extracted
+        except OSError:
+            pass
+        return None, extracted
+    agent = entry.get("agent")
+    if directory is not None and isinstance(agent, str):
+        matches = sorted(directory.glob(f"agent-{agent}*.jsonl"))
+        if matches:
+            return matches[0], None
+    return None, None
+
+
+def _jsonl_lines(path, size=64 * 1024):
+    """A running sub-agent's transcript tail as main.log-style lines, tagged by
+    tool-use id so an entry can be opened in full."""
+    try:
+        with path.open("rb") as stream:
+            end = stream.seek(0, 2)
+            stream.seek(max(0, end - size))
+            data = stream.read(size)
+    except OSError:
+        return []
+    lines = []
+    for raw in data.splitlines()[1 if end > size else 0:]:
+        try:
+            event = json.loads(raw)
+        except ValueError:
+            continue
+        message = event.get("message") if isinstance(event, dict) else None
+        if not isinstance(message, dict):
+            continue
+        at = _local(event.get("timestamp"))
+        content = message.get("content")
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            kind = block.get("type")
+            if kind == "text" and block.get("text"):
+                role = "text" if message.get("role") == "assistant" else "sub-user"
+                lines.append(f"[{at}] [{role}] " + " / ".join(block["text"].splitlines())[:400])
+            elif kind == "tool_use":
+                args = json.dumps(block.get("input"), ensure_ascii=False)[:300]
+                lines.append(f"[{at}] [{block.get('id')}] [tool_use] {block.get('name')}({args})")
+            elif kind == "tool_result":
+                result = block.get("content")
+                text = result if isinstance(result, str) else " ".join(
+                    part.get("text", "") for part in result or [] if isinstance(part, dict))
+                flag = " ERR" if block.get("is_error") else ""
+                lines.append(f"[{at}] [{block.get('tool_use_id')}] [tool_result{flag}] "
+                             + " / ".join(str(text).splitlines())[:300])
+    return lines[-120:]
+
+
+def subagent_activity(root, name, spec, ident):
+    rows, found = subagents(root, name)
+    if ident not in found:
+        return None
+    path, extracted = sub_transcript(root, name, spec, ident, found)
+    entry = found[ident]
+    if entry["status"] == "running" and path is not None:
+        lines = _jsonl_lines(path)
+    elif extracted is not None:
+        lines = tail(extracted, 32 * 1024)
+    else:
+        lines = []
+    return {"id": ident, "type": entry.get("type"), "description": entry.get("description", ""),
+            "status": entry["status"], "logs": lines}
 
 
 def task_outcome(data):
@@ -339,7 +498,7 @@ def display_model(spec, view, tasks, parse):
     return max(candidates, key=lambda item: item[0])[1] if candidates else requested
 
 
-def snapshot(home, session=None, show_all=True, expanded=(), cache=None):
+def snapshot(home, session=None, show_all=True, expanded=(), cache=None, focus=None):
     pairs = Path(home).expanduser().resolve() / "pairs"
     script = pairs / "wait.py"
     if not script.is_file():
@@ -570,6 +729,13 @@ def snapshot(home, session=None, show_all=True, expanded=(), cache=None):
             if orphaned:
                 details.update(reply=None, outcome="orphaned", note=None)
             details["logs"] = tail(pairs / "logs" / name / "main.log")
+            if (spec.get("backend") or "claude") == "claude":
+                details["subagents"] = subagents(pairs.parent, name)[0]
+                ident = (focus or {}).get(name) if isinstance(focus, dict) else None
+                sub = subagent_activity(pairs.parent, name, spec, ident) if type(ident) is int else None
+                if sub is not None:
+                    details["logs"] = sub.pop("logs")
+                    details["focus"] = sub
             size = len(json.dumps(details).encode("utf-8"))
             if detail_bytes + size > 1024 * 1024:
                 details = {"reply": None, "reply_at": None, "working_on": None, "logs": [],
@@ -672,13 +838,31 @@ def _clip(text):
     return text if len(text) <= DETAIL_CHARS else text[:DETAIL_CHARS] + f"\n… ({len(text) - DETAIL_CHARS:,} more characters)"
 
 
-def tool_detail(home, name, tag):
+def tool_detail(home, name, tag, sub=None):
     """One tool call's full input and output, read only when its activity line is opened."""
     root = Path(home).expanduser().resolve()
-    if not safe_pair(name) or not isinstance(tag, str) or not re.fullmatch(r"T-\d+", tag):
+    if not safe_pair(name) or not isinstance(tag, str) or not re.fullmatch(r"T-\d+|toolu_\w+", tag):
         return {"note": "No tool call to show."}
     reads = Reads()
     logs = root / "pairs" / "logs" / name
+    if type(sub) is int:
+        # A sub-agent's call: T-n from its extracted index, or (while it runs)
+        # the tool-use id itself; searched in that sub-agent's transcript only.
+        registry = reads.json(root / "pairs" / "registry.json", 2 * 1024 * 1024) or {}
+        spec = registry.get("pairs", {}).get(name, {})
+        found = subagents(root, name)[1]
+        path = sub_transcript(root, name, spec, sub, found)[0] if isinstance(spec, dict) else None
+        tool_id = tag
+        if tag.startswith("T-"):
+            index = reads.json(logs / f"subagent-{sub}-{(found.get(sub) or {}).get('type', '')}.idx.json",
+                               4 * 1024 * 1024)
+            entry = index.get(tag) if isinstance(index, dict) else None
+            tool_id = entry.get("tool_use_id") if isinstance(entry, dict) else None
+        if path is None or not isinstance(tool_id, str):
+            return {"note": "Full detail isn't recorded for this call; the activity line is all there is."}
+        return _transcript_call([path], tool_id)
+    if not tag.startswith("T-"):
+        return {"note": "No tool call to show."}
     item = reads.json(logs / "codex-tool-items" / f"{tag}.json", TASK_LIMIT)
     if isinstance(item, dict):
         event = item.get("completed") or item.get("started") or {}
@@ -712,6 +896,11 @@ def tool_detail(home, name, tag):
                              key=lambda p: p.stat().st_mtime, reverse=True)
     except OSError:
         pass
+    return _transcript_call(candidates, tool_id)
+
+
+def _transcript_call(candidates, tool_id):
+    """A Claude tool call's input and result from the first transcript tail holding its id."""
     needle = tool_id.encode("utf-8")
     budget = DETAIL_SCAN * 2
     data = b""
@@ -773,10 +962,11 @@ def main():
             result = {"transcript": transcript_page(args.home, target.get("pair"), target.get("offset", 0))}
         elif isinstance(request.get("tool"), dict):
             target = request["tool"]
-            result = {"tool": tool_detail(args.home, target.get("pair"), target.get("tag"))}
+            result = {"tool": tool_detail(args.home, target.get("pair"), target.get("tag"), target.get("sub"))}
         else:
             result = snapshot(args.home, session=request.get("session"), show_all=request.get("all", True),
-                              expanded=request.get("expanded", []), cache=request.get("cache"))
+                              expanded=request.get("expanded", []), cache=request.get("cache"),
+                              focus=request.get("focus"))
     except Exception as exc:
         result = {"rows": [], "error": f"Pair state could not be read: {exc}"}
     print(json.dumps(result, ensure_ascii=True))

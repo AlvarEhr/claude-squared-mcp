@@ -13,6 +13,8 @@ const replies = atom({ plugin: 'pairs-pane', key: 'replies' } as const, [] as st
 const logs = atom({ plugin: 'pairs-pane', key: 'logs' } as const, [] as string[])
 const transcript = atom({ plugin: 'pairs-pane', key: 'transcript' } as const, null as TranscriptView | null)
 const entry = atom({ plugin: 'pairs-pane', key: 'entry' } as const, null as EntryView | null)
+// The sub-agent whose activity a pair's card shows instead of the pair's own, by pair.
+const focus = atom({ plugin: 'pairs-pane', key: 'focus' } as const, {} as Record<string, number>)
 
 function tokens(value: number | null | undefined): string {
   if (value == null) return '—'
@@ -137,7 +139,7 @@ function clip(lines: string[]): string {
   return head.join('\n') + (fences % 2 ? '\n```' : '') + (lines.length > 12 ? '\n\n…' : '')
 }
 
-type LogEntry = { at: string; kind: string; text: string; color?: string; dim?: boolean; quiet?: boolean; tag?: string }
+type LogEntry = { at: string; kind: string; text: string; color?: string; dim?: boolean; quiet?: boolean; tag?: string; sub?: number }
 
 // Codex item types, named as a reader would say them.
 const CODEX_TOOLS: Record<string, string> = {
@@ -153,14 +155,21 @@ function tidy(text: string): string {
 // main.log lines read "[HH:MM:SS] [T-n] [kind] text"; time, turn and kind are each optional.
 export function parseLog(line: string): LogEntry {
   const parsed = parseRaw(line)
-  const tag = /^(?:\[\d\d:\d\d:\d\d\]\s*)?\[(T-\d+)\]/.exec(line)?.[1]
+  const tag = /^(?:\[\d\d:\d\d:\d\d\]\s*)?\[(T-\d+|toolu_\w+)\]/.exec(line)?.[1]
   return { ...parsed, text: tidy(parsed.text), ...(tag ? { tag } : {}) }
 }
 
 function parseRaw(line: string): LogEntry {
-  const match = /^(?:\[(\d\d:\d\d):\d\d\]\s*)?(?:\[T-\d+\]\s*)?(?:\[([a-z_]+(?::[a-z_]+)?)( ERR)?\]\s*)?([\s\S]*)$/.exec(line)
+  const launch = /^(?:\[(\d\d:\d\d):\d\d\]\s*)?(?:\[T-\d+\]\s*)?\[(->|<-) sub-agent #(\d+)(?:: ([^\]]+))?(?: returned)?\]\s*(?:launching:\s*)?([\s\S]*)$/.exec(line)
+  if (launch) {
+    const [, at = '', arrow, id, type, body = ''] = launch
+    return arrow === '->' ? { at, kind: 'sub-agent', text: `#${id} ${type || ''} · ${body}`, color: 'merged', sub: Number(id) }
+      : { at, kind: '↩ sub-agent', text: `#${id} returned`, dim: true, sub: Number(id) }
+  }
+  const match = /^(?:\[(\d\d:\d\d):\d\d\]\s*)?(?:\[(?:T-\d+|toolu_\w+)\]\s*)?(?:\[(?:sub-)?([a-z_]+(?::[a-z_]+)?)( ERR)?\]\s*)?([\s\S]*)$/.exec(line)
   if (!match) return { at: '', kind: '', text: line }
   const [, at = '', kind = '', failed, body = ''] = match
+  if (kind === 'user') return { at, kind: 'brief', text: body, dim: true }
   if (kind === 'tool_use') {
     const call = /^([\w.-]+)\(([\s\S]*?)\)?$/.exec(body)
     const name = call ? call[1].replace(/^mcp__.+?__/, '') : 'tool'
@@ -229,7 +238,7 @@ async function refresh($: EngineInterface) {
     const page = await read($, transcript)
     if (page && !page.loading) return
     const request = page ? { transcript: { pair: page.pair, offset: page.offset } }
-      : { session, all: showAll, expanded: details, cache: readerCache }
+      : { session, all: showAll, expanded: details, cache: readerCache, focus: await read($, focus) }
     const result = await $.process.run([
       String(options.python || 'python'), '-B', `${$.plugin.root}/read_pairs.py`, '--home', home,
     ], { timeoutMs: 5000, stdin: JSON.stringify(request) })
@@ -318,7 +327,7 @@ async function openTranscript($: EngineInterface, name: string, offset = 0) {
 
 // One activity entry open at a time; a tool call's full input and output
 // are read only when it is opened.
-async function toggleEntry($: EngineInterface, pair: string, key: string, tag: string | null) {
+async function toggleEntry($: EngineInterface, pair: string, key: string, tag: string | null, sub?: number) {
   const current = await read($, entry)
   if (current?.pair === pair && current.key === key) { await update($, entry, () => null); return }
   await update($, entry, () => ({ pair, key, tag, loading: !!tag }))
@@ -328,10 +337,22 @@ async function toggleEntry($: EngineInterface, pair: string, key: string, tag: s
     const home = cacheHome || String(options.claudeHome || '') || await $.env.get('CLAUDE_HOME')
       || `${await $.env.get('USERPROFILE') || await $.env.get('HOME')}/.claude`
     const result = await $.process.run([String(options.python || 'python'), '-B', `${$.plugin.root}/read_pairs.py`, '--home', home],
-      { timeoutMs: 5000, stdin: JSON.stringify({ tool: { pair, tag } }) })
+      { timeoutMs: 5000, stdin: JSON.stringify({ tool: { pair, tag, ...(sub == null ? {} : { sub }) } }) })
     if (result.exitCode === 0 && !result.isStdoutTruncated) detail = JSON.parse(result.stdout).tool || detail
   } catch { /* the note above stands */ }
   await update($, entry, value => value?.pair === pair && value.key === key ? { ...value, ...detail, loading: false } : value)
+}
+
+// Show a sub-agent's activity in its pair's card, or (null) the pair's own again.
+async function focusSub($: EngineInterface, pair: string, id: number | null) {
+  await update($, focus, value => {
+    const next = { ...value }
+    if (id == null) delete next[pair]
+    else next[pair] = id
+    return next
+  })
+  await update($, entry, () => null)
+  requestRefresh($)
 }
 
 async function closeTranscript($: EngineInterface) {
@@ -368,6 +389,7 @@ export const register: Register = (on, configured) => {
     await update($, logs, () => [])
     await update($, transcript, () => null)
     await update($, entry, () => null)
+    await update($, focus, () => ({}))
     await update($, view, () => ({ rows: [], error: null, notice: null, session: '', home: '' }))
     return next(e)
   })
@@ -394,6 +416,7 @@ export const register: Register = (on, configured) => {
     const moreLogs = await read($, logs)
     const page = await read($, transcript)
     const opened = await read($, entry)
+    const focused = await read($, focus)
     // A pane opened before any surface attached stopped polling; the first
     // drawing after a surface places it starts the reads again.
     if (wanted && !cancel) { start($); requestRefresh($) }
@@ -443,6 +466,8 @@ export const register: Register = (on, configured) => {
       // Successful tool results only repeat the call above them; failures stay.
       const entries = row.detail!.logs.slice().reverse().map(parseLog).filter(item => !item.quiet && (item.text || item.kind))
       const open = moreLogs.includes(row.name)
+      const sub = row.detail!.focus && focused[row.name] === row.detail!.focus.id ? row.detail!.focus.id : undefined
+      if (focused[row.name] != null && sub === undefined) return <Text {...cap} dimColor>Loading sub-agent…</Text>
       return <Box flexDirection="column">
         {(open ? entries : entries.slice(0, 8)).map((item, index) => {
           const key = `${item.tag || item.at}|${item.kind}|${item.text.slice(0, 60)}`
@@ -452,7 +477,10 @@ export const register: Register = (on, configured) => {
               <Text {...cap} {...mono} dimColor>{item.at || '--:--'}</Text>
               <Text {...cap} {...semi} color={item.color} dimColor={item.dim}>{item.kind}</Text>
               <Box flexShrink={1} flexGrow={1} minWidth={0} overflow="hidden">
-                <Button key={`entry-${row.name}-${index}`} plain onPress={() => { void toggleEntry($, row.name, key, item.tag || null) }}>
+                <Button key={`entry-${row.name}-${index}`} plain onPress={() => {
+                  if (item.sub != null && sub === undefined) void focusSub($, row.name, item.sub)
+                  else void toggleEntry($, row.name, key, item.tag || null, sub)
+                }}>
                   <Text {...cap} dimColor={item.dim && !shown} wrap="truncate-end">{item.text}</Text>
                 </Button>
               </Box>
@@ -463,6 +491,28 @@ export const register: Register = (on, configured) => {
         {entries.length === 0 && <Text {...cap} dimColor>No activity logged yet.</Text>}
         {entries.length > 8 && <Button key={`logs-more-${row.name}`} plain dimColor
           label={open ? 'Show fewer' : `Show ${entries.length - 8} more`} onPress={() => { void toggleMore($, row.name, 'log') }} />}
+      </Box>
+    }
+
+    // Running sub-agents first, then the most recent; picking one swaps the
+    // activity list below to that sub-agent's own calls.
+    const subagentList = (row: PairRow) => {
+      const list = row.detail!.subagents!.slice(0, moreLogs.includes(`${row.name}#subs`) ? 12 : 4)
+      return <Box flexDirection="column">
+        <Text {...cap} {...semi} dimColor>Sub-agents</Text>
+        {list.map(item => <Box key={`sub-${row.name}-${item.id}`} gap={1} minWidth={0}>
+          <Text {...cap} color={item.status === 'running' ? 'success' : undefined} dimColor={item.status !== 'running'}>{item.status === 'running' ? '●' : '○'}</Text>
+          <Box flexShrink={1} flexGrow={1} minWidth={0} overflow="hidden">
+            <Button key={`sub-${row.name}-${item.id}`} plain dimColor={focused[row.name] !== item.id}
+              onPress={() => { void focusSub($, row.name, focused[row.name] === item.id ? null : item.id) }}>
+              <Text {...cap} wrap="truncate-end">#{item.id} {item.type}{item.description ? ` · ${item.description}` : ''}</Text>
+            </Button>
+          </Box>
+          {item.at && <Text {...cap} {...mono} dimColor>{item.at}</Text>}
+        </Box>)}
+        {row.detail!.subagents!.length > 4 && <Button key={`subs-more-${row.name}`} plain dimColor
+          label={moreLogs.includes(`${row.name}#subs`) ? 'Show fewer' : `Show ${row.detail!.subagents!.length - 4} more`}
+          onPress={() => { void toggleMore($, `${row.name}#subs`, 'log') }} />}
       </Box>
     }
 
@@ -504,7 +554,13 @@ export const register: Register = (on, configured) => {
             {replyLines.length > 12 && <Button key={`reply-more-${row.name}`} plain dimColor
               label={fullReply ? 'Show less' : `Show full reply (${replyLines.length} lines)`} onPress={() => { void toggleMore($, row.name, 'reply') }} />}
             {d.note && <Text {...cap} dimColor>{d.note}</Text>}
-            <Text {...cap} {...semi} dimColor>Activity · newest first</Text>
+            {d.subagents && d.subagents.length > 0 && subagentList(row)}
+            {d.focus && focused[row.name] === d.focus.id
+              ? <Box gap={1} flexWrap="wrap">
+                <Button key={`unfocus-${row.name}`} plain dimColor label={`‹ ${row.name}`} onPress={() => { void focusSub($, row.name, null) }} />
+                <Text {...cap} {...semi} dimColor>Activity · #{d.focus.id} {d.focus.type}{d.focus.status === 'running' ? ' · live' : ''}</Text>
+              </Box>
+              : <Text {...cap} {...semi} dimColor>Activity · newest first</Text>}
             {activity(row)}
           </Box>}
         </Box>}

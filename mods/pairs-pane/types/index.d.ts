@@ -2,11 +2,13 @@ export type PairWatch = {
   session_id: string; cwd: string | null; hook_pid: number;
   started_at: string; elapsed_s: number; verified: boolean;
 }
+export type SubAgent = { id: number; type: string; description?: string; status: string; at?: string | null }
 export type PairRow = {
   name: string; backend: string; model: string; status: string;
   elapsed_s: number | null;
   detail?: { reply: string | null; reply_at: string | null; outcome?: string | null;
-    working_on: string | null; logs: string[]; note: string | null } | null;
+    working_on: string | null; logs: string[]; note: string | null;
+    subagents?: SubAgent[]; focus?: { id: number; type: string; description: string; status: string } } | null;
   partial?: boolean;
   compact?: boolean; details_skipped?: boolean;
   finished_at?: string | null; finished_ago_s?: number | null; outcome?: string | null;
@@ -26,6 +28,6 @@ declare module 'claude-code' {
   interface PluginState {
     'pairs-pane': { view: PairsView; all: boolean; expanded: string[]; idle: boolean;
       replies: string[]; logs: string[]; transcript: TranscriptView | null;
-      entry: EntryView | null }
+      entry: EntryView | null; focus: Record<string, number> }
   }
 }

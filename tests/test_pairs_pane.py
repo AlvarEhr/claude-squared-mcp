@@ -625,6 +625,39 @@ class SnapshotTests(unittest.TestCase):
         self.assertIn("note", P.tool_detail(self.home, "helper", "T-4"))
         self.assertIn("note", P.tool_detail(self.home, "../x", "T-3"))
 
+    def test_subagents_listed_running_first_with_live_and_extracted_activity(self):
+        self.write("registry.json", {"pairs": {"helper": {"backend": "claude", "session_id": "s1", "cwd": "C:/w"}}})
+        logs = self.pairs / "logs" / "helper"
+        logs.mkdir(parents=True)
+        subs = self.home / "projects" / "C--w" / "s1" / "subagents"
+        subs.mkdir(parents=True)
+        done = subs / "agent-aaa111.jsonl"
+        (logs / "subagent-1-scout.log").write_text(
+            "=== sub-agent #1 (scout) ===\n=== source jsonl: " + str(done) + " ===\n"
+            "[10:00:01] [T-1] [sub-tool_use] Read({\"file_path\": \"a.py\"})\n"
+            "[10:00:01] [T-1] [sub-tool_result] line one\nline two\n", encoding="utf-8")
+        (logs / "subagent-1-scout.idx.json").write_text(json.dumps({"T-1": {"tool_use_id": "toolu_done"}}), encoding="utf-8")
+        done.write_text(json.dumps({"message": {"content": [{"type": "tool_use", "id": "toolu_done", "name": "Read",
+                                                            "input": {"file_path": "a.py"}}]}}), encoding="utf-8")
+        (logs / "main.log").write_text(
+            "[09:59:00] [T-5] [-> sub-agent #1: scout] launching: Look around\n"
+            "[09:59:01] [system:task_started] local_agent (background) aaa111: Look around\n"
+            "[10:00:02] [T-5] [<- sub-agent #1 returned] done\n"
+            "[10:01:00] [T-6] [-> sub-agent #2: coder] launching: Fix it\n"
+            "[10:01:01] [system:task_started] local_agent (background) bbb222: Fix it\n", encoding="utf-8")
+        (subs / "agent-bbb222xyz.jsonl").write_text(json.dumps({"timestamp": "2026-10-29T10:01:05Z", "message": {
+            "role": "assistant", "content": [{"type": "tool_use", "id": "toolu_live", "name": "Bash",
+                                              "input": {"command": "pytest"}}]}}), encoding="utf-8")
+        rows, _ = P.subagents(self.home, "helper")
+        self.assertEqual([(r["id"], r["status"]) for r in rows], [(2, "running"), (1, "done")])
+        spec = {"backend": "claude", "session_id": "s1", "cwd": "C:/w"}
+        live = P.subagent_activity(self.home, "helper", spec, 2)
+        self.assertIn("[toolu_live] [tool_use] Bash", live["logs"][-1])
+        finished = P.subagent_activity(self.home, "helper", spec, 1)
+        self.assertEqual(finished["logs"][-1], "[10:00:01] [T-1] [sub-tool_result] line one / line two")
+        self.assertIn("a.py", P.tool_detail(self.home, "helper", "T-1", 1)["input"])
+        self.assertIn("note", P.tool_detail(self.home, "helper", "T-1", 9))
+
 
 if __name__ == "__main__":
     unittest.main()
