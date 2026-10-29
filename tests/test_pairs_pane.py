@@ -449,16 +449,11 @@ class SnapshotTests(unittest.TestCase):
         self.assertTrue(data["budget_limited"])
         self.assertIn("budget", data["notice"])
 
-    def test_directory_scan_budget_marks_unconfirmed_idle_rows(self):
+    def test_elapsed_scan_budget_marks_unconfirmed_idle_rows(self):
         for name in ("old-a", "old-b"):
             path = self.write(f"async/{name}.json", {"status": "done"})
             os.utime(path, (1, 1))
-        # entries()'s default scan bound is fixed at definition time; pass a
-        # smaller bound through the scanner without changing the read budget.
-        original = P.Reads.entries
-        def limited(reader, directory, limit=P.SCAN_BUDGET):
-            return original(reader, directory, min(limit, 1))
-        with patch.object(P.Reads, "entries", limited):
+        with patch.object(P, "ASYNC_SCAN_SECONDS", 0):
             data = P.snapshot(self.home)
         self.assertEqual([row["name"] for row in data["rows"]], ["scout"])
         self.assertTrue(data["rows"][0]["details_skipped"])
@@ -518,11 +513,51 @@ class SnapshotTests(unittest.TestCase):
         self.assertTrue(row["details_skipped"])
         self.assertEqual(row["status"], "idle")
         completed.unlink()
-        self.activity()  # fresh activity alone cannot settle status without a read
+        self.activity()  # the primary activity pass establishes busy before detail reads
         with patch.object(P, "ROW_BUDGET", 0):
             row = P.snapshot(self.home)["rows"][0]
         self.assertTrue(row["details_skipped"])
-        self.assertEqual(row["status"], "unknown")
+        self.assertEqual(row["status"], "busy")
+
+    def test_large_old_task_directory_does_not_hide_late_pair_or_make_others_unknown(self):
+        names = [f"idle-{i:02}" for i in range(51)] + ["zz-working"]
+        self.write("registry.json", {"pairs": {name: {} for name in names}})
+        folder = self.pairs / "async"
+        folder.mkdir()
+        for i in range(10000):
+            path = folder / f"old-{i:05}.json"
+            path.write_text('{"status":"done"}', encoding="utf-8")
+            os.utime(path, (1, 1))
+        self.write(f"activity/zz-working/{os.getpid()}.json", {"version": 1, "state": "live",
+            "owner_pid": os.getpid(), "turn": {"task_id": "zzz-running", "started_at": self.now.isoformat()}})
+        self.write("async/zzz-running.json", {"task_id": "zzz-running", "pair_name": "zz-working", "status": "running",
+            "owner_pid": os.getpid(), "started_at": self.now.isoformat()})
+        original = Path.open
+        def checked(path, *args, **kwargs):
+            self.assertFalse(path.name.startswith("old-"), "old history must be filtered before opening")
+            return original(path, *args, **kwargs)
+        with patch.object(Path, "open", checked):
+            data = P.snapshot(self.home)
+        self.assertEqual(len(data["rows"]), 52)
+        self.assertEqual(data["rows"][0]["name"], "zz-working")
+        self.assertEqual(data["rows"][0]["status"], "busy")
+        self.assertTrue(all(row["status"] == "idle" for row in data["rows"][1:]), data["notice"])
+        self.assertFalse(data["budget_limited"], data["io"])
+        (self.pairs / "activity/zz-working" / f"{os.getpid()}.json").unlink()
+        with patch.object(Path, "open", checked):
+            cold = P.snapshot(self.home)  # no activity reference or previous cache
+        self.assertEqual(cold["rows"][0]["status"], "busy")
+        self.assertTrue(all(row["status"] == "idle" for row in cold["rows"][1:]), cold["notice"])
+
+    def test_activity_primary_finds_an_old_task_even_when_supplement_scan_times_out(self):
+        self.activity()
+        task = self.write("async/task.json", {"task_id": "task", "pair_name": "scout", "status": "running",
+            "owner_pid": os.getpid(), "started_at": self.now.isoformat()})
+        os.utime(task, (1, 1))
+        with patch.object(P, "ASYNC_SCAN_SECONDS", 0):
+            data = P.snapshot(self.home)
+        self.assertEqual(data["rows"][0]["status"], "busy")
+        self.assertIn("task.json", data["cache"]["tasks"])
 
     def test_interrupted_turns_are_not_replies_and_naive_utc_is_normalized(self):
         for status, error, expected in [("failed", "ORPHANED: owner exited", "orphaned"),

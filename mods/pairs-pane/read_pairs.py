@@ -15,6 +15,7 @@ import re
 import runpy
 import sys
 import sqlite3
+import time
 
 JSON_LIMIT = 128 * 1024
 TASK_LIMIT = 64 * 1024
@@ -25,6 +26,8 @@ TASK_BUDGET = 128
 ROW_BUDGET = 64
 WATCH_BUDGET = 24
 TASK_READ_BUDGET = 48
+ASYNC_SCAN_SECONDS = .15
+ASYNC_POSIX_SCAN_CAP = 50000
 RECENT_SECONDS = 2 * 60 * 60
 WATCH_MAX_AGE = 7 * 24 * 3600
 
@@ -82,6 +85,24 @@ class Reads:
             self.partial = True
             self.issues.add(str(directory))
 
+    def task_entries(self, directory):
+        # Windows DirEntry caches stat metadata from enumeration. A 2,048-entry
+        # ceiling hid current tasks behind old history; bound elapsed work instead.
+        deadline = time.monotonic() + ASYNC_SCAN_SECONDS
+        try:
+            with os.scandir(directory) as entries:
+                for index, entry in enumerate(entries):
+                    if time.monotonic() >= deadline or (os.name != "nt" and index >= ASYNC_POSIX_SCAN_CAP):
+                        self.partial = self.budget_limited = self.task_discovery_limited = True
+                        self.issues.add(str(directory))
+                        break
+                    yield entry
+        except FileNotFoundError:
+            pass
+        except OSError:
+            self.partial = self.task_discovery_limited = True
+            self.issues.add(str(directory))
+
 
 def task_summaries(pairs, names, references, reader, reads, now, cache, show_all):
     """Recent metadata plus known-running task IDs; never retain result/prompt blobs."""
@@ -110,7 +131,7 @@ def task_summaries(pairs, names, references, reader, reads, now, cache, show_all
         except OSError:
             pass
     recent = []
-    for entry in reads.entries(folder):
+    for entry in reads.task_entries(folder):
         if not entry.name.endswith(".json") or entry.name.startswith("."):
             continue
         try:
@@ -396,13 +417,32 @@ def snapshot(home, session=None, show_all=True, expanded=(), cache=None):
     # Task summaries and stat hints rank work before we spend the shared file
     # budget on activity. Registry-only rows survive every detail limit.
     hints, candidates = activity_hints(pairs, names, reads)
-    tasks, saved = task_summaries(pairs, set(names), (), reader, reads, now, cache, show_all) if names else ([], {})
+    cutoff = now.timestamp() - RECENT_SECONDS
+    activity_busy, activity_references = set(), set()
+    primary = sorted(names, key=lambda name: (name not in watches, -hints.get(name, 0), name))
+    for name in primary:
+        for path in candidates.get(name, []):
+            pid = int(path.stem)
+            alive, born = process(pid)
+            if alive is False or (born is not None and born > hints.get(name, 0) + 2):
+                continue
+            if reads.files >= FILE_BUDGET - TASK_READ_BUDGET:
+                reads.budget_limited = True
+                break
+            data = reads.json(path)
+            if not isinstance(data, dict) or data.get("state", "live") != "live":
+                continue
+            turn = data.get("turn")
+            if turn or data.get("background") or data.get("wake_pending"):
+                activity_busy.add(name)
+            if isinstance(turn, dict) and isinstance(turn.get("task_id"), str):
+                activity_references.add(turn["task_id"])
+    tasks, saved = task_summaries(pairs, set(names), activity_references, reader, reads, now, cache, show_all) if names else ([], {})
     tasks_by_pair = {}
     for task in tasks:
         if safe_pair(task.get("pair")):
             tasks_by_pair.setdefault(task["pair"], []).append(task)
-    busy = {name for name, items in tasks_by_pair.items() if any(t.get("status") == "running" for t in items)}
-    cutoff = now.timestamp() - RECENT_SECONDS
+    busy = activity_busy | {name for name, items in tasks_by_pair.items() if any(t.get("status") == "running" for t in items)}
     recent_tasks = {name for name, items in tasks_by_pair.items()
                     if any(parse(t.get("finished_at")) and parse(t["finished_at"]).timestamp() >= cutoff for t in items)}
     if show_all:

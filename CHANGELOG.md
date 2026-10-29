@@ -12,6 +12,12 @@ A Pairs pane for the Claude desktop app, and auto-watch waits that survive a res
 
 ### Added
 
+- Best-effort server housekeeping prunes unreferenced terminal async task JSON
+  older than 14 days, on startup and at most daily across servers. Running,
+  queued, unresolved detached tasks and activity references are protected;
+  cleanup logs counts and leaves transcripts/logs intact. See
+  [retention notes](docs/task-retention.md).
+
 - Optional Claude Code **Pairs** pane (`mods/pairs-pane`), opened by `/pairs`
   or at session start. Shows this session's auto-watch waits by default, with
   a Waiting on / All switch, working pairs first, recent completions newest
@@ -72,6 +78,9 @@ A Pairs pane for the Claude desktop app, and auto-watch waits that survive a res
   as compact rows when budgets run out, with an explicit notice. Compact rows keep
   an established idle status; unknown means discovery could not decide. Forgotten
   activity directories appear only with evidence of busy or recently finished work.
+- Pane async discovery uses a 150 ms time budget (plus a higher POSIX count cap)
+  instead of stopping after 2,048 history entries. Activity turn records supply
+  primary busy evidence; old task payloads are skipped without opening them.
 - Codex transcript lookup uses immutable SQLite reads to avoid creating WAL/SHM
   files. Claude login guidance requires failed CLI-envelope evidence; MCP auth
   diagnostics and successful replies quoting key errors are not login failures.

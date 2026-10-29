@@ -45,7 +45,7 @@ a bounded task set and bounded JSON reads. Limits live beside the reader:
 | Limit | Value |
 | --- | --- |
 | Recent task window | 2 hours (also the recent-completion group) |
-| Task-directory entries examined | 2,048 per refresh |
+| Supplemental task scan | 150 ms elapsed budget; POSIX additionally caps at 50,000 entries |
 | Candidate tasks | 128, with activity-referenced / previously running IDs eligible regardless of age |
 | Task file | 64 KiB; size checked before opening |
 | Other JSON file | 128 KiB; watch/receipt 8 KiB; registry 2 MiB |
@@ -63,9 +63,14 @@ a bounded task set and bounded JSON reads. Limits live beside the reader:
 Only matching session watches select pairs in the default view. All-pairs mode
 lists registry pairs, plus non-registry pairs with busy/recent completion evidence;
 old forgotten activity directories do not create idle or budget-skipped rows.
-A stat-only activity pass plus bounded
-task/watch discovery ranks busy pairs, watched pairs and recent activity before
-per-pair JSON reads. Old idle rows come directly from the registry and keep idle
+A stat-only activity pass identifies likely live owner files; their turn,
+background and wake records are read before async discovery and supply primary
+busy evidence and task references. The async scan supplements this, using cached
+Windows DirEntry mtimes (POSIX pays for stat) to skip old payloads before opening.
+The 10,000-old-file regression finds a late-alphabet running task both with and
+without activity references, keeps all other rows idle, and opens no old JSON.
+Another regression times out the supplement and still finds the referenced turn.
+Old idle rows come directly from the registry and keep idle
 status when their per-pair scan is complete, even if unrelated task history hit
 a limit. Missing/incomplete discovery remains unknown; skipped detail alone
 does not change known status. The 60-pair

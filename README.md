@@ -285,6 +285,13 @@ on Codex).
 
 ## Async handles
 
+The server checks task-result retention at startup and at most once daily
+across server processes. Unreferenced terminal task JSON older than **14 days**
+(both completion time and file mtime) may be pruned. Running, queued, unresolved
+detached tasks, live/unknown children, and activity-referenced tasks are retained.
+Cleanup is best-effort and logged; pair logs and transcripts are untouched.
+After pruning, an old task ID may no longer resolve through `pair_poll`.
+
 Every `pair_send` goes through async-task machinery internally. If your wait
 expires (`timeout_seconds` exceeded, or > server's RPC-hold cap of
 `CLAUDE_PAIR_SYNC_CAP_SECONDS`, default 45s), the response is a "still running,
@@ -649,12 +656,15 @@ cap. View switches and expand/collapse redraw cached content immediately;
 reads run in the background, with at most one reader at a time. More controls
 do no I/O. Transcripts are read only on explicit open/page requests.
 
-Each refresh scans at most 2,048 task-directory entries and considers at most
-128 tasks: files modified in the last two hours, plus task IDs referenced by
+Activity records are the primary busy signal and supply task IDs before the
+supplemental async-directory scan. That scan uses an approximately **150 ms**
+deadline, plus a **50,000-entry cap on POSIX**; Windows enumeration supplies
+cached mtimes. Old history is filtered by mtime without opening its JSON.
+Each refresh considers at most 128 tasks: files modified in the last two hours, plus task IDs referenced by
 selected activity or known-running cached summaries. Task JSON is capped at
 64 KiB per file; metadata at 128 KiB (registry: 2 MiB), with a combined 4 MiB /
-128-file JSON-read budget. A stat-only pass and task/watch metadata prioritize
-busy and recent pairs before per-pair reads. At most 64 pairs get detailed
+128-file JSON-read budget. A stat-only pass, live activity records and task/watch
+metadata prioritize busy and recent pairs. At most 64 pairs get detailed
 snapshots; every pair in the bounded registry remains listed. Old idle pairs use
 registry-only compact rows. Pairs whose detail reads cannot fit stay visible as
 **details skipped (budget)**, and budget exhaustion always shows a notice.

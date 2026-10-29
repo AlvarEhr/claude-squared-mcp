@@ -26,6 +26,7 @@ from filelock import FileLock, Timeout as FileLockTimeout
 from claude_squared import activity as activity_mod
 from claude_squared import agents as agents_mod
 from claude_squared import async_tasks
+from claude_squared import task_retention
 from claude_squared import codex_models
 from claude_squared import connectors
 from claude_squared import registry as reg_mod
@@ -6005,4 +6006,8 @@ def run() -> None:
     # One exit handler for the whole process: runtimes first, then the
     # activity files (runtime.install_exit_handler).
     runtime_mod.install_exit_handler()
+    try:
+        task_retention.start_housekeeping()
+    except Exception as exc:
+        task_retention.logger.warning("Could not start async task retention (%s)", type(exc).__name__)
     mcp.run()
