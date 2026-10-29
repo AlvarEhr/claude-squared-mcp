@@ -1,5 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
+import { parseLog } from '../hooks/register'
 
 const PANE = {
   plugin: 'pairs-pane', component: 'Pane', requestId: 'pairs',
@@ -131,6 +132,41 @@ test('no drawing surface does not launch or poll a reader', async ($, on) => {
   expect(answer.text).toContain('No pane surface')
   await clock.advance(6000)
   expect(calls).toBe(0)
+})
+
+test('a pane opened before a surface attached starts reading once it is drawn', async ($, on) => {
+  mock.env(on, { CLAUDE_HOME: '/custom/claude', HOME: '/home/user' })
+  const clock = mock.clock(on)
+  on('command.register', () => ({ value: { command: 'pairs' } }))
+  on('ui.open', () => ({ value: { isPlaced: false, reason: 'no-surface' } }))
+  on('ui.panes', () => ({ value: [VISIBLE] }))
+  on('session.id', () => ({ value: 'manager-session' }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  let calls = 0
+  on('process.run', () => {
+    calls++
+    return { value: { exitCode: 0, stdout: JSON.stringify({ rows: [row('scout', 'manager-session')] }),
+      stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: false })
+  await clock.advance(6000)
+  expect(calls).toBe(0)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await clock.advance(1)
+  expect(calls).toBe(1)
+  expect((await ui.find({ type: 'Text', text: /^scout$/ }))?.text).toBe('scout')
+  await ui.unmount()
+})
+
+test('activity lines parse Claude and Codex kinds, failures and bare lines', async () => {
+  expect(parseLog('[19:44:01] [T-30] [tool_use] command_execution(.venv/python -B x.py)'))
+    .toMatchObject({ at: '19:44', kind: 'shell', text: '.venv/python -B x.py' })
+  expect(parseLog('[19:44:02] [T-30] [tool_result ERR] exit 1 Traceback'))
+    .toMatchObject({ kind: '↳ failed', text: 'Traceback', color: 'error' })
+  expect(parseLog('[19:44:03] [T-31] [tool_use] mcp__pair__pair_send({"name": "a"})')).toMatchObject({ kind: 'pair_send' })
+  expect(parseLog('[19:44:04] [summary] Planning')).toMatchObject({ kind: 'thinking', dim: true })
+  expect(parseLog('[19:44:05] [system:task_started] local_bash')).toMatchObject({ kind: 'task started' })
+  expect(parseLog('plain line')).toMatchObject({ at: '', kind: '', text: 'plain line' })
 })
 
 test('clearing the session clears the view and ends polling', async ($, on) => {
@@ -400,7 +436,7 @@ test('expanded reply and log controls are local; transcript pages load only on r
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'detail-scout' })
   expect((await ui.find({ type: 'Text', text: /Previous task done/ }))?.text).toContain('next task running')
-  expect((await ui.find({ type: 'Text', text: /Working on:/ }))?.text).toBe('Working on: Check the change')
+  expect((await ui.find({ type: 'Text', text: /Check the change/ }))?.text).toBe('↳ Check the change')
   expect((await ui.find({ key: 'reply-scout' }))?.props.text).not.toContain('reply line 19')
   expect(await ui.find({ type: 'Text', text: /log line 0 / })).toBeUndefined()
   // Newest first: the latest entry leads the list.

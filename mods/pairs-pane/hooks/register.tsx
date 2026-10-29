@@ -123,6 +123,12 @@ function replyHeading(row: PairRow): string {
   return `Latest reply${at ? ` · ${at}` : ''}`
 }
 
+// A brief's opening, short enough for one caption line.
+function brief(message: string): string {
+  const first = message.split(/(?<=[.!?])\s/)[0]
+  return first.length > 140 ? `${first.slice(0, 139)}…` : first
+}
+
 // The first lines of a markdown reply, closing a code fence the cut left open.
 function clip(lines: string[]): string {
   const head = lines.slice(0, 12)
@@ -133,16 +139,25 @@ function clip(lines: string[]): string {
 type LogEntry = { at: string; kind: string; text: string; color?: string; dim?: boolean }
 
 // main.log lines read "[HH:MM:SS] [T-n] [kind] text"; time, turn and kind are each optional.
+// Codex item types, named as a reader would say them.
+const CODEX_TOOLS: Record<string, string> = {
+  command_execution: 'shell', file_change: 'edit', collab_tool_call: 'agent', mcp_tool_call: 'mcp', web_search: 'search',
+}
+
 export function parseLog(line: string): LogEntry {
-  const match = /^(?:\[(\d\d:\d\d):\d\d\]\s*)?(?:\[T-\d+\]\s*)?(?:\[([a-z_]+(?::[a-z_]+)?)\]\s*)?([\s\S]*)$/.exec(line)
+  const match = /^(?:\[(\d\d:\d\d):\d\d\]\s*)?(?:\[T-\d+\]\s*)?(?:\[([a-z_]+(?::[a-z_]+)?)( ERR)?\]\s*)?([\s\S]*)$/.exec(line)
   if (!match) return { at: '', kind: '', text: line }
-  const [, at = '', kind = '', body = ''] = match
+  const [, at = '', kind = '', failed, body = ''] = match
   if (kind === 'tool_use') {
     const call = /^([\w.-]+)\(([\s\S]*?)\)?$/.exec(body)
-    return { at, kind: call ? call[1].replace(/^mcp__.+?__/, '') : 'tool', text: call ? call[2] : body, color: 'suggestion' }
+    const name = call ? call[1].replace(/^mcp__.+?__/, '') : 'tool'
+    return { at, kind: CODEX_TOOLS[name] || name, text: call ? call[2] : body, color: 'suggestion' }
   }
-  if (kind === 'tool_result') return { at, kind: '↳', text: body, dim: true }
-  if (kind === 'thinking') return { at, kind: 'thinking', text: body, dim: true }
+  if (kind === 'tool_result') return failed
+    ? { at, kind: '↳ failed', text: body.replace(/^exit \d+\s*/, ''), color: 'error' }
+    : { at, kind: '↳', text: body.replace(/^exit 0\s*/, ''), dim: true }
+  if (kind === 'error') return { at, kind: 'error', text: body, color: 'error' }
+  if (kind === 'thinking' || kind === 'summary') return { at, kind: 'thinking', text: body, dim: true }
   if (kind === 'text') return { at, kind: 'says', text: body, color: 'claude' }
   if (kind.startsWith('system:')) return { at, kind: kind.slice(7).replace(/_/g, ' '), text: body, dim: true }
   return { at, kind: kind.replace(/_/g, ' '), text: body }
@@ -158,6 +173,8 @@ let cacheHome = ''
 let scopeCache: Record<string, PairsView> = {}
 let scheduled: (() => void) | undefined
 let pending = false
+// Set by open, cleared by close and session end: whether a drawing may restart reads.
+let wanted = false
 
 function requestRefresh($: EngineInterface) {
   if (!active) return
@@ -252,6 +269,7 @@ function start($: EngineInterface) {
 
 async function open($: EngineInterface) {
   active = true
+  wanted = true
   const placed = await $.ui.open({ id: PANE, title: 'Pairs' })
   if (placed.isPlaced) {
     start($)
@@ -290,11 +308,6 @@ async function closeTranscript($: EngineInterface) {
   requestRefresh($)
 }
 
-// Box widths take a whole-number percentage; a fractional or non-numeric fill
-// made the desktop app reject the whole Pane tree.
-const barWidth = (percent: number): string =>
-  `${Number.isFinite(percent) ? Math.round(Math.max(0, Math.min(100, percent))) : 0}%`
-
 export const register: Register = (on, configured) => {
   options = configured
   on('session.start', async ($, e, next) => {
@@ -308,10 +321,12 @@ export const register: Register = (on, configured) => {
   })
   on('ui.close', { id: PANE }, async (_, e, next) => {
     const result = await next(e)
+    wanted = false
     stopPolling()
     return result
   })
   on('session.end', async ($, e, next) => {
+    wanted = false
     stopPolling()
     readerCache = {}
     scopeCache = {}
@@ -345,6 +360,9 @@ export const register: Register = (on, configured) => {
     const moreReplies = await read($, replies)
     const moreLogs = await read($, logs)
     const page = await read($, transcript)
+    // A pane opened before any surface attached stopped polling; the first
+    // drawing after a surface places it starts the reads again.
+    if (wanted && !cancel) { start($); requestRefresh($) }
     if (page) return <Box flexDirection="column" gap={1}>
       <Box gap={1}>
         <Button key="back" label="‹ Pairs" onPress={() => { void closeTranscript($) }} />
@@ -377,10 +395,10 @@ export const register: Register = (on, configured) => {
       return <Box flexDirection="column">
         {(open ? entries : entries.slice(0, 8)).map((line, index) => {
           const item = parseLog(line)
-          return <Box key={`log-${row.name}-${index}`} gap={1}>
+          return <Box key={`log-${row.name}-${index}`} gap={1} minWidth={0}>
             <Text {...cap} {...mono} dimColor>{item.at || '--:--'}</Text>
             <Text {...cap} {...semi} color={item.color} dimColor={item.dim}>{item.kind}</Text>
-            <Box flexShrink={1} flexGrow={1}><Text {...cap} dimColor={item.dim} wrap={open ? 'wrap' : 'truncate-end'}>{item.text}</Text></Box>
+            <Box flexShrink={1} flexGrow={1} minWidth={0} overflow="hidden"><Text {...cap} dimColor={item.dim} wrap={open ? 'wrap' : 'truncate-end'}>{item.text}</Text></Box>
           </Box>
         })}
         {entries.length === 0 && <Text {...cap} dimColor>No activity logged yet.</Text>}
@@ -394,10 +412,10 @@ export const register: Register = (on, configured) => {
       const d = row.detail
       const replyLines = d?.reply?.split('\n') || []
       const fullReply = moreReplies.includes(row.name)
-      return <Box key={`row-${row.name}`} flexDirection="column" marginTop={1} paddingX={1}
+      return <Box key={`row-${row.name}`} flexDirection="column" marginTop={1} paddingX={1} minWidth={0} overflow="hidden"
         borderStyle="round" borderDimColor={row.status !== 'busy'} borderColor={row.status === 'busy' ? 'claude' : undefined}>
         <Box justifyContent="space-between" gap={1}>
-          <Box gap={1} alignItems="center" flexShrink={1}>
+          <Box gap={1} alignItems="center" flexShrink={1} minWidth={0}>
             {indicator(row)}
             <Text {...semi} wrap="truncate-end">{row.name}</Text>
             <Text {...cap} dimColor wrap="truncate-end">{modelLabel(row)}</Text>
@@ -411,7 +429,7 @@ export const register: Register = (on, configured) => {
           {row.watches.length > 0 && <Text {...cap} dimColor>{watchLabel(row, current.session)}</Text>}
         </Box>
         {!desktop && knownContext(row) && <Text color={contextColor(row)}>{contextBar(row)}</Text>}
-        {row.status === 'busy' && d?.working_on && <Text {...cap} italic wrap={open ? 'wrap' : 'truncate-end'}>Working on: {d.working_on}</Text>}
+        {row.status === 'busy' && d?.working_on && <Text {...cap} italic dimColor wrap="truncate-end">↳ {brief(d.working_on)}</Text>}
         <Box gap={2}>
           <Button key={`detail-${row.name}`} plain dimColor label={open ? '▾ Hide details' : '▸ Details'}
             onPress={() => { void toggleDetail($, row.name) }} />
@@ -448,7 +466,7 @@ export const register: Register = (on, configured) => {
             <Button key="all" variant={showAll ? 'primary' : undefined} dimColor={!showAll}
               label="All" onPress={() => { void changeScope($, true) }} />
           </Box>
-          <Button key="close" plain dimColor label="Close" onPress={() => { stopPolling(); void $.ui.close({ id: PANE }) }} />
+          <Button key="close" plain dimColor label="Close" onPress={() => { wanted = false; stopPolling(); void $.ui.close({ id: PANE }) }} />
         </Box>
         {current.error && <Box marginTop={1}><Text color="error">{current.error}</Text></Box>}
         {!current.error && rows.length === 0 && <Box marginTop={1}><Text dimColor>{showAll ? 'No pairs found.' : 'No recorded waits for this session. Choose All to see running pairs. Enable auto-watch on a current server to track waits here.'}</Text></Box>}
