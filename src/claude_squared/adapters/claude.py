@@ -509,11 +509,26 @@ def _failure_text(stdout: str, stderr: str) -> str:
     return stdout.strip() if not any(line.lstrip().startswith(("{", "[")) for line in stdout.splitlines()) else ""
 
 
-def _login_failure(spec: PairSpec | None, text: str, *, logged_out: bool = False) -> str | None:
+def _login_failure(spec: PairSpec | None, result: dict | None) -> str | None:
     if spec is not None and spec.billing == "api":
         return None
-    if logged_out or re.search(r"failed to authenticate|oauth session expired|invalid api key|not logged in"
-                 r"|loggedIn[\"']?\s*:\s*false", text, re.IGNORECASE):
+    if not result or result.get("parent_tool_use_id") or not _failed_result(result):
+        return None
+    text = _result_text(result).strip()
+    auth = r"(?:failed to authenticate|oauth session expired|invalid api key|not logged in)\b"
+    usage = result.get("usage")
+    zero_usage = (isinstance(usage, dict) and bool(usage)
+                  and all(isinstance(value, (int, float)) and not isinstance(value, bool) and value == 0
+                          for key, value in usage.items() if key.endswith("tokens"))
+                  and any(key.endswith("tokens") for key in usage))
+    # MCP diagnostics can contain the exact same phrases. Only the CLI's own
+    # failed terminal envelope is evidence; a nonzero process exit alone isn't.
+    if re.match(r"(?:\[?MCP\b|\[?tool\b|the tool\b)", text, re.IGNORECASE):
+        return None
+    if (result.get("loggedIn") is False
+            or (result.get("is_error") is True and re.match(auth, text, re.IGNORECASE))
+            or (result.get("terminal_reason") == "api_error" and zero_usage
+                and re.search(auth, text, re.IGNORECASE))):
         return (f"the claude CLI is not logged in ({text.strip()}) — the user must run "
                 "`claude auth login` in a terminal; pairs can't sign in themselves.")
     return None
@@ -527,14 +542,16 @@ def claude_failure_message(spec: PairSpec | None, stdout: str, stderr: str,
     zero usage, and the actionable explanation in result, after long metadata.
     """
     text = _failure_text(stdout, stderr)
-    result = _failure_result(stdout) or _failure_result(stderr) or {}
-    billing = _billing_failure(spec, text)
+    result = _failure_result(stdout)
+    if result is None:
+        result = _failure_result(stderr)
+    billing = _billing_failure(spec, text) if result is None or _failed_result(result) else None
     if billing:
         return f"{billing} The CLI said: {text}"
-    login = _login_failure(spec, text, logged_out=result.get("loggedIn") is False)
+    login = _login_failure(spec, result)
     if login:
         return login
-    if MODEL_UNAVAILABLE_MARKER in text.lower():
+    if (result is None or _failed_result(result)) and MODEL_UNAVAILABLE_MARKER in text.lower():
         return f"{text}\n{_MODEL_UNAVAILABLE_HELP}"
     return text or fallback
 
@@ -1315,8 +1332,7 @@ class ClaudeAdapter(PairAdapter):
         #     and let the human interpret rather than hard-matching values.
         stop_reason = result_json.get("stop_reason")
         api_err = result_json.get("api_error_status")
-        login_failure = (_login_failure(spec, _result_text(result_json), logged_out=result_json.get("loggedIn") is False)
-                         if _failed_result(result_json) else None)
+        login_failure = _login_failure(spec, result_json)
         safety_signal: str | None = None
         safety_kind: str | None = None
         if stop_reason == "refusal":

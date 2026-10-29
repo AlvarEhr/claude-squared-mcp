@@ -76,6 +76,7 @@ function orderRows(a: PairRow, b: PairRow): number {
 }
 
 function statusLabel(row: PairRow): string {
+  if (row.details_skipped) return `${row.status === 'busy' ? 'working · ' : ''}details skipped (budget)`
   if (row.status === 'busy') return `working${row.elapsed_s == null ? '' : ` · ${duration(row.elapsed_s)}`}`
   if (interrupted(row.status) || interrupted(row.outcome)) {
     const at = localTime(row.finished_at)
@@ -163,7 +164,8 @@ async function refresh($: EngineInterface) {
         detail: row.detail || (!details.includes(row.name) && previousView.home === home
           ? previousView.rows.find(old => old.name === row.name && old.finished_at === row.finished_at
             && old.status === row.status && old.outcome === row.outcome)?.detail : null) }))
-      const snapshot = { rows, error: data.error || null, notice: data.notice || null, session, home }
+      const snapshot = { rows, error: data.error || null, notice: data.notice || null, session, home,
+        budget_limited: !!data.budget_limited }
       scopeCache[String(showAll)] = snapshot
       if ((await read($, all)) === showAll && !(await read($, transcript))) await update($, view, () => snapshot)
     }
@@ -289,8 +291,9 @@ export const register: Register = (on, configured) => {
       </Box>)}
     </Box>
     const rows = current.rows.filter(row => showAll || row.watches.some(w => w.session_id === current.session)).sort(orderRows)
-    const dormant = showAll ? rows.filter(row => !foreground(row) && !recent(row)) : []
-    const prominent = rows.filter(row => !dormant.includes(row))
+    const skipped = rows.filter(row => row.details_skipped)
+    const dormant = showAll ? rows.filter(row => !row.details_skipped && (row.compact || (!foreground(row) && !recent(row)))) : []
+    const prominent = rows.filter(row => !dormant.includes(row) && !row.details_skipped)
     return (
       <Box flexDirection="column">
         <Box gap={1}>
@@ -347,6 +350,9 @@ export const register: Register = (on, configured) => {
             ))}
           </Box>
         ))}
+        {skipped.map(row => <Box key={`skipped-${row.name}`} gap={1} marginTop={1}>
+          <Text bold>{row.name}</Text><Text dimColor>{modelLabel(row)} · {statusLabel(row)}</Text>
+        </Box>)}
         {dormant.length > 0 && <Box flexDirection="column" marginTop={2} gap={1}>
           <Button key="idle" label={`${showIdle ? '▾' : '▸'} Idle (${dormant.length})`}
             onPress={() => { void toggleIdle($) }} />
@@ -358,8 +364,8 @@ export const register: Register = (on, configured) => {
             </Text>
           </Box>)}
         </Box>}
-        {rows.some(row => row.partial && (foreground(row) || recent(row))) && <Box marginTop={2}>
-          <Text dimColor>Some working/recent pair details are unavailable within the read limits.</Text>
+        {(current.budget_limited || rows.some(row => row.partial && (foreground(row) || recent(row)))) && <Box marginTop={2}>
+          <Text dimColor>{current.budget_limited ? current.notice || 'Details skipped (budget).' : 'Some working/recent pair details are unavailable within the read limits.'}</Text>
         </Box>}
       </Box>
     )

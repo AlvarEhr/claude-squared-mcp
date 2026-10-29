@@ -23,6 +23,8 @@ FILE_BUDGET = 128
 SCAN_BUDGET = 2048
 TASK_BUDGET = 128
 ROW_BUDGET = 64
+WATCH_BUDGET = 24
+TASK_READ_BUDGET = 48
 RECENT_SECONDS = 2 * 60 * 60
 
 
@@ -34,6 +36,8 @@ class Reads:
         self.partial = False
         self.memo = {}
         self.issues = set()
+        self.budget_limited = False
+        self.task_discovery_limited = False
 
     def json(self, path, limit=JSON_LIMIT):
         path = Path(path)
@@ -44,6 +48,7 @@ class Reads:
             size = path.stat().st_size
             if size > limit or size > BYTE_BUDGET - self.bytes or self.files >= FILE_BUDGET:
                 self.partial = True
+                self.budget_limited = True
                 self.issues.add(str(path))
                 self.memo[path] = None
                 return None
@@ -66,6 +71,7 @@ class Reads:
                 for index, entry in enumerate(entries):
                     if index >= limit:
                         self.partial = True
+                        self.budget_limited = True
                         self.issues.add(str(directory))
                         break
                     yield entry
@@ -92,6 +98,8 @@ def task_summaries(pairs, names, references, reader, reads, now, cache, show_all
             references.add(filename[:-5] if filename.endswith(".json") else filename)
     if len(references) > TASK_BUDGET:
         reads.partial = True
+        reads.budget_limited = True
+        reads.task_discovery_limited = True
     for task_id in list(references)[:TASK_BUDGET]:
         if not isinstance(task_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", task_id):
             continue
@@ -114,32 +122,34 @@ def task_summaries(pairs, names, references, reader, reads, now, cache, show_all
         if stat.st_mtime < now.timestamp() - RECENT_SECONDS:
             continue
         recent.append((stat, Path(entry.path)))
+    if str(folder) in reads.issues:
+        reads.task_discovery_limited = True
     room = max(0, TASK_BUDGET - len(candidates))
     if len(recent) > room:
         reads.partial = True
+        reads.budget_limited = True
+        reads.task_discovery_limited = True
     for stat, path in heapq.nlargest(room, recent, key=lambda item: item[0].st_mtime_ns):
         candidates[path.name] = (stat, path)
     summaries, saved = [], {}
     cache_bytes = 0
+    initial_reads = reads.files
     for filename, (stat, path) in candidates.items():
         old = previous.get(filename)
         if (isinstance(old, dict) and old.get("mtime") == str(stat.st_mtime_ns) and old.get("size") == stat.st_size
                 and isinstance(old.get("summary"), dict)):
             summary = old["summary"]
         else:
+            # Leave capacity for the selected pairs' activity and window data.
+            if reads.files - initial_reads >= TASK_READ_BUDGET or reads.files >= FILE_BUDGET - 32:
+                reads.budget_limited = True
+                reads.task_discovery_limited = True
+                continue
             data = reads.json(path, TASK_LIMIT)
             if not isinstance(data, dict):
+                reads.task_discovery_limited = True
                 continue
-            summary = reader["_av_task_summary"](data)
-            summary["filename"] = filename
-            summary["outcome"] = task_outcome(data)
-            # Retain only the last reported context, never the model reply.
-            result = data.get("result")
-            if isinstance(result, dict) and isinstance(result.get("model_used"), str):
-                summary["model_used"] = result["model_used"][:160]
-            context = result.get("context") if isinstance(result, dict) else None
-            if isinstance(context, dict):
-                summary["result_context"] = {key: context.get(key) for key in ("tokens_used", "tokens_max")}
+            summary = summarize_task(data, filename, reader)
         # Nanosecond timestamps exceed JavaScript's exact integer range; the
         # cache crosses the mod's JSON boundary between refreshes.
         saved_item = {"mtime": str(stat.st_mtime_ns), "size": stat.st_size, "summary": summary}
@@ -153,6 +163,49 @@ def task_summaries(pairs, names, references, reader, reads, now, cache, show_all
         if show_all or summary.get("pair") in names:
             summaries.append(summary)
     return summaries, {"tasks": saved}
+
+
+def summarize_task(data, filename, reader):
+    summary = reader["_av_task_summary"](data)
+    summary.update(filename=filename, outcome=task_outcome(data))
+    result = data.get("result")
+    if isinstance(result, dict) and isinstance(result.get("model_used"), str):
+        summary["model_used"] = result["model_used"][:160]
+    context = result.get("context") if isinstance(result, dict) else None
+    if isinstance(context, dict):
+        summary["result_context"] = {key: context.get(key) for key in ("tokens_used", "tokens_max")}
+    return summary
+
+
+def compact_row(name, spec, watches=(), skipped=False, busy=False):
+    return {"name": name, "backend": spec.get("backend") or "unknown", "model": spec.get("model") or "unknown",
+            "status": "busy" if busy else "unknown" if skipped else "idle", "elapsed_s": None,
+            "finished_at": None, "finished_ago_s": None, "outcome": None, "detail": None,
+            "context": {"used": None, "window": None, "percent": None, "alert_at": None, "above_alert": False},
+            "watches": list(watches), "partial": skipped, "details_skipped": skipped, "compact": True}
+
+
+def activity_hints(pairs, names, reads):
+    """Bounded stat-only pass; old idle owners never consume JSON read slots."""
+    hints, paths = {}, {}
+    remaining = SCAN_BUDGET
+    for index, name in enumerate(names):
+        files = []
+        if remaining <= 0 or index >= SCAN_BUDGET:
+            reads.budget_limited = True
+            continue
+        for entry in reads.entries(pairs / "activity" / name, min(16, remaining)):
+            remaining -= 1
+            if entry.name == "pair.json" or (entry.name.endswith(".json") and entry.name[:-5].isdigit()):
+                try:
+                    stat = entry.stat()
+                except OSError:
+                    continue
+                files.append((stat.st_mtime, Path(entry.path)))
+        files.sort(key=lambda item: item[0], reverse=True)
+        paths[name] = [path for _, path in files if path.name != "pair.json"]
+        hints[name] = max((at for at, _ in files), default=0)
+    return hints, paths
 
 
 def safe_pair(name):
@@ -300,10 +353,18 @@ def snapshot(home, session=None, show_all=True, expanded=(), cache=None):
     if not isinstance(defaults, dict):
         defaults = {}
     watches = {}
+    watch_paths = []
     for entry in reads.entries(pairs / "watches"):
         path = Path(entry.path)
         if path.suffix != ".json":
             continue
+        try:
+            watch_paths.append((entry.stat().st_mtime, path))
+        except OSError:
+            pass
+    if len(watch_paths) > WATCH_BUDGET:
+        reads.budget_limited = True
+    for _, path in sorted(watch_paths, reverse=True)[:WATCH_BUDGET]:
         record = reads.json(path, 8192)
         if not isinstance(record, dict) or record.get("version") != 1 or not safe_pair(record.get("pair")):
             continue
@@ -329,39 +390,82 @@ def snapshot(home, session=None, show_all=True, expanded=(), cache=None):
     if show_all:
         names.update(e.name for e in reads.entries(pairs / "activity") if e.is_dir())
     names = sorted(n for n in names if safe_pair(n))
-    if len(names) > ROW_BUDGET:
-        reads.partial = True
-    names = names[:ROW_BUDGET]
+    # Task summaries and stat hints rank work before we spend the shared file
+    # budget on activity. Registry-only rows survive every detail limit.
+    hints, candidates = activity_hints(pairs, names, reads)
+    tasks, saved = task_summaries(pairs, set(names), (), reader, reads, now, cache, show_all) if names else ([], {})
+    tasks_by_pair = {}
+    for task in tasks:
+        if safe_pair(task.get("pair")):
+            tasks_by_pair.setdefault(task["pair"], []).append(task)
+    busy = {name for name, items in tasks_by_pair.items() if any(t.get("status") == "running" for t in items)}
+    cutoff = now.timestamp() - RECENT_SECONDS
+    recent_tasks = {name for name, items in tasks_by_pair.items()
+                    if any(parse(t.get("finished_at")) and parse(t["finished_at"]).timestamp() >= cutoff for t in items)}
+    selected = busy | set(watches) | recent_tasks | {name for name in names if hints.get(name, 0) >= cutoff}
+    names.sort(key=lambda name: (0 if name in busy else 1 if name in watches else 2 if name in selected else 3,
+                                  -hints.get(name, 0), name))
     owner_files = {}
-    references = set()
+    view_fn.__globals__["_av_scan_tasks"] = lambda *args, **kwargs: tasks
+    view_fn.__globals__["_av_owner_files"] = lambda root, name: owner_files.get(name, [])
+    rows = []
+    detail_bytes = 0
+    detailed = 0
     for name in names:
-        # Context/window metadata takes priority over the optional task scan;
-        # exhausting its budget must not replace a reported window with a guess.
-        reads.json(pairs / "activity" / name / "pair.json")
-        owner_files[name] = [Path(e.path) for e in reads.entries(pairs / "activity" / name, 16)
-                             if e.name.endswith(".json") and e.name[:-5].isdigit()]
-        for path in owner_files[name]:
+        spec = specs.get(name) if isinstance(specs.get(name), dict) else {}
+        waiting = watches.get(name, [])
+        if name not in selected:
+            skipped = (name not in hints or reads.task_discovery_limited
+                       or str(pairs / "activity" / name) in reads.issues)
+            rows.append(compact_row(name, spec, waiting, skipped=skipped))
+            continue
+        paths = candidates.get(name, [])
+        meta = pairs / "activity" / name / "pair.json"
+        required = sum(1 for path in paths + [meta] if path not in reads.memo and path.is_file())
+        if (detailed >= ROW_BUDGET or reads.files + required > FILE_BUDGET or reads.bytes >= BYTE_BUDGET
+                or str(pairs / "activity" / name) in reads.issues):
+            reads.budget_limited = True
+            rows.append(compact_row(name, spec, waiting, skipped=True, busy=name in busy))
+            continue
+        detailed += 1
+        owner_files[name] = paths
+        reads.json(meta)
+        references = set()
+        for path in paths:
             activity = reads.json(path)
             turn = activity.get("turn") if isinstance(activity, dict) else None
             if isinstance(turn, dict) and isinstance(turn.get("task_id"), str):
                 references.add(turn["task_id"])
             if name in expanded and isinstance(activity, dict):
-                finished = [item for item in activity.get("window_turns", []) if isinstance(item, dict)
-                            and item.get("ended_at") and isinstance(item.get("task_id"), str)]
-                if finished:
-                    references.add(max(finished, key=lambda item: str(item["ended_at"]))["task_id"])
-    tasks, saved = task_summaries(pairs, set(names), references, reader, reads, now, cache, show_all) if names else ([], {})
-    view_fn.__globals__["_av_scan_tasks"] = lambda *args, **kwargs: tasks
-    view_fn.__globals__["_av_owner_files"] = lambda root, name: owner_files.get(name, [])
-    rows = []
-    detail_bytes = 0
-    for name in names:
+                finished_turns = [item for item in activity.get("window_turns", []) if isinstance(item, dict)
+                                  and item.get("ended_at") and isinstance(item.get("task_id"), str)]
+                if finished_turns:
+                    references.add(max(finished_turns, key=lambda item: str(item["ended_at"]))["task_id"])
+        known_ids = {task.get("task_id") for task in tasks}
+        for task_id in sorted(references - known_ids):
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", task_id):
+                continue
+            if len(tasks) >= TASK_BUDGET:
+                reads.budget_limited = True
+                break
+            data = reads.json(pairs / "async" / (task_id + ".json"), TASK_LIMIT)
+            if isinstance(data, dict):
+                summary = summarize_task(data, task_id + ".json", reader)
+                tasks.append(summary)
+                try:
+                    stat = (pairs / "async" / (task_id + ".json")).stat()
+                    item = {"mtime": str(stat.st_mtime_ns), "size": stat.st_size, "summary": summary}
+                    if len(json.dumps(saved).encode("utf-8")) + len(json.dumps(item).encode("utf-8")) < 256 * 1024:
+                        saved.setdefault("tasks", {})[task_id + ".json"] = item
+                except OSError:
+                    pass
+        if any(reads.memo.get(path) is None and str(path) in reads.issues for path in paths + [meta]):
+            rows.append(compact_row(name, spec, waiting, skipped=True, busy=name in busy))
+            continue
         view = view_fn(pairs, name, now=now)
-        waiting = watches.get(name, [])
         attention = any(t.get("state") in ("orphaned", "finished_detached") for t in view["running_tasks"])
         if view["verdict"] == "idle" and not waiting and not attention and name not in specs:
             continue
-        spec = specs.get(name) if isinstance(specs.get(name), dict) else {}
         starts = [parse(item.get("started_at")) for key in ("turns", "running_tasks", "background")
                   for item in view[key]]
         starts += [parse(item.get("since")) for item in view["wake_pending"]]
@@ -436,7 +540,9 @@ def snapshot(home, session=None, show_all=True, expanded=(), cache=None):
                              or (finished and (now - finished).total_seconds() <= RECENT_SECONDS))),
         })
     return {"rows": rows, "error": error, "updated_at": now.isoformat(), "cache": saved,
-            "notice": "Some working/recent pair details are unavailable within the read limits." if any(r["partial"] for r in rows) else None,
+            "budget_limited": reads.budget_limited,
+            "notice": "Details skipped (budget); all known registry pairs are still listed." if reads.budget_limited else
+                      "Some working/recent pair details are unavailable within the read limits." if any(r["partial"] for r in rows) else None,
             "io": {"bytes": reads.bytes, "files": reads.files}}
 
 
@@ -455,7 +561,7 @@ def transcript_page(home, name, offset=0):
         databases = sorted(Path(e.path) for e in reads.entries(codex) if re.fullmatch(r"state_\d+\.sqlite", e.name))
         if databases:
             try:
-                con = sqlite3.connect(databases[-1].resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
+                con = sqlite3.connect(databases[-1].resolve().as_uri() + "?mode=ro&immutable=1", uri=True, timeout=1)
                 try:
                     record = con.execute("SELECT rollout_path FROM threads WHERE id=?", (session,)).fetchone()
                     path = Path(record[0]) if record and record[0] else None

@@ -634,12 +634,17 @@ Each refresh scans at most 2,048 task-directory entries and considers at most
 128 tasks: files modified in the last two hours, plus task IDs referenced by
 selected activity or known-running cached summaries. Task JSON is capped at
 64 KiB per file; metadata at 128 KiB (registry: 2 MiB), with a combined 4 MiB /
-128-file JSON-read budget. At most 64 rows are displayed. Compact task summaries
+128-file JSON-read budget. A stat-only pass and task/watch metadata prioritize
+busy and recent pairs before per-pair reads. At most 64 pairs get detailed
+snapshots; every pair in the bounded registry remains listed. Old idle pairs use
+registry-only compact rows. Pairs whose detail reads cannot fit stay visible as
+**details skipped (budget)**, and budget exhaustion always shows a notice.
+Compact task summaries
 are cached in the mod across refreshes; this metadata cache contains no
 prompt/reply bodies. Expanded detail is cached separately for instant redraw,
 with a combined 1 MiB detail-output cap per snapshot. Oversized/unavailable
 replies show an explanation. Old-history omissions alone do not change idle
-status; a dim footnote appears only for affected working/recent rows. This pane
+status; other read-limit notes appear only for affected working/recent rows. This pane
 is an overview, not an exhaustive substitute for `pair_status`/`pair_poll`.
 Old unreferenced queued work may be omitted by the bounded task scan.
 

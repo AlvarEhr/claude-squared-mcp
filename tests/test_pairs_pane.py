@@ -194,8 +194,9 @@ class SnapshotTests(unittest.TestCase):
             data = P.snapshot(self.home)
         self.assertFalse(any(path.parent == folder for path in opened))
         self.assertLess(data["io"]["bytes"], 10000)
-        self.assertIsNone(data["notice"])
-        self.assertEqual(data["rows"][0]["status"], "idle")
+        self.assertIn("budget", data["notice"])
+        self.assertEqual(data["rows"][0]["status"], "unknown")
+        self.assertTrue(data["rows"][0]["details_skipped"])
 
     def test_task_count_budget_and_warm_summary_cache(self):
         for i in range(P.TASK_BUDGET + 20):
@@ -208,7 +209,7 @@ class SnapshotTests(unittest.TestCase):
         self.assertTrue(all(isinstance(item["mtime"], str) for item in cold["cache"]["tasks"].values()))
         warm = P.snapshot(self.home, cache=cold["cache"])
         self.assertLess(warm["io"]["bytes"], cold["io"]["bytes"])
-        self.assertIsNone(warm["notice"])
+        self.assertIn("budget", warm["notice"])
 
     def test_filter_precedes_activity_reads_and_detail_requires_expansion(self):
         self.activity()
@@ -360,7 +361,7 @@ class SnapshotTests(unittest.TestCase):
         data = P.snapshot(self.home)
         self.assertEqual(data["rows"][0]["status"], "busy")
         self.assertTrue(data["rows"][0]["partial"])
-        self.assertIn("read limits", data["notice"])
+        self.assertIn("budget", data["notice"])
 
     def test_transcript_is_explicit_bounded_and_paged(self):
         self.write("registry.json", {"pairs": {"scout": {"backend": "claude", "cwd": "/fixture", "session_id": "thread"}}})
@@ -387,18 +388,81 @@ class SnapshotTests(unittest.TestCase):
         path.write_text(json.dumps({"payload": {"role": "assistant", "content": [{"type": "output_text", "text": "Reply"}]}}) + "\n", encoding="utf-8")
         database = codex / "state_5.sqlite"
         con = sqlite3.connect(database)
+        con.execute("PRAGMA journal_mode=WAL")
         con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT)")
         con.execute("INSERT INTO threads VALUES (?, ?)", ("thread", str(path)))
         con.commit()
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         con.close()
         self.write("registry.json", {"pairs": {"scout": {"backend": "codex", "session_id": "thread"}}})
         before = database.read_bytes()
+        files_before = {file.name for file in codex.iterdir()}
         with patch.dict(os.environ, {"CODEX_HOME": str(codex)}):
             self.assertEqual(P.transcript_page(self.home, "scout")["lines"][0]["text"], "Reply")
+            self.assertEqual({file.name for file in codex.iterdir()}, files_before)
             path.rename(path.with_suffix(".jsonl.zst"))
             self.assertIn("compressed", P.transcript_page(self.home, "scout")["note"])
             self.assertFalse(path.exists())
         self.assertEqual(database.read_bytes(), before)
+
+    def test_sixty_pairs_busy_last_is_prioritized_and_idle_uses_only_registry(self):
+        names = [f"idle-{i:02}" for i in range(59)] + ["zz-busy"]
+        self.write("registry.json", {"pairs": {name: {"backend": "claude", "model": "opus"} for name in names}})
+        for name in names[:-1]:
+            for owner in range(3):
+                path = self.write(f"activity/{name}/{1000 + owner}.json", {"version": 1, "state": "closed"})
+                os.utime(path, (1, 1))
+        self.write(f"activity/zz-busy/{os.getpid()}.json", {"version": 1, "state": "live", "owner_pid": os.getpid(),
+            "turn": {"task_id": "busy", "started_at": self.started},
+            "context": {"used": 50000, "window": 1000000, "at": self.now.isoformat()}})
+        self.write("async/busy.json", {"task_id": "busy", "pair_name": "zz-busy", "status": "running",
+            "owner_pid": os.getpid(), "started_at": self.now.isoformat(), "message": "Work on this"})
+        self.write("async/previous.json", {"task_id": "previous", "pair_name": "zz-busy", "status": "done",
+            "finished_at": self.started, "result": {"response": "Previous reply"}})
+        original = Path.open
+        opened = []
+        def track(path, *args, **kwargs):
+            opened.append(path)
+            return original(path, *args, **kwargs)
+        with patch.object(Path, "open", track):
+            data = P.snapshot(self.home, expanded=["zz-busy"])
+        self.assertEqual(len(data["rows"]), 60)
+        self.assertEqual(data["rows"][0]["name"], "zz-busy")
+        row = data["rows"][0]
+        self.assertEqual(row["status"], "busy")
+        self.assertEqual(row["context"]["used"], 50000)
+        self.assertEqual(row["detail"]["reply"], "Previous reply")
+        self.assertEqual(row["detail"]["working_on"], "Work on this")
+        self.assertFalse(any("activity" in path.parts and any(part.startswith("idle-") for part in path.parts) for path in opened))
+        self.assertTrue(all(row["compact"] for row in data["rows"][1:]))
+
+    def test_exhausted_detail_budget_keeps_every_registry_pair_visible(self):
+        names = [f"recent-{i:02}" for i in range(70)]
+        self.write("registry.json", {"pairs": {name: {} for name in names}})
+        for name in names:
+            for owner in range(3):
+                self.write(f"activity/{name}/{1000 + owner}.json", {"version": 1, "state": "closed"})
+        data = P.snapshot(self.home)
+        self.assertEqual({row["name"] for row in data["rows"]}, set(names))
+        self.assertLessEqual(data["io"]["files"], P.FILE_BUDGET)
+        self.assertTrue(any(row.get("details_skipped") for row in data["rows"]))
+        self.assertTrue(data["budget_limited"])
+        self.assertIn("budget", data["notice"])
+
+    def test_directory_scan_budget_marks_unconfirmed_idle_rows(self):
+        for name in ("old-a", "old-b"):
+            path = self.write(f"async/{name}.json", {"status": "done"})
+            os.utime(path, (1, 1))
+        # entries()'s default scan bound is fixed at definition time; pass a
+        # smaller bound through the scanner without changing the read budget.
+        original = P.Reads.entries
+        def limited(reader, directory, limit=P.SCAN_BUDGET):
+            return original(reader, directory, min(limit, 1))
+        with patch.object(P.Reads, "entries", limited):
+            data = P.snapshot(self.home)
+        self.assertEqual([row["name"] for row in data["rows"]], ["scout"])
+        self.assertTrue(data["rows"][0]["details_skipped"])
+        self.assertTrue(data["budget_limited"])
 
     def test_interrupted_turns_are_not_replies_and_naive_utc_is_normalized(self):
         for status, error, expected in [("failed", "ORPHANED: owner exited", "orphaned"),

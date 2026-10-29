@@ -8,6 +8,7 @@ export type PairRow = {
   detail?: { reply: string | null; reply_at: string | null; outcome?: string | null;
     working_on: string | null; logs: string[]; note: string | null } | null;
   partial?: boolean;
+  compact?: boolean; details_skipped?: boolean;
   finished_at?: string | null; finished_ago_s?: number | null; outcome?: string | null;
   context: {
     used: number | null; window: number | null; percent: number | null;
@@ -15,7 +16,7 @@ export type PairRow = {
   } | null;
   watches: PairWatch[];
 }
-export type PairsView = { rows: PairRow[]; error: string | null; notice: string | null; session: string; home: string }
+export type PairsView = { rows: PairRow[]; error: string | null; notice: string | null; session: string; home: string; budget_limited?: boolean }
 export type TranscriptView = { pair: string; offset: number; next: number | null; loading: boolean;
   lines: { role: string; at: string; text: string }[]; note: string | null }
 

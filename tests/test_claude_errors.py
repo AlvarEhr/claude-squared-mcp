@@ -90,14 +90,39 @@ class ClaudeErrors(unittest.TestCase):
 
     def test_plain_and_structured_auth_signals_and_negative_controls(self):
         for stdout, stderr in [(json.dumps({"loggedIn": False}), ""),
-                               (json.dumps({"loggedIn": False, "result": "Please authenticate"}), ""), ("", "not logged in"),
-                               ("", "Invalid API key"), ("", "[claude] not logged in"),
-                               ("not logged in", ""), ("", json.dumps(EXPIRED))]:
+                               (json.dumps({"loggedIn": False, "result": "Please authenticate"}), ""),
+                               ("", json.dumps(EXPIRED))]:
             self.assertIn("claude auth login", C.claude_failure_message(self.spec, stdout, stderr))
         quoted = json.dumps({"type": "assistant", "message": {"content": MESSAGE}})
         last = json.dumps({"type": "result", "is_error": True, "result": "Too many turns"})
         self.assertEqual(C.claude_failure_message(self.spec, quoted + "\n" + last, ""), "Too many turns")
         self.assertNotIn("claude auth login", C.claude_failure_message(self.spec, quoted, ""))
+
+    def test_mcp_diagnostics_and_successful_quoted_results_are_not_claude_auth_failures(self):
+        mcp = "[MCP github] Failed to authenticate: GitHub token expired"
+        for stdout, stderr in [("", mcp), (mcp, ""), ("", "not logged in"), ("", "Invalid API key"),
+                (json.dumps({"type": "result", "is_error": True, "result": mcp}), ""),
+                (json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "Invalid API key"}), MESSAGE)]:
+            with self.subTest(stdout=stdout, stderr=stderr):
+                text = C.claude_failure_message(self.spec, stdout, stderr)
+                self.assertNotIn("claude auth login", text)
+                self.run.return_value = SimpleNamespace(returncode=1, stdout=stdout.encode(), stderr=stderr.encode())
+                with self.assertRaises(CLIError) as caught:
+                    self.adapter._run_print(["--print"], timeout_seconds=5, pair_name="fixture", env_spec=self.spec)
+                self.assertNotIn("claude auth login", str(caught.exception))
+        api = self.spec.model_copy(update={"billing": "api"})
+        success = json.dumps({"type": "result", "subtype": "success", "result": "Invalid API key"})
+        self.assertEqual(C.claude_failure_message(api, success, ""), "Invalid API key")
+
+    def test_api_error_zero_usage_is_evidence_but_embedded_tool_failure_is_not(self):
+        event = {"type": "result", "terminal_reason": "api_error", "usage": {"input_tokens": 0, "output_tokens": 0},
+                 "result": "The request failed: OAuth session expired and could not be refreshed"}
+        self.assertIn("claude auth login", C.claude_failure_message(self.spec, json.dumps(event), ""))
+        event["usage"]["input_tokens"] = 30
+        self.assertNotIn("claude auth login", C.claude_failure_message(self.spec, json.dumps(event), ""))
+        event.update(is_error=True, result="The tool returned: Failed to authenticate: GitHub token expired")
+        event["usage"]["input_tokens"] = 0
+        self.assertNotIn("claude auth login", C.claude_failure_message(self.spec, json.dumps(event), ""))
 
     def test_warm_send_maps_only_error_results_and_preserves_api_key_guidance(self):
         with patch.object(self.adapter, "_read_last_turn_context_fill", return_value=None):

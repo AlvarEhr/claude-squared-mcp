@@ -8,6 +8,13 @@ All notable changes to this project are documented here. Format follows
 
 ### Fixed
 
+- Pane detail reads prioritize working/recent pairs, so late-alphabet pairs no
+  longer lose their reads to idle history. All known registry pairs remain visible
+  as compact rows when budgets run out, with an explicit notice.
+- Codex transcript lookup uses immutable SQLite reads to avoid creating WAL/SHM
+  files. Claude login guidance requires failed CLI-envelope evidence; MCP auth
+  diagnostics and successful replies quoting key errors are not login failures.
+
 - Claude CLI launch failures now lead with the JSON result's message. Expired
   OAuth and other plan-login failures direct the user to `claude auth login`;
   API-billing key/credit guidance is preserved. Covers create, clear, hard stop,

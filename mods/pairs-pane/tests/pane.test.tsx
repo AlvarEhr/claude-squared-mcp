@@ -524,3 +524,23 @@ test('expanded detail never retains an old log tail when its refresh is unavaila
   expect(logs.map(line => line.text)).toEqual(['[14:10:00] [T-566] new day', '[14:10:01] [T-567] new day'])
   await ui.unmount()
 })
+
+test('budget-skipped pairs stay visible as compact rows and always surface a notice', async ($, on) => {
+  const clock = base(on)
+  on('process.run', () => ({ value: { exitCode: 0, stdout: JSON.stringify({ budget_limited: true,
+    notice: 'Details skipped (budget); all known registry pairs are still listed.', rows: [
+      { ...row('zz-temper'), status: 'unknown', details_skipped: true, compact: true, partial: true },
+      { ...row('old-idle'), status: 'idle', compact: true },
+    ] }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  await $.session.start({ cwd: '/project', surface: 'desktop', isInteractive: false })
+  await clock.advance(1)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'all' })
+  expect((await ui.find({ type: 'Text', text: /^zz-temper$/ }))?.text).toBe('zz-temper')
+  expect((await ui.find({ type: 'Text', text: /details skipped \(budget\)/ }))?.text).toContain('details skipped (budget)')
+  expect((await ui.find({ type: 'Text', text: /all known registry pairs/ }))?.props.dimColor).toBe(true)
+  expect(await ui.find({ key: 'detail-zz-temper' })).toBeUndefined()
+  await ui.press({ key: 'idle' })
+  expect((await ui.find({ type: 'Text', text: /^old-idle$/ }))?.text).toBe('old-idle')
+  await ui.unmount()
+})

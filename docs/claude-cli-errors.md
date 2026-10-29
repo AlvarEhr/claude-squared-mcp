@@ -12,8 +12,13 @@ the old exception displayed only the beginning of the large JSON envelope.
 
 The Claude adapter now extracts the last top-level CLI result before formatting
 an error. Print and stream-json paths share the formatter, including explicit
-error results with exit 0. It never diagnoses auth from assistant/tool events
-that happen to quote an error. Generic result text comes before the exit code;
+error results with exit 0. Login guidance requires a top-level `is_error` result
+starting with an auth phrase, or `terminal_reason: api_error` with zero reported
+token usage and an auth phrase; structured `loggedIn: false` also qualifies.
+Plain diagnostics (including `[MCP github] Failed to authenticate`) remain their
+own messages. Successful result envelopes are never classified, even if the
+process exited nonzero. Assistant/tool events quoting errors are excluded.
+Generic result text comes before the exit code;
 raw JSON envelopes are not used as the error headline.
 
 Plan-billed authentication failures say the CLI is not logged in, include its
@@ -26,5 +31,6 @@ and exit errors share the formatter while retaining the supervisor prefix.
 `tests/test_claude_errors.py` uses isolated homes and mocked CLI subprocesses.
 It covers the manager's exact envelope (with and without `type: result`), long
 stream preambles, lifecycle calls including clear/hard stop, warm results,
-plain and structured auth diagnostics, quote-negative controls, and API billing.
+plain and structured auth diagnostics, MCP/successful-result negative controls,
+zero-usage evidence, and API billing.
 No live model probe was run by the implementer.

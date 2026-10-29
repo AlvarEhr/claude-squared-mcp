@@ -34,7 +34,10 @@ a bounded task set and bounded JSON reads. Limits live beside the reader:
 | Task file | 64 KiB; size checked before opening |
 | Other JSON file | 128 KiB; watch/receipt 8 KiB; registry 2 MiB |
 | Combined JSON I/O | 4 MiB and 128 file reads per refresh |
-| Selected pairs | 64; at most 16 activity-directory entries per pair |
+| Detailed pairs | 64; registry-only/omitted-detail rows remain visible beyond that |
+| Priority metadata | Stat-only activity scan: 2,048 total entries/directories, at most 16 entries per pair |
+| Watch discovery | Newest 24 records; overflow is reported |
+| Initial task reads | At most 48 uncached task files, reserving 32 remaining file slots for activity; references share the global limits |
 | Cross-refresh task cache | 256 KiB of metadata; no prompt/result bodies |
 | Log detail | 8 KiB only for an expanded, selected row; initial display 15 lines |
 | Reply detail | Latest selected task's full response within its 64 KiB file cap; initial display 12 lines |
@@ -42,11 +45,18 @@ a bounded task set and bounded JSON reads. Limits live beside the reader:
 | Transcript | Explicit open/page only; 64 KiB per page, user/assistant text; no restore/decompression |
 
 Only matching session watches select pairs in the default view. All-pairs mode
-also selects registered/activity pairs. Filtering precedes activity and log
-reads. Expanded rows read latest finished/current task payloads within the same
+also lists registered/activity pairs. A stat-only activity pass plus bounded
+task/watch discovery ranks busy pairs, watched pairs and recent activity before
+per-pair JSON reads. Old idle rows come directly from the registry. The 60-pair
+regression puts the busy pair alphabetically last and verifies full detail with
+no idle activity reads. A separate exhausted-budget fixture retains all 70 names.
+Filtering precedes activity JSON and log reads. Expanded rows read latest finished/current task payloads within the same
 byte/file budget. Activity-referenced previous completed tasks remain eligible
 even beyond the two-hour scan window. Old-history omissions alone do not alter
-idle status. A dim footnote is gated on known affected working/recent rows.
+idle status. Any exhausted scan/read/detail budget produces a notice; rows that
+cannot be read stay compact and explicitly marked, including idle candidates
+whose task discovery was incomplete. Other notes are gated on known affected
+working/recent rows.
 An old queued task without an activity reference or cached running summary may
 be omitted; use pair_status/pair_poll when completeness matters.
 
@@ -114,7 +124,11 @@ The interval cuts scheduled launches from 30 to 12/minute (60%); clicks do not
 await those reads. These are offline reader timings, not Desktop frame timings.
 
 Transcript lookup is explicit only: Claude's home/projects/cwd/session path,
-or Codex's indexed thread path from a read-only SQLite connection. No recursive
+or Codex's indexed thread path from an immutable SQLite connection
+(`mode=ro&immutable=1`). A checkpointed WAL-database regression asserts no files
+appear in the source directory. Immutable mode reads checkpointed state only;
+a new path still only in the live WAL may be unavailable until checkpointed.
+No recursive
 rollout search or model call. Missing/compressed files and oversized JSONL
 records have visible explanations. Pages cover user/assistant text; tool and
 metadata records are skipped. Log timestamps are already local (runtime.py's
