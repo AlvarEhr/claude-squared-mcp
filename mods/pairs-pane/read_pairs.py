@@ -267,16 +267,15 @@ def tail(path, size=8192):
 
 
 SUB_LAUNCH = re.compile(r"^\[(\d\d:\d\d):\d\d\] \[T-\d+\] \[-> sub-agent #(\d+): ([^\]]+)\] launching: ?(.*)$")
-SUB_RETURN = re.compile(r"^\[\d\d:\d\d:\d\d\] \[T-\d+\] \[<- sub-agent #(\d+) returned\]")
-SUB_STARTED = re.compile(r"^\[\d\d:\d\d:\d\d\] \[system:task_started\] local_agent \(\w+\) ([0-9a-f]{6,}): ?(.*)$")
+SUB_RETURN = re.compile(r"^\[\d\d:\d\d:\d\d\] \[T-\d+\] \[<- sub-agent #(\d+) returned\](.*)$")
+SUB_STARTED = re.compile(r"^\[\d\d:\d\d:\d\d\] \[system:task_started\] local_agent (?:\(\w+\) )?([0-9a-f]{6,}): ?(.*)$")
+SUB_ENDED = re.compile(r"^\[\d\d:\d\d:\d\d\] \[system:task_notification\] task ([0-9a-f]{6,}) (?:completed|failed|stopped|killed)")
 SUB_SCAN = 256 * 1024
 
 
-def _subagent_dir(root, spec):
-    session, cwd = spec.get("session_id"), spec.get("cwd")
-    if not isinstance(session, str) or not isinstance(cwd, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", session):
-        return None
-    return root / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", cwd) / session / "subagents"
+def _project_dir(root, spec):
+    cwd = spec.get("cwd")
+    return root / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", cwd) if isinstance(cwd, str) else None
 
 
 def subagents(root, name):
@@ -300,22 +299,36 @@ def subagents(root, name):
             text = stream.read(SUB_SCAN).decode("utf-8", "replace")
     except OSError:
         text = ""
-    last = None
+    waiting = []  # launches whose task_started line has not been seen yet
     for line in text.splitlines():
         launch = SUB_LAUNCH.match(line)
         if launch:
+            # Numbers restart when a pair is cleared: the newest launch wins.
             ident = int(launch.group(2))
-            entry = found.setdefault(ident, {"id": ident, "type": launch.group(3), "status": "running"})
-            entry.update(description=launch.group(4).strip(), at=launch.group(1))
-            last = entry
+            entry = {"id": ident, "type": launch.group(3), "description": launch.group(4).strip(),
+                     "status": "running", "at": launch.group(1)}
+            if (logs / f"subagent-{ident}-{entry['type']}.log").is_file() and ident in found:
+                entry["status"] = found[ident]["status"]
+            found[ident] = entry
+            waiting.append(entry)
             continue
         started = SUB_STARTED.match(line)
-        if started and last is not None and "agent" not in last:
-            last["agent"] = started.group(1)
+        if started and waiting:
+            # Parallel launches can log their starts out of order; match by description.
+            entry = next((e for e in waiting if e["description"] == started.group(2).strip()), waiting[0])
+            entry["agent"] = started.group(1)
+            waiting.remove(entry)
             continue
         returned = SUB_RETURN.match(line)
-        if returned and int(returned.group(1)) in found:
+        # A background launch "returns" at once; it ends with its task notification.
+        if returned and int(returned.group(1)) in found and "Async agent launched" not in returned.group(2):
             found[int(returned.group(1))]["status"] = "done"
+            continue
+        ended = SUB_ENDED.match(line)
+        if ended:
+            for entry in found.values():
+                if entry.get("agent") == ended.group(1):
+                    entry["status"] = "done"
     rows = sorted(found.values(), key=lambda e: (e["status"] != "running", -e["id"]))
     return [{k: v for k, v in e.items() if k != "agent"} for e in rows[:12]], found
 
@@ -328,11 +341,12 @@ def _local(stamp):
 
 
 def sub_transcript(root, name, spec, ident, found):
-    """The sub-agent's own transcript, named in its extracted log's header or,
-    while it runs, found by the agent id its launch reported. Only paths inside
-    the pair's own subagents directory are accepted."""
+    """The sub-agent's own transcript, named in its extracted log's header or
+    found by the agent id its launch reported. Only paths inside the pair's
+    own project folder's subagents directories are accepted."""
     entry = found.get(ident) or {}
-    directory = _subagent_dir(root, spec)
+    project = _project_dir(root, spec)
+    agent = entry.get("agent")
     extracted = root / "pairs" / "logs" / name / f"subagent-{ident}-{entry.get('type', '')}.log"
     if extracted.is_file():
         try:
@@ -340,17 +354,23 @@ def sub_transcript(root, name, spec, ident, found):
                 head = stream.read(4096)
             match = re.search(r"=== source jsonl: (.+?\.jsonl) ===", head)
             path = Path(match.group(1)) if match else None
-            if path is not None and directory is not None and path.parent.resolve() == directory.resolve():
-                return path, extracted
         except OSError:
-            pass
-        return None, extracted
-    agent = entry.get("agent")
-    if directory is not None and isinstance(agent, str):
-        matches = sorted(directory.glob(f"agent-{agent}*.jsonl"))
+            path = None
+        # Numbers restart after a clear: an extracted log of an earlier run
+        # with the same number names another agent's transcript.
+        if path is not None and isinstance(agent, str) and not path.name.startswith(f"agent-{agent}"):
+            extracted = None
+        elif (path is not None and project is not None and path.parent.name == "subagents"
+                and path.parent.parent.parent.resolve() == project.resolve()):
+            return path, extracted
+    else:
+        extracted = None
+    if project is not None and isinstance(agent, str):
+        # The pair's session may have rotated since the launch: any session's folder.
+        matches = sorted(project.glob(f"*/subagents/agent-{agent}*.jsonl"))
         if matches:
-            return matches[0], None
-    return None, None
+            return matches[0], extracted
+    return None, extracted
 
 
 def _jsonl_lines(path, size=64 * 1024):
@@ -402,7 +422,9 @@ def subagent_activity(root, name, spec, ident):
         return None
     path, extracted = sub_transcript(root, name, spec, ident, found)
     entry = found[ident]
-    if entry["status"] == "running" and path is not None:
+    # The sub-agent's own transcript has real times and covers background
+    # sub-agents, which never get an extracted log; the log is the fallback.
+    if path is not None:
         lines = _jsonl_lines(path)
     elif extracted is not None:
         lines = tail(extracted, 32 * 1024)
