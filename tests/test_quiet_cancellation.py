@@ -14,7 +14,11 @@ os.environ["CLAUDE_CONFIG_DIR"] = os.environ["CLAUDE_HOME"]
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import anyio  # noqa: E402
-from mcp.shared.session import RequestResponder  # noqa: E402
+
+try:  # mcp 1.x; 2.x reorganised its sessions and the patch then does nothing
+    from mcp.shared.session import RequestResponder  # noqa: E402
+except ImportError:  # pragma: no cover - depends on the installed SDK
+    RequestResponder = None
 
 from claude_squared import server  # noqa: E402,F401  (installs the patch)
 
@@ -27,6 +31,7 @@ class FakeSession:
         self.sent.append((request_id, response))
 
 
+@unittest.skipIf(RequestResponder is None, "mcp SDK without mcp.shared.session (2.x)")
 class QuietCancellationTests(unittest.TestCase):
     def test_cancel_sends_no_response(self):
         session = FakeSession()
