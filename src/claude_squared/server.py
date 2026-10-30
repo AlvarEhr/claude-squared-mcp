@@ -68,6 +68,35 @@ from claude_squared.models import (
 )
 
 
+def _quiet_cancellation() -> None:
+    """Answer a cancelled request with nothing, as the MCP spec says.
+
+    The mcp SDK (1.27) replies to ``notifications/cancelled`` with an error
+    response. Claude Code 2.1.309 treats a response to a request it already
+    discarded as a protocol error and drops the whole stdio connection, so one
+    Esc during a pair tool call disconnected the MCP for that session
+    (2026-10-30). Cancel the handler and mark it done without sending.
+    """
+    try:
+        from mcp.shared.session import RequestResponder
+    except ImportError:  # pragma: no cover - SDK layout changed; keep its behaviour
+        return
+    if getattr(RequestResponder.cancel, "_claude_squared_quiet", False):
+        return
+
+    async def cancel(self) -> None:
+        if not self._entered:
+            raise RuntimeError("RequestResponder must be used as a context manager")
+        if not self._cancel_scope:
+            raise RuntimeError("No active cancel scope")
+        self._cancel_scope.cancel()
+        self._completed = True
+
+    cancel._claude_squared_quiet = True  # type: ignore[attr-defined]
+    RequestResponder.cancel = cancel  # type: ignore[method-assign]
+
+
+_quiet_cancellation()
 mcp = FastMCP("claude-squared")
 
 

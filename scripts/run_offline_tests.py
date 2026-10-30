@@ -111,6 +111,10 @@ def main() -> int:
         "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
         "-p", "test_steer.py", "-v",
     ]))
+    commands.append(("quiet_cancellation", [
+        "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
+        "-p", "test_quiet_cancellation.py", "-v",
+    ]))
     scratch = ROOT / ".test-homes"
     scratch.mkdir(exist_ok=True)
     failures = []

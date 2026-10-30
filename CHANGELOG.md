@@ -6,6 +6,15 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### 0.22.0 — Fixed
+
+- Cancelling a pair tool call (Esc during `pair_status`, `pair_poll`, …) no
+  longer disconnects the MCP. The mcp SDK answered `notifications/cancelled`
+  with an error response; Claude Code treats a response for a request it already
+  dropped as a protocol error and closes the stdio connection, leaving the
+  session without pair tools until restart. Cancelled requests now get no
+  response, as the MCP specification says.
+
 ### 0.22.0 — Added
 
 - Unified Codex Desktop completion callbacks and Claude auto-watch in the `pair`
