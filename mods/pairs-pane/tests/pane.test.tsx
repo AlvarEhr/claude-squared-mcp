@@ -215,10 +215,10 @@ test('sub-agents list in the details and swap the activity list to their own cal
     const focused = request.focus?.scout === 8
     const detail = { ...row('scout').detail,
       logs: focused ? ['[20:41:27] [toolu_01X] [tool_use] Bash({"command": "ls"})']
-        : ['[20:22:08] [T-866] [-> sub-agent #8: dbot-docs] launching: Condense the plan'],
-      subagents: [{ id: 8, type: 'dbot-docs', description: 'Condense the plan', status: 'running', at: '20:22' },
-        { id: 7, type: 'dbot-coder', description: 'Fix C4', status: 'done', at: '19:58' }],
-      ...(focused ? { focus: { id: 8, type: 'dbot-docs', description: 'Condense the plan', status: 'running' } } : {}) }
+        : ['[20:22:08] [T-866] [-> sub-agent #8: docs-writer] launching: Condense the plan'],
+      subagents: [{ id: 8, type: 'docs-writer', description: 'Condense the plan', status: 'running', at: '20:22' },
+        { id: 7, type: 'coder', description: 'Fix C4', status: 'done', at: '19:58' }],
+      ...(focused ? { focus: { id: 8, type: 'docs-writer', description: 'Condense the plan', status: 'running' } } : {}) }
     return { value: { exitCode: 0, stdout: JSON.stringify({ rows: [{ ...row('scout', 'manager-session'), detail }] }),
       stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
@@ -227,7 +227,7 @@ test('sub-agents list in the details and swap the activity list to their own cal
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'detail-scout' })
   await clock.advance(1)
-  expect((await ui.find({ type: 'Text', text: /#7 dbot-coder/ }))?.text).toContain('Fix C4')
+  expect((await ui.find({ type: 'Text', text: /#7 coder/ }))?.text).toContain('Fix C4')
   // The launch line in the pair's own activity opens that sub-agent too.
   await ui.press({ key: 'entry-scout-0' })
   await clock.advance(1)

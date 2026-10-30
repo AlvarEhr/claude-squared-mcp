@@ -35,7 +35,7 @@ successful-steer reply does not promise a new callback to the steering caller.
 
 ## Accepted boundary
 
-Alvar approved the first release for managers **already using full access and approval policy `never`**. Child pairs can still be read-only. The adapter never changes a manager's or pair's permissions to enable delivery, and sends no model/effort/cwd/permission override.
+The maintainer approved the first release for managers **already using full access and approval policy `never`**. Child pairs can still be read-only. The adapter never changes a manager's or pair's permissions to enable delivery, and sends no model/effort/cwd/permission override.
 
 Read-only/workspace/plan managers, custom permission profiles, remote callers, CLI/pair callers, missing/conflicting metadata and unverifiable contexts are refused. Results remain available through `pair_poll`.
 
@@ -67,7 +67,7 @@ copy pair state or change permissions; no config file is edited automatically.
 
 ### Earlier Codex-only clone
 
-Alvar requested a parallel installation on 2026-10-07. `codex_squared` runs a pinned exported snapshot under `%USERPROFILE%/.codex/mcp/codex-squared/releases/`, using existing Python 3.11/dependencies. The local `installation.json` records its current commit and path; earlier snapshots are retained unchanged. This is not an editable checkout or a replacement package installation. Local adjustments are the display name and self-recursive alias guard; each release's manifest records original/installed SHA-256 values.
+A parallel installation was requested on 2026-10-07. `codex_squared` runs a pinned exported snapshot under `%USERPROFILE%/.codex/mcp/codex-squared/releases/`, using existing Python 3.11/dependencies. The local `installation.json` records its current commit and path; earlier snapshots are retained unchanged. This is not an editable checkout or a replacement package installation. Local adjustments are the display name and self-recursive alias guard; each release's manifest records original/installed SHA-256 values.
 
 The new Codex config entry supplies that snapshot's `src` through `PYTHONPATH` and `CLAUDE_PAIR_CODEX_COMPLETION=desktop`. The old `pair` entry and Claude configuration were not changed. Pair/task/activity state remains shared; no registry was copied or edited by hand. Child Codex execs still ignore user config, and the cloned connector selector refuses `codex_squared` itself.
 
@@ -77,7 +77,7 @@ Verification: the isolated initialization/list smoke found the correct display n
 
 ### Loading the unified installation
 
-Do not merge or switch the installed editable checkout while Alvar's pairs are active. Integration into main is deployment. No version bump or bundle rebuild was performed on this branch.
+Do not merge or switch the installed editable checkout while the maintainer's pairs are active. Integration into main is deployment. No version bump or bundle rebuild was performed on this branch.
 
 After review/integration, when existing pairs are idle, use the existing Codex
 MCP entry. The env key below is optional; preserve any other values:
@@ -110,7 +110,7 @@ Executable path, Desktop ancestry, creation times and pipe owner are checked. Ca
 
 Codex's local index can store an active rollout as `\\\\?\\C:\\...\\sessions\\...` while Python resolves the sessions directory without the extended prefix. The original lexical containment check incorrectly refused it as "manager is not an active local session." Resolved paths now compare equally with/without that Windows prefix (drive and UNC forms), while I/O retains the original path for long-path support. Archived directories, sibling directories, other drives/shares and junction escapes still fail containment. This mismatch was reproduced on actual active manager index rows; 55 completion tests pass, including real Windows extended-path arming/delivery in an isolated fixture.
 
-Compatibility is checked against the live callback catalog/schema, not a fixed build list. Alvar requested removal of the allowlist on October 7 after `26.1002.7124.0` was refused solely because it was new. Regression tests accept that build and a synthetic future build while still rejecting invalid executable identity or creation times. Read-only endpoint discovery passed on actual Desktop `26.1002.7124.0`; that check sends no callback. Earlier full idle/active tests on Desktop `26.930.7945.0` / CLI `0.160.1` and Desktop `26.1002.6548.0` / CLI `0.162.0-alpha.2` preserved manager policy/model/cwd. Newer builds are attempted automatically; incompatible catalogs/protocols still fail closed. The request includes `callerSource: codex`, absent from September's prototype.
+Compatibility is checked against the live callback catalog/schema, not a fixed build list. The maintainer requested removal of the allowlist on October 7 after `26.1002.7124.0` was refused solely because it was new. Regression tests accept that build and a synthetic future build while still rejecting invalid executable identity or creation times. Read-only endpoint discovery passed on actual Desktop `26.1002.7124.0`; that check sends no callback. Earlier full idle/active tests on Desktop `26.930.7945.0` / CLI `0.160.1` and Desktop `26.1002.6548.0` / CLI `0.162.0-alpha.2` preserved manager policy/model/cwd. Newer builds are attempted automatically; incompatible catalogs/protocols still fail closed. The request includes `callerSource: codex`, absent from September's prototype.
 
 Current manager policy/cwd and source are checked before transmission, and pair generation/activity are rechecked after discovery. A new turn with unpublished/mismatched context defers instead of inheriting older permissions. Any rollback marker after the source invalidates that registration. User-turn replay is deliberately not approximated by counting task-start events; new work can arm a fresh record.
 
@@ -135,7 +135,7 @@ were performed during integration; configs, pane sources and main were untouched
 Earlier callback-branch checks passed **33 maintained offline suites** and
 **64 completion/regression tests** after the v0.20 refresh. The live manager's
 extended-path rollout passed caller identity and full-access eligibility.
-After Alvar restarted on October 13, the actual clone armed a read-only Luna task, the manager ended its turn, and the completion callback woke it automatically. The command slept 25 seconds and returned `RESTART_WAKE_OK_B72` with exit 0; the notification was acknowledged as delivered, its result was collected once, and the disposable pair was forgotten/thread archived. No terminal watcher or polling loop was used. `git diff --check` passed; original main remained clean.
+After a restart on October 13, the actual clone armed a read-only Luna task, the manager ended its turn, and the completion callback woke it automatically. The command slept 25 seconds and returned `RESTART_WAKE_OK_B72` with exit 0; the notification was acknowledged as delivered, its result was collected once, and the disposable pair was forgotten/thread archived. No terminal watcher or polling loop was used. `git diff --check` passed; original main remained clean.
 
 The offline runner includes the completion suite. It covers disabled behavior, metadata injection/schema hiding, origin/policy/profile/plan checks, coalescing, fast completion/loss/generation races, pending/background work, context publication lag, cwd changes, clear/forget/archive/rewind, concurrent dispatchers, atomic failures, malformed catalogs/frames, handle cleanup, destination acknowledgments, uncertain sends and reconciliation. Real stdio fixtures validate dispatch after the RPC returns and an owned-server restart with no model calls.
 
@@ -153,7 +153,7 @@ The restarted chat exposed all 31 clone tools. Native checks passed conversation
 
 Three real failures were found:
 
-- The restart installed a new Desktop build and the original allowlist refused callbacks. Idle/active checks passed before commit `c651d08` added that build. A subsequent update to `26.1002.7124.0` led Alvar to request removing the allowlist entirely; current code validates the live protocol instead.
+- The restart installed a new Desktop build and the original allowlist refused callbacks. Idle/active checks passed before commit `c651d08` added that build. A subsequent update to `26.1002.7124.0` led to a request to remove the allowlist entirely; current code validates the live protocol instead.
 - Old loaded dispatchers could claim a newer dispatcher’s ticket and impose shared unsupported-build backoff. Schema-2 tickets initially isolated the v1 dispatcher. Build-gate removal now uses schema 3 to fence both v1 and v2 build-gated processes; safe legacy claims preserve uncertain-send handling without restarting old servers.
 - Codex compaction incorrectly used lifetime usage as post-context size (showing 16,772 -> 66,533). It now uses the latest context total, including the new CLI's compaction shape with zero input/output and nonzero last.total_tokens. The live corrected result was **16,395 -> 4,608**, with retained `DELTA-662` / 76 and `V2_COMPACT_CALLBACK_PASS`.
 
@@ -163,7 +163,7 @@ Existing MCP processes retain their loaded snapshot. Current-chat direct lifecyc
 
 ### October 13 base refresh and sandbox recheck
 
-The original MCP advanced to v0.17.0 and v0.18.0 while the clone remained on v0.16.2. This branch merged the released v0.18.0 commit, preserving callback entry points and compaction metrics. Only the offline-runner additions conflicted: the resolution retains completion, pair-options and billing suites. The clone now exposes 32 tools, including the new billing tool. Installing it does not switch any pair to API billing; that still requires Alvar's explicit request. Upstream changes include Claude tool/options controls, context alerts, per-turn cost accounting and shutdown fix A. They did not modify the Codex adapter or repair its sandbox.
+The original MCP advanced to v0.17.0 and v0.18.0 while the clone remained on v0.16.2. This branch merged the released v0.18.0 commit, preserving callback entry points and compaction metrics. Only the offline-runner additions conflicted: the resolution retains completion, pair-options and billing suites. The clone now exposes 32 tools, including the new billing tool. Installing it does not switch any pair to API billing; that still requires the maintainer's explicit request. Upstream changes include Claude tool/options controls, context alerts, per-turn cost accounting and shutdown fix A. They did not modify the Codex adapter or repair its sandbox.
 
 The two reported builder failures were traced to the Windows sandbox setup log at the exact tool-call times: `helper_unknown_error: setup refresh had errors` hid an ACL refresh failing to open the shared `node_repl.exe` for a root-only permissions update, with Windows sharing violation **32**. This was an upstream runtime/setup problem, not a pair-level permission denial. The manager's own full-access shell success does not prove the elevated sandbox is healthy.
 

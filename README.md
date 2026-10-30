@@ -738,7 +738,7 @@ Python 3.7+ must be available to the host. In `/config`, the plugin exposes
 `CLAUDE_HOME`, then `~/.claude`. If only the MCP server has a custom
 `CLAUDE_HOME`, set the same directory in the plugin's option.
 
-The mod API is early access. Alvar confirmed the pane loads and renders in
+The mod API is early access. The maintainer confirmed the pane loads and renders in
 Desktop; automated checks use the local CLI's function-hook test harness.
 The API has no direct PID-liveness query, so the pane uses the read-only
 Python helper through `$.process.run`. A host that refuses that call cannot

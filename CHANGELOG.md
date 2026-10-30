@@ -4,18 +4,18 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.22.0] — 2026-10-30
 
-### 0.22.0 — Fixed
+### Added
 
-- Cancelling a pair tool call (Esc during `pair_status`, `pair_poll`, …) no
-  longer disconnects the MCP. The mcp SDK answered `notifications/cancelled`
-  with an error response; Claude Code treats a response for a request it already
-  dropped as a protocol error and closes the stdio connection, leaving the
-  session without pair tools until restart. Cancelled requests now get no
-  response, as the MCP specification says.
-
-### 0.22.0 — Added
+- Pairs pane redesign (plugin 0.2.0): a card per pair grouped Working / Needs
+  attention / Recently finished, a context ring, Markdown replies, and activity
+  listed newest first, one line per entry (successful tool results folded away,
+  failures in red). Click an entry to open the call in full: input and output
+  read on demand, from Codex's saved items or the Claude transcript (sub-agent
+  transcripts included). A Claude pair's sub-agents are listed (running first);
+  picking one swaps the activity to that sub-agent's calls, live while it runs.
+  A busy pair's last reply is labelled "previous task done · next task running".
 
 - Unified Codex Desktop completion callbacks and Claude auto-watch in the `pair`
   MCP. With `CLAUDE_PAIR_CODEX_COMPLETION` unset, callbacks arm only for verified
@@ -36,11 +36,28 @@ All notable changes to this project are documented here. Format follows
   explicitly fall back to normal FIFO. Overrides and timeouts with steering
   are refused. The manager confirmed mid-turn delivery on CLI 2.1.296; an opt-in
   Haiku probe is provided in `scripts/probe_claude_steer.py`. Its `--interrupt`
-  mode remains unrun. A stop that must discard unconsumed steering input reports
+  mode showed an interrupt leaves a pending steer to run as its own turn, so a stop that must discard unconsumed steering input reports
   the hard stop and background losses; a turn ending before delivery gives an
   explicit resend hint.
 
-## [0.21.0] — 2026-10-26
+### Fixed
+
+- Cancelling a pair tool call (Esc during `pair_status`, `pair_poll`, …) no
+  longer disconnects the MCP. The mcp SDK answered `notifications/cancelled`
+  with an error response; Claude Code treats a response for a request it already
+  dropped as a protocol error and closes the stdio connection, leaving the
+  session without pair tools until restart. Cancelled requests now get no
+  response, as the MCP specification says.
+
+- The pane opened at session start before a surface attached stayed empty until
+  reopened; it now starts reading when first drawn.
+
+- `~/.claude/pairs/auto_watch.py` is shared by every claude-squared server, and
+  an older install's server rewrote it at startup (silently dropping watch
+  records and restart recovery). Send-type calls now reinstall the current
+  script before the hook runs.
+
+## [0.21.0] — 2026-10-29
 
 A Pairs pane for the Claude desktop app, and auto-watch waits that survive a restart.
 
