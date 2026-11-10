@@ -181,6 +181,16 @@ class ContextCostTests(unittest.TestCase):
         verbose = json.loads(tool(S.pair_list)(cwd=str(self.home), prefix="scout", verbose=True))
         self.assertEqual(verbose["pairs"][0]["purpose"], "z" * 300)
 
+    def test_cwd_filter_skips_adopted_pair_without_cwd(self):
+        R.add_pair(self.spec.model_copy(update={"name": "adopted", "cwd": None}))
+        self.assertIn("adopted", tool(S.pair_list)())
+        self.assertIn("adopted", tool(S.pair_list)(prefix="adopt"))
+        for verbose in (False, True):
+            listing = tool(S.pair_list)(cwd=str(self.home), verbose=verbose)
+            self.assertNotIn("adopted", listing)
+            self.assertIn("scout", listing)
+        self.assertEqual(tool(S.pair_list)(cwd=str(self.home), prefix="adopt"), "(no pairs registered)")
+
     def test_ack_is_two_lines_and_model_resolution_is_honest(self):
         with patch.object(ClaudeAdapter, "read_resolved_model", return_value="claude-fable-5-1"):
             model = S._ack_model(self.spec)

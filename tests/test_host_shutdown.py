@@ -134,6 +134,129 @@ class HostShutdownTests(unittest.TestCase):
         A._finish_task(state, threading.Event())
         self.assertFalse(H.path_for(self.spec.name).exists())
 
+    def test_placeholder_then_shutdown_protects_background_and_pending_wake(self):
+        for pending in ("background", "wake"):
+            with self.subTest(pending=pending):
+                RT._SHUTTING_DOWN.clear()
+                RT._FAST_CLAUDE_SHUTDOWN.clear()
+                self.alive = True
+                rt = RT.PairRuntime(self.spec, ClaudeAdapter())
+                rt.proc = SimpleNamespace(stdin=io.BytesIO(), pid=self.record["runtime_pid"], poll=lambda: None)
+                rt._process_started_at = self.record["runtime_started_at"]
+                rt._server_started_at = self.record["server_started_at"]
+                rt._handoff_record = dict(self.record)
+                H.publish(self.record)
+                if pending == "background":
+                    rt._bg_tasks["bg"] = {"kind": "bash", "started_at": self.started.isoformat()}
+                else:
+                    rt._wake_at = time.monotonic()
+                self.state.status = "done"
+                self.state.result = SendResult(name=self.spec.name, session_id=self.spec.session_id,
+                    response="Checks running in background", model_used="claude-haiku-5-5", duration_ms=1)
+                reg = RT.RuntimeRegistry()
+                reg._runtimes[self.spec.name] = rt
+                with patch.object(RT, "_REGISTRY", reg):
+                    A._finish_task(self.state, threading.Event())
+                    self.assertTrue(H.path_for(self.spec.name).exists(), "completion must retain background protection")
+                    self.assertIsNone(rt._current_scope)
+                    self.assertIsNone(rt._implicit_scope)
+                    RT._shutdown_runtimes()
+                self.assertTrue(rt.proc.stdin.closed)
+                receipt = H.view(self.spec.name)
+                self.assertTrue(receipt["owner_exiting"])
+                self.assertTrue(receipt["alive"])
+                self.assertEqual(V.pair_activity_view(R.pairs_dir(), self.spec.name)["verdict"], "busy")
+                with patch.object(RT, "_SHUTTING_DOWN", threading.Event()), \
+                        patch.object(RT.subprocess, "Popen", side_effect=AssertionError("duplicate spawn")):
+                    with self.assertRaisesRegex(PairError, "still finishing"):
+                        RT.RuntimeRegistry().get_or_start(self.spec, ClaudeAdapter())
+                self.alive = False
+                H.guard(self.spec.name)
+                self.assertFalse(H.path_for(self.spec.name).exists())
+                self.assertEqual(A.load_task(self.tid).result.response, "Checks running in background")
+
+    def test_shutdown_rebuilds_missing_receipt_for_background_without_scope(self):
+        H.path_for(self.spec.name).unlink()
+        self.state.status = "done"
+        A._save(self.state)
+        rt = RT.PairRuntime(self.spec, ClaudeAdapter())
+        rt.proc = SimpleNamespace(stdin=io.BytesIO(), pid=self.record["runtime_pid"], poll=lambda: None)
+        rt._process_started_at = self.record["runtime_started_at"]
+        rt._bg_tasks["bg"] = {"kind": "bash"}
+        reg = RT.RuntimeRegistry()
+        reg._runtimes[self.spec.name] = rt
+        with patch.object(RT, "_REGISTRY", reg):
+            RT._shutdown_runtimes()
+        self.assertTrue(H.view(self.spec.name)["owner_exiting"])
+        with self.assertRaisesRegex(PairError, "still finishing"):
+            H.guard(self.spec.name)
+
+    def test_placeholder_launch_flag_keeps_receipt_without_a_runtime_snapshot(self):
+        self.state.status = "done"
+        self.state.result = SendResult(name=self.spec.name, session_id=self.spec.session_id,
+            response="Background launched", model_used="claude-haiku-5-5", duration_ms=1,
+            background_launches=["bash"])
+        with patch.object(RT, "_REGISTRY", None):
+            A._finish_task(self.state, threading.Event())
+        self.assertTrue(H.path_for(self.spec.name).exists())
+
+    def test_self_wake_registration_does_not_block_interrupt_ack_on_control(self):
+        H.path_for(self.spec.name).unlink()
+        A._task_path(self.tid).unlink()
+        rt = RT.PairRuntime(self.spec, ClaudeAdapter())
+        scope_open, interrupted = threading.Event(), threading.Event()
+        receipt_path = str(H.path_for(self.spec.name))
+        def write(frame):
+            self.assertEqual(json.loads(frame)["request"]["subtype"], "interrupt")
+            interrupted.set()
+            return len(frame)
+        rt.proc = SimpleNamespace(pid=os.getpid(), stdin=Mock(write=write), poll=lambda: None)
+        rt._process_started_at = RT.process_identity.started_at(os.getpid())
+        rt.stop = Mock(return_value="tree-killed")
+        reg = RT.RuntimeRegistry()
+        reg._runtimes[self.spec.name] = rt
+        register = A.register_external_task
+        registered, errors, stopped = [], [], []
+        def held_registration(*args, **kwargs):
+            scope_open.set()
+            if not interrupted.wait(3):
+                raise AssertionError("stop never wrote its interrupt")
+            task = register(*args, **kwargs)
+            registered.append(task.task_id)
+            return task
+        def read():
+            try:
+                rt._on_event_for_log(json.dumps({"type": "assistant", "message": {"content": []}}))
+                rt._on_event_for_log(json.dumps({"type": "result", "subtype": "error_during_execution",
+                                                "result": "Interrupted", "duration_ms": 1}))
+            except BaseException as exc:
+                errors.append(exc)
+        def stop():
+            try:
+                stopped.append(tool(S.pair_stop)(self.spec.name))
+            except BaseException as exc:
+                errors.append(exc)
+        with patch.object(A, "register_external_task", side_effect=held_registration), \
+                patch.object(S.runtime_mod, "registry", return_value=reg), patch.object(RT, "_REGISTRY", reg):
+            reader = threading.Thread(target=read)
+            stopper = threading.Thread(target=stop)
+            reader.start()
+            try:
+                self.assertTrue(scope_open.wait(3))
+                stopper.start()
+                stopper.join(4)
+            finally:
+                interrupted.set()
+                reader.join(5)
+                if stopper.ident is not None:
+                    stopper.join(5)
+        self.assertEqual(errors, [])
+        self.assertFalse(reader.is_alive())
+        self.assertFalse(stopper.is_alive())
+        rt.stop.assert_not_called()
+        self.assertIn("sent in-band interrupt", stopped[0])
+        self.assertEqual(A.load_task(registered[0]).claude_handoff_path, receipt_path)
+
     def test_recovery_keeps_receipt_when_result_cannot_be_persisted(self):
         self.transcript()
         self.alive = False

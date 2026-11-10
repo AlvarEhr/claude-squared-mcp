@@ -695,7 +695,8 @@ class PairRuntime:
                       "turn_started_at": datetime.utcnow().isoformat(), "kind": kind}
             self._handoff_record = record
             receipt = claude_handoff.publish(record)
-            _async_tasks.note_claude_handoff(task_id, str(receipt))
+            if kind == "send":
+                _async_tasks.note_claude_handoff(task_id, str(receipt))
             self._activity.note_handoff(str(receipt))
         self._activity.turn_opened(task_id, kind, gen=self._gen)
 
@@ -1643,8 +1644,10 @@ class PairRuntime:
         # Registration is file I/O — outside the lock (see __init__ note).
         task: AsyncTaskState | None = None
         try:
+            handoff = ({"claude_handoff_path": str(claude_handoff.path_for(self.spec.name))}
+                       if self.proc is not None and self._process_started_at is not None else {})
             task = _async_tasks.register_external_task(
-                self.spec.name, _async_tasks.SELF_WOKEN_MESSAGE,
+                self.spec.name, _async_tasks.SELF_WOKEN_MESSAGE, **handoff,
             )
         except Exception:
             task = None
@@ -1978,7 +1981,7 @@ class PairRuntime:
             # scope across task-file I/O. ``mark_task_executing`` takes the
             # cross-process control lock itself (stop-vs-promotion), so the
             # order is promote -> control -> scope on this thread; the reader
-            # takes the control lock for handoff metadata only outside scope.
+            # never takes control: stop can hold it while awaiting a reader ACK.
             with self._promote_lock:
                 with self._scope_lock:
                     if self._implicit_scope is not None or self._wake_live_locked():
@@ -2483,18 +2486,20 @@ class RuntimeRegistry:
                 scope = rt._current_scope
                 if scope is None or scope.result_snapshot is not None:
                     scope = rt._implicit_scope
-                if proc is not None and scope is not None:
-                    task_id = scope.task_id
+                background = bool(rt._bg_tasks or rt._wake_at is not None)
+                if proc is not None and (scope is not None or background):
+                    record = rt._handoff_record
+                    task_id = scope.task_id if scope is not None else (record or {}).get("task_id")
                     if scope is rt._implicit_scope and rt._implicit_task is not None:
                         task_id = rt._implicit_task.task_id
-                    record = rt._handoff_record
                     if record is None or record.get("task_id") != task_id:
                         record = {"version": 1, "pair": rt.spec.name, "runtime_pid": proc.pid,
                                   "runtime_started_at": rt._process_started_at,
                                   "server_pid": os.getpid(), "server_started_at": rt._server_started_at,
                                   "session_id": rt.spec.session_id, "cwd": rt.spec.cwd or str(Path.cwd()),
                                   "model": rt.spec.model, "task_id": task_id,
-                                  "turn_started_at": scope.started_at.isoformat()}
+                                  "turn_started_at": (scope.started_at if scope is not None else
+                                                      rt.started_at or datetime.utcnow()).isoformat()}
                     if record.get("runtime_started_at") is not None and time.monotonic() < deadline:
                         record = {**record, "owner_exiting": True}
                         def publish(record=record, publisher=claude_handoff.publish):
@@ -2643,6 +2648,16 @@ class RuntimeRegistry:
 
 
 _REGISTRY: RuntimeRegistry | None = None
+
+
+def handoff_work_pending(name: str) -> bool:
+    """Lock-free, conservative snapshot for receipt retention on task completion.
+    The reader also finalizes tasks, so this must not take a lock held by stop
+    while awaiting that reader. Shutdown rechecks the same pending-work fields.
+    """
+    rt = _REGISTRY._runtimes.get(name) if _REGISTRY is not None else None
+    return rt is not None and bool(rt._bg_tasks or rt._wake_at is not None or rt._implicit_scope is not None)
+
 
 # v0.18.0 (Incident 2026-10-04, fix A): set FIRST by the exit handler. Stopping
 # the runtimes releases a send queued behind a self-woken turn; it used to

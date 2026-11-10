@@ -8,18 +8,23 @@ All notable changes to this project are documented here. Format follows
 
 ### Added
 
-- Busy Claude warm runtimes survive graceful MCP host shutdown. Per-turn
+- Claude warm runtimes survive graceful MCP host shutdown while a turn or
+  post-reply background work remains. Per-turn
   handoff receipts preserve process identity and task ownership; shutdown
   closes stdin without tree-killing and bounds its receipt refresh to 100 ms.
   Successor sends wait, while destructive/one-shot respawns refuse until the
   recorded runtime exits. Recovery collects final assistant text from the
   session JSONL, or retains an honest orphan failure if none was recorded.
   Background work is not preserved. Codex's adapter/recovery path is unchanged.
+- Self-woken handoff registration does not block soft-stop acknowledgments on
+  the control lock. Completed placeholder receipts keep protecting the session
+  while background work or a wake-up is pending.
 - Short context advisory on async acks and completion notices above 40% of the
   window. `pair_settings_set(context_advisory_at=0.40)` configures the fraction;
   `0` disables it. Existing per-pair `context_alert_at` is unchanged.
 - `pair_list(cwd=..., prefix=...)` filters; purposes limited to 80 characters
-  unless verbose. `pair_send_async(cwd=..., extra_dirs=...)` applies update
+  unless verbose. Adopted pairs with no cwd are excluded from cwd-filtered
+  lists. `pair_send_async(cwd=..., extra_dirs=...)` applies update
   semantics for either or both path arguments and queues atomically, refusing
   busy pairs and pending background work.
 - `pair_poll(summary=True)` returns a marked `<summary>` block or the first

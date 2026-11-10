@@ -342,6 +342,10 @@ delivery; graceful shutdown refreshes it within one shared 100 ms budget,
 closes stdin, and exits promptly. Idle runtimes also receive EOF without a tree
 kill. Explicit stops and evictions retain their existing behavior.
 
+Receipts remain after placeholder replies when background work or a pending
+wake-up can still write to the session. Shutdown also covers that state when
+no turn scope is open; a successor waits for the old process to exit.
+
 `pair_status`, `pair_poll` and the waiter's activity view show **finishing after
 a host restart** while that process is alive. New sends queue behind it;
 clear/compact/update and one-shot spawn paths refuse. A PID reused by another
@@ -501,7 +505,8 @@ server process per pair/model.
 
 `pair_list(cwd="/repo", prefix="build-")` selects pairs at or below that path
 and matching that name prefix. Purposes are limited to 80 characters unless
-`verbose=True`. `pair_send_async(..., cwd="/repo/worktree", extra_dirs=["/repo"])`
+`verbose=True`. Adopted pairs without a cwd do not match a cwd filter.
+`pair_send_async(..., cwd="/repo/worktree", extra_dirs=["/repo"])`
 applies `pair_update` semantics for either or both path arguments, then enqueues
 the send under one lock. `extra_dirs` replaces the existing list; `[]` clears it.
 It refuses busy pairs or pending background work, even for unchanged values;

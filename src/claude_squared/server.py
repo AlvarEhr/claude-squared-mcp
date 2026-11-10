@@ -3521,7 +3521,7 @@ def pair_list(verbose: bool = False, cwd: str | None = None, prefix: str | None 
     root = Path(_normalize_path(cwd)).resolve() if cwd and _normalize_path(cwd) else None
     reg.pairs = {name: spec for name, spec in reg.pairs.items()
                  if (prefix is None or name.startswith(prefix))
-                 and (root is None or Path(spec.cwd).resolve().is_relative_to(root))}
+                 and (root is None or (spec.cwd is not None and Path(spec.cwd).resolve().is_relative_to(root)))}
     if not reg.pairs:
         return "(no pairs registered)"
     if verbose:

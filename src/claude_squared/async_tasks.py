@@ -260,6 +260,8 @@ def _task_path(task_id: str) -> Path:
 
 
 def note_claude_handoff(task_id: str | None, receipt: str) -> None:
+    """Worker-side metadata update. Reader-side tasks get this in their initial
+    registration: a stop can hold control while waiting for the reader's ACK."""
     if not task_id:
         return
     with _states_guard:
@@ -537,7 +539,11 @@ def _finish_task(state: AsyncTaskState, event: threading.Event) -> None:
     else:
         runtime = sys.modules.get("claude_squared.runtime")
         exiting = runtime is not None and runtime.shutting_down()
-        if state.claude_handoff_path and state.recovered_at is None and not exiting:
+        launched_background = isinstance(state.result, SendResult) and bool(state.result.background_launches)
+        pending_background = (state.claude_handoff_path is not None and runtime is not None
+                              and runtime.handoff_work_pending(state.pair_name))
+        if (state.claude_handoff_path and state.recovered_at is None
+                and not exiting and not launched_background and not pending_background):
             from claude_squared import claude_handoff
             try:
                 claude_handoff.discard(state.pair_name, state.task_id)
@@ -762,7 +768,7 @@ def is_self_woken_task(state_or_message: "AsyncTaskState | str | None") -> bool:
     return msg.startswith(SELF_WOKEN_MESSAGE_PREFIX)
 
 
-def register_external_task(pair_name: str, message: str) -> AsyncTaskState:
+def register_external_task(pair_name: str, message: str, *, claude_handoff_path: str | None = None) -> AsyncTaskState:
     """Register a RUNNING task for work this process observes but did not start.
 
     No worker thread — the observer finalizes it via ``finalize_external_task``.
@@ -782,6 +788,9 @@ def register_external_task(pair_name: str, message: str) -> AsyncTaskState:
         status="running",
         started_at=now,
         owner_pid=os.getpid(),
+        claude_handoff_path=claude_handoff_path,
+        owner_note=("On host exit, the runtime finishes its turn; receipt: " + claude_handoff_path
+                    if claude_handoff_path else None),
     )
     _save(state)
     _get_or_create_event(state.task_id)
