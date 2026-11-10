@@ -1197,6 +1197,13 @@ class PairRuntime:
         # kept working for 10 min after a result with no init in between).
         ev_type = ev.get("type")
         top_level = not ev.get("parent_tool_use_id")
+        if top_level:
+            served = ((ev.get("message") or {}).get("model") if ev_type == "assistant"
+                      else ev.get("model") if ev_type == "system" and ev.get("subtype") == "init" else None)
+            if isinstance(served, str) and served != "<synthetic>":
+                self._resolved_model = served
+            if ev_type == "result" and getattr(self, "_resolved_model", None):
+                ev["_resolved_model"] = self._resolved_model
         # CLI schema inspected 2026-10-29: these are the client UUIDs actually
         # consumed, including follow-ups folded in between tool rounds. Older
         # CLIs cannot safely distinguish a late steer from the original reply.
@@ -1732,6 +1739,7 @@ class PairRuntime:
                     ev["duration_ms"] = solicited.steer_duration_ms
                     ev["permission_denials"] = solicited.steer_denials
                 solicited.result_snapshot = {
+                    "_resolved_model": ev.get("_resolved_model"),
                     "turn_cost_usd": ev["_turn_cost_usd"],
                     "duration_ms": ev.get("duration_ms"),
                     "permission_denials": ev.get("permission_denials"),
@@ -2287,6 +2295,8 @@ class PairRuntime:
                             # result was attributed) — by now a self-woken
                             # continuation may already have moved the live fields.
                             snap = scope.result_snapshot or {}
+                            if snap.get("_resolved_model"):
+                                ev["_resolved_model"] = snap["_resolved_model"]
                             if snap.get("steer_abort"):
                                 # An interrupt/error need not consume queued CLI
                                 # input. Discard it before releasing the pair lock

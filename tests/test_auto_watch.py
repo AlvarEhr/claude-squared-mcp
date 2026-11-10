@@ -43,8 +43,9 @@ def event(tool="pair_send_async", response="Started async task.\nAsync task: abc
 
 def settings(script):
     return {"hooks": {"PostToolUse": [{"matcher": H.TOOL_PATTERN, "hooks": [{
-        "type": "command", "command": f'python "{script.as_posix()}"',
-        "asyncRewake": True, "timeout": H.HOOK_TIMEOUT_SECONDS}]}]}}
+        "type": "command", "command": f'python "{script.as_posix()}"{flag}',
+        "asyncRewake": True, "timeout": H.HOOK_TIMEOUT_SECONDS}
+        for flag in ("", " --alert-only")]}]}}
 
 
 class HookTests(unittest.TestCase):
@@ -125,7 +126,7 @@ class HookTests(unittest.TestCase):
             self.assertEqual(H.watch(event(), self.pairs), 0)
         self.assertEqual(claude_env()[H.PAIR_ENV], "1")
 
-    def test_all_wait_outcomes_wake_with_both_streams(self):
+    def test_all_wait_outcomes_wake_without_dumping_wait_output(self):
         for code in (*range(11), 64):
             with self.subTest(code=code):
                 self.stub(f"import sys\ndef main(argv):\n print('stdout ✓')\n "
@@ -134,8 +135,9 @@ class HookTests(unittest.TestCase):
                 self.assertEqual(status, 2)
                 self.assertEqual(out, "")
                 self.assertIn(f"wait.py exit {code}", err)
-                self.assertIn("stdout ✓", err)
-                self.assertIn("stderr detail", err)
+                self.assertNotIn("stdout ✓", err)
+                self.assertNotIn("stderr detail", err)
+                self.assertIn("pair_poll('scout') for full reply", err)
                 if code == 3:
                     self.assertIn("Re-arm", err)
 
@@ -387,8 +389,8 @@ class HookTests(unittest.TestCase):
                 self.assertNotIn("Bash(", hint)
             r = SendResult(name="scout", response="reply", session_id="sid", model_used="haiku",
                            duration_ms=1, background_launches=["Bash"])
-            self.assertIn("auto-watch hook armed", S._fmt_send_result(r, tool="pair_send"))
-            self.assertNotIn("auto-watch hook armed", S._fmt_send_result(r))
+            self.assertIn("auto-watch completion + alert armed", S._fmt_send_result(r, tool="pair_send"))
+            self.assertNotIn("auto-watch completion + alert armed", S._fmt_send_result(r))
             for key, value in (("asyncRewake", False), ("timeout", 60), ("command", "python other.py")):
                 invalid = settings(self.script)
                 invalid["hooks"]["PostToolUse"][0]["hooks"][0][key] = value
@@ -458,7 +460,16 @@ class HookTests(unittest.TestCase):
         # Atomic like the server, so a reader never sees a torn test update.
         temp = path.with_suffix(".tmp")
         temp.write_text(json.dumps(data), encoding="utf-8")
-        temp.replace(path)
+        # Match the server's replace retry: the live watcher can briefly hold
+        # a Windows read handle while this fixture completes its fake task.
+        for attempt in range(4):
+            try:
+                temp.replace(path)
+                break
+            except PermissionError:
+                if attempt == 3:
+                    raise
+                time.sleep(.02 * (attempt + 1))
 
     def start_recovery(self, source="resume", session="manager-session"):
         return self.start({"hook_event_name": "SessionStart", "source": source,
@@ -500,7 +511,7 @@ class HookTests(unittest.TestCase):
         self.recovery_task(status="done")
         code, _, err = self.finish(first)
         self.assertEqual(code, 2, err)
-        self.assertIn("pair 'scout', wait.py exit 0", err)
+        self.assertIn("scout: idle (wait.py exit 0)", err)
         self.assertFalse(path.exists())
 
     def test_completed_pair_wakes_without_waiting_for_other_busy_pair(self):
@@ -511,7 +522,7 @@ class HookTests(unittest.TestCase):
         self.recovery_task("other")
         code, _, err = self.finish(self.start_recovery())
         self.assertEqual(code, 2, err)
-        self.assertIn("pair 'scout', wait.py exit 0", err)
+        self.assertIn("scout: idle (wait.py exit 0)", err)
         self.assertFalse(done.exists())
         self.assertTrue(busy.exists())
         self.assertIn("Still-unwatched recovered pairs: other", err)
@@ -521,8 +532,8 @@ class HookTests(unittest.TestCase):
         self.recovery_task("other", status="done")
         code, _, err = self.finish(follow)
         self.assertEqual(code, 2, err)
-        self.assertIn("pair 'other', wait.py exit 0", err)
-        self.assertNotIn("pair 'scout', wait.py exit", err)
+        self.assertIn("other: idle (wait.py exit 0)", err)
+        self.assertNotIn("scout: idle (wait.py exit", err)
         self.assertFalse(busy.exists())
 
     def test_recovery_explains_gone_pair_and_removes_record(self):

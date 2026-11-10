@@ -134,7 +134,7 @@ class CompletionTests(unittest.TestCase):
                             patch.object(A, "start_task", return_value=task):
                         reply = send("child", "fixture", ctx=None)
                     self.assertEqual(reply, S._format_async_handle(
-                        task.task_id, "Started async task for pair 'child'.", "child"))
+                        task.task_id, "", "child", model_hint=S._ack_model(spec)))
         self.assertFalse(N.directory().exists())
         N.start.assert_not_called()
         B.desktop_ancestor.assert_not_called()

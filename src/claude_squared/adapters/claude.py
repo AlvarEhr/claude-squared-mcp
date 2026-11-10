@@ -1284,13 +1284,41 @@ class ClaudeAdapter(PairAdapter):
             return None
         return last_total
 
+    def read_resolved_model(self, spec: PairSpec) -> str | None:
+        path = self.transcript_path(spec)
+        last = None
+        try:
+            if path is None:
+                return None
+            with path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(event, dict) or event.get("parent_tool_use_id"):
+                        continue
+                    message = event.get("message") or {}
+                    model = message.get("model") if isinstance(message, dict) else None
+                    if event.get("type") == "assistant" and isinstance(model, str) and model != "<synthetic>":
+                        last = model
+                    elif event.get("type") == "system" and event.get("subtype") == "init":
+                        last = event.get("model") or last
+        except OSError:
+            pass
+        return last
+
     def _build_send_result(self, spec: PairSpec, result_json: dict) -> SendResult:
         usage = result_json.get("usage", {}) or {}
         denials = [PermissionDenial(**d) for d in result_json.get("permission_denials", []) or []]
         model_usage = result_json.get("modelUsage", {}) or {}
         # Robust primary-model pick (NOT next(iter(...)) — modelUsage carries the
         # haiku helper too, in nondeterministic order). See _select_primary_model.
-        model_used = _select_primary_model(model_usage, spec.model)
+        model_used = result_json.get("_resolved_model") or _select_primary_model(model_usage, spec.model)
+        if not model_usage and not result_json.get("_resolved_model"):
+            # One-shot sends do not use the runtime's event reader. The session
+            # transcript records the served model even when modelUsage is absent.
+            model_used = self.read_resolved_model(spec) or model_used
         # Prefer the CLI-reported window (authoritative — correctly reports 1M
         # for million-context models). Fall back only when it's absent: infer 1M
         # for 1m-variant model names (substring), else the standard 200k. Keeps

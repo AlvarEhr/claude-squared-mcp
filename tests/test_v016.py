@@ -1486,9 +1486,9 @@ class MiscTests(V016Case):
         R.add_pair(spec)
         r = SendResult(name=self.pair, response="blocked", session_id="s", model_used="haiku",
                        duration_ms=1, permission_denials=[PermissionDenial(tool_name="Bash")])
-        self.assertIn("`Bash(git -C * log*)`", S._fmt_send_result(r))
+        self.assertIn("`Bash(git -C * log*)`", S._fmt_send_result(r, verbose=True))
         R.update_pair(self.pair, allowed_tools=None)
-        self.assertNotIn("git -C", S._fmt_send_result(r))
+        self.assertNotIn("git -C", S._fmt_send_result(r, verbose=True))
 
 
 if __name__ == "__main__":

@@ -286,7 +286,7 @@ r = SendResult(name="swt", response="recon is out", session_id=SID, model_used="
                self_woken_completed=[{"task_id": imp_id, "status": "done", "log_line_start": 3,
                                       "log_line_end": 9, "response_preview": "Synthesized", "cost_usd": 0.42}],
                self_woken_waited_s=12.0, terminal_reason="completed")
-ftxt = server._fmt_send_result(r)
+ftxt = server._fmt_send_result(r, verbose=True)
 check("⏳ background launched with counts", "⏳ BACKGROUND WORK LAUNCHED (2 agent, 1 workflow)" in ftxt)
 check("⏮ self-woken completed listed", "⏮ 1 SELF-WOKEN TURN completed" in ftxt and "main.log:3-9" in ftxt)
 check("waited note", "waited 12s" in ftxt)

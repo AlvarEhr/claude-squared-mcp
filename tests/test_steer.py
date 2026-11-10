@@ -152,7 +152,8 @@ class SteerTests(unittest.TestCase):
         for mode in ("codex", "foreign", "old-cli", "idle", "self-woken"):
             with self.subTest(mode=mode), ExitStack() as stack:
                 if mode == "codex":
-                    stack.enter_context(patch.object(S.reg_mod, "get_pair", return_value=SimpleNamespace(backend="codex")))
+                    stack.enter_context(patch.object(S.reg_mod, "get_pair", return_value=self.spec.model_copy(
+                        update={"backend": "codex", "model": "gpt-6-sol"})))
                 elif mode == "foreign":
                     stack.enter_context(patch.object(S.runtime_mod, "registry", return_value=SimpleNamespace(get_or_none=lambda name: None)))
                 elif mode == "old-cli":

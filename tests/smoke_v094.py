@@ -19,7 +19,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from claude_squared import registry as reg_mod
 from claude_squared.adapters.claude import ClaudeAdapter
 from claude_squared.models import HEADLESS_INCOMPATIBLE_TOOLS, PairSpec, PermissionDenial, SendResult
-from claude_squared.server import _fmt_send_result
+from claude_squared.server import _fmt_send_result as _format
+
+
+def _fmt_send_result(result):
+    # Detailed recovery instructions are opt-in as of v0.23.
+    return _format(result, verbose=True)
 
 
 def assert_eq(actual, expected, label):

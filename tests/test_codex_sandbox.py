@@ -980,7 +980,7 @@ class PolicyRefusalTests(SandboxCase):
         result = CX.CodexAdapter()._build_send_result(
             self.spec(), [{"type": "turn.completed", "usage": {}}], BLOCKED_LINE, 0, 5, 0.0,
             model_used="gpt-5.6-sol", permission_level="workspace")
-        text = S._fmt_send_result(result)
+        text = S._fmt_send_result(result, verbose=True)
         self.assertIn("never ran", text)
         self.assertIn("Remove-Item -Force victim.txt", text)
         self.assertIn("permission_mode='auto'", text)

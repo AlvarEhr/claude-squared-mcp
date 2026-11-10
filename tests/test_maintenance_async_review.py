@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import unittest
@@ -244,7 +245,18 @@ class AsyncReviewTests(unittest.TestCase):
 
         with patch.object(Path, "write_text", write), patch.object(S.runtime_mod, "registry", return_value=registry):
             response = tool(S.pair_stop)("pair", force=True)
-            done = A.wait_for_task(task.task_id, 5)
+            # Windows, 2026-11-10: force-stop and the returning worker both
+            # publish terminal state. A replace can briefly deny the reader;
+            # this fixture tests cancellation-write failure, not read sharing.
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    done = A.wait_for_task(task.task_id, max(0, deadline - time.monotonic()))
+                    break
+                except PermissionError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(.02)
         self.assertIn("could not persist cancellation", response)
         self.assertIn("tree-killed", response)
         self.assertEqual(done.status, "stopped")

@@ -16,6 +16,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -266,8 +267,79 @@ def _normalize_path_list(paths: list[str] | None) -> list[str] | None:
 # policy never (stderr only; the command never ran).
 _CODEX_POLICY_REFUSALS = ("policy-blocked", "escalation-refused")
 
+_premium_seen: set[tuple[str, str]] = set()
+_premium_guard = threading.Lock()
+_observed_models: set[str] = set()
 
-def _fmt_send_result(r: SendResult, tool: str | None = None, notification: str | None = None) -> str:
+
+def _premium_once(name: str, model: str) -> str | None:
+    note = premium_model_note(model)
+    if note:
+        with _premium_guard:
+            key = (name, model)
+            if key in _premium_seen:
+                return None
+            _premium_seen.add(key)
+    return note
+
+
+def _alias_resolution_note(spec: PairSpec, served: str) -> str | None:
+    try:
+        return _known_alias_resolution_note(spec, served)
+    except Exception:
+        return None  # model diagnostics must never lose a completed reply
+
+
+def _known_alias_resolution_note(spec: PairSpec, served: str) -> str | None:
+    if spec.backend != "claude" or is_pinned_model(spec.model):
+        return None
+    # Local evidence only: registered pins, models served in this process, and
+    # the manager's observed model. Never guess a CLI alias from a release date.
+    with _premium_guard:
+        _observed_models.add(served)
+        candidates = set(_observed_models)
+    candidates.update(s.model for s in reg_mod.load().pairs.values() if s.backend == "claude")
+    parent = _detect_parent_model()
+    if parent:
+        candidates.add(parent)
+    newest = served
+    for candidate in candidates:
+        newest = newer_version_available(newest, candidate) or newest
+    if newest != served:
+        return f"alias {spec.model} resolved to {served}; newest known in family: {newest}"
+    return None
+
+
+def _ack_model(spec: PairSpec, override: str | None = None) -> str:
+    requested = override or spec.model
+    if spec.backend == "codex":
+        try:
+            return codex_models.resolve_codex_model(requested)[0]
+        except ValueError:
+            return f"{requested} (resolution pending)"
+    rt = runtime_mod.registry().get_or_none(spec.name)
+    served = None
+    if (override is None and rt is not None and rt.spec.model == requested
+            and rt.spec.session_id == spec.session_id):
+        served = getattr(rt, "_resolved_model", None)
+    if not served and override is None:
+        try:
+            candidate = ClaudeAdapter().read_resolved_model(spec)
+        except Exception:
+            candidate = None
+        # A model update leaves the previous transcript intact. A different
+        # family's last response must not masquerade as the next send's model.
+        if candidate and (candidate == requested or (not is_pinned_model(requested)
+                and short_model_label(candidate) == short_model_label(requested))):
+            served = candidate
+    if served:
+        note = _alias_resolution_note(spec, served)
+        return f"{served} (last observed)" + (f"; {note}" if note else "")
+    return f"{requested} (resolution pending)"
+
+
+def _fmt_send_result(r: SendResult, tool: str | None = None, notification: str | None = None,
+                     *, verbose: bool = False) -> str:
     # Visual separator so the agent can clearly see where the pair's response
     # starts/ends in the UI (otherwise the response text bleeds into the agent's
     # surrounding message). Bottom marker doubles as the footer (in brackets).
@@ -277,7 +349,7 @@ def _fmt_send_result(r: SendResult, tool: str | None = None, notification: str |
     footer_parts: list[str] = []
     if ctx:
         footer_parts.append(f"{ctx.percent:.0f}% ctx ({ctx.tokens_used:,}/{ctx.tokens_max:,})")
-    label = short_model_label(r.model_used)
+    label = r.model_used
     footer_parts.append(f"codex/{label}" if r.backend == "codex" else label)
     if r.duration_ms:
         footer_parts.append(f"{r.duration_ms / 1000:.1f}s")
@@ -363,26 +435,39 @@ def _fmt_send_result(r: SendResult, tool: str | None = None, notification: str |
         from collections import Counter as _Counter
         _kinds = _Counter(r.background_launches)
         _desc = ", ".join(f"{n} {k}" for k, n in _kinds.items())
+        hook_armed = tool and auto_watch_configured(_current_auto_watch_script(), tool)
         watch_hint = notification if notification is not None else (
             "auto-watch hook armed — don't start wait.py"
-            if tool and auto_watch_configured(_current_auto_watch_script(), tool) else
+            if hook_armed else
             f'Bash(run_in_background=True, command="{_watcher_cmd(r.name)}") '
             "follows the pair until it is idle"
         )
-        lines.append(
-            f"⏳ BACKGROUND WORK LAUNCHED ({_desc}): this turn started background work "
-            f"and ended before it finished — the reply above may be a placeholder. "
-            f"The pair will wake itself when the work completes; that continuation is "
-            f"tracked as its OWN task: pair_poll('{r.name}', wait_seconds=30) waits "
-            f"for the wake-up and shows its reply; pair_status('{r.name}') shows what's "
-            f"still out; {watch_hint}. Do NOT re-send the same request."
-        )
+        if verbose:
+            lines.append(
+                f"⏳ BACKGROUND WORK LAUNCHED ({_desc}): this turn started background work "
+                f"and ended before it finished — the reply above may be a placeholder. "
+                f"The pair will wake itself when the work completes; that continuation is "
+                f"tracked as its OWN task: pair_poll('{r.name}', wait_seconds=30) waits "
+                f"for the wake-up and shows its reply; pair_status('{r.name}') shows what's "
+                f"still out; {watch_hint}. Do NOT re-send the same request."
+            )
+        else:
+            line = (f"⏳ BACKGROUND WORK LAUNCHED ({_desc}); reply may be interim; do not re-send; "
+                    f"pair_poll('{r.name}', verbose=True) for detail.")
+            if tool:
+                line += " " + (notification or ("auto-watch completion + alert armed" if hook_armed
+                                               else "auto-watch not armed; use wait.py"))
+            lines.append(line)
     _lost = [c for c in (r.self_woken_completed or []) if c.get("status") == "background_lost"]
     for _c in _lost:
         lines.append(f"⚠ BACKGROUND WORK LOST since your last send: {_c.get('note')}")
     _woken = [c for c in (r.self_woken_completed or []) if c.get("status") != "background_lost"]
     if _woken:
         _n = len(_woken)
+        if not verbose:
+            lines.append(f"⏮ {_n} SELF-WOKEN TURN(S) since last send; pair_info('{r.name}') for detail.")
+            _woken = []
+    if _woken:
         lines.append(
             f"⏮ {_n} SELF-WOKEN TURN{'S' if _n != 1 else ''} completed since your last "
             f"send (the pair resumed on its own after background work finished — NOT "
@@ -407,7 +492,10 @@ def _fmt_send_result(r: SendResult, tool: str | None = None, notification: str |
         lines.append(f"(terminal_reason={r.terminal_reason!r})")
     if ctx and ctx.warning:
         lines.append(f"⚠ {ctx.warning}")
-    if r.permission_denials:
+    if r.permission_denials and not verbose:
+        lines.append(f"⛔ PAIR HANDOFF: {len(r.permission_denials)} blocked action(s); retry needs the USER's "
+                     f"explicit authorization; pair_poll('{r.name}', verbose=True) for detail.")
+    if r.permission_denials and verbose:
         from collections import Counter
         counts = Counter(d.tool_name for d in r.permission_denials)
         denied_summary = ", ".join(f"{name} ×{n}" if n > 1 else name for name, n in counts.items())
@@ -1077,7 +1165,7 @@ def pair_create(
     # premium family arriving via defaults.json or match-parent detection, not
     # just an explicit per-call argument. Prepended: a usage/spending decision
     # outranks the version-drift note below it.
-    _premium = premium_model_note(resolved["model"])
+    _premium = _premium_once(name, resolved["model"])
     if _premium:
         transparency_msgs.insert(0, _premium)
 
@@ -1995,6 +2083,11 @@ def _build_send_runner(
                     writer.turn_closed(task_id, status="failed")
                 raise
             result.notes.extend(wait_notes)
+            resolution_note = _alias_resolution_note(
+                current.model_copy(update={"model": override_model}) if override_model else current,
+                result.model_used)
+            if resolution_note:
+                result.notes.append(resolution_note)
             _apply_context_alert(current, result)
             if writer is not None:
                 if result.context is not None:
@@ -2009,7 +2102,7 @@ def _build_send_runner(
             # was warned at that switch point; nagging every turn would be noise.
             if override_model:
                 try:
-                    result.premium_note = premium_model_note(override_model)
+                    result.premium_note = _premium_once(name, override_model)
                 except Exception:
                     pass
 
@@ -2205,7 +2298,7 @@ def _watcher_cmd(ref: str) -> str:
 
 def _format_async_handle(task_id: str, why: str, pair_name: str | None = None,
                          tool: str = "pair_send_async", exact_task: bool = False,
-                         notification: str | None = None) -> str:
+                         notification: str | None = None, model_hint: str | None = None) -> str:
     """Terse runtime hint when an operation degrades to async.
 
     Returns the task_id and poll hints. With the opt-in hook configured, tell
@@ -2235,6 +2328,14 @@ def _format_async_handle(task_id: str, why: str, pair_name: str | None = None,
     # rare case an agent needs to target an older task explicitly.
     # Steering names that exact task: a later FIFO waiter may already be the
     # latest. The watcher still follows the pair through all queued work.
+    if model_hint is not None:
+        if notification and notification.startswith("Codex completion notification armed"):
+            notification = notification.split(";", 1)[0]
+        armed = notification or (
+            "auto-watch completion + alert armed"
+            if auto_watch_configured(_current_auto_watch_script(), tool) else
+            "auto-watch not armed; use wait.py")
+        return f"Async task: {task_id}\n{pair_name}: {model_hint}; {armed}" + (f"; {why}" if why else "")
     poll_ref = task_id if exact_task else (pair_name or task_id)
     wait_cmd = _watcher_cmd(pair_name or task_id)
     name_hint = (
@@ -2775,9 +2876,8 @@ async def pair_send(
                             and getattr(final.result, "background_launches", None)
                             and completion.background_followup(state)) else None)
         if verbose:
-            if notification is None:
-                return _verbose_dump(final.result)
             value = final.result.model_dump(mode="json")
+            value["formatted_reply"] = _fmt_send_result(final.result, verbose=True)
             if notification is not None:
                 value["codex_completion_notification"] = notification
             return json.dumps(value, ensure_ascii=False, indent=2)
@@ -2832,6 +2932,7 @@ def pair_send_async(
     override_permission_mode: str | None = None,
     steer: bool = False,
     ctx: Context | None = None,
+    cwd: str | None = None,
 ) -> str:
     """Send a message to a pair asynchronously. Returns task_id immediately.
 
@@ -2851,6 +2952,9 @@ def pair_send_async(
             hard timeout allowed with steer. Idle pairs use a normal send.
             Codex, foreign-owned/one-shot/self-woken turns and older Claude
             runtimes fall back to FIFO with an explicit queued notice.
+        cwd: Apply pair_update's cwd migration, then enqueue under the same
+            pair lock. Refused while busy or with pending background work,
+            even if the requested cwd is unchanged. Cannot combine with steer.
         hard_timeout_seconds: Auto-kill ceiling for the underlying claude
             operation. **Default None (no ceiling) — STRONGLY recommended for
             most uses.** This is NOT your "patience" — async sends don't have
@@ -2870,6 +2974,12 @@ def pair_send_async(
     Multiple async sends to the same pair stay FIFO-serialized via the
     per-pair lock.
     """
+    if cwd is not None:
+        if steer:
+            raise PairError("cwd cannot be combined with steer=True.")
+        return _send_async_in_cwd(name, message, cwd, hard_timeout_seconds=hard_timeout_seconds,
+                                  override_model=override_model, override_effort=override_effort,
+                                  override_permission_mode=override_permission_mode, ctx=ctx)
     # Sanity: pair must exist before we spawn a worker
     spec = reg_mod.get_pair(name)
     _check_model_backend(spec, override_model)
@@ -2890,9 +3000,9 @@ def pair_send_async(
                 task_id, reason = rt.steer(message)
                 if task_id is not None:
                     return _format_async_handle(task_id,
-                        f"{reason} for pair '{name}'; continuing the existing task. "
-                        "Delivery occurs at a CLI boundary; a late follow-up may continue after its first result.",
+                        f"{reason}; continuing the existing task; pair_poll('{task_id}')",
                         pair_name=name, exact_task=True,
+                        model_hint=_ack_model(spec, override_model),
                         notification=notification_context.get("hint") if "hint" in notification_context else (
                             "No new completion notification was armed for this steer; "
                             "follow the original task with pair_poll."))
@@ -2913,8 +3023,25 @@ def pair_send_async(
         ),
     )
     state = async_tasks.start_task(name, message, runner, queued=True)
-    return _format_async_handle(state.task_id, steer_note + f"Started async task for pair '{name}'.", pair_name=name,
+    return _format_async_handle(state.task_id, steer_note.strip(), pair_name=name,
+                                model_hint=_ack_model(spec, override_model),
                                 notification=completion.arm(state, ctx, notification_context))
+
+
+def _send_async_in_cwd(name: str, message: str, cwd: str, **kwargs) -> str:
+    """Update and enqueue under one pair lock, using pair_update's move rules."""
+    try:
+        with _with_pair_lock(name, timeout_s=0):
+            spec = reg_mod.get_pair(name)
+            _check_model_backend(spec, kwargs.get("override_model"))
+            if async_tasks.list_running_task_ids_for_pair(name):
+                raise PairError(f"Pair '{name}' is busy; cwd send refused.")
+            _refuse_if_background(name, "sending with cwd", False)
+            _update_pair_impl(name, cwd=cwd, _locked=True)
+            send = getattr(pair_send_async, "fn", pair_send_async)
+            return send(name, message, **kwargs)
+    except FileLockTimeout:
+        raise PairError(f"Pair '{name}' is busy; cwd send refused.") from None
 
 
 def _read_current_or_last_turn_log(
@@ -2979,6 +3106,7 @@ def pair_poll(
     with_turn_log: bool = False,
     wait_seconds: int = 0,
     verbose: bool = False,
+    summary: bool = False,
 ) -> str:
     """Inspect a specific async task — works for ALL statuses (running, done,
     failed, stopped). **This is the right tool whenever you have a task_id**,
@@ -3031,7 +3159,10 @@ def pair_poll(
             background Bash (e.g. Claude Cowork) where the documented "fire
             wait.py via Bash for hands-off notification" pattern isn't
             available — block-polling beats spam-polling every few seconds.
-        verbose: If True, return the full JSON ``AsyncTaskState``.
+        verbose: If True, return full JSON ``AsyncTaskState`` and detailed formatted reply.
+        summary: Return the reply's <summary> block, or its first 20 lines.
+            Save the full reply to pairs/reports/<pair>/<task>.md and show its
+            path and byte size. Takes precedence over verbose and turn logs.
     """
     # Resolution ladder (additive — exact-id behavior unchanged):
     #   1. exact task_id
@@ -3142,8 +3273,13 @@ def pair_poll(
         if waited_state is not None:
             state = async_tasks.reap_orphan(task_id) or waited_state
 
+    if summary and isinstance(state.result, SendResult):
+        return _poll_summary(state)
     if verbose:
-        return _verbose_dump(state)
+        data = state.model_dump(mode="json")
+        if isinstance(state.result, SendResult):
+            data["formatted_reply"] = _fmt_send_result(state.result, verbose=True)
+        return json.dumps(data, ensure_ascii=False, indent=2)
 
     # Build the headline status
     if state.status == "running":
@@ -3308,17 +3444,43 @@ def pair_poll(
     return "\n".join(lines)
 
 
+def _poll_summary(state: AsyncTaskState) -> str:
+    reply = state.result.response
+    root = reg_mod.pairs_dir() / "reports"
+    target = root / state.pair_name / (state.task_id + ".md")
+    if not target.resolve().is_relative_to(root.resolve()):
+        raise PairError("Invalid report path in task state.")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    scratch = target.with_name(target.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        content = reply.encode("utf-8")
+        scratch.write_bytes(content)
+        scratch.replace(target)
+    finally:
+        scratch.unlink(missing_ok=True)
+    marked = re.search(r"<summary>(.*?)</summary>", reply, re.DOTALL)
+    excerpt = marked[1].strip() if marked else "\n".join(reply.splitlines()[:20])
+    rendered = _fmt_send_result(state.result.model_copy(update={"response": excerpt}))
+    return (f"{state.pair_name}: {state.status}, task {state.task_id}\n{rendered}\n"
+            f"Full reply: {target.resolve()} ({len(content):,} bytes)")
+
+
 # ============================================================================
 # Inspection
 # ============================================================================
 
 @mcp.tool(output_schema=None, annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True})
-def pair_list(verbose: bool = False) -> str:
-    """List all registered pairs.
+def pair_list(verbose: bool = False, cwd: str | None = None, prefix: str | None = None) -> str:
+    """List registered pairs, optionally filtered by cwd subtree and name prefix.
 
-    Default: one line per pair. Pass verbose=True for the full JSON list.
+    Default: one line per pair, purposes limited to 80 characters.
+    Pass verbose=True for the full JSON list, with the same filters.
     """
     reg = reg_mod.load()
+    root = Path(_normalize_path(cwd)).resolve() if cwd and _normalize_path(cwd) else None
+    reg.pairs = {name: spec for name, spec in reg.pairs.items()
+                 if (prefix is None or name.startswith(prefix))
+                 and (root is None or Path(spec.cwd).resolve().is_relative_to(root))}
     if not reg.pairs:
         return "(no pairs registered)"
     if verbose:
@@ -3333,7 +3495,8 @@ def pair_list(verbose: bool = False) -> str:
     lines = []
     for s in reg.pairs.values():
         last = _fmt_local(s.last_active_at, "%H:%M")
-        purpose = f" - {s.purpose}" if s.purpose else ""
+        purpose_text = " ".join(s.purpose.split())
+        purpose = " - " + (purpose_text[:77] + "..." if len(purpose_text) > 80 else purpose_text) if purpose_text else ""
         model_disp = f"codex:{s.model}" if s.backend == "codex" else s.model
         if s.backend == "claude" and s.billing == "api":
             model_disp += ", API billing"  # v0.18.0: visible wherever pairs are listed
@@ -3343,6 +3506,8 @@ def pair_list(verbose: bool = False) -> str:
     # v0.14.0: entries this process could not validate are preserved on disk
     # but unreachable — say so, or they'd look silently gone.
     for qname, why in reg_mod.quarantined().items():
+        if cwd or (prefix is not None and not qname.startswith(prefix)):
+            continue
         lines.append(f"  {qname} (UNREADABLE entry kept verbatim in registry.json — {why}; repair or delete it by hand)")
     # Defaults header — surfaces what NEW pairs would inherit so agents picking
     # up mid-session can see the configured state at a glance. Cheap; no I/O
@@ -3621,11 +3786,37 @@ def pair_update(
         next spawn after eviction; a Claude ``cwd`` change also moves the session
         JSONL across project dirs (rejected with recovery hint if move fails).
     """
+    return _update_pair_impl(**locals())
+
+
+def _update_pair_impl(
+    name: str,
+    model: str | None = None,
+    effort: str | None = None,
+    permission_mode: str | None = None,
+    purpose: str | None = None,
+    allowed_tools: str | list[str] | None = None,
+    allowed_invocations: str | list[str] | None = None,
+    cwd: str | None = None,
+    extra_dirs: str | list[str] | None = None,
+    ultracode: bool | None = None,
+    fallback_model: str | None = None,
+    context_window: str | None = None,
+    backend_options: dict | str | None = None,
+    verbose: bool = False,
+    mcp_whitelist: str | list[str] | None = None,
+    force: bool = False,
+    disallowed_tools: str | list[str] | None = None,
+    context_alert_at: int | str | None = None,
+    billing: str | None = None,
+    system_prompt_append: str | None = None,
+    _locked: bool = False,
+) -> str:
     # Hold the cross-process lock for the whole update: cwd-move + registry write
     # + runtime eviction must all be atomic against other processes' pair_send.
     transparency_msgs: list[str] = []
     try:
-        with _with_pair_lock(name):
+        with (nullcontext() if _locked else _with_pair_lock(name)):
             _refuse_detached_codex(name)
             fields: dict[str, Any] = {}
             cur_spec = reg_mod.get_pair(name)
@@ -3752,8 +3943,8 @@ def pair_update(
                 # v0.12.0 premium-model notice. Guarded on an ACTUAL model change
                 # so routine updates to a pair already sitting on a premium family
                 # don't re-nag on every unrelated field edit.
-                if "model" in fields:
-                    _premium = premium_model_note(effective_model)
+                if "model" in fields and effective_model != old_spec.model:
+                    _premium = _premium_once(name, effective_model)
                     if _premium:
                         transparency_msgs.insert(0, _premium)
 
@@ -3835,9 +4026,10 @@ def pair_update(
             # Changing the model invalidates the drift dedup marker — the pair is
             # now on a different version, so the "newer available" check should
             # re-evaluate from scratch on the next send.
-            if "model" in fields:
+            if "model" in fields and fields["model"] != cur_spec.model:
                 fields["last_drift_notice"] = None
 
+            fields = {k: v for k, v in fields.items() if v != getattr(cur_spec, k, None)}
             if not fields:
                 spec = reg_mod.get_pair(name)
                 return f"No fields to update for '{name}'."
@@ -3886,7 +4078,7 @@ def pair_update(
                 return _verbose_dump_with_msgs(spec, update_msgs)
             msg = f"Updated '{name}': " + ", ".join(
                 f"{k}={_redact_backend_options(v) if k == 'backend_options' else v!r}"
-                for k, v in fields.items())
+                for k, v in fields.items() if k != "last_drift_notice")
             for tmsg in transparency_msgs:
                 msg += f"\n  {tmsg}"
             if cwd_move_msg:

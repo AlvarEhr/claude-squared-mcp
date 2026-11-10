@@ -48,6 +48,7 @@ def auto_watch_configured(script: Path | None, tool: str) -> bool:
         settings = json.loads((settings_home / "settings.json").read_text(encoding="utf-8"))
         if not isinstance(settings, dict) or settings.get("disableAllHooks"):
             return False
+        modes = set()
         for group in settings.get("hooks", {}).get("PostToolUse", []):
             matcher = group.get("matcher", "")
             # Require both supported aliases: the server cannot tell which
@@ -62,10 +63,14 @@ def auto_watch_configured(script: Path | None, tool: str) -> bool:
                 command = shlex.split(hook.get("command", ""))
                 # The documented command is one interpreter and one script,
                 # with forward slashes on Windows. No shell wrapper guessing.
-                if (len(command) == 2 and re.fullmatch(
+                if (len(command) in (2, 3) and re.fullmatch(
                         r"(?:python(?:\d+(?:\.\d+)*)?|py)(?:\.exe)?", Path(command[0]).name.lower())
                         and Path(command[1]).expanduser().resolve() == script.resolve()):
-                    return True
+                    if len(command) == 2:
+                        modes.add("completion")
+                    elif command[2] == "--alert-only":
+                        modes.add("alert")
+        return modes == {"completion", "alert"}
     except (OSError, ValueError, TypeError, AttributeError, re.error):
         pass
     return False

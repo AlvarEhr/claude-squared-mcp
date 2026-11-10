@@ -40,7 +40,7 @@ _WAIT_HEAD = r'''#!/usr/bin/env python3
     python wait.py <task_id|prefix>    wait for that one task (as before 0.16)
 
 Options: --timeout SECS (default 21600 = 6 h) --poll SECS (default 2)
-         --context-alert PCT | --no-context-alert
+         --context-alert PCT | --no-context-alert | --ignore-alert
 
 Context alert: exits 8 when the pair's context CROSSES the alert level while
 the watcher runs (never at start, so re-arming is safe). Default level: the
@@ -412,7 +412,7 @@ def wait_task(task_id: str, arg: str, timeout_s: float, poll_s: float, alert: Al
             view = pair_activity_view(_pairs_dir(), pair, now=now, grace_seconds=0)
             alert.note_registry(*_registry_read(pair))
             hit = alert.check(view.get("context"), view.get("reported_window"))
-            if hit:
+            if hit and "--ignore-alert" not in extra:
                 print(_alert_message(pair, *hit, [arg] + extra, alert.backend, alert.auto_compact_token_limit))
                 return 8
         if time.monotonic() >= deadline:
@@ -586,7 +586,10 @@ def wait_pair(pair: str, each_turn: bool, timeout_s: float, poll_s: float, alert
         registry = _registry_read(pair)  # once per poll: the alert and the forgotten check
         alert.note_registry(*registry)
         hit = alert.check(view.get("context"), view.get("reported_window"))
-        if hit:
+        if "--alert-only" in extra and (not any(view.get(k) for k in
+                ("turns", "running_tasks", "background", "wake_pending"))):
+            return 0
+        if hit and "--ignore-alert" not in extra:
             print(_alert_message(pair, *hit, base, alert.backend, alert.auto_compact_token_limit))
             return 8
         for row in view.get("running_tasks") or []:
@@ -696,6 +699,9 @@ def main(argv: list[str]) -> int:
                 alert = Alert("pct", pct)
                 extra += [a, argv[i + 1]]
                 i += 2
+            elif a in ("--ignore-alert", "--alert-only"):
+                extra.append(a)
+                i += 1
             elif a == "--no-context-alert":
                 alert = Alert("off", None)
                 extra.append(a)

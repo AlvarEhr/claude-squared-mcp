@@ -2,6 +2,7 @@
 
 Run by the main session, outside the implementer's offline-only sandbox:
     python tests/smoke_live_auto_watch.py --live
+    python tests/smoke_live_auto_watch.py --live --alert
 
 Uses a private pair registry and a stream-json manager, with explicit settings
 and MCP config files. Never edits user settings or reads credentials. Keeps
@@ -30,6 +31,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--live", action="store_true", help="spend a few short Haiku turns")
     parser.add_argument("--timeout", type=int, default=180)
+    parser.add_argument("--alert", action="store_true", help="also verify a context alert followed by completion")
     args = parser.parse_args()
     if not args.live:
         parser.error("requires --live; this probe spends Claude usage")
@@ -54,14 +56,17 @@ def main():
     from claude_squared._auto_watch_script import install_auto_watch_script
     from claude_squared._wait_script import install_wait_script
     from claude_squared.process_spawn import hidden_process_kwargs
+    from claude_squared import registry
+    from claude_squared.activity import pair_activity_view
 
     pairs = home / "pairs"
     install_wait_script(pairs / "wait.py")
     script = install_auto_watch_script(pairs / "auto_watch.py")
     config = home / "settings.json"
     config.write_text(json.dumps({"hooks": {"PostToolUse": [{"matcher": TOOL_PATTERN, "hooks": [{
-        "type": "command", "command": f'"{Path(sys.executable).as_posix()}" "{script.as_posix()}"',
-        "asyncRewake": True, "timeout": HOOK_TIMEOUT_SECONDS}]}]}}), encoding="utf-8")
+        "type": "command", "command": f'"{Path(sys.executable).as_posix()}" "{script.as_posix()}"{flag}',
+        "asyncRewake": True, "timeout": HOOK_TIMEOUT_SECONDS}
+        for flag in ("", " --alert-only")]}]}}), encoding="utf-8")
     mcp = scratch / "mcp.json"
     mcp.write_text(json.dumps({"mcpServers": {"pair": {"type": "stdio", "command": sys.executable,
         "args": ["-B", "-m", "claude_squared"], "env": {
@@ -72,7 +77,7 @@ def main():
         raise RuntimeError("claude is not on PATH")
     token = "AUTO_WATCH_DONE_" + uuid.uuid4().hex[:8]
     py = shlex.quote(Path(sys.executable).as_posix())
-    command = f'{py} -c "import time; time.sleep(20); print(\'{token}\')"'
+    command = f'{py} -c "import time; time.sleep({45 if args.alert else 20}); print(\'{token}\')"'
     prompt = (
         "This is a small hook integration probe. Use ONLY the pair MCP tools. "
         "Call pair_create exactly once with name='rewake-probe', model='haiku', "
@@ -83,6 +88,9 @@ def main():
         "call pair_poll('rewake-probe', with_turn_log=True) once. "
         f"Only if the task is done and its reply contains {token}, reply exactly WOKEN."
     )
+    if args.alert:
+        prompt += (" Exception: if a hook notice says 'to compact cleanly', reply exactly ALERTED and end "
+                   "your turn without polling, stopping or re-sending. Wait for the later completion notice.")
     events = queue.Queue()
     logfile = scratch / "manager.jsonl"
     argv = [cli, "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
@@ -110,7 +118,7 @@ def main():
             child.stdin.write(json.dumps({"type": "user", "message": {
                 "role": "user", "content": prompt}}) + "\n")
             child.stdin.flush()
-            while time.monotonic() - started < args.timeout and len(results) < 2:
+            while time.monotonic() - started < args.timeout and len(results) < (3 if args.alert else 2):
                 try:
                     event = events.get(timeout=1)
                 except queue.Empty:
@@ -123,6 +131,17 @@ def main():
                             calls.append((len(results), item.get("name")))
                 if event.get("type") == "result":
                     results.append(event)
+                    if args.alert and len(results) == 1:
+                        # Only this probe's private registry: lower the alert
+                        # while its foreground sleep runs, exercising wait.py's
+                        # threshold-drop crossing without burning a large prompt.
+                        ready_by = time.monotonic() + 20
+                        while not (pair_activity_view(pairs, "rewake-probe").get("context") or {}).get("used"):
+                            if time.monotonic() >= ready_by:
+                                raise AssertionError("no mid-turn context sample; inspect the private activity feed")
+                            time.sleep(.1)
+                        time.sleep(2.5)  # let the hook's 2 s poll observe the original threshold
+                        registry.update_pair("rewake-probe", context_alert_at=1)
                     print(f"{time.monotonic() - started:.1f}s result {len(results)}: "
                           f"{event.get('result')!r}", flush=True)
         finally:
@@ -134,10 +153,12 @@ def main():
                 child.wait(timeout=10)
             reader.join(timeout=5)
     print(f"Evidence: {scratch}")
-    assert len(results) == 2, "manager did not wake; inspect manager.jsonl and manager.stderr"
+    assert len(results) == (3 if args.alert else 2), "manager did not wake; inspect manager.jsonl and manager.stderr"
     assert str(results[0].get("result")).strip() == "ARMED", results[0]
-    assert str(results[1].get("result")).strip() == "WOKEN", results[1]
-    assert calls == [(0, "mcp__pair__pair_create"), (1, "mcp__pair__pair_poll")], calls
+    if args.alert:
+        assert str(results[1].get("result")).strip() == "ALERTED", results[1]
+    assert str(results[-1].get("result")).strip() == "WOKEN", results[-1]
+    assert calls == [(0, "mcp__pair__pair_create"), (2 if args.alert else 1, "mcp__pair__pair_poll")], calls
     states = [json.loads(p.read_text(encoding="utf-8")) for p in (pairs / "async").glob("*.json")]
     assert any(s.get("status") == "done" and token in json.dumps(s.get("result")) for s in states)
     print("PASS: real Haiku pair finished; idle stream-json manager woke and polled without Bash.")
