@@ -125,7 +125,7 @@ display it. See [Windows launch verification](docs/windows-hidden-spawn.md).
 
 Old spellings (`default`, `dontAsk`, `acceptEdits`, `bypassPermissions`, `workspace-write`, `approve-for-me` …) are accepted as input aliases forever; outputs and the registry use the neutral names. Nuances: Claude's `plan` still allows Bash, so it is looser than `read-only`; Claude's `workspace` auto-accepts edits but Bash still needs permission (denied and reported headless), while Codex's `workspace-write` allows sandboxed commands. On Windows, Codex needs `[windows] sandbox = "elevated"` in `~/.codex/config.toml` for `workspace-write` (the Codex app writes it; without it the sandbox silently runs read-only — the pair's footer says so).
 
-A denied action produces a `⛔ PAIR HANDOFF` block in the reply with the pair's level, what was blocked, and the remedy (re-send with `override_permission_mode="unrestricted"` after the user authorizes, or widen `extra_dirs`). At `auto`, a Codex escalation is judged by the guardian model; its verdict and rationale appear as `🛡 guardian review: allow|deny — …`.
+A denied action produces a one-line `⛔ PAIR HANDOFF` notice requiring the USER's explicit authorization before retrying. `pair_poll(..., verbose=True)` includes the full block with the pair's level, blocked actions and remedies. At `auto`, a Codex escalation is judged by the guardian model; its verdict and rationale appear as `🛡 guardian review: allow|deny — …`.
 
 ### Codex specifics worth knowing
 
@@ -180,11 +180,11 @@ Gates: a busy source is refused; a source with a Claude tool allow-list needs an
 
 ### Communication
 - `pair_send(name, message, timeout_seconds=45, hard_timeout_seconds?, override_model?, override_effort?, override_permission_mode?)` — sync, FIFO-queued
-- `pair_send_async(name, message, hard_timeout_seconds?, ...)` — returns task_id immediately
-- `pair_poll(task_id_or_name, with_turn_log?, wait_seconds?)` — check async status
+- `pair_send_async(name, message, hard_timeout_seconds?, cwd?, ...)` — returns task_id, model and watch status immediately
+- `pair_poll(task_id_or_name, with_turn_log?, wait_seconds?, summary?, verbose?)` — check async status; summary mode saves the full reply to a report file
 
 ### Inspection
-- `pair_list()` — short list (Codex pairs show as `codex:<model>`, `[1m]` windows flagged)
+- `pair_list(cwd?, prefix?, verbose?)` — filter by cwd subtree and name prefix; purposes limited to 80 characters unless verbose
 - `pair_info(name)` — full details + transcript path (Claude: billing and cost too)
 - `pair_transcript(name, last_n=10)` — tail recent turns (Claude JSONL or Codex rollout)
 - `pair_status(name)` — liveness (active / slow / likely-hung; Codex: in-flight process)
@@ -348,7 +348,7 @@ here's the task_id" handle — work continues, no second turn is queued.
 
 **With the optional [auto-watch hook](#automatic-wake-up-opt-in-claude-code-hook),
 the manager needs no Bash watcher step.** When the response says
-"auto-watch hook armed — don't start wait.py", finish independent work or end
+"auto-watch completion + alert armed", finish independent work or end
 your turn. The hook wakes you with the watcher outcome; read the result with
 `pair_poll(name, with_turn_log=True)`. Without the hook, use the pattern below.
 
@@ -450,6 +450,41 @@ Same on-disk state file (`~/.claude/pairs/async/<task_id>.json`); the MCP writes
 atomically so a watcher in a different process (different MCP install) sees the
 result.
 
+### Smaller tool responses (0.23)
+
+`pair_send_async` acknowledges with the task ID, model and watch status in two
+lines. Claude reports the last observed served ID from init/assistant events
+or the session JSONL; a fresh or changed model says `resolution pending` until
+it has been observed. Codex reports its resolved slug. Reply footers always
+show the served ID, including the version. A floating Claude alias resolving
+behind the newest family ID known from registered pins, observed replies or
+the manager's transcript gets a note; this is local evidence, not an online
+model catalogue.
+
+Self-woken, background-work and permission-handoff notices default to one line
+each. `pair_poll(..., verbose=True)` and `pair_send(..., verbose=True)` include
+the full blocks in `formatted_reply` alongside structured data. A blocked
+action still needs the USER's explicit authorization before retrying.
+`pair_update` lists changed fields only; premium warnings appear once per
+server process per pair/model.
+
+`pair_list(cwd="/repo", prefix="build-")` selects pairs at or below that path
+and matching that name prefix. Purposes are limited to 80 characters unless
+`verbose=True`. `pair_send_async(..., cwd="/repo/worktree")` applies the same
+cwd migration as `pair_update` and then enqueues the send under one lock. It
+refuses busy pairs or pending background work; it cannot be used with steer.
+
+For long replies, ask a pair to **end with a `<summary>…</summary>` block**.
+`pair_poll(name_or_task, summary=True)` returns that block (or the first 20
+lines if absent), saves the full reply to
+`~/.claude/pairs/reports/<pair>/<task>.md`, and prints its absolute path and UTF-8
+byte size. Another pair or sub-agent with access can read the file. Reports
+remain until removed by the user; normal polling still returns the full reply.
+Summary mode takes precedence over verbose output and turn-log inclusion.
+The opt-in live check `python tests/smoke_live_auto_watch.py --live --alert`
+should produce `ARMED → ALERTED → WOKEN`, with no manual completion re-arm.
+It uses a private registry and explicit hook settings and spends Claude usage.
+
 ### Automatic wake-up (opt-in Claude Code hook)
 
 Claude Code's `asyncRewake` command hook runs in the background and wakes an
@@ -463,7 +498,8 @@ To opt in:
 2. Merge [docs/auto-watch.settings.json](docs/auto-watch.settings.json) into
    your Claude Code user settings (`~/.claude/settings.json`, or the settings
    directory selected by `CLAUDE_CONFIG_DIR`). Add its `SessionStart` entry and
-   use the updated `PostToolUse` matcher, including `pair_poll`. Keep other
+   add both `PostToolUse` commands (completion and `--alert-only`), with the
+   matcher including `pair_poll`. Keep other
    hooks; replace an older auto-watch entry rather than duplicating it.
 3. Replace `/absolute/path/to/.claude/pairs/auto_watch.py` with the installed
    script's absolute path. Use a working Python interpreter (Python ≥ 3.7);
@@ -481,24 +517,38 @@ The snippet is:
 ```json
 {
   "hooks": {
-    "PostToolUse": [{
-      "matcher": "^mcp__(?:pair|Claude_Squared)__(?:pair_send|pair_send_async|pair_compact|pair_create|pair_handoff|pair_poll)$",
-      "hooks": [{
-        "type": "command",
-        "command": "python \"/absolute/path/to/.claude/pairs/auto_watch.py\"",
-        "asyncRewake": true,
-        "timeout": 604800
-      }]
-    }],
-    "SessionStart": [{
-      "matcher": "startup|resume|clear|compact|fork",
-      "hooks": [{
-        "type": "command",
-        "command": "python \"/absolute/path/to/.claude/pairs/auto_watch.py\" --resume",
-        "asyncRewake": true,
-        "timeout": 604800
-      }]
-    }]
+    "PostToolUse": [
+      {
+        "matcher": "^mcp__(?:pair|Claude_Squared)__(?:pair_send|pair_send_async|pair_compact|pair_create|pair_handoff|pair_poll)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"/absolute/path/to/.claude/pairs/auto_watch.py\"",
+            "asyncRewake": true,
+            "timeout": 604800
+          },
+          {
+            "type": "command",
+            "command": "python \"/absolute/path/to/.claude/pairs/auto_watch.py\" --alert-only",
+            "asyncRewake": true,
+            "timeout": 604800
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact|fork",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"/absolute/path/to/.claude/pairs/auto_watch.py\" --resume",
+            "asyncRewake": true,
+            "timeout": 604800
+          }
+        ]
+      }
+    ]
   }
 }
 ```
@@ -517,12 +567,21 @@ queued sends, background work and self-woken turns. A second send to the
 same busy pair shares that watcher; another manager has its own watcher.
 Fast completions still notify even if the task finished before the hook
 started. A pair forgotten before the hook starts also wakes the manager with
-an explanation. All watcher outcomes wake the manager: done, failed, stopped,
-context alert, lost work, unknown state, and timeout. The notification gives
-the original `wait.py` exit code and output. Read completed work with
-`pair_poll`, not a repeat send. After a context alert or timeout, follow the
-output's re-arm command in background Bash if you want to keep watching.
-Re-arming does not stop or re-send the work.
+an explanation. Completion outcomes wake the manager with a compact notice: pair, outcome,
+`wait.py` exit code, task ID, context percentage (and `over alert` when above
+its threshold), and the first reply line, limited to 120 characters. Use its
+`pair_poll('<task>')` hint for the full reply. The completion watch passes
+`--ignore-alert` and keeps following through context alerts. A timeout still
+needs a manual re-arm; work continues.
+
+The second PostToolUse entry, `auto_watch.py --alert-only`, watches independently
+and wakes once when context crosses the alert during work. It exits silently
+if the work ends first. Its notice shows context and estimated tokens to
+auto-compaction, with the choice: `pair_stop → pair_compact/pair_clear → re-send`
+to compact cleanly, or let the pair finish and possibly auto-compact. It never
+stops work itself. Both Claude and Codex expose mid-turn activity context;
+Codex's rollout token counts may lag a tool call. Standalone `wait.py` retains
+exit 8 on a crossing unless `--ignore-alert` (or `--no-context-alert`) is passed.
 
 Pairs inherit user settings too: the hook is suppressed inside pair
 processes, with a registered-session check for older runtimes. Sessions
@@ -531,11 +590,12 @@ death, so an interrupted hook cannot leave a stale PID blocking later sends.
 The hook does not stop any process or modify pair tasks/activity.
 It passes its resolved Claude home to `wait.py`, including when a custom
 `CLAUDE_HOME` is configured only in the MCP server's environment. Printed
-timeout and alert re-arm commands carry that home into the manager's Bash too.
+standalone wait.py re-arm commands carry that home into the manager's Bash too.
 
 The server's "armed" hint is **best-effort settings detection**, not a
 receipt from the host. It recognizes the documented interpreter/script
-command, matcher, `asyncRewake: true` and timeout in user settings, provided
+commands for **both completion and alert hooks**, matcher, `asyncRewake: true`
+and timeout in user settings, provided
 `disableAllHooks` is not set. Project/managed overrides, unsupported hosts,
 shell wrappers and custom MCP aliases are not detectable. In those cases
 use the manual watcher. This feature is for Claude Code managers; Codex and
@@ -778,9 +838,8 @@ its own async task, so nothing about it is hidden:
   whole thing until the pair is idle;
 - your **next** `pair_send` queues behind an in-progress continuation (FIFO — its
   result is never mistaken for your answer; a send from *another* MCP process
-  queues behind it too) and its footer lists
-  `⏮ N SELF-WOKEN TURN(S) completed since your last send` with task ids, log
-  ranges and cost;
+  queues behind it too) and its footer gives the self-woken count with a
+  `pair_info` pointer. Verbose send/poll includes task ids, log ranges and cost;
 - `main.log` shows `=== SELF-WOKEN TURN (task …) ===`, `[background launch: …]`
   and the CLI's `task_notification` so the wake-up has a visible cause.
 
@@ -922,7 +981,7 @@ Mutable via `pair_update(allowed_invocations=...)` **without runtime eviction** 
 ## Limits / known issues
 
 - **Idle Claude pairs expire: the Claude CLI deletes old session transcripts.** Claude Code runs a transcript-retention cleanup governed by `cleanupPeriodDays` in `~/.claude/settings.json` (unset → 30 days). It deletes exactly the session JSONLs a pair resumes from. **If you rely on long-lived pairs, set `cleanupPeriodDays` to a large value** (e.g. `36500`) — this MCP never writes your `settings.json`. It cannot be disabled (`0` is a trap: it fails validation and historically disabled transcript *writing*). The sweep runs on interactive/desktop startup, not on the headless calls pairs use. Recovery: the pair's own `main.log` survives; `pair_clear(name)` rotates onto a fresh session with all pinned config.
-- **Premium models warn, they don't block.** Plan-gated models (Claude Fable — own weekly limit, faster burn; Codex Astra — frontier tier, most usage-hungry) raise a `💳 PREMIUM MODEL` notice whenever a pair is *switched* onto one, and are never chosen as defaults, but stick once set. The table encodes commercial terms and is dated in-source; verify before trusting it.
+- **Premium models warn, they don't block.** Plan-gated models (Claude Fable — own weekly limit, faster burn; Codex Astra — frontier tier, most usage-hungry) raise a `💳 PREMIUM MODEL` notice when a pair is switched onto one, at most once per server process per pair/model. They are never chosen as defaults, but stick once set. The table encodes commercial terms and is dated in-source; verify before trusting it.
 - **Codex has no slash-command channel** (`pair_invoke` hard-errors with the reason); `pair_compact` works via the app-server but costs a full-context turn and loses detail — pick `context_window="1m"` for large work.
 - **Registry damage is preserved, never overwritten.** An entry that fails validation (an unknown permission spelling, a missing field, something a newer version wrote) is quarantined: kept verbatim on disk, hidden from the tools, listed by `pair_list` as `UNREADABLE`, and carried through every save while the other pairs keep working — repair or delete it by hand. If the file's root is unreadable (invalid JSON, non-object root, a bad or newer `version`) it reads as empty, a copy is kept as `registry.corrupt-<sha>.json`, and every mutation raises until the file is fixed or restored.
 - **Codex `pair_tool_detail` covers turns run since 0.14.0** (the item sidecar); older turns only have the main.log previews.

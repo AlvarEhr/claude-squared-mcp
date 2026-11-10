@@ -4,6 +4,34 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.0] — Unreleased
+
+### Added
+
+- Independent one-shot context-alert hook (`auto_watch.py --alert-only`) for
+  Claude and Codex pairs. Updated opt-in settings snippet requires both hook
+  entries for the send's armed hint. User settings are never edited by the server.
+- `pair_list(cwd=..., prefix=...)` filters; purposes limited to 80 characters
+  unless verbose. `pair_send_async(cwd=...)` applies cwd migration and queues
+  atomically, refusing busy pairs and pending background work.
+- `pair_poll(summary=True)` returns a marked `<summary>` block or the first
+  20 lines, and saves the full UTF-8 reply under `pairs/reports/<pair>/<task>.md`.
+
+### Changed
+
+- Compact completion/recovery notices with outcome, wait exit code, task ID,
+  context percentage, first reply line and full-reply pointer. Completion
+  watches use `wait.py --ignore-alert` and follow through context alerts;
+  standalone wait.py retains exit 8 by default.
+- Two-line async acknowledgments and one-line self-woken, background and
+  permission-handoff footers. Verbose send/poll includes detailed blocks.
+  Permission handoffs retain the USER's explicit authorization requirement.
+- Updates report changed fields only; premium model warnings are deduplicated
+  per server process and pair/model.
+- Resolved model IDs appear in acknowledgments and reply footers. Claude acks
+  label last-observed IDs or resolution pending; served IDs come from stream
+  events or JSONL. Floating aliases behind a locally known newer ID are noted.
+
 ## [0.22.0] — 2026-10-30
 
 ### Added
