@@ -1,7 +1,6 @@
 """v0.23 context-cost regressions; synthetic state, never live model calls."""
 from contextlib import ExitStack
 from datetime import datetime
-import io
 import json
 import os
 from pathlib import Path
@@ -11,7 +10,7 @@ import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -87,10 +86,10 @@ class ContextCostTests(unittest.TestCase):
         self.assertIn("A" * 120, notice)
         self.assertNotIn("A" * 121, notice)
         self.assertNotIn("second line", notice)
-        self.assertLess(len(notice), 310)
+        self.assertLess(len(notice), 390)
 
     def test_wait_ignore_alert_reaches_idle_and_default_still_exits_eight(self):
-        for flags, expected in (([], 8), (["--ignore-alert"], 0), (["--alert-only"], 8)):
+        for flags, expected in (([], 8), (["--ignore-alert"], 0)):
             views = iter([self.view(80000), self.view(140000), self.view(140000, idle=True)])
             namespace = self.reader["wait_pair"].__globals__
             with patch.dict(namespace, {"pair_activity_view": lambda *a, **kw: next(views),
@@ -100,69 +99,64 @@ class ContextCostTests(unittest.TestCase):
                 alert = self.reader["Alert"]("default", None)
                 self.assertEqual(self.reader["wait_pair"]("scout", False, 10, 0, alert, flags), expected)
 
-    def test_alert_is_silent_if_turn_finishes_at_crossing(self):
-        views = iter([self.view(80000), self.view(140000, idle=True)])
-        namespace = self.reader["wait_pair"].__globals__
-        with patch.dict(namespace, {"pair_activity_view": lambda *a, **kw: next(views),
-                "_registry_read": lambda name: (True, {}), "print": Mock(),
-                "time": SimpleNamespace(time=lambda: 0, monotonic=lambda: 0, sleep=lambda s: None)}):
-            self.assertEqual(self.reader["wait_pair"]("scout", False, 10, 0,
-                             self.reader["Alert"]("default", None), ["--alert-only"]), 0)
-            namespace["print"].assert_not_called()
-
-    def test_hook_modes_dedupe_independently_and_alert_fires_once(self):
-        self.state(self.reply())
-        reader = {**self.reader, "pair_activity_view": lambda *a: self.view()}
-        with patch.object(H, "_host_identity", return_value={}), patch.object(H, "_wait", return_value=(8, "")) as wait:
-            output = io.StringIO()
-            self.assertEqual(H.watch(self.payload(), self.pairs, reader=reader, output=output, alert_only=True), 2)
-            self.assertIn("30,000 tokens to auto-compact", output.getvalue())
-            self.assertIn("pair_stop → pair_compact/pair_clear → re-send", output.getvalue())
-            self.assertEqual(H.watch(self.payload(), self.pairs, reader=reader, output=output, alert_only=True), 0)
-            wait.assert_called_once()
-            wait.return_value = (0, "")
-            self.assertEqual(H.watch(self.payload(), self.pairs, reader=reader, output=output), 2)
-            self.assertIn("idle (wait.py exit 0)", output.getvalue())
-
     def test_wait_and_resume_pass_ignore_alert(self):
         self.wait.write_text("def main(argv):\n assert '--ignore-alert' in argv\n return 0\n", encoding="utf-8")
         self.assertEqual(H._wait(self.pairs, "scout", 1), (0, ""))
-        import threading
         self.assertEqual(H._recovery_wait(self.pairs, "scout", 1, threading.Event()), (0, ""))
 
-    def test_alert_and_completion_can_wait_concurrently(self):
+    def test_advisory_boundary_and_disabled_setting_agree_in_ack_and_notice(self):
         self.state(self.reply())
-        entered = [threading.Event(), threading.Event()]
-        release = threading.Event()
-        def wait(*args, alert_only=False):
-            entered[int(alert_only)].set()
-            release.wait(5)
-            return (8 if alert_only else 0), ""
-        results = []
-        def run(alert):
-            results.append(H.watch(self.payload(), self.pairs, reader=self.reader,
-                                   output=io.StringIO(), alert_only=alert))
-        with patch.object(H, "_host_identity", return_value={}), patch.object(H, "_wait", side_effect=wait):
-            threads = [threading.Thread(target=run, args=(mode,)) for mode in (False, True)]
-            for thread in threads:
-                thread.start()
-            try:
-                self.assertTrue(all(event.wait(3) for event in entered))
-            finally:
-                release.set()
-                for thread in threads:
-                    thread.join(5)
-        self.assertEqual(results, [2, 2])
+        R.update_pair("scout", context_alert_at=130000)
+        for setting, used, expected in ((None, 80000, False), (None, 86000, True),
+                                        (0.5, 86000, False), (0.5, 102000, True),
+                                        (0, 190000, False)):
+            with self.subTest(setting=setting, used=used):
+                if setting is not None:
+                    tool(S.pair_settings_set)(context_advisory_at=setting)
+                view = self.view(used)
+                with patch.object(S.activity_mod, "pair_activity_view", return_value=view):
+                    ack = S._format_async_handle(self.tid, "", "scout", model_hint="claude-fable-5-1")
+                notice = H._notice(self.pairs, "scout", 0, "", {
+                    **self.reader, "pair_activity_view": lambda *a: view})
+                for output in (ack, notice):
+                    self.assertEqual("consider pair_clear/pair_compact" in output, expected)
+                    if expected:
+                        self.assertIn(f"ctx {used * 100 / 200000:.0f}%", output)
+                        self.assertIn("before the next large task", output)
+                self.assertEqual(len(ack.splitlines()), 2)
+        self.assertEqual(R.get_pair("scout").context_alert_at, 130000)
+        self.assertIn("over alert", notice)  # disabling the advisory leaves the existing alert intact
 
-    def test_armed_detection_requires_both_entries(self):
+    def test_advisory_settings_validate_persist_reset_and_describe_scope(self):
+        setter = tool(S.pair_settings_set)
+        self.assertIn("0.4", tool(S.pair_settings_get)())
+        for invalid in (-0.1, 1.01, float("nan"), float("inf")):
+            with self.subTest(value=invalid), self.assertRaises(PairError):
+                setter(context_advisory_at=invalid)
+        text = setter(context_advisory_at=0.6)
+        self.assertIn("ALL pairs", text)
+        data = json.loads(tool(S.pair_settings_get)(verbose=True))
+        self.assertEqual(data["writable_defaults"]["context_advisory_at"], 0.6)
+        self.assertEqual(data["hardcoded_fallbacks"]["context_advisory_at"], 0.4)
+        S.settings_mod.reset_defaults()
+        self.assertIsNone(S.settings_mod.load_defaults().context_advisory_at)
+        self.assertTrue(H.context_advisory(86000, 200000))
+
+    def test_advisory_uses_reported_window_and_tolerates_missing_context(self):
+        for view, expected in (({"context": {"used": 86000}, "reported_window": {"tokens": 200000}}, True),
+                               ({"context": {"used": 86000}}, False), ({}, False)):
+            with patch.object(S.activity_mod, "pair_activity_view", return_value=view):
+                self.assertEqual(bool(S._context_advisory_for_pair("scout")), expected)
+
+    def test_single_documented_hook_is_detected(self):
         script = I.install_auto_watch_script(self.pairs / "auto_watch.py")
-        hooks = []
-        settings = {"hooks": {"PostToolUse": [{"matcher": H.TOOL_PATTERN, "hooks": hooks}]}}
-        for flag, expected in (("", False), (" --alert-only", True)):
-            hooks.append({"type": "command", "command": f'python "{script.as_posix()}"{flag}',
-                          "asyncRewake": True, "timeout": H.HOOK_TIMEOUT_SECONDS})
-            (self.home / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
-            self.assertEqual(I.auto_watch_configured(script, "pair_send_async"), expected)
+        data = json.loads((ROOT / "docs/auto-watch.settings.json").read_text(encoding="utf-8"))
+        hooks = data["hooks"]["PostToolUse"]
+        self.assertEqual(len(hooks), 1)
+        self.assertEqual(len(hooks[0]["hooks"]), 1)
+        hooks[0]["hooks"][0]["command"] = f'python "{script.as_posix()}"'
+        (self.home / "settings.json").write_text(json.dumps(data), encoding="utf-8")
+        self.assertTrue(I.auto_watch_configured(script, "pair_send_async"))
 
     def test_footers_one_line_each_and_verbose_details_preserved(self):
         reply = self.reply(background_launches=["Bash"], permission_denials=[PermissionDenial(tool_name="Bash", tool_input={})],
@@ -257,16 +251,56 @@ class ContextCostTests(unittest.TestCase):
         old_path.parent.mkdir(parents=True, exist_ok=True)
         old_path.write_text('{"type":"user"}\n', encoding="utf-8")
         dest = str(self.home / "new")
+        extra = [str(self.home / "sibling")]
         state = self.state(status="running")
         (self.pairs / "async" / (self.tid + ".json")).unlink()
         def start(name, message, runner, **kwargs):
             self.assertEqual(R.get_pair(name).cwd, dest)
+            self.assertEqual(R.get_pair(name).extra_dirs, extra)
             self.assertTrue(adapter.transcript_path(R.get_pair(name)).exists())
             return state
         with patch.object(A, "start_task", side_effect=start), patch.object(S.completion, "arm", return_value=None):
-            answer = tool(S.pair_send_async)("scout", "go", cwd=dest)
+            answer = tool(S.pair_send_async)("scout", "go", cwd=dest, extra_dirs=extra)
         self.assertIn(self.tid, answer)
         self.assertFalse(old_path.exists())
+
+    def test_extra_dirs_only_replaces_normalizes_and_clears_before_enqueue(self):
+        state = self.state(status="running")
+        (self.pairs / "async" / (self.tid + ".json")).unlink()
+        expected = [str(self.home / "sibling")]
+        def start(name, message, runner, **kwargs):
+            spec = R.get_pair(name)
+            self.assertEqual(spec.cwd, self.spec.cwd)
+            self.assertEqual(spec.extra_dirs, expected)
+            return state
+        with patch.object(A, "start_task", side_effect=start), patch.object(S.completion, "arm", return_value=None), \
+                patch.object(S, "_move_session_jsonl_for_cwd_change") as move:
+            tool(S.pair_send_async)("scout", "review", extra_dirs=[str(self.home / "sibling" / "child" / "..")])
+            expected = None
+            tool(S.pair_send_async)("scout", "review", extra_dirs=[])
+            move.assert_not_called()
+
+    def test_extra_dirs_busy_background_and_steer_refuse_without_mutation(self):
+        send = tool(S.pair_send_async)
+        extra = [str(self.home / "sibling")]
+        R.update_pair("scout", extra_dirs=extra)
+        self.state(status="running")
+        with patch.object(A, "start_task") as start:
+            for paths in ({"extra_dirs": extra}, {"extra_dirs": []},
+                          {"cwd": str(self.home / "new"), "extra_dirs": []}):
+                with self.subTest(paths=paths), self.assertRaisesRegex(PairError, "busy"):
+                    send("scout", "go", **paths)
+            start.assert_not_called()
+        (self.pairs / "async" / (self.tid + ".json")).unlink()
+        with patch.object(S, "_refuse_if_background", side_effect=PairError("pending background")), \
+                patch.object(A, "start_task") as start:
+            with self.assertRaisesRegex(PairError, "background"):
+                send("scout", "go", extra_dirs=[])
+            start.assert_not_called()
+        with self.assertRaisesRegex(PairError, "steer"):
+            send("scout", "go", extra_dirs=extra, steer=True)
+        self.assertEqual(R.get_pair("scout").extra_dirs, extra)
+        self.assertEqual(R.get_pair("scout").cwd, self.spec.cwd)
 
     def test_cwd_send_refuses_running_background_and_failed_move(self):
         send = tool(S.pair_send_async)

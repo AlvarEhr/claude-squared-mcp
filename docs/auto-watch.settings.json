@@ -9,12 +9,6 @@
             "command": "python \"/absolute/path/to/.claude/pairs/auto_watch.py\"",
             "asyncRewake": true,
             "timeout": 604800
-          },
-          {
-            "type": "command",
-            "command": "python \"/absolute/path/to/.claude/pairs/auto_watch.py\" --alert-only",
-            "asyncRewake": true,
-            "timeout": 604800
           }
         ]
       }

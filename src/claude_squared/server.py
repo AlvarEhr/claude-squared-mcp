@@ -116,6 +116,7 @@ except OSError:
     _WAIT_SCRIPT_PATH = None
 
 from claude_squared._auto_watch_script import auto_watch_configured, install_auto_watch_script
+from claude_squared._auto_watch import DEFAULT_CONTEXT_ADVISORY_AT, context_advisory
 try:
     _AUTO_WATCH_SCRIPT_PATH = install_auto_watch_script(reg_mod.pairs_dir() / "auto_watch.py")
 except OSError:
@@ -338,6 +339,17 @@ def _ack_model(spec: PairSpec, override: str | None = None) -> str:
     return f"{requested} (resolution pending)"
 
 
+def _context_advisory_for_pair(name: str) -> str:
+    try:
+        view = activity_mod.pair_activity_view(reg_mod.pairs_dir(), name)
+        context = view.get("context") or {}
+        window = context.get("window") or (view.get("reported_window") or {}).get("tokens")
+        return context_advisory(context.get("used"), window,
+                                settings_mod.load_defaults().context_advisory_at)
+    except Exception:
+        return ""  # diagnostics must not turn a successfully queued send into an error
+
+
 def _fmt_send_result(r: SendResult, tool: str | None = None, notification: str | None = None,
                      *, verbose: bool = False) -> str:
     # Visual separator so the agent can clearly see where the pair's response
@@ -455,7 +467,7 @@ def _fmt_send_result(r: SendResult, tool: str | None = None, notification: str |
             line = (f"⏳ BACKGROUND WORK LAUNCHED ({_desc}); reply may be interim; do not re-send; "
                     f"pair_poll('{r.name}', verbose=True) for detail.")
             if tool:
-                line += " " + (notification or ("auto-watch completion + alert armed" if hook_armed
+                line += " " + (notification or ("auto-watch hook armed" if hook_armed
                                                else "auto-watch not armed; use wait.py"))
             lines.append(line)
     _lost = [c for c in (r.self_woken_completed or []) if c.get("status") == "background_lost"]
@@ -2332,10 +2344,12 @@ def _format_async_handle(task_id: str, why: str, pair_name: str | None = None,
         if notification and notification.startswith("Codex completion notification armed"):
             notification = notification.split(";", 1)[0]
         armed = notification or (
-            "auto-watch completion + alert armed"
+            "auto-watch hook armed"
             if auto_watch_configured(_current_auto_watch_script(), tool) else
             "auto-watch not armed; use wait.py")
-        return f"Async task: {task_id}\n{pair_name}: {model_hint}; {armed}" + (f"; {why}" if why else "")
+        advisory = _context_advisory_for_pair(pair_name) if pair_name else ""
+        return (f"Async task: {task_id}\n{pair_name}: {model_hint}; {armed}"
+                + (f"; {advisory}" if advisory else "") + (f"; {why}" if why else ""))
     poll_ref = task_id if exact_task else (pair_name or task_id)
     wait_cmd = _watcher_cmd(pair_name or task_id)
     name_hint = (
@@ -2396,6 +2410,7 @@ _HARDCODED_DEFAULTS = {
     # or session-wide via pair_settings_set to guard against trial/access loss.
     "fallback_model": None,
     "extra_dirs": None,
+    "context_advisory_at": DEFAULT_CONTEXT_ADVISORY_AT,
 }
 
 
@@ -2933,6 +2948,7 @@ def pair_send_async(
     steer: bool = False,
     ctx: Context | None = None,
     cwd: str | None = None,
+    extra_dirs: str | list[str] | None = None,
 ) -> str:
     """Send a message to a pair asynchronously. Returns task_id immediately.
 
@@ -2955,6 +2971,9 @@ def pair_send_async(
         cwd: Apply pair_update's cwd migration, then enqueue under the same
             pair lock. Refused while busy or with pending background work,
             even if the requested cwd is unchanged. Cannot combine with steer.
+        extra_dirs: Replace the pair's extra directory grants using pair_update
+            semantics (including [] to clear). Can be passed with or without
+            cwd; the same busy/background refusal and steer restriction apply.
         hard_timeout_seconds: Auto-kill ceiling for the underlying claude
             operation. **Default None (no ceiling) — STRONGLY recommended for
             most uses.** This is NOT your "patience" — async sends don't have
@@ -2974,12 +2993,12 @@ def pair_send_async(
     Multiple async sends to the same pair stay FIFO-serialized via the
     per-pair lock.
     """
-    if cwd is not None:
+    if cwd is not None or extra_dirs is not None:
         if steer:
-            raise PairError("cwd cannot be combined with steer=True.")
-        return _send_async_in_cwd(name, message, cwd, hard_timeout_seconds=hard_timeout_seconds,
-                                  override_model=override_model, override_effort=override_effort,
-                                  override_permission_mode=override_permission_mode, ctx=ctx)
+            raise PairError("cwd/extra_dirs cannot be combined with steer=True.")
+        return _send_async_with_paths(name, message, cwd, extra_dirs, hard_timeout_seconds=hard_timeout_seconds,
+                                      override_model=override_model, override_effort=override_effort,
+                                      override_permission_mode=override_permission_mode, ctx=ctx)
     # Sanity: pair must exist before we spawn a worker
     spec = reg_mod.get_pair(name)
     _check_model_backend(spec, override_model)
@@ -3028,20 +3047,21 @@ def pair_send_async(
                                 notification=completion.arm(state, ctx, notification_context))
 
 
-def _send_async_in_cwd(name: str, message: str, cwd: str, **kwargs) -> str:
+def _send_async_with_paths(name: str, message: str, cwd: str | None,
+                           extra_dirs: str | list[str] | None, **kwargs) -> str:
     """Update and enqueue under one pair lock, using pair_update's move rules."""
     try:
         with _with_pair_lock(name, timeout_s=0):
             spec = reg_mod.get_pair(name)
             _check_model_backend(spec, kwargs.get("override_model"))
             if async_tasks.list_running_task_ids_for_pair(name):
-                raise PairError(f"Pair '{name}' is busy; cwd send refused.")
-            _refuse_if_background(name, "sending with cwd", False)
-            _update_pair_impl(name, cwd=cwd, _locked=True)
+                raise PairError(f"Pair '{name}' is busy; cwd/extra_dirs send refused.")
+            _refuse_if_background(name, "sending with cwd/extra_dirs", False)
+            _update_pair_impl(name, cwd=cwd, extra_dirs=extra_dirs, _locked=True)
             send = getattr(pair_send_async, "fn", pair_send_async)
             return send(name, message, **kwargs)
     except FileLockTimeout:
-        raise PairError(f"Pair '{name}' is busy; cwd send refused.") from None
+        raise PairError(f"Pair '{name}' is busy; cwd/extra_dirs send refused.") from None
 
 
 def _read_current_or_last_turn_log(
@@ -4634,6 +4654,7 @@ def pair_settings_get(verbose: bool = False) -> str:
     lines.append(f"    allowed_invocations = {_show('allowed_invocations', defaults.allowed_invocations, 'None (allow all)')}")
     lines.append(f"    interim_triage  = {_show('interim_triage', defaults.interim_triage, 'auto')}")
     lines.append(f"    context_alert_headroom = {_show('context_alert_headroom', defaults.context_alert_headroom, 'max(15% of window, 40k)')}")
+    lines.append(f"    context_advisory_at = {_show('context_advisory_at', defaults.context_advisory_at, DEFAULT_CONTEXT_ADVISORY_AT)} (fraction; 0 disables)")
     lines.append("")
     lines.append("  File paths:")
     for k, v in paths.items():
@@ -4674,12 +4695,14 @@ def pair_settings_set(
     verbose: bool = False,
     interim_triage: str | None = None,
     context_alert_headroom: int | None = None,
+    context_advisory_at: float | None = None,
 ) -> str:
     """Set per-user defaults for new pairs (writable subset of pair_settings_get).
 
     Per-call args ALWAYS override defaults — these only fill in fields you don't
-    explicitly pass on ``pair_create``. Existing pairs unaffected; defaults apply
-    only to NEW pairs. Pass any field to set; omit to leave unchanged. To clear,
+    explicitly pass on ``pair_create``. Creation defaults apply only to NEW
+    pairs; the triage/context settings below apply
+    immediately to ALL pairs. Pass any field to set; omit to leave unchanged. To clear,
     use ``pair_settings_reset`` or edit ``defaults.json`` by hand.
 
     Args:
@@ -4716,6 +4739,9 @@ def pair_settings_set(
             missing) | ``haiku`` | ``off`` — triage of self-woken interim turns.
         context_alert_headroom: tokens before the estimated auto-compaction point
             at which wait.py's context alert fires (default max(15% of window, 40k)).
+        context_advisory_at: Window fraction above which async acks/completion
+            notices suggest clearing or compacting before the next large task.
+            Default 0.40; 0 disables. Applies to ALL pairs; context_alert_at unchanged.
         verbose: If True, return full JSON + change messages.
     """
     # Build the kwargs dict with only the fields actually passed (None means
@@ -4744,6 +4770,8 @@ def pair_settings_set(
         fields["interim_triage"] = interim_triage
     if context_alert_headroom is not None:
         fields["context_alert_headroom"] = int(context_alert_headroom)
+    if context_advisory_at is not None:
+        fields["context_advisory_at"] = context_advisory_at
     if allowed_invocations is not None:
         # Don't path-normalize — these are fnmatch glob patterns over slash-command
         # names like "mcp__claude_ai_*", not filesystem paths. preserve_empty=True
@@ -4779,10 +4807,11 @@ def pair_settings_set(
     for msg in change_msgs:
         lines.append(f"  {msg}")
     lines.append("")
-    lines.append("Affects only NEW pairs. Existing pairs untouched (use pair_update for those).")
-    if interim_triage is not None or context_alert_headroom is not None:
-        lines.append("(interim_triage / context_alert_headroom apply to ALL pairs: read at each "
-                     "send and by every wait.py.)")
+    if fields.keys() - {"interim_triage", "context_alert_headroom", "context_advisory_at"}:
+        lines.append("Creation defaults affect only NEW pairs (use pair_update for existing pairs).")
+    if fields.keys() & {"interim_triage", "context_alert_headroom", "context_advisory_at"}:
+        lines.append("Triage/context settings apply to ALL pairs when next read; context_advisory_at "
+                     "does not change context_alert_at or standalone wait.py alerts.")
     return "\n".join(lines)
 
 

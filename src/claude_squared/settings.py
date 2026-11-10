@@ -101,6 +101,9 @@ class PairDefaults(BaseModel):
     # estimated auto-compaction point (window - 30k, measured on 1M Opus
     # windows). None = max(15% of the window, 40k).
     context_alert_headroom: int | None = None
+    # v0.23: advisory on send acks/completion notices for ALL pairs. None =
+    # 0.40 of the window; 0 disables. Does not change wait.py's alert threshold.
+    context_advisory_at: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
 
     @field_validator("interim_triage")
     @classmethod

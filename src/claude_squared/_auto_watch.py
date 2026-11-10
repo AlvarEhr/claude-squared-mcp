@@ -311,7 +311,7 @@ class _Lock:
             return self.file.read()
 
 
-def _wait(pairs, name, timeout, host=None, reader=None, *, alert_only=False):
+def _wait(pairs, name, timeout, host=None, reader=None):
     # Run in THIS process, not a child: a hook killed by its host must not
     # leave an orphan wait.py holding the dedupe lock for the next seven days.
     pairs = pairs.resolve()
@@ -325,8 +325,7 @@ def _wait(pairs, name, timeout, host=None, reader=None, *, alert_only=False):
         # same home's registry/activity, not a same-named default-home pair
         # (quench review, 2026-10-26).
         os.environ["CLAUDE_HOME"] = str(pairs.parent)
-        sys.argv = [str(script), name, "--timeout", str(max(0, timeout)),
-                    "--alert-only" if alert_only else "--ignore-alert"]
+        sys.argv = [str(script), name, "--timeout", str(max(0, timeout)), "--ignore-alert"]
         with redirect_stdout(output), redirect_stderr(output):
             watcher = runpy.run_path(str(script))
             if host:
@@ -483,7 +482,22 @@ def _recovery_wait(pairs, name, timeout, cancel, host=None, reader=None):
     return watcher["main"](argv[1:]), output.getvalue()
 
 
-def _notice(pairs, name, code, message, reader, *, alert_only=False):
+DEFAULT_CONTEXT_ADVISORY_AT = 0.40
+
+
+def context_advisory(used, window, threshold=None):
+    """Shared by the installed hook and send ack; independent of exit-8 alerts."""
+    if threshold is None:
+        threshold = DEFAULT_CONTEXT_ADVISORY_AT
+    if (isinstance(threshold, (int, float)) and 0 < threshold <= 1
+            and isinstance(used, (int, float)) and isinstance(window, (int, float))
+            and window > 0 and used / window > threshold):
+        return (f"ctx {used * 100 / window:.0f}% — consider pair_clear/pair_compact "
+                "before the next large task")
+    return ""
+
+
+def _notice(pairs, name, code, message, reader):
     """Keep the wake small; task files retain the complete reply and errors."""
     tasks = [_read(p) for p in (pairs / "async").glob("*.json")]
     task = max((t for t in tasks if isinstance(t, dict) and t.get("pair_name") == name),
@@ -504,22 +518,15 @@ def _notice(pairs, name, code, message, reader, *, alert_only=False):
     level = threshold(window, defaults.get("context_alert_headroom"), backend, limit,
                       entry.get("context_alert_at")) if threshold and window else None
     over = " over alert" if level and used is not None and used >= level else ""
-    if alert_only:
-        crossing = re.search(r"is at ([\d,]+) / ([\d,]+) tokens", message)
-        if crossing:
-            used, window = (int(v.replace(",", "")) for v in crossing.groups())
-            percent = f"{used * 100 / window:.0f}%"
-        point_fn = reader.get("compaction_point")
-        point = point_fn(window, backend, limit) if point_fn and window else None
-        distance = f", ~{max(0, point - used):,} tokens to auto-compact" if point and used is not None else ""
-        return (f"{name}: context {percent}{distance}; to compact cleanly: "
-                "pair_stop → pair_compact/pair_clear → re-send; otherwise it finishes and may auto-compact")
     outcomes = {0: "idle", 1: "failed", 2: "not-found", 3: "timeout", 4: "orphaned",
                 5: "stopped", 6: "crashed", 7: "detached", 8: "alert", 9: "background-lost", 10: "unknown"}
     reply = (task.get("error") if task.get("status") in ("failed", "stopped") else None)
     reply = reply or result.get("response") or ""
     preview = reply.splitlines()[0][:120] if reply else ""
     notice = f"{name}: {outcomes.get(code, 'error')} (wait.py exit {code}); task {tid}; ctx {percent}{over}"
+    advisory = context_advisory(used, window, defaults.get("context_advisory_at"))
+    if advisory:
+        notice += " — " + advisory.split(" — ", 1)[1]
     if preview:
         notice += f"\n{preview}"
     notice += f"\npair_poll('{tid}') for full reply."
@@ -529,8 +536,7 @@ def _notice(pairs, name, code, message, reader, *, alert_only=False):
     return notice
 
 
-def watch(payload, pairs, timeout=WAIT_TIMEOUT_SECONDS, *, recover=None, reader=None, cancel=None, output=None,
-          alert_only=False):
+def watch(payload, pairs, timeout=WAIT_TIMEOUT_SECONDS, *, recover=None, reader=None, cancel=None, output=None):
     deadline = time.monotonic() + timeout
     name = "(unresolved)"
     gate = owner = None
@@ -553,25 +559,10 @@ def watch(payload, pairs, timeout=WAIT_TIMEOUT_SECONDS, *, recover=None, reader=
         directory = pairs / "auto_watch"
         directory.mkdir(parents=True, exist_ok=True)
         key = _watch_key(session, name)
-        if alert_only:
-            # A receipt per send prevents a repeated PostToolUse from firing a
-            # second alert after the first watcher has already exited.
-            handles = [re.search(r"(?m)^Async task: ([0-9a-f-]+)\s*$", r)
-                       for r in _responses(payload.get("tool_response")) if isinstance(r, str)]
-            tid = next((m[1] for m in handles if m), None)
-            if tid is None:
-                tasks = [_read(p) for p in (pairs / "async").glob("*.json")]
-                task = max((t for t in tasks if isinstance(t, dict) and t.get("pair_name") == name),
-                           key=lambda t: t.get("started_at") or "", default={})
-                tid = task.get("task_id") or payload.get("tool_use_id") or "background"
-            key += ".alert"
-        fired = directory / (key + ".fired")
         gate = _Lock(directory / (key + ".gate"))
         owner = _Lock(directory / (key + ".lock"))
         if not gate.acquire(5):
             raise OSError("could not acquire watcher coordination lock")
-        if alert_only and _read(fired) == tid:
-            return 0
         if recover:
             # Recheck under the same gate used by PostToolUse. Another restart
             # or send may already have taken ownership since the initial scan.
@@ -601,7 +592,7 @@ def watch(payload, pairs, timeout=WAIT_TIMEOUT_SECONDS, *, recover=None, reader=
                 print(f"claude-squared auto-watch recovery: pair '{name}' is gone from the registry "
                       "(possibly forgotten while the session was down); clearing its stale watch record.", file=output)
                 return 2
-        published = None if alert_only else _publish_watch(pairs, key, session, name, payload, host)
+        published = _publish_watch(pairs, key, session, name, payload, host)
         if published:
             record, record_data = published
         elif recover:
@@ -609,8 +600,7 @@ def watch(payload, pairs, timeout=WAIT_TIMEOUT_SECONDS, *, recover=None, reader=
         gate.release()
         while True:
             code, message = (_recovery_wait(pairs, name, deadline - time.monotonic(), cancel, host, reader)
-                             if recover else _wait(pairs, name, deadline - time.monotonic(), host, reader,
-                                                   **({"alert_only": True} if alert_only else {})))
+                             if recover else _wait(pairs, name, deadline - time.monotonic(), host, reader))
             _host_check(host, reader)
             if not gate.acquire(5):
                 raise OSError("could not finish watcher coordination")
@@ -623,11 +613,7 @@ def watch(payload, pairs, timeout=WAIT_TIMEOUT_SECONDS, *, recover=None, reader=
                 revision = current
                 gate.release()
                 continue
-            if alert_only:
-                if code != 8:
-                    return 0
-                fired.write_text(json.dumps(tid), encoding="utf-8")
-            print(_notice(pairs, name, code, message, reader, alert_only=alert_only), file=output)
+            print(_notice(pairs, name, code, message, reader), file=output)
             finished = True
             return 2
     except _HostGone:
@@ -784,8 +770,6 @@ def main():
         return 0
     home = os.environ.get("CLAUDE_HOME")
     pairs = Path(home) / "pairs" if home else Path(__file__).resolve().parent
-    if sys.argv[1:] == ["--alert-only"]:
-        return watch(payload, pairs, alert_only=True)
     if sys.argv[1:] == ["--resume"] or (payload.get("hook_event_name") == "PostToolUse"
             and str(payload.get("tool_name", "")).endswith("__pair_poll")):
         return resume_watches(payload, pairs)

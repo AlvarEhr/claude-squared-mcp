@@ -586,9 +586,6 @@ def wait_pair(pair: str, each_turn: bool, timeout_s: float, poll_s: float, alert
         registry = _registry_read(pair)  # once per poll: the alert and the forgotten check
         alert.note_registry(*registry)
         hit = alert.check(view.get("context"), view.get("reported_window"))
-        if "--alert-only" in extra and (not any(view.get(k) for k in
-                ("turns", "running_tasks", "background", "wake_pending"))):
-            return 0
         if hit and "--ignore-alert" not in extra:
             print(_alert_message(pair, *hit, base, alert.backend, alert.auto_compact_token_limit))
             return 8
@@ -699,7 +696,7 @@ def main(argv: list[str]) -> int:
                 alert = Alert("pct", pct)
                 extra += [a, argv[i + 1]]
                 i += 2
-            elif a in ("--ignore-alert", "--alert-only"):
+            elif a == "--ignore-alert":
                 extra.append(a)
                 i += 1
             elif a == "--no-context-alert":

@@ -8,12 +8,13 @@ All notable changes to this project are documented here. Format follows
 
 ### Added
 
-- Independent one-shot context-alert hook (`auto_watch.py --alert-only`) for
-  Claude and Codex pairs. Updated opt-in settings snippet requires both hook
-  entries for the send's armed hint. User settings are never edited by the server.
+- Short context advisory on async acks and completion notices above 40% of the
+  window. `pair_settings_set(context_advisory_at=0.40)` configures the fraction;
+  `0` disables it. Existing per-pair `context_alert_at` is unchanged.
 - `pair_list(cwd=..., prefix=...)` filters; purposes limited to 80 characters
-  unless verbose. `pair_send_async(cwd=...)` applies cwd migration and queues
-  atomically, refusing busy pairs and pending background work.
+  unless verbose. `pair_send_async(cwd=..., extra_dirs=...)` applies update
+  semantics for either or both path arguments and queues atomically, refusing
+  busy pairs and pending background work.
 - `pair_poll(summary=True)` returns a marked `<summary>` block or the first
   20 lines, and saves the full UTF-8 reply under `pairs/reports/<pair>/<task>.md`.
 

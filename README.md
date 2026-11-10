@@ -180,7 +180,7 @@ Gates: a busy source is refused; a source with a Claude tool allow-list needs an
 
 ### Communication
 - `pair_send(name, message, timeout_seconds=45, hard_timeout_seconds?, override_model?, override_effort?, override_permission_mode?)` — sync, FIFO-queued
-- `pair_send_async(name, message, hard_timeout_seconds?, cwd?, ...)` — returns task_id, model and watch status immediately
+- `pair_send_async(name, message, hard_timeout_seconds?, cwd?, extra_dirs?, ...)` — returns task_id, model and watch status immediately
 - `pair_poll(task_id_or_name, with_turn_log?, wait_seconds?, summary?, verbose?)` — check async status; summary mode saves the full reply to a report file
 
 ### Inspection
@@ -348,7 +348,7 @@ here's the task_id" handle — work continues, no second turn is queued.
 
 **With the optional [auto-watch hook](#automatic-wake-up-opt-in-claude-code-hook),
 the manager needs no Bash watcher step.** When the response says
-"auto-watch completion + alert armed", finish independent work or end
+"auto-watch hook armed", finish independent work or end
 your turn. The hook wakes you with the watcher outcome; read the result with
 `pair_poll(name, with_turn_log=True)`. Without the hook, use the pattern below.
 
@@ -470,9 +470,18 @@ server process per pair/model.
 
 `pair_list(cwd="/repo", prefix="build-")` selects pairs at or below that path
 and matching that name prefix. Purposes are limited to 80 characters unless
-`verbose=True`. `pair_send_async(..., cwd="/repo/worktree")` applies the same
-cwd migration as `pair_update` and then enqueues the send under one lock. It
-refuses busy pairs or pending background work; it cannot be used with steer.
+`verbose=True`. `pair_send_async(..., cwd="/repo/worktree", extra_dirs=["/repo"])`
+applies `pair_update` semantics for either or both path arguments, then enqueues
+the send under one lock. `extra_dirs` replaces the existing list; `[]` clears it.
+It refuses busy pairs or pending background work, even for unchanged values;
+path arguments cannot be used with steer.
+Give read-only Claude reviewers the parent code folder in `extra_dirs` so they can read sibling worktrees.
+
+Async acks and completion notices add a short clearing/compaction advisory
+when reported context exceeds 40% of the window. Configure the fraction with
+`pair_settings_set(context_advisory_at=0.40)`; `0` disables it. This applies to
+all pairs when their next ack/notice is rendered. It is separate from the
+existing per-pair `context_alert_at`, which remains unchanged.
 
 For long replies, ask a pair to **end with a `<summary>…</summary>` block**.
 `pair_poll(name_or_task, summary=True)` returns that block (or the first 20
@@ -481,9 +490,6 @@ lines if absent), saves the full reply to
 byte size. Another pair or sub-agent with access can read the file. Reports
 remain until removed by the user; normal polling still returns the full reply.
 Summary mode takes precedence over verbose output and turn-log inclusion.
-The opt-in live check `python tests/smoke_live_auto_watch.py --live --alert`
-should produce `ARMED → ALERTED → WOKEN`, with no manual completion re-arm.
-It uses a private registry and explicit hook settings and spends Claude usage.
 
 ### Automatic wake-up (opt-in Claude Code hook)
 
@@ -498,8 +504,7 @@ To opt in:
 2. Merge [docs/auto-watch.settings.json](docs/auto-watch.settings.json) into
    your Claude Code user settings (`~/.claude/settings.json`, or the settings
    directory selected by `CLAUDE_CONFIG_DIR`). Add its `SessionStart` entry and
-   add both `PostToolUse` commands (completion and `--alert-only`), with the
-   matcher including `pair_poll`. Keep other
+   use its single `PostToolUse` command, with the matcher including `pair_poll`. Keep other
    hooks; replace an older auto-watch entry rather than duplicating it.
 3. Replace `/absolute/path/to/.claude/pairs/auto_watch.py` with the installed
    script's absolute path. Use a working Python interpreter (Python ≥ 3.7);
@@ -524,12 +529,6 @@ The snippet is:
           {
             "type": "command",
             "command": "python \"/absolute/path/to/.claude/pairs/auto_watch.py\"",
-            "asyncRewake": true,
-            "timeout": 604800
-          },
-          {
-            "type": "command",
-            "command": "python \"/absolute/path/to/.claude/pairs/auto_watch.py\" --alert-only",
             "asyncRewake": true,
             "timeout": 604800
           }
@@ -574,14 +573,11 @@ its threshold), and the first reply line, limited to 120 characters. Use its
 `--ignore-alert` and keeps following through context alerts. A timeout still
 needs a manual re-arm; work continues.
 
-The second PostToolUse entry, `auto_watch.py --alert-only`, watches independently
-and wakes once when context crosses the alert during work. It exits silently
-if the work ends first. Its notice shows context and estimated tokens to
-auto-compaction, with the choice: `pair_stop → pair_compact/pair_clear → re-send`
-to compact cleanly, or let the pair finish and possibly auto-compact. It never
-stops work itself. Both Claude and Codex expose mid-turn activity context;
-Codex's rollout token counts may lag a tool call. Standalone `wait.py` retains
-exit 8 on a crossing unless `--ignore-alert` (or `--no-context-alert`) is passed.
+The completion notice and async ack suggest `pair_clear`/`pair_compact` before
+the next large task when context exceeds `context_advisory_at` (default 0.40).
+This advisory does not interrupt the watch or the pair. Standalone `wait.py`
+retains exit 8 on a crossing unless `--ignore-alert` (or `--no-context-alert`)
+is passed.
 
 Pairs inherit user settings too: the hook is suppressed inside pair
 processes, with a registered-session check for older runtimes. Sessions
@@ -594,8 +590,7 @@ standalone wait.py re-arm commands carry that home into the manager's Bash too.
 
 The server's "armed" hint is **best-effort settings detection**, not a
 receipt from the host. It recognizes the documented interpreter/script
-commands for **both completion and alert hooks**, matcher, `asyncRewake: true`
-and timeout in user settings, provided
+command, matcher, `asyncRewake: true` and timeout in user settings, provided
 `disableAllHooks` is not set. Project/managed overrides, unsupported hosts,
 shell wrappers and custom MCP aliases are not detectable. In those cases
 use the manual watcher. This feature is for Claude Code managers; Codex and

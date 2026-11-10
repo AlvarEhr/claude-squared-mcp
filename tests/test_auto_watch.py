@@ -43,9 +43,8 @@ def event(tool="pair_send_async", response="Started async task.\nAsync task: abc
 
 def settings(script):
     return {"hooks": {"PostToolUse": [{"matcher": H.TOOL_PATTERN, "hooks": [{
-        "type": "command", "command": f'python "{script.as_posix()}"{flag}',
-        "asyncRewake": True, "timeout": H.HOOK_TIMEOUT_SECONDS}
-        for flag in ("", " --alert-only")]}]}}
+        "type": "command", "command": f'python "{script.as_posix()}"',
+        "asyncRewake": True, "timeout": H.HOOK_TIMEOUT_SECONDS}]}]}}
 
 
 class HookTests(unittest.TestCase):
@@ -389,8 +388,8 @@ class HookTests(unittest.TestCase):
                 self.assertNotIn("Bash(", hint)
             r = SendResult(name="scout", response="reply", session_id="sid", model_used="haiku",
                            duration_ms=1, background_launches=["Bash"])
-            self.assertIn("auto-watch completion + alert armed", S._fmt_send_result(r, tool="pair_send"))
-            self.assertNotIn("auto-watch completion + alert armed", S._fmt_send_result(r))
+            self.assertIn("auto-watch hook armed", S._fmt_send_result(r, tool="pair_send"))
+            self.assertNotIn("auto-watch hook armed", S._fmt_send_result(r))
             for key, value in (("asyncRewake", False), ("timeout", 60), ("command", "python other.py")):
                 invalid = settings(self.script)
                 invalid["hooks"]["PostToolUse"][0]["hooks"][0][key] = value
