@@ -72,8 +72,8 @@ class Server:
                 return response["result"]
         raise AssertionError("MCP request timed out")
 
-    def tool(self, name, **arguments):
-        response = self.request("tools/call", {"name": name, "arguments": arguments})
+    def tool(self, tool_name, **arguments):
+        response = self.request("tools/call", {"name": tool_name, "arguments": arguments})
         if response.get("isError"):
             raise AssertionError(response)
         text = "\n".join(b.get("text", "") for b in response.get("content", []) if b.get("type") == "text")
@@ -124,7 +124,7 @@ def main():
     receipt = None
     canary = "HOST_SHUTDOWN_DONE_" + uuid.uuid4().hex[:8]
     marker = scratch / "tool-started"
-    code = f"from pathlib import Path; import time; Path({str(marker)!r}).write_text('started'); time.sleep(20); print({canary!r})"
+    code = f"from pathlib import Path; import time; Path({marker.as_posix()!r}).write_text('started'); time.sleep(20); print({canary!r})"
     command = shlex.quote(Path(sys.executable).as_posix()) + " -c " + shlex.quote(code)
     try:
         first = Server(scratch, "server-1", env)
