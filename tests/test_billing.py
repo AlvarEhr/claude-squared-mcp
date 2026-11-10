@@ -91,6 +91,7 @@ class BillingCase(unittest.TestCase):
         self.stack.enter_context(patch.object(CL, "_cli_permission_choices", return_value=("manual", "auto")))
         self.stack.enter_context(patch.object(N, "inventory", return_value=[]))
         self.stack.enter_context(patch.object(RT, "_SHUTTING_DOWN", threading.Event()))
+        self.stack.enter_context(patch.object(RT, "_FAST_CLAUDE_SHUTDOWN", threading.Event()))
         self.runtime = SimpleNamespace(get_or_none=Mock(return_value=None), evict=Mock(return_value=[]))
         self.stack.enter_context(patch.object(S.runtime_mod, "registry", return_value=self.runtime))
 
@@ -783,9 +784,8 @@ class ShutdownTests(BillingCase):
         self.popen.assert_not_called()
 
     def test_a_send_queued_behind_a_self_woken_turn_is_not_delivered(self):
-        # The incident: the exit handler stops the runtime, which ends the
-        # self-woken turn and releases the queued send. It must not spawn a
-        # new runtime; it fails as NOT DELIVERED (never "may have completed").
+        # The exit handler preserves the self-woken runtime. Its queued send
+        # still observes shutdown and fails as NOT DELIVERED without spawning.
         spec = self.add("pair")
         adapter = CL.ClaudeAdapter()
         rt = PairRuntime(spec, adapter)
@@ -823,7 +823,7 @@ class ShutdownTests(BillingCase):
         self.assertEqual(done.error, NOT_DELIVERED_MESSAGE)
         self.assertTrue(done.queued)
         self.popen.assert_not_called()
-        self.assertEqual(AT.load_task(implicit.task_id).status, "stopped")
+        self.assertEqual(AT.load_task(implicit.task_id).status, "running")
 
     def test_a_live_runtime_releasing_a_queued_send_writes_nothing(self):
         # Review round 1: the process can still be alive when the wait ends

@@ -31,6 +31,7 @@ from claude_squared import task_retention
 from claude_squared import codex_models
 from claude_squared import connectors
 from claude_squared import completion
+from claude_squared import claude_handoff
 from claude_squared import registry as reg_mod
 from claude_squared import transcript as transcript_mod
 from claude_squared import runtime as runtime_mod
@@ -849,8 +850,10 @@ class _PairLock:
     we want, not a failure mode.
     """
 
-    def __init__(self, name: str, timeout_s: float = 60.0):
+    def __init__(self, name: str, timeout_s: float = 60.0, *, handoff_wait: bool = False,
+                 should_stop=None):
         self.name = name
+        self.handoff_wait, self.should_stop = handoff_wait, should_stop
         self.timeout_s = timeout_s
         self._file_lock = FileLock(str(_pair_lock_path(name)), timeout=timeout_s)
         with _locks_guard:
@@ -863,6 +866,7 @@ class _PairLock:
             self._thread_lock.acquire()
             acquired = True
             reg_mod.assert_writable()
+            claude_handoff.guard(self.name, pair_locked=True, wait=self.handoff_wait, should_stop=self.should_stop)
         except BaseException:
             if acquired:
                 self._thread_lock.release()
@@ -878,7 +882,8 @@ class _PairLock:
             self._file_lock.__exit__(exc_type, exc_val, exc_tb)
 
 
-def _with_pair_lock(name: str, timeout_s: float = 60.0) -> _PairLock:
+def _with_pair_lock(name: str, timeout_s: float = 60.0, *, handoff_wait: bool = False,
+                    should_stop=None) -> _PairLock:
     """Construct a pair-level lock context manager. Translate filelock Timeout to
     PairError at the tool boundary by catching ``FileLockTimeout``.
 
@@ -889,7 +894,7 @@ def _with_pair_lock(name: str, timeout_s: float = 60.0) -> _PairLock:
         except FileLockTimeout as e:
             raise PairError(f"Pair '{name}' is busy (held by another process > {e.lock_file.timeout}s)")
     """
-    return _PairLock(name, timeout_s=timeout_s)
+    return _PairLock(name, timeout_s=timeout_s, handoff_wait=handoff_wait, should_stop=should_stop)
 
 
 # Legacy alias kept for any internal helpers that grabbed the in-process lock
@@ -1941,6 +1946,11 @@ def _activity_status_lines(name: str) -> list[str]:
     except Exception:
         return []
     out: list[str] = []
+    receipt = view.get("claude_handoff") or {}
+    if receipt.get("invalid"):
+        out.append(f"  handoff identity unconfirmed; inspect receipt {receipt['path']}")
+    elif receipt.get("detached"):
+        out.append(f"  finishing after a host restart; receipt {receipt['path']}")
     ctx = view.get("context") or {}
     used = ctx.get("used")
     if used:
@@ -2039,7 +2049,8 @@ def _build_send_runner(
         # `stop <pair>` marker interrupts this turn and reports it as stopped.
         # task_id is always passed by async_tasks._go; default None keeps the
         # runner callable directly in any edge path (then no stop polling).
-        with _with_pair_lock(name, timeout_s=lock_acquire_timeout_s):
+        with _with_pair_lock(name, timeout_s=lock_acquire_timeout_s, handoff_wait=True,
+                             should_stop=_make_stop_checker(name, task_id) if task_id else None):
             async_tasks.raise_if_stopped(task_id)
             # v0.18.0 (fix A): a send that reaches its turn while the server
             # exits fails as NOT DELIVERED instead of spawning a backend.
@@ -2056,6 +2067,13 @@ def _build_send_runner(
             # that process is mid-writing. Its on-disk task is the signal.
             wait_notes: list[str] = []
             _wait_for_foreign_self_woken(name, hard_timeout_seconds, should_stop, wait_notes)
+            if current.backend == "claude":
+                # The foreign owner may have exited while the wait above was
+                # following its implicit turn. Recheck before any adapter spawn.
+                receipt = claude_handoff.view(name)
+                if receipt and receipt.get("detached"):
+                    wait_notes.append(claude_handoff.FINISHING + " (waited before delivery)")
+                claude_handoff.guard(name, pair_locked=True, wait=True, should_stop=should_stop)
             adapter = _adapter_for(current)
             # Claude promotes immediately before opening its solicited scope,
             # after any local self-woken turn. Other adapters start here.
@@ -2340,6 +2358,9 @@ def _format_async_handle(task_id: str, why: str, pair_name: str | None = None,
     # rare case an agent needs to target an older task explicitly.
     # Steering names that exact task: a later FIFO waiter may already be the
     # latest. The watcher still follows the pair through all queued work.
+    receipt = claude_handoff.view(pair_name) if pair_name else None
+    if receipt and receipt.get("detached") and receipt.get("alive"):
+        why = (why + "; " if why else "") + claude_handoff.FINISHING
     if model_hint is not None:
         if notification and notification.startswith("Codex completion notification armed"):
             notification = notification.split(";", 1)[0]
@@ -5884,6 +5905,11 @@ def pair_status(name: str, last_n_log: int = 5, verbose: bool = False) -> str:
     if spec.backend == "codex":
         return _codex_status(spec, last_n_log=last_n_log, verbose=verbose)
 
+    receipt = claude_handoff.view(name)
+    if receipt and receipt.get("detached") and not receipt.get("alive"):
+        claude_handoff.reconcile(name)
+        receipt = claude_handoff.view(name)
+
     runtime_alive = runtime_obj is not None and runtime_obj.is_alive()
     started_at = runtime_obj.started_at if runtime_obj else None
     last_activity = runtime_obj._last_log_activity_at if runtime_obj else None  # noqa: SLF001
@@ -5980,7 +6006,11 @@ def pair_status(name: str, last_n_log: int = 5, verbose: bool = False) -> str:
     # Heuristic. The active/slow/likely-hung gradient only makes sense when
     # there's actually in-flight work to monitor; otherwise an alive runtime
     # with no tasks is just idle (and that's fine).
-    if local_corpse_exit is not None:
+    if receipt and receipt.get("invalid"):
+        heuristic = f"handoff identity unconfirmed; inspect receipt {receipt['path']}"
+    elif receipt and receipt.get("detached"):
+        heuristic = f"finishing after a host restart; receipt {receipt['path']}"
+    elif local_corpse_exit is not None:
         # v0.9.8 Bug 3 fix: local corpse — our runtime object is still in the
         # registry but its subprocess has terminated. Report this directly
         # with the captured exit code instead of "runtime cold + mystery
@@ -6370,7 +6400,9 @@ def run() -> None:
     except Exception as exc:
         task_retention.logger.warning("Could not start async task retention (%s)", type(exc).__name__)
     completion.start()
+    restore_stdin = runtime_mod.install_stdin_eof_exit()
     try:
         mcp.run()
     finally:
+        restore_stdin()
         completion.shutdown()

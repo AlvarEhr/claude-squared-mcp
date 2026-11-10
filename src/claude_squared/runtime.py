@@ -21,6 +21,7 @@ spawning a thread per Agent invocation.
 from __future__ import annotations
 
 import atexit
+import io
 import json
 import os
 import queue
@@ -39,6 +40,7 @@ from claude_squared.cli_paths import encode_cwd_for_project as _encode_cwd_for_p
 from claude_squared.errors import CLIError, CommandTimeout, ServerShuttingDown, TaskStopped
 from claude_squared import activity as _activity
 from claude_squared import async_tasks as _async_tasks
+from claude_squared import claude_handoff, process_identity
 from claude_squared.models import SPAWN_PINNED_FIELDS, AsyncTaskState, PairSpec
 from claude_squared.registry import claude_home, logs_dir
 from claude_squared.process_spawn import hidden_process_kwargs
@@ -422,6 +424,7 @@ class TurnLogScope:
 
     def __init__(self, main_log_path: Path, start_line: int):
         self.main_log_path = main_log_path
+        self.started_at = datetime.utcnow()
         self.start_line = start_line
         self.end_line = start_line
         self.subagent_logs: list[str] = []  # paths to sub-agent log files this turn produced
@@ -457,6 +460,10 @@ class PairRuntime:
         self.spec = spec
         self.adapter = adapter
         self.proc: subprocess.Popen | None = None
+        self._process_started_at: float | None = None
+        self._handoff_record: dict | None = None
+        self._handed_off = False
+        self._server_started_at = process_identity.started_at(os.getpid())
         # v0.18.0: hash of the API key this process was spawned with (None on
         # the plan) — get_or_start respawns when the key file changes.
         self.key_fingerprint: str | None = None
@@ -679,6 +686,17 @@ class PairRuntime:
         return True
 
     def _turn_opened(self, task_id: str | None, kind: str) -> None:
+        if self.proc is not None and self._process_started_at is not None:
+            record = {"version": 1, "pair": self.spec.name, "runtime_pid": self.proc.pid,
+                      "runtime_started_at": self._process_started_at, "server_pid": os.getpid(),
+                      "server_started_at": self._server_started_at,
+                      "session_id": self.spec.session_id, "cwd": self.spec.cwd or str(Path.cwd()),
+                      "model": self.spec.model, "task_id": task_id,
+                      "turn_started_at": datetime.utcnow().isoformat(), "kind": kind}
+            self._handoff_record = record
+            receipt = claude_handoff.publish(record)
+            _async_tasks.note_claude_handoff(task_id, str(receipt))
+            self._activity.note_handoff(str(receipt))
         self._activity.turn_opened(task_id, kind, gen=self._gen)
 
     def _turn_closed(self, task_id: str | None, **kwargs: Any) -> dict | None:
@@ -758,6 +776,7 @@ class PairRuntime:
         # v0.18.0 (fix A): the exit handler has begun — a runtime spawned now
         # would die with this process before its message is delivered.
         refuse_if_shutting_down()
+        claude_handoff.guard(self.spec.name)
         # Built first: an API pair with no usable key refuses here, before
         # anything is spawned (never a silent fall back to the plan).
         env = self.adapter._spawn_env(self.spec)  # noqa: SLF001
@@ -796,6 +815,14 @@ class PairRuntime:
             popen_kwargs["start_new_session"] = True
         popen_kwargs["env"] = env
         self.proc = subprocess.Popen(args, **hidden_process_kwargs(popen_kwargs))
+        pid = getattr(self.proc, "pid", None)
+        self._process_started_at = process_identity.started_at(pid) if isinstance(pid, int) and pid > 0 else None
+        if isinstance(pid, int) and pid > 0 and self._process_started_at is None:
+            proc, self.proc = self.proc, None
+            if proc.stdin is not None:
+                proc.stdin.close()
+            raise CLIError("Could not record Claude runtime creation time; no message was delivered.")
+        self._handed_off = False
         self.key_fingerprint = _api_key_fingerprint(env.get("ANTHROPIC_API_KEY")) \
             if self.spec.billing == "api" else None
         self._cost_seen = 0.0
@@ -818,6 +845,8 @@ class PairRuntime:
         gen = self._reader_gen if gen is None else gen
         assert proc is not None and proc.stdout is not None
         for raw in iter(proc.stdout.readline, b""):
+            if self._handed_off:
+                continue  # drain only; the successor owns outcome publication now
             if self._reader_gen != gen:
                 continue  # retired by stop(): drain, act on nothing
             try:
@@ -859,6 +888,8 @@ class PairRuntime:
         runtime is never idle-evicted, and its background read "busy"
         forever (anvil review, 2026-09-25). After stop() this finds nothing
         left: stop() records its own, more specific losses before the kill."""
+        if self._handed_off:
+            return  # the successor owns this turn's outcome and background losses
         code: Any = None
         try:
             code = proc.wait(timeout=2)
@@ -1899,6 +1930,7 @@ class PairRuntime:
         end = (t0 + timeout_seconds) if timeout_seconds is not None else None
         last_stop_check = 0.0
         while True:
+            refuse_if_shutting_down()
             with self._scope_lock:
                 open_now = self._implicit_scope is not None or self._wake_live_locked()
             if not open_now:
@@ -1946,7 +1978,7 @@ class PairRuntime:
             # scope across task-file I/O. ``mark_task_executing`` takes the
             # cross-process control lock itself (stop-vs-promotion), so the
             # order is promote -> control -> scope on this thread; the reader
-            # takes promote -> scope and never the control lock.
+            # takes the control lock for handoff metadata only outside scope.
             with self._promote_lock:
                 with self._scope_lock:
                     if self._implicit_scope is not None or self._wake_live_locked():
@@ -2364,6 +2396,7 @@ class RuntimeRegistry:
 
     def get_or_start(self, spec: PairSpec, adapter: "ClaudeAdapter") -> PairRuntime:
         refuse_if_shutting_down()
+        claude_handoff.guard(spec.name)
         # v0.18.0: an API pair's key is re-read at every send: a rotated or
         # removed key file respawns the runtime, and the respawn reads the
         # file again (a missing key then refuses the send). Not while work is
@@ -2435,7 +2468,62 @@ class RuntimeRegistry:
         self._stop(expected, reason)
         return True
 
-    def stop_all(self, reason: str | None = None) -> None:
+    def stop_all(self, reason: str | None = None, *, graceful: bool = False) -> bool:
+        if graceful:
+            # GIL snapshot; never wait for a map lock held by runtime construction.
+            # Normal receipts precede delivery; the exit refresh shares one
+            # bounded budget and never waits for registry/activity bookkeeping.
+            runtimes = list(self._runtimes.values())
+            self._stop_evictor.set()
+            publishers = []
+            deadline = time.monotonic() + .1
+            for rt in runtimes:
+                rt._handed_off = True
+                proc = rt.proc
+                scope = rt._current_scope
+                if scope is None or scope.result_snapshot is not None:
+                    scope = rt._implicit_scope
+                if proc is not None and scope is not None:
+                    task_id = scope.task_id
+                    if scope is rt._implicit_scope and rt._implicit_task is not None:
+                        task_id = rt._implicit_task.task_id
+                    record = rt._handoff_record
+                    if record is None or record.get("task_id") != task_id:
+                        record = {"version": 1, "pair": rt.spec.name, "runtime_pid": proc.pid,
+                                  "runtime_started_at": rt._process_started_at,
+                                  "server_pid": os.getpid(), "server_started_at": rt._server_started_at,
+                                  "session_id": rt.spec.session_id, "cwd": rt.spec.cwd or str(Path.cwd()),
+                                  "model": rt.spec.model, "task_id": task_id,
+                                  "turn_started_at": scope.started_at.isoformat()}
+                    if record.get("runtime_started_at") is not None and time.monotonic() < deadline:
+                        record = {**record, "owner_exiting": True}
+                        def publish(record=record, publisher=claude_handoff.publish):
+                            try:
+                                publisher(record)
+                            except Exception:
+                                pass  # the pre-delivery receipt remains usable
+                        worker = threading.Thread(target=publish, daemon=True, name="claude-handoff-exit")
+                        try:
+                            worker.start()
+                        except RuntimeError:
+                            # Python 3.12+ forbids starting threads in atexit.
+                            # The pre-delivery receipt still protects this turn.
+                            pass
+                        else:
+                            publishers.append(worker)
+            # Parallel filesystem writes get one shared budget, not N budgets.
+            # Normal turns already have a durable receipt; this also covers the
+            # narrow self-wake/registration window without delaying host exit.
+            for worker in publishers:
+                worker.join(timeout=max(0, deadline - time.monotonic()))
+            for rt in runtimes:
+                proc = rt.proc
+                if proc is not None and proc.stdin is not None:
+                    try:
+                        proc.stdin.close()  # unbuffered FileIO; no wait/tree kill
+                    except (OSError, ValueError):
+                        pass
+            return bool(runtimes)
         with self._lock:
             runtimes = list(self._runtimes.values())
             self._runtimes.clear()
@@ -2445,6 +2533,7 @@ class RuntimeRegistry:
             except Exception:
                 pass
         self._stop_evictor.set()
+        return False
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -2561,6 +2650,7 @@ _REGISTRY: RuntimeRegistry | None = None
 # message was written) and the successor reaped the task as ORPHANED "may have
 # completed". Now every spawn refuses and the send fails as NOT DELIVERED.
 _SHUTTING_DOWN = threading.Event()
+_FAST_CLAUDE_SHUTDOWN = threading.Event()
 
 
 def shutting_down() -> bool:
@@ -2574,13 +2664,80 @@ def refuse_if_shutting_down() -> None:
 
 
 def _shutdown_runtimes() -> None:
-    """atexit: tree-kill every runtime (M2, 2026-09-25: closing only stdin
-    doesn't let background work finish — the CLI kills it ~5 s after EOF),
-    recording what dies, then close this process's activity files."""
+    """2026-11-10 probes: a busy runtime finishes after parent death, but the
+    host kills the whole tree if this server lingers 300 ms after stdin EOF.
+    Durable receipts precede delivery; leave slow reconciliation to successors.
+    """
     _SHUTTING_DOWN.set()
     if _REGISTRY is not None:
-        _REGISTRY.stop_all("the owning MCP process exited")
+        if _REGISTRY.stop_all("the owning MCP process exited", graceful=True):
+            _FAST_CLAUDE_SHUTDOWN.set()
+            return
     _activity.shutdown()
+
+
+class _EofInput(io.RawIOBase):
+    def __init__(self, raw):
+        self.raw = raw
+
+    def readable(self):
+        return True
+
+    def fileno(self):
+        return self.raw.fileno()
+
+    def readinto(self, buffer):
+        count = self.raw.readinto(buffer)
+        if count == 0 and len(buffer):
+            _shutdown_runtimes()
+            if _FAST_CLAUDE_SHUTDOWN.is_set():
+                # Async tool/executor teardown and other atexit hooks may wait
+                # for the very turn we are handing off. No model work is killed.
+                os._exit(0)
+        return count
+
+    def close(self):
+        self.raw.close()
+        super().close()
+
+
+def install_stdin_eof_exit():
+    """Own a duplicate of stdin before FastMCP wraps it (works with SDK 1/2).
+    The SDK sees a non-standard fd and cannot bypass our EOF reader by duping 0.
+    """
+    original = sys.stdin
+    raw = os.fdopen(os.dup(original.fileno()), "rb", buffering=0)
+    # SDK 2 normally diverts fd 0 itself. Our private stream bypasses that
+    # claim, so retain its protection: unrelated child commands inherit EOF,
+    # never the manager's JSON-RPC pipe.
+    null = os.open(os.devnull, os.O_RDONLY)
+    try:
+        os.dup2(null, original.fileno())
+    finally:
+        os.close(null)
+    def rebind():
+        if os.name == "nt":
+            import ctypes
+            import msvcrt
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.SetStdHandle.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+            kernel.SetStdHandle(-10 & 0xffffffff, msvcrt.get_osfhandle(original.fileno()))
+    rebind()
+    wrapped = io.TextIOWrapper(io.BufferedReader(_EofInput(raw)), encoding="utf-8")
+    sys.stdin = wrapped
+    def restore():
+        # SDK 1's temporary TextIOWrapper can close our buffer during teardown.
+        # EOF has already arrived; restoring a closed descriptor must not turn
+        # an otherwise clean server exit into an exception.
+        if not raw.closed:
+            os.dup2(raw.fileno(), original.fileno())
+            rebind()
+        sys.stdin = original
+        try:
+            wrapped.close()
+        except (OSError, ValueError):
+            pass
+    return restore
 
 
 _EXIT_HOOK_LOCK = threading.Lock()
@@ -2588,15 +2745,8 @@ _EXIT_HOOKED = [False]
 
 
 def install_exit_handler() -> None:
-    """Register THE process exit handler once: stop the runtimes (each
-    records the background it kills, with its own reason, on the next send's
-    footer and in main.log), THEN close the activity files. Every path that
-    needs exit cleanup — the server, the first runtime, a CLI process that
-    recovers a Codex turn — installs this same handler. A separately
-    registered activity.shutdown ran first whenever it was registered later
-    (atexit is LIFO): it moved every runtime's background to lost with a
-    generic reason and the runtimes' own records came up empty (critic,
-    2026-09-25)."""
+    """Register THE owner-exit handler. Explicit stops/evictions remain hard
+    stops; graceful Claude handoff defers bookkeeping to the successor."""
     with _EXIT_HOOK_LOCK:
         if not _EXIT_HOOKED[0]:
             _EXIT_HOOKED[0] = True

@@ -1346,19 +1346,19 @@ class RoundFourFixTests(ReviewHelpers):
             spec = PairSpec(name=self.pair + "-cx", session_id="thread-x", cwd=str(self.home))
             C._new_codex_activity(spec, None).close()  # a Codex turn (or a CLI recovery)
         self.assertEqual(calls, [RT._shutdown_runtimes])
-        # And that handler: the runtime's own loss record comes first.
+        # Graceful Claude shutdown now leaves loss bookkeeping to a successor.
         rt = self.live_runtime()
         self.feed(rt, task_started("bgX"))
         reg = RT.RuntimeRegistry()
         reg._runtimes[self.pair] = rt
         # v0.18.0: the handler sets the process-wide shutting-down flag; keep
         # it out of the later tests in this process.
-        with patch.object(RT, "_REGISTRY", reg), patch.object(RT, "_SHUTTING_DOWN", threading.Event()):
+        with patch.object(RT, "_REGISTRY", reg), patch.object(RT, "_SHUTTING_DOWN", threading.Event()), \
+                patch.object(RT, "_FAST_CLAUDE_SHUTDOWN", threading.Event()):
             RT._shutdown_runtimes()
-        rec = R.get_pair(self.pair).self_woken_pending[-1]
-        self.assertEqual(rec["status"], "background_lost")
-        self.assertIn("the owning MCP process exited", rec["note"])
-        self.assertIn("BACKGROUND LOST", self.main_log(rt))
+        self.assertEqual(R.get_pair(self.pair).self_woken_pending, [])
+        self.assertTrue(rt._handed_off)
+        self.assertNotIn("BACKGROUND LOST", self.main_log(rt))
 
     # -- 2a: only a completion or a failure announces a wake --
 

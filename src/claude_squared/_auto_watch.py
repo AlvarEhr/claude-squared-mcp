@@ -524,6 +524,8 @@ def _notice(pairs, name, code, message, reader):
     reply = reply or result.get("response") or ""
     preview = reply.splitlines()[0][:120] if reply else ""
     notice = f"{name}: {outcomes.get(code, 'error')} (wait.py exit {code}); task {tid}; ctx {percent}{over}"
+    if (view.get("claude_handoff") or {}).get("detached"):
+        notice += "; finishing after a host restart"
     advisory = context_advisory(used, window, defaults.get("context_advisory_at"))
     if advisory:
         notice += " — " + advisory.split(" — ", 1)[1]

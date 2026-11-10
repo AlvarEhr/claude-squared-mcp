@@ -99,6 +99,10 @@ def main() -> int:
         "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
         "-p", "test_context_cost.py", "-v",
     ]))
+    commands.append(("host_shutdown", [
+        "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
+        "-p", "test_host_shutdown.py", "-v",
+    ]))
     commands.append(("pairs_pane", [
         "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
         "-p", "test_pairs_pane.py", "-v",

@@ -259,6 +259,20 @@ def _task_path(task_id: str) -> Path:
     return async_dir() / f"{task_id}.json"
 
 
+def note_claude_handoff(task_id: str | None, receipt: str) -> None:
+    if not task_id:
+        return
+    with _states_guard:
+        state = _local_states.get(task_id)
+    state = state or load_task(task_id)
+    if state is None or state.status != "running":
+        return
+    with control_lock(state.pair_name):
+        state.claude_handoff_path = receipt
+        state.owner_note = "On host exit, the runtime finishes its turn; receipt: " + receipt
+        _save(state)
+
+
 def _save(state: AsyncTaskState) -> None:
     p = _task_path(state.task_id)
     tmp = p.with_name(f".{p.name}.{uuid.uuid4().hex}.tmp")
@@ -320,6 +334,13 @@ def reap_orphan(task_id: str, *, pair_locked: bool = False,
         return state
     if not state.owner_pid and not legacy:
         return state
+    from claude_squared import claude_handoff
+    receipt = claude_handoff.view(state.pair_name)
+    from claude_squared.activity import claude_handoff_matches
+    if claude_handoff_matches(receipt, state.model_dump(mode="json")):
+        if receipt.get("alive"):
+            return state
+        return claude_handoff.reconcile(state.pair_name, pair_locked=pair_locked) or state
     if state.events_path and not pair_locked:
         path = registry.pairs_dir() / "locks" / f"{state.pair_name}.lock"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -513,6 +534,15 @@ def _finish_task(state: AsyncTaskState, event: threading.Event) -> None:
             _unsaved_results[state.task_id] = state.model_copy(deep=True)
         logger.warning("Task %s completed but state persistence failed: %s", state.task_id, exc)
         _retry_persist_in_background(state.task_id)
+    else:
+        runtime = sys.modules.get("claude_squared.runtime")
+        exiting = runtime is not None and runtime.shutting_down()
+        if state.claude_handoff_path and state.recovered_at is None and not exiting:
+            from claude_squared import claude_handoff
+            try:
+                claude_handoff.discard(state.pair_name, state.task_id)
+            except OSError:
+                pass
     finally:
         try:
             if state.events_path and (state.recovered_at or not owner_alive(state)):
@@ -867,6 +897,12 @@ def _cleanup_orphaned_running_tasks() -> None:
     subprocess may have orphaned but completed its work (visible in the
     session JSONL); the next ``pair_send`` will ``--resume`` from there.
     """
+    # Claude's EOF path must exit before the host's 300 ms tree-kill deadline.
+    # The successor handles queued tasks and dead-owner activity; no directory
+    # scan or terminal-state rewrite belongs on this fast exit path.
+    runtime = sys.modules.get("claude_squared.runtime")
+    if runtime is not None and runtime._FAST_CLAUDE_SHUTDOWN.is_set():
+        return
     _sweep_running_tasks(
         predicate=lambda data: data.get("owner_pid") == os.getpid(),
         message=(
@@ -901,6 +937,12 @@ def _sweep_dead_predecessor_orphans() -> None:
             return True  # malformed PID; treat as orphan
 
     _sweep_running_tasks(predicate=_predicate, message=_ORPHAN_MESSAGE)
+    from claude_squared import claude_handoff
+    for path in (async_dir().parent / "handoff").glob("*.json"):
+        try:
+            claude_handoff.reconcile(path.stem)
+        except (OSError, ValueError):
+            pass  # retain a receipt when recovery cannot read/publish its evidence
 
 
 def _sweep_running_tasks(predicate: Callable[[dict], bool], message: str) -> None:
@@ -922,6 +964,13 @@ def _sweep_running_tasks(predicate: Callable[[dict], bool], message: str) -> Non
                 if data.get("status") != "running":
                     continue
                 if not predicate(data):
+                    continue
+                from claude_squared import claude_handoff
+                receipt = claude_handoff.view(data.get("pair_name", ""))
+                from claude_squared.activity import claude_handoff_matches
+                if claude_handoff_matches(receipt, data):
+                    if message == _ORPHAN_MESSAGE:
+                        reap_orphan(data["task_id"], legacy=True)
                     continue
                 # A file-backed exec is deliberately allowed to outlive this
                 # process. Startup/observation performs recovery after death.

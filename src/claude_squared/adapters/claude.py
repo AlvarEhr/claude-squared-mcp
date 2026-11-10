@@ -1120,6 +1120,8 @@ class ClaudeAdapter(PairAdapter):
     def _run_print(self, args: list[str], *, timeout_seconds: int, pair_name: str,
                    cwd: str | None = None, connector_spec: PairSpec | None = None,
                    env_spec: PairSpec | None = None, env: dict[str, str] | None = None) -> dict:
+        from claude_squared.claude_handoff import guard
+        guard(pair_name)
         cli = _claude_executable()
         if env is None:
             env = self._spawn_env(env_spec)
@@ -1175,6 +1177,8 @@ class ClaudeAdapter(PairAdapter):
     def _run_stream_json(self, spec: PairSpec, messages: list[str], *,
                          timeout_seconds: int) -> list[dict]:
         """Run a stream-json subprocess that pushes the given user messages in order."""
+        from claude_squared.claude_handoff import guard
+        guard(spec.name)
         cli = _claude_executable()
         args = [cli, "--print", "--verbose",
                 "--resume", spec.session_id,

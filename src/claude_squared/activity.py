@@ -87,6 +87,7 @@ from claude_squared.registry import claude_home, pairs_dir
 # (stdlib only, Python >= 3.7, no names from outside this block). Helpers are
 # prefixed _av_ so they cannot clash with wait.py's own functions.
 import json
+import math
 import os
 import sys
 import time
@@ -280,6 +281,7 @@ def _av_task_summary(data):
         "child_pid": data.get("child_pid"),
         "child_started_at": data.get("child_started_at"),
         "events_path": data.get("events_path"),
+        "claude_handoff_path": data.get("claude_handoff_path"),
         "queued": bool(data.get("queued")),
         "started_at": data.get("started_at"),
         "finished_at": data.get("finished_at"),
@@ -341,6 +343,60 @@ def _av_beacon_ok(pairs_dir, pid):
     if not isinstance(data, dict):
         return False
     return _av_owner_alive(pid, data.get("owner_started_at"))
+
+
+def claude_handoff_view(pairs_dir, pair):
+    """Stdlib receipt view, also embedded in wait.py. Unknown identity blocks
+    a replacement just like a live child; only proven death/reuse releases it."""
+    if not isinstance(pair, str) or pair in ("", ".", "..") or any(c in pair for c in ("/", chr(92), ":", chr(0))):
+        return None
+    path = Path(pairs_dir) / "handoff" / (pair + ".json")
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return {"path": str(path), "invalid": True, "alive": True}
+    data, err = _av_read_json(path, attempts=1)
+    if err == "missing":
+        return None
+    if not isinstance(data, dict) or data.get("version") != 1:
+        return {"path": str(path), "invalid": True, "alive": True}
+    pid, expected = data.get("runtime_pid"), data.get("runtime_started_at")
+    def component(value):
+        return (isinstance(value, str) and value not in ("", ".", "..")
+                and not any(c in value for c in ("/", chr(92), ":", chr(0))))
+    if (data.get("pair") != pair or not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+            or not isinstance(expected, (float, int)) or isinstance(expected, bool)
+            or not math.isfinite(expected) or expected <= 0
+            or not component(data.get("session_id"))
+            or (data.get("task_id") is not None and not component(data.get("task_id")))
+            or not isinstance(data.get("cwd"), str) or not data["cwd"]
+            or not isinstance(data.get("server_pid"), int) or data["server_pid"] <= 0):
+        return {"path": str(path), "invalid": True, "alive": True}
+    alive, born = _av_proc(pid)
+    matches = born is None or abs(born - expected) < .001
+    server_alive, server_born = _av_proc(data.get("server_pid"))
+    expected_server = data.get("server_started_at")
+    # A reused owner PID must not make us ignore a still-live child receipt.
+    # Unconfirmed ownership is conservative: wait for the receipt to retire.
+    server_live = (server_alive is True and server_born is not None
+                   and isinstance(expected_server, (int, float)) and abs(server_born - expected_server) < .001)
+    return {**data, "path": str(path), "alive": alive is not False and matches,
+            "detached": not server_live or bool(data.get("owner_exiting")),
+            "identity_unknown": alive is None or born is None}
+
+
+def claude_handoff_matches(record, task):
+    if not record:
+        return False
+    if record.get("invalid") or record.get("task_id") == task.get("task_id"):
+        return True
+    # A self-wake can start just before its async registration finishes. The
+    # bounded exit publisher has the scope timestamp even without the task ID.
+    start, boundary = _av_parse(task.get("started_at")), _av_parse(record.get("turn_started_at"))
+    return (record.get("task_id") is None and task.get("owner_pid") == record.get("server_pid")
+            and not task.get("queued") and start is not None and boundary is not None and start >= boundary)
 
 
 def _av_dead_owner_state(data, pid):
@@ -456,6 +512,10 @@ def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,
         "compactions": [], "losses": [], "quiet_since": None, "quiet_for_s": None,
     }
     busy, unknown, notes, quiet = [], [], [], []
+    handoff = claude_handoff_view(pairs_dir, pair)
+    view["claude_handoff"] = handoff
+    if handoff and handoff.get("detached") and handoff.get("alive"):
+        busy.append("finishing after a host restart; receipt %s" % handoff["path"])
     owners = []
     seen = set()
     for path in _av_owner_files(pairs_dir, pair):
@@ -475,9 +535,12 @@ def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,
             continue
         status = data.get("state") or "live"
         if status == "live" and not _av_owner_alive(pid, data.get("owner_started_at")):
-            status = "died"
-            data = _av_dead_owner_state(data, pid)
-            notes.append("owner PID %d died without closing its activity" % pid)
+            if handoff and handoff.get("server_pid") == pid:
+                status = "finishing"  # successor reconciliation owns the final outcome
+            else:
+                status = "died"
+                data = _av_dead_owner_state(data, pid)
+                notes.append("owner PID %d died without closing its activity" % pid)
         owners.append((pid, status, data))
     for pid, data in live_states.items():
         if pid not in seen and isinstance(data, dict):
@@ -599,6 +662,10 @@ def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,
                 row["state"] = "queued" if t.get("queued") else "running"
                 busy.append("task %s %s in PID %d%s" % (
                     tid[:8], row["state"], owner, " (self-woken)" if t.get("self_woken") else ""))
+            elif claude_handoff_matches(handoff, t):
+                row["state"] = "finishing_after_restart" if handoff.get("alive") else "finished_after_restart"
+                note = "task %s finishing after a host restart; receipt %s" % (tid[:8], handoff["path"])
+                (busy if handoff.get("alive") else notes).append(note)
             # The child is spawned AFTER its task starts (a queued task can
             # spawn it minutes later), so the owner rule "created after the
             # task = PID reuse" would misread a live child as gone; the task
@@ -1272,6 +1339,12 @@ class ActivityWriter:
             self._last_write = time.monotonic()
             return ok
 
+    def note_handoff(self, path: str) -> None:
+        with self._lock:
+            self._state["claude_handoff_path"] = path
+            self._state["owner_note"] = "On host exit, finishing after a host restart; receipt: " + path
+            self._mark(_URGENT)
+
     def flush(self, timeout: float = 5.0) -> bool:
         """Write now from the calling thread (never from the reader thread)."""
         end = time.monotonic() + timeout
@@ -1553,6 +1626,9 @@ def sweep(*, now: datetime | None = None,
                 if state == "live":
                     if _av_owner_alive(pid, data.get("owner_started_at")):
                         continue
+                    handoff = claude_handoff_view(home, pdir.name)
+                    if handoff and handoff.get("server_pid") == pid:
+                        continue  # retain the running turn until the receipt is reconciled
                     _atomic_write(path, json.dumps(_av_dead_owner_state(data, pid), indent=1))
                     counts["marked_dead"] += 1
                 else:

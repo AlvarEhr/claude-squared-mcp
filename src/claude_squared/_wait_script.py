@@ -61,8 +61,8 @@ Exit codes:
        Still queued ("not delivered"): it never ran — re-send it.
     5  stopped (pair_stop; the runtime is still alive)
     6  crashed (the pair's claude process died mid-turn; pair_send resumes)
-    7  finished detached (Codex: the owner died, the turn finished on its own —
-       pair_poll collects the result)
+    7  finished detached (Codex), or a handed-off Claude runtime exited —
+       pair_poll collects the result
     8  context alert (see above)
     9  background work lost (killed while the watcher ran)
    10  idle as far as can be seen, but part of the pair is invisible or
@@ -356,6 +356,13 @@ def _dead_owner_exit(data, now) -> int | None:
     started = _av_parse(data.get("started_at"))
     if _av_task_owner_alive(owner, started):
         return None
+    receipt = claude_handoff_view(_pairs_dir(), str(data.get("pair_name") or ""))
+    if claude_handoff_matches(receipt, data):
+        if receipt.get("alive"):
+            return None
+        print(f"finished after a host restart; pair_poll('{data.get('task_id')}') collects the reply",
+              file=sys.stderr)
+        return 7
     child = data.get("child_pid")
     if (isinstance(child, int) and child > 0
             and _av_owner_alive(child, data.get("child_started_at"))):
@@ -590,7 +597,7 @@ def wait_pair(pair: str, each_turn: bool, timeout_s: float, poll_s: float, alert
             print(_alert_message(pair, *hit, base, alert.backend, alert.auto_compact_token_limit))
             return 8
         for row in view.get("running_tasks") or []:
-            if row.get("state") in ("orphaned", "finished_detached"):
+            if row.get("state") in ("orphaned", "finished_detached", "finished_after_restart"):
                 data = _read(_state_path(row["task_id"]))
                 code = _dead_owner_exit(data, now) if isinstance(data, dict) else None
                 if code is not None:
