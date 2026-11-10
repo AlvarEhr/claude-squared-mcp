@@ -8,6 +8,13 @@ All notable changes to this project are documented here. Format follows
 
 ### Added
 
+- Busy Claude warm runtimes survive graceful MCP host shutdown. Per-turn
+  handoff receipts preserve process identity and task ownership; shutdown
+  closes stdin without tree-killing and bounds its receipt refresh to 100 ms.
+  Successor sends wait, while destructive/one-shot respawns refuse until the
+  recorded runtime exits. Recovery collects final assistant text from the
+  session JSONL, or retains an honest orphan failure if none was recorded.
+  Background work is not preserved. Codex's adapter/recovery path is unchanged.
 - Short context advisory on async acks and completion notices above 40% of the
   window. `pair_settings_set(context_advisory_at=0.40)` configures the fraction;
   `0` disables it. Existing per-pair `context_alert_at` is unchanged.

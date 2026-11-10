@@ -332,6 +332,37 @@ the runtime is stopped to discard that input; this also ends its background work
 hard stop is still in progress), rather than claiming the runtime stays alive.
 An uncertain stdin write fails explicitly and is never automatically retried.
 
+### Host restarts
+
+Since 0.23, a busy **Claude warm stream-json runtime** can finish its current
+turn after its MCP server closes. A receipt at
+`~/.claude/pairs/handoff/<pair>.json` records the runtime PID and creation time,
+session, cwd, task ID, turn start and server PID. It is prepared before message
+delivery; graceful shutdown refreshes it within one shared 100 ms budget,
+closes stdin, and exits promptly. Idle runtimes also receive EOF without a tree
+kill. Explicit stops and evictions retain their existing behavior.
+
+`pair_status`, `pair_poll` and the waiter's activity view show **finishing after
+a host restart** while that process is alive. New sends queue behind it;
+clear/compact/update and one-shot spawn paths refuse. A PID reused by another
+process does not keep the old runtime alive; an unknown identity conservatively
+blocks a replacement. Once it exits, the next observer or queued send recovers
+the last final assistant text after the recorded turn boundary and removes the
+receipt. No final assistant text means an `ORPHANED` failure, not invented
+success. Recovery preserves the reply; live tool logs and cost accounting may
+be incomplete. A waiter can exit 7 when collection by `pair_poll` is needed.
+
+**Background work does not survive the runtime's eventual exit.** This is turn
+completion, not a permanent detached Claude session. One-shot override sends
+do not gain this survival guarantee. Codex continues using its existing
+file-backed exec/recovery path; this change does not extend its graceful-host
+shutdown contract.
+
+The opt-in `python tests/smoke_live_host_shutdown.py --live` harness uses Haiku
+and a private registry. It closes a real stdio server during a foreground
+20-second sleep, starts a successor and checks the recovered canary reply.
+It spends usage and is separate from the offline runner.
+
 ### Task retention and waiting
 
 The server checks task-result retention at startup and at most once daily
@@ -385,7 +416,7 @@ Three ways to consume the handle:
    | 4 | the owning MCP server died (supervision event, not a work failure): mid-turn = orphaned, the work may have completed; still queued = not delivered, re-send it |
    | 5 | stopped by `pair_stop` |
    | 6 | crashed: the pair's claude process died mid-turn |
-   | 7 | finished detached (Codex): the owner died, the turn finished on its own — `pair_poll` collects it |
+   | 7 | finished detached (Codex), or a handed-off Claude runtime exited — `pair_poll` collects its result |
    | 8 | context alert (below) |
    | 9 | background work was killed while the watcher ran — the pair will not wake for it |
    | 10 | idle as far as can be seen, but part of the pair is invisible or unresolved (a pre-0.16 MCP process, an activity file that is unreadable or behind, a wake-up that never started, background with no completion event for 24 h) — check `pair_status` |
