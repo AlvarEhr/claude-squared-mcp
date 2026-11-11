@@ -16,6 +16,10 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 SCRATCH = ROOT / ".test-homes"
 SCRATCH.mkdir(exist_ok=True)
+# Owner PIDs for planted idle activity files: above every OS's PID limit
+# (Linux pid_max <= 4194304, macOS < 100000), so they are never live. Low
+# numbers like 1000 can be real processes on a macOS runner (CI, 2026-11-11).
+DEAD_PID_BASE = 2_000_000_000
 HOME = tempfile.TemporaryDirectory(dir=SCRATCH, prefix="pane-tests-", ignore_cleanup_errors=True)
 os.environ["CLAUDE_HOME"] = str(Path(HOME.name) / "claude")
 os.environ["CODEX_HOME"] = str(Path(HOME.name) / "codex")
@@ -410,7 +414,7 @@ class SnapshotTests(unittest.TestCase):
         self.write("registry.json", {"pairs": {name: {"backend": "claude", "model": "opus"} for name in names}})
         for name in names[:-1]:
             for owner in range(3):
-                path = self.write(f"activity/{name}/{1000 + owner}.json", {"version": 1, "state": "closed"})
+                path = self.write(f"activity/{name}/{DEAD_PID_BASE + owner}.json", {"version": 1, "state": "closed"})
                 os.utime(path, (1, 1))
         self.write(f"activity/zz-busy/{os.getpid()}.json", {"version": 1, "state": "live", "owner_pid": os.getpid(),
             "turn": {"task_id": "busy", "started_at": self.started},
@@ -441,7 +445,7 @@ class SnapshotTests(unittest.TestCase):
         self.write("registry.json", {"pairs": {name: {} for name in names}})
         for name in names:
             for owner in range(3):
-                self.write(f"activity/{name}/{1000 + owner}.json", {"version": 1, "state": "closed"})
+                self.write(f"activity/{name}/{DEAD_PID_BASE + owner}.json", {"version": 1, "state": "closed"})
         data = P.snapshot(self.home)
         self.assertEqual({row["name"] for row in data["rows"]}, set(names))
         self.assertLessEqual(data["io"]["files"], P.FILE_BUDGET)
