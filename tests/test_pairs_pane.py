@@ -648,14 +648,15 @@ class SnapshotTests(unittest.TestCase):
             "[10:01:01] [system:task_started] local_agent ccc333: Map it\n"
             "[10:01:01] [system:task_started] local_agent (background) bbb222: Fix it\n"
             "[10:01:01] [T-6] [<- sub-agent #2 returned] Async agent launched successfully.\n"
-            "[10:01:09] [system:task_notification] task ccc333 completed: done\n", encoding="utf-8")
+            "[10:01:09] [system:task_notification] task ccc333 completed: done\n"
+            "[10:01:10] [sub-agent #2] [T-8] [-> sub-agent #4: scout] launching: Nested\n", encoding="utf-8")
         (subs / "agent-bbb222xyz.jsonl").write_text(json.dumps({"timestamp": "2026-10-29T10:01:05Z", "message": {
             "role": "assistant", "content": [{"type": "tool_use", "id": "toolu_live", "name": "Bash",
                                               "input": {"command": "pytest"}}]}}), encoding="utf-8")
         rows, _ = P.subagents(self.home, "helper")
         # A background launch's immediate return leaves it running; starts
         # logged out of order are matched by description.
-        self.assertEqual([(r["id"], r["status"]) for r in rows], [(2, "running"), (3, "done"), (1, "done")])
+        self.assertEqual([(r["id"], r["status"]) for r in rows], [(4, "running"), (2, "running"), (3, "done"), (1, "done")])
         spec = {"backend": "claude", "session_id": "s1", "cwd": "C:/w"}
         live = P.subagent_activity(self.home, "helper", spec, 2)
         self.assertIn("[toolu_live] [tool_use] Bash", live["logs"][-1])

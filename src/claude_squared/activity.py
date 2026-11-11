@@ -510,8 +510,17 @@ def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,
         "context": None, "reported_window": None, "window_started_at": None,
         "window_turns": [], "background_finished": [], "background_lost": [],
         "compactions": [], "losses": [], "quiet_since": None, "quiet_for_s": None,
+        "context_previous_session": False,
     }
     busy, unknown, notes, quiet = [], [], [], []
+    # 0.23.1: a context figure names the session it measured; one from a
+    # session the pair no longer uses (pair_clear rotated it) is skipped.
+    # Figures without a session id (older servers) are kept.
+    reg, _err = _av_read_json(pairs_dir / "registry.json", attempts=1)
+    entry = ((reg.get("pairs") or {}).get(pair) if isinstance(reg, dict)
+             and isinstance(reg.get("pairs"), dict) else None)
+    current_sid = entry.get("session_id") if isinstance(entry, dict) else None
+    skipped_ctx = False
     handoff = claude_handoff_view(pairs_dir, pair)
     view["claude_handoff"] = handoff
     if handoff and handoff.get("detached") and handoff.get("alive"):
@@ -612,6 +621,10 @@ def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,
             if isinstance(e, dict):
                 view["losses"].append(dict(e, pid=pid))
         ctx = d.get("context")
+        if (isinstance(ctx, dict) and current_sid and ctx.get("session_id")
+                and ctx.get("session_id") != current_sid):
+            skipped_ctx = True
+            ctx = None
         if isinstance(ctx, dict):
             at = _av_parse(ctx.get("at"))
             if at is not None and (ctx_best is None or at > ctx_best[0]):
@@ -619,6 +632,7 @@ def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,
     for key, tkey in list_keys + (("losses", "at"),):
         view[key].sort(key=lambda e: str(e.get(tkey) or ""))
     view["context"] = ctx_best[1] if ctx_best else None
+    view["context_previous_session"] = skipped_ctx and ctx_best is None
     meta, _err = _av_read_json(pairs_dir / "activity" / pair / "pair.json")
     if isinstance(meta, dict):
         view["reported_window"] = meta.get("reported_window")
@@ -1244,7 +1258,7 @@ class ActivityWriter:
         _poke()
 
     def note_compaction(self, trigger: str | None, pre: int | None = None,
-                        post: int | None = None) -> None:
+                        post: int | None = None, session_id: str | None = None) -> None:
         now = _av_iso(_av_now())
         with self._lock:
             st = self._state
@@ -1260,6 +1274,8 @@ class ActivityWriter:
                 else:
                     ctx.update(used=int(post), at=now, source="compaction",
                                pct=round(post * 100.0 / window, 1) if window else None)
+                if session_id:
+                    ctx["session_id"] = str(session_id)  # the compacted session
             self._mark(_URGENT)
         _poke()
 

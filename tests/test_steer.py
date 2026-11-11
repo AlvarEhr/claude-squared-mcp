@@ -201,12 +201,29 @@ class SteerTests(unittest.TestCase):
             "unknown-type": json.dumps({"type": "brand-new-row"}) + "\n",
             "partial": '{"type": "tools-used", "too',
             "not-json": "garbage\n",
+            # A rewind checkpoint from another session changes history.
+            "rewind-checkpoint": json.dumps({"type": "last-prompt", "leafUuid": "u1",
+                                             "explicit": True, "rewound": True}) + "\n",
         }
         for label, text in cases.items():
             with self.subTest(label=label):
                 path = self._plant_jsonl([{"type": "user", "message": {"content": "hi"}}])
                 self._append(path, text)
                 self.assertTrue(self.rt.is_stale())
+
+    def test_rows_written_after_the_inspected_snapshot_are_not_absorbed(self):
+        path = self._plant_jsonl([{"type": "user", "message": {"content": "hi"}}])
+        self._append(path, json.dumps({"type": "tools-used", "tools": ["Read"]}) + "\n")
+        real = self.rt._appended_only_bookkeeping
+
+        def foreign_write_in_the_gap(end):
+            with open(path, "a", encoding="utf-8") as f:  # lands after is_stale's stat
+                f.write(json.dumps({"type": "user", "message": {"content": "foreign"}}) + "\n")
+            return real(end)
+
+        with patch.object(self.rt, "_appended_only_bookkeeping", foreign_write_in_the_gap):
+            self.assertFalse(self.rt.is_stale())  # the inspected part was bookkeeping
+        self.assertTrue(self.rt.is_stale())  # the foreign row is seen next time
 
     def test_shrunk_or_unmeasured_file_is_stale(self):
         path = self._plant_jsonl([{"type": "user"}, {"type": "assistant"}])

@@ -14,20 +14,23 @@ All notable changes to this project are documented here. Format follows
   2.1.322 the pair's own CLI appends `tools-used` bookkeeping rows to the
   session file while its sub-agents work; the stale-session check read that
   as another process's write. An append made only of bookkeeping rows now
-  keeps the runtime. Any conversation row, unknown row type or partial row
-  still counts as a foreign write. A steer that fell back to a normal send
-  hit this path too.
-- Right after `pair_clear`, send acknowledgements still showed the cleared
-  session's context ("ctx 58% — consider pair_clear…") and `pair_status`
-  its fill. Context figures now record the session they measured; a figure
-  from a previous session is skipped, and `pair_status` says the next reply
-  will report it. Figures written by older servers carry no session and are
-  shown as before.
+  keeps the runtime, and only the bytes actually inspected are absorbed. Any
+  conversation row, rewind checkpoint (`last-prompt`), unknown row type or
+  partial row still counts as a foreign write. A steer that fell back to a
+  normal send hit this path too.
+- Right after `pair_clear`, send acknowledgements, `pair_status`, `wait.py`
+  and auto-watch notices still showed the cleared session's context ("ctx
+  58% — consider pair_clear…"). Context figures, compactions included, now
+  record the session they measured; the activity view skips a figure from a
+  session the registry no longer names, and `pair_status` says the next
+  reply will report it. Figures written by older servers carry no session
+  and are shown as before.
 
 ### Changed
 
 - `main.log` labels sub-agent events `[sub-agent #N]`. A background agent's
   tool calls between turns previously looked like the pair itself working.
+  The Pairs pane parses the label (tool details and nested launches).
 - A steer that cannot join a running turn now says why in plain terms
   (`Not steered: …`), and that the message was queued as a normal send with
   a new task ID. The respawn reason for a genuinely changed session file is

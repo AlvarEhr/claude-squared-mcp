@@ -798,6 +798,28 @@ class ViewTests(ActivityTestCase):
         w.note_context(7, 10, window_source="reported")
         self.assertEqual(A.view(self.pair)["context"]["used"], 7)  # live state, before any flush
 
+    def test_context_from_a_previous_session_is_skipped_across_owners(self):
+        # 0.23.1: after pair_clear the registry names a new session; a newer
+        # figure for the old one must not hide the current one or be shown.
+        self.pairs.mkdir(parents=True, exist_ok=True)
+        (self.pairs / "registry.json").write_text(json.dumps(
+            {"version": 3, "pairs": {self.pair: {"session_id": "new"}}}), encoding="utf-8")
+        older = A._av_iso(A._av_now() - timedelta(minutes=1))
+        self.foreign(self.live.pid, owner_started_at=self.live_started,
+                     context={"used": 3, "window": 10, "pct": 30.0, "at": older, "session_id": "new"})
+        w = A.writer(self.pair)
+        w.note_context(9, 10, window_source="reported", session_id="old")
+        view = A.view(self.pair)
+        self.assertEqual(view["context"]["used"], 3)
+        self.assertFalse(view["context_previous_session"])
+        w.note_compaction("manual", 9, 4, session_id="new")  # compaction measures the current session
+        self.assertEqual(A.view(self.pair)["context"]["used"], 4)
+        w.note_context(9, 10, window_source="reported", session_id="old")
+        self.foreign(self.live.pid, owner_started_at=self.live_started, context=None)
+        view = A.view(self.pair)
+        self.assertIsNone(view["context"])
+        self.assertTrue(view["context_previous_session"])
+
     def test_package_view_uses_unflushed_state_and_counts_self_as_new(self):
         release = threading.Event()
         real = A._atomic_write

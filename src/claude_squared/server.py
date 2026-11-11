@@ -345,7 +345,9 @@ def _context_for_current_session(view: dict, name: str) -> tuple[dict, bool]:
     no longer uses (pair_clear rotated it; the next reply re-measures).
     Figures written before 0.23.1 carry no session id and are kept."""
     context = view.get("context") or {}
-    measured = context.get("session_id")
+    if view.get("context_previous_session"):
+        return {}, True
+    measured = context.get("session_id")  # belt: a view built without the registry
     if measured:
         try:
             if measured != reg_mod.get_pair(name).session_id:
@@ -2322,7 +2324,8 @@ def _build_compact_runner(
             except BaseException:
                 writer.turn_closed(task_id, status="failed")
                 raise
-            writer.note_compaction(result.trigger or "manual", result.pre_tokens, result.post_tokens)
+            writer.note_compaction(result.trigger or "manual", result.pre_tokens, result.post_tokens,
+                                   session_id=current.session_id)
             writer.turn_closed(task_id, preview=f"compacted {result.pre_tokens} -> {result.post_tokens}")
             note = _lost_note(lost)
             if note:

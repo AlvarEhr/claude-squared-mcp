@@ -266,8 +266,11 @@ def tail(path, size=8192):
         return []
 
 
-SUB_LAUNCH = re.compile(r"^\[(\d\d:\d\d):\d\d\] \[T-\d+\] \[-> sub-agent #(\d+): ([^\]]+)\] launching: ?(.*)$")
-SUB_RETURN = re.compile(r"^\[\d\d:\d\d:\d\d\] \[T-\d+\] \[<- sub-agent #(\d+) returned\](.*)$")
+# 0.23.1: a sub-agent's own events carry "[sub-agent #N] " after the time
+# (nested launches included).
+SUB_LABEL = r"(?:\[sub-agent(?: #\d+)?\] )?"
+SUB_LAUNCH = re.compile(r"^\[(\d\d:\d\d):\d\d\] " + SUB_LABEL + r"\[T-\d+\] \[-> sub-agent #(\d+): ([^\]]+)\] launching: ?(.*)$")
+SUB_RETURN = re.compile(r"^\[\d\d:\d\d:\d\d\] " + SUB_LABEL + r"\[T-\d+\] \[<- sub-agent #(\d+) returned\](.*)$")
 SUB_STARTED = re.compile(r"^\[\d\d:\d\d:\d\d\] \[system:task_started\] local_agent (?:\(\w+\) )?([0-9a-f]{6,}): ?(.*)$")
 SUB_ENDED = re.compile(r"^\[\d\d:\d\d:\d\d\] \[system:task_notification\] task ([0-9a-f]{6,}) (?:completed|failed|stopped|killed)")
 SUB_SCAN = 256 * 1024

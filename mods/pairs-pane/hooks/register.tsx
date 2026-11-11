@@ -153,20 +153,26 @@ function tidy(text: string): string {
 }
 
 // main.log lines read "[HH:MM:SS] [T-n] [kind] text"; time, turn and kind are each optional.
+// A sub-agent's own events add "[sub-agent #N] " after the time (claude-squared 0.23.1).
+const SUB_LABEL = String.raw`(?:\[sub-agent(?: #\d+)?\]\s*)?`
+const TAG_RE = new RegExp(String.raw`^(?:\[\d\d:\d\d:\d\d\]\s*)?` + SUB_LABEL + String.raw`\[(T-\d+|toolu_\w+)\]`)
+const LAUNCH_RE = new RegExp(String.raw`^(?:\[(\d\d:\d\d):\d\d\]\s*)?` + SUB_LABEL + String.raw`(?:\[T-\d+\]\s*)?\[(->|<-) sub-agent #(\d+)(?:: ([^\]]+))?(?: returned)?\]\s*(?:launching:\s*)?([\s\S]*)$`)
+const LINE_RE = new RegExp(String.raw`^(?:\[(\d\d:\d\d):\d\d\]\s*)?` + SUB_LABEL + String.raw`(?:\[(?:T-\d+|toolu_\w+)\]\s*)?(?:\[(?:sub-)?([a-z_]+(?::[a-z_]+)?)( ERR)?\]\s*)?([\s\S]*)$`)
+
 export function parseLog(line: string): LogEntry {
   const parsed = parseRaw(line)
-  const tag = /^(?:\[\d\d:\d\d:\d\d\]\s*)?\[(T-\d+|toolu_\w+)\]/.exec(line)?.[1]
+  const tag = TAG_RE.exec(line)?.[1]
   return { ...parsed, text: tidy(parsed.text), ...(tag ? { tag } : {}) }
 }
 
 function parseRaw(line: string): LogEntry {
-  const launch = /^(?:\[(\d\d:\d\d):\d\d\]\s*)?(?:\[T-\d+\]\s*)?\[(->|<-) sub-agent #(\d+)(?:: ([^\]]+))?(?: returned)?\]\s*(?:launching:\s*)?([\s\S]*)$/.exec(line)
+  const launch = LAUNCH_RE.exec(line)
   if (launch) {
     const [, at = '', arrow, id, type, body = ''] = launch
     return arrow === '->' ? { at, kind: 'sub-agent', text: `#${id} ${type || ''} · ${body}`, color: 'merged', sub: Number(id) }
       : { at, kind: '↩ sub-agent', text: `#${id} returned`, dim: true, sub: Number(id) }
   }
-  const match = /^(?:\[(\d\d:\d\d):\d\d\]\s*)?(?:\[(?:T-\d+|toolu_\w+)\]\s*)?(?:\[(?:sub-)?([a-z_]+(?::[a-z_]+)?)( ERR)?\]\s*)?([\s\S]*)$/.exec(line)
+  const match = LINE_RE.exec(line)
   if (!match) return { at: '', kind: '', text: line }
   const [, at = '', kind = '', failed, body = ''] = match
   if (kind === 'user') return { at, kind: 'brief', text: body, dim: true }

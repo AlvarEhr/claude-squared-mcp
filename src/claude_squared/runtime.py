@@ -73,8 +73,10 @@ CRASHED_ERROR_PREFIX = "CRASHED: "
 # appends ``tools-used`` between turns while background sub-agents run, so an
 # append made only of these rows does not mean another process took a turn.
 # Unknown types are NOT listed: anything new counts as a foreign write.
+# ``last-prompt`` is deliberately absent: CLI 2.1.322 also writes it as a
+# rewind checkpoint (``leafUuid``, ``rewound: true``), which changes history.
 JSONL_BOOKKEEPING_TYPES = frozenset({
-    "tools-used", "mode", "last-prompt", "session-owner", "atis-latch",
+    "tools-used", "mode", "session-owner", "atis-latch",
     "cost-state", "custom-title", "ai-title",
 })
 # Larger appends are not inspected (treated as foreign): bookkeeping rows are
@@ -791,12 +793,14 @@ class PairRuntime:
             return False
         if self._last_seen_jsonl_mtime is None:
             return False
-        cur = self._current_jsonl_mtime()
-        if cur is None:
+        try:
+            st = self._jsonl_path.stat()
+        except OSError:
             return False
         # Use a small epsilon to tolerate filesystem mtime resolution (Windows ~10ms,
-        # most Linux ~1ns, macOS HFS+ ~1s).
-        if cur <= self._last_seen_jsonl_mtime + 0.001:
+        # most Linux ~1ns, macOS HFS+ ~1s). A size change counts even inside it.
+        if (st.st_mtime <= self._last_seen_jsonl_mtime + 0.001
+                and self._last_seen_jsonl_size in (None, st.st_size)):
             return False
         # v0.23.1: our own CLI appends bookkeeping rows between turns while
         # background sub-agents run — a ``tools-used`` row each time a
@@ -806,8 +810,10 @@ class PairRuntime:
         # A foreign turn always appends conversation rows (user/assistant/
         # queue-operation/...), so only an append made ENTIRELY of
         # bookkeeping rows is ours to absorb.
-        if self._appended_only_bookkeeping():
-            self._mark_jsonl_seen()
+        # Advance only to the snapshot inspected: bytes appended after this
+        # stat are checked next time, never absorbed unseen (quench review).
+        if self._appended_only_bookkeeping(st.st_size):
+            self._last_seen_jsonl_mtime, self._last_seen_jsonl_size = st.st_mtime, st.st_size
             return False
         return True
 
@@ -821,23 +827,21 @@ class PairRuntime:
             return
         self._last_seen_jsonl_mtime, self._last_seen_jsonl_size = st.st_mtime, st.st_size
 
-    def _appended_only_bookkeeping(self) -> bool:
-        """True when every row appended since the size watermark is a
+    def _appended_only_bookkeeping(self, end: int) -> bool:
+        """True when every row in bytes [size watermark, ``end``) is a
         non-conversation CLI bookkeeping row (see JSONL_BOOKKEEPING_TYPES).
         Anything unreadable, partial, shrunk or unknown counts as foreign."""
         start = self._last_seen_jsonl_size
-        if start is None:
+        if start is None or end <= start or end - start > _BOOKKEEPING_SCAN_LIMIT:
             return False
         try:
             with open(self._jsonl_path, "rb") as f:
-                f.seek(0, os.SEEK_END)
-                end = f.tell()
-                if end <= start or end - start > _BOOKKEEPING_SCAN_LIMIT:
-                    return False
                 f.seek(start)
                 added = f.read(end - start)
         except OSError:
             return False
+        if len(added) != end - start:
+            return False  # shrank since the stat
         if not added.endswith(b"\n"):
             return False  # a writer is mid-row: not provably ours
         rows = [ln for ln in added.split(b"\n") if ln.strip()]
@@ -1355,7 +1359,7 @@ class PairRuntime:
         elif ev_type == "system" and top_level and ev.get("subtype") == "compact_boundary":
             meta = ev.get("compact_metadata") or {}
             self._activity.note_compaction(meta.get("trigger"), meta.get("pre_tokens"),
-                                           meta.get("post_tokens"))
+                                           meta.get("post_tokens"), session_id=self.spec.session_id)
         elif ev_type == "system" and top_level and ev.get("subtype") == "post_turn_summary":
             # v0.16.0: the CLI's own per-turn classification (status_category,
             # status_detail, needs_action) — the primary interim-triage input.
@@ -2192,7 +2196,8 @@ class PairRuntime:
                     return None, ("this runtime has not confirmed steering support yet (the first turn after "
                                   "each start cannot be steered)")
                 if scope.steer_count >= 63:
-                    return None, "the running turn already took the CLI's maximum of 64 follow-ups"
+                    return None, ("the running turn already holds the CLI's maximum of 64 messages "
+                                  "(the original plus 63 follow-ups)")
                 proc = self.proc
                 if proc is None or proc.poll() is not None or proc.stdin is None:
                     return None, "the pair's runtime is no longer alive"

@@ -220,7 +220,7 @@ class _CodexActivity:
                 # fill; an unchanged old token_count isn't a measured post.
                 if post is None and pre is not None and self.used is not None and self.used < pre:
                     post = self.used
-                self.writer.note_compaction("auto", pre, post)
+                self.writer.note_compaction("auto", pre, post, session_id=self.spec.session_id)
         except Exception:
             pass
 

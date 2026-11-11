@@ -48,7 +48,9 @@ sub-agent uses a tool the session hasn't used yet, with no turn open. In the pro
 a sub-agent that only reused known tools wrote nothing, which is why the
 2026-09 measurement missed it. `PairRuntime.is_stale` now reads the bytes
 appended since its watermark and keeps the runtime when every row is a
-bookkeeping type (`runtime.JSONL_BOOKKEEPING_TYPES`). The fallback reply
+bookkeeping type (`runtime.JSONL_BOOKKEEPING_TYPES`), advancing its watermark
+only to the stat it inspected. `last-prompt` is excluded: the CLI also writes
+it as a rewind checkpoint (`leafUuid`, `rewound: true`). The fallback reply
 names the reason (`Not steered: …`). `main.log` labels sub-agent events
 `[sub-agent #N]`: unlabelled, a background agent's tool calls looked like
 the pair still busy in the foreground.
