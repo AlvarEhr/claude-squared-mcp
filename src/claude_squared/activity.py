@@ -516,10 +516,14 @@ def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,
     # 0.23.1: a context figure names the session it measured; one from a
     # session the pair no longer uses (pair_clear rotated it) is skipped.
     # Figures without a session id (older servers) are kept.
-    reg, _err = _av_read_json(pairs_dir / "registry.json", attempts=1)
+    reg, reg_err = _av_read_json(pairs_dir / "registry.json", attempts=2)
     entry = ((reg.get("pairs") or {}).get(pair) if isinstance(reg, dict)
              and isinstance(reg.get("pairs"), dict) else None)
     current_sid = entry.get("session_id") if isinstance(entry, dict) else None
+    # An unreadable registry can't confirm any session: skip tagged figures
+    # rather than risk a cleared one (a missing file — no registry at all —
+    # keeps them).
+    unconfirmed = current_sid is None and reg_err not in (None, "missing")
     skipped_ctx = False
     handoff = claude_handoff_view(pairs_dir, pair)
     view["claude_handoff"] = handoff
@@ -621,8 +625,8 @@ def pair_activity_view(pairs_dir, pair, now=None, grace_seconds=5.0,
             if isinstance(e, dict):
                 view["losses"].append(dict(e, pid=pid))
         ctx = d.get("context")
-        if (isinstance(ctx, dict) and current_sid and ctx.get("session_id")
-                and ctx.get("session_id") != current_sid):
+        if (isinstance(ctx, dict) and ctx.get("session_id")
+                and (unconfirmed or (current_sid and ctx.get("session_id") != current_sid))):
             skipped_ctx = True
             ctx = None
         if isinstance(ctx, dict):

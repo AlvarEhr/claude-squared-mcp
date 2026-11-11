@@ -148,6 +148,19 @@ class ContextCostTests(unittest.TestCase):
             with patch.object(S.activity_mod, "pair_activity_view", return_value=view):
                 self.assertEqual(bool(S._context_advisory_for_pair("scout")), expected)
 
+    def test_notice_ignores_a_finished_tasks_context_from_before_a_clear(self):
+        from claude_squared.models import ContextStatus
+        reply = self.reply(context=ContextStatus(tokens_used=150000, tokens_max=200000, percent=75.0))
+        self.state(reply)
+        empty = {"context": None, "context_previous_session": True, "verdict": "idle", "turns": [],
+                 "running_tasks": [], "window_turns": [], "losses": []}
+        reader = {**self.reader, "pair_activity_view": lambda *a: empty}
+        self.assertIn("75%", H._notice(self.pairs, "scout", 0, "", reader))  # same session: kept
+        R.update_pair("scout", session_id=str(uuid.uuid4()))  # pair_clear rotated it
+        notice = H._notice(self.pairs, "scout", 0, "", reader)
+        self.assertNotIn("75%", notice)
+        self.assertNotIn("consider pair_clear", notice)
+
     def test_context_from_a_cleared_session_is_not_reported(self):
         # 2026-11-11: the ack right after pair_clear still said "ctx 58%".
         base = {"used": 120000, "window": 200000}

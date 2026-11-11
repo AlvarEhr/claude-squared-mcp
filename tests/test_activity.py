@@ -814,6 +814,10 @@ class ViewTests(ActivityTestCase):
         self.assertFalse(view["context_previous_session"])
         w.note_compaction("manual", 9, 4, session_id="new")  # compaction measures the current session
         self.assertEqual(A.view(self.pair)["context"]["used"], 4)
+        registry = (self.pairs / "registry.json").read_text(encoding="utf-8")
+        (self.pairs / "registry.json").write_text("{torn", encoding="utf-8")
+        self.assertIsNone(A.view(self.pair)["context"])  # identity unconfirmed: tagged figures skipped
+        (self.pairs / "registry.json").write_text(registry, encoding="utf-8")
         w.note_context(9, 10, window_source="reported", session_id="old")
         self.foreign(self.live.pid, owner_started_at=self.live_started, context=None)
         view = A.view(self.pair)

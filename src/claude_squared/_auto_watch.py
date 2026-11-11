@@ -507,10 +507,16 @@ def _notice(pairs, name, code, message, reader):
     view = reader["pair_activity_view"](pairs, name) if "pair_activity_view" in reader else {}
     ctx = view.get("context") or {}
     reported = view.get("reported_window") or {}
-    used = ctx.get("used") or (result.get("context") or {}).get("tokens_used")
-    window = ctx.get("window") or reported.get("tokens") or (result.get("context") or {}).get("tokens_max")
-    percent = f"{used * 100 / window:.0f}%" if used is not None and window else "?%"
     entry = (_registry_entries(pairs) or {}).get(name) or {}
+    # The task's own figure only stands in for the current session's (0.23.1):
+    # a pair cleared after that task finished has a new session.
+    result_ctx = result.get("context") or {}
+    rsid, csid = result.get("session_id"), entry.get("session_id")
+    if (rsid and csid and rsid != csid) or (not rsid and view.get("context_previous_session")):
+        result_ctx = {}
+    used = ctx.get("used") or result_ctx.get("tokens_used")
+    window = ctx.get("window") or reported.get("tokens") or result_ctx.get("tokens_max")
+    percent = f"{used * 100 / window:.0f}%" if used is not None and window else "?%"
     defaults = _read(pairs / "defaults.json") or {}
     backend = entry.get("backend", "claude")
     limit = ctx.get("auto_compact_token_limit") or reported.get("auto_compact_token_limit")
