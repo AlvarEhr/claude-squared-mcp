@@ -311,10 +311,15 @@ The CLI takes the message at its next input boundary. If it finishes the origina
 turn first, the same task waits for the follow-up's result. The final task reply is
 the latest result; earlier replies remain in `pair_log` and the transcript.
 
-Idle pairs use a normal async send. Codex steering is not supported yet: its
-`exec` backend has no live input channel. Codex, sends owned by another MCP
-process, one-shot override sends, self-woken turns, and Claude CLIs without
-message correlation support explicitly report **queued as a normal send**.
+Otherwise the reply starts with `Not steered:` and the reason, and the
+message is **queued as a normal send** with a new task ID. It runs as its own
+turn, right away if the pair is idle, otherwise after the current turn. It
+never interrupts running work, and the pair's background sub-agents keep
+running. Reasons: the pair is idle; its turn is self-woken (it resumed on its
+own when background work finished, so no send owns it); another session's
+MCP server runs it; the running send is a one-shot override send; it is a
+Codex pair (its `exec` backend has no live input channel); or the runtime has
+not yet confirmed steering support.
 Ordinary sends remain FIFO. Steering cannot change the running model, effort,
 permissions or timeout: omit per-call overrides and `hard_timeout_seconds`.
 On the verified Claude CLI (2.1.296), the first turn after each spawn/respawn

@@ -36,6 +36,23 @@ turns. No cross-process mailbox or new backend is introduced.
   that queued input was cancelled. This mode was run on 2026-10-29 (see below); the manager
   will use it to decide whether the conservative hard stop can be avoided.
 
+## Fallback sends and background work — 2026-11-11
+
+A steer that cannot join a turn (idle pair, self-woken turn, another
+server's runtime, Codex, first turn) is queued as a normal send. Two pairs lost
+their background sub-agents that way on 2026-11-10: the queued send's stale
+check saw the session file's mtime move and respawned the runtime. Cause, from
+the pairs' transcripts and a live probe (`scripts/probe_background_jsonl.py`,
+CLI 2.1.322, Haiku): the pair's own CLI appends a `tools-used` row each time a
+sub-agent uses a tool the session hasn't used yet, with no turn open. In the probe,
+a sub-agent that only reused known tools wrote nothing, which is why the
+2026-09 measurement missed it. `PairRuntime.is_stale` now reads the bytes
+appended since its watermark and keeps the runtime when every row is a
+bookkeeping type (`runtime.JSONL_BOOKKEEPING_TYPES`). The fallback reply
+names the reason (`Not steered: …`). `main.log` labels sub-agent events
+`[sub-agent #N]`: unlabelled, a background agent's tool calls looked like
+the pair still busy in the foreground.
+
 ## Bookkeeping and locks
 
 `_input_lock` serializes complete stdin frames (send, steer, interrupt). It is

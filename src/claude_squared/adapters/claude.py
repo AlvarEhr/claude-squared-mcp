@@ -829,12 +829,14 @@ class ClaudeAdapter(PairAdapter):
             # stale and evict (tree-kill) the pair's in-flight background work.
             # The self-woken turn's close refreshes the watermark (our own
             # write), so the warm runtime is kept; only a genuine foreign write
-            # respawns it here. Background work never moves the JSONL on its
-            # own (verified 2026-09-25), so no refresh is needed between turns.
+            # respawns it here. Between turns, background sub-agents can make
+            # the CLI append bookkeeping rows (``tools-used``); is_stale absorbs
+            # those, since a respawn would kill that same work (v0.23.1).
             pre_wait_s = rt.wait_for_implicit_idle(timeout_seconds, should_stop)
             if rt.is_stale():
-                reg.evict(spec.name, "another process wrote the pair's session; the stale "
-                                     "runtime was respawned")
+                reg.evict(spec.name, "the pair's session file was changed outside this "
+                                     "runtime (another session or MCP server wrote to it); "
+                                     "the runtime was restarted to reload it")
                 rt = reg.get_or_start(spec, self)
             result_json = rt.send(message, timeout_seconds=timeout_seconds,
                                   on_event=on_event, should_stop=should_stop, task_id=task_id)

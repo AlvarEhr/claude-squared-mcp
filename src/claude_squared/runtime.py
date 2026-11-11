@@ -68,6 +68,19 @@ BACKGROUND_EVICT_CEILING_SECONDS = 24 * 3600
 # self-contained. Any change must be made in all three places in sync.
 CRASHED_ERROR_PREFIX = "CRASHED: "
 
+# v0.23.1: session-JSONL row types the Claude CLI writes as bookkeeping, never
+# as conversation (inspected on CLI 2.1.322 transcripts). A pair's own CLI
+# appends ``tools-used`` between turns while background sub-agents run, so an
+# append made only of these rows does not mean another process took a turn.
+# Unknown types are NOT listed: anything new counts as a foreign write.
+JSONL_BOOKKEEPING_TYPES = frozenset({
+    "tools-used", "mode", "last-prompt", "session-owner", "atis-latch",
+    "cost-state", "custom-title", "ai-title",
+})
+# Larger appends are not inspected (treated as foreign): bookkeeping rows are
+# a few hundred bytes each.
+_BOOKKEEPING_SCAN_LIMIT = 256 * 1024
+
 
 def _claude_executable() -> str:
     env = os.environ.get("CLAUDE_PAIR_CLI_PATH")
@@ -249,6 +262,13 @@ def find_tool_use_in_jsonl(jsonl_path: Path, tool_use_id: str) -> tuple[dict | N
             break
     is_err = bool(tool_result_block.get("is_error")) if tool_result_block else False
     return tool_use, tool_result_block, is_err
+
+
+def _label_log_line(line: str, label: str) -> str:
+    """Insert ``label`` after a main.log line's ``[HH:MM:SS]`` stamp."""
+    if line.startswith("[") and line[9:11] == "] ":
+        return f"{line[:11]}{label} {line[11:]}"
+    return f"{label} {line}"
 
 
 def format_event(ev: dict, *, label_prefix: str = "",
@@ -492,6 +512,9 @@ class PairRuntime:
         # other writer's appended turn → JSONL turn-lineage divergence.
         self._jsonl_path: Path = self._compute_jsonl_path(spec)
         self._last_seen_jsonl_mtime: float | None = None
+        # Byte size at the same moment, so is_stale can read exactly what was
+        # appended since and tell CLI bookkeeping from a foreign turn.
+        self._last_seen_jsonl_size: int | None = None
 
         # Per-pair log folder layout
         self.log_dir: Path = logs_dir() / spec.name
@@ -520,6 +543,10 @@ class PairRuntime:
             pass
         # tool_use_id -> {"n": int, "type": str, "started_ts": float, "description": str}
         self._pending_subagents: dict[str, dict] = {}
+        # Agent tool_use_id -> sub-agent number, kept after the launch's
+        # tool_result (a background agent's arrives at once) so its streamed
+        # events can be labelled in main.log.
+        self._subagent_numbers: dict[str, int] = {}
         self._subagent_seen_jsonls: set[str] = set()
 
         # Tool-use ID counter for main.log (each tool_use gets a sequential T-N tag).
@@ -769,7 +796,61 @@ class PairRuntime:
             return False
         # Use a small epsilon to tolerate filesystem mtime resolution (Windows ~10ms,
         # most Linux ~1ns, macOS HFS+ ~1s).
-        return cur > self._last_seen_jsonl_mtime + 0.001
+        if cur <= self._last_seen_jsonl_mtime + 0.001:
+            return False
+        # v0.23.1: our own CLI appends bookkeeping rows between turns while
+        # background sub-agents run — a ``tools-used`` row each time a
+        # sub-agent uses a tool the session hasn't used yet (CLI 2.1.322; two
+        # real pdm-partner losses, 2026-11-10). Treating that as a foreign
+        # write respawned the runtime and killed the very work that wrote it.
+        # A foreign turn always appends conversation rows (user/assistant/
+        # queue-operation/...), so only an append made ENTIRELY of
+        # bookkeeping rows is ours to absorb.
+        if self._appended_only_bookkeeping():
+            self._mark_jsonl_seen()
+            return False
+        return True
+
+    def _mark_jsonl_seen(self) -> None:
+        """Record the JSONL's current mtime and size as our own state (one
+        stat call, so the two describe the same moment)."""
+        try:
+            st = self._jsonl_path.stat()
+        except OSError:
+            self._last_seen_jsonl_mtime = self._last_seen_jsonl_size = None
+            return
+        self._last_seen_jsonl_mtime, self._last_seen_jsonl_size = st.st_mtime, st.st_size
+
+    def _appended_only_bookkeeping(self) -> bool:
+        """True when every row appended since the size watermark is a
+        non-conversation CLI bookkeeping row (see JSONL_BOOKKEEPING_TYPES).
+        Anything unreadable, partial, shrunk or unknown counts as foreign."""
+        start = self._last_seen_jsonl_size
+        if start is None:
+            return False
+        try:
+            with open(self._jsonl_path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                end = f.tell()
+                if end <= start or end - start > _BOOKKEEPING_SCAN_LIMIT:
+                    return False
+                f.seek(start)
+                added = f.read(end - start)
+        except OSError:
+            return False
+        if not added.endswith(b"\n"):
+            return False  # a writer is mid-row: not provably ours
+        rows = [ln for ln in added.split(b"\n") if ln.strip()]
+        if not rows:
+            return False
+        for ln in rows:
+            try:
+                row = json.loads(ln)
+            except ValueError:
+                return False
+            if not isinstance(row, dict) or row.get("type") not in JSONL_BOOKKEEPING_TYPES:
+                return False
+        return True
 
     # ---- lifecycle ----
 
@@ -1303,6 +1384,18 @@ class PairRuntime:
             self._clear_wake()
             return False
 
+        # v0.23.1: sub-agent events (parent_tool_use_id set) stream into
+        # main.log too. Label them, or a background agent's tool calls between
+        # turns read as the pair itself still working in the foreground.
+        if top_level:
+            log_line = self._append_main_log_line
+        else:
+            num = self._subagent_numbers.get(ev.get("parent_tool_use_id") or "")
+            sub_label = f"[sub-agent #{num}]" if num else "[sub-agent]"
+
+            def log_line(text: str) -> None:
+                self._append_main_log_line(_label_log_line(text, sub_label))
+
         # Detect sub-agent SPAWN (assistant.tool_use of Agent) — special-cased for the
         # bookend label + log extraction. The T-N tag still gets assigned (so main.log
         # carries the unified ID for all tool uses including Agent).
@@ -1314,6 +1407,8 @@ class PairRuntime:
                     inp = block.get("input") or {}
                     self._subagent_counter += 1
                     n = self._subagent_counter
+                    if tool_use_id:
+                        self._subagent_numbers[tool_use_id] = n
                     sub_type = (inp.get("subagent_type") or "general-purpose")
                     desc = (inp.get("description") or "")[:200]
                     self._pending_subagents[tool_use_id] = {
@@ -1329,10 +1424,10 @@ class PairRuntime:
                     # Reserve a T-N for the Agent invocation itself (so it has the same
                     # tag in main.log as any other tool_use). Persisted to the index file.
                     tag = self._main_tool_counter.next_id_for(tool_use_id, tool_name="Agent")
-                    self._append_main_log_line(
+                    log_line(
                         f"[{ts}] [{tag}] [-> sub-agent #{n}: {sub_type}] launching: {desc}"
                     )
-                    self._append_main_log_line(
+                    log_line(
                         f"           live log will be written to: {sub_log_path}"
                     )
 
@@ -1355,14 +1450,14 @@ class PairRuntime:
                                    else json.dumps(res, default=str))[:200]
                         ts = datetime.now().strftime("%H:%M:%S")
                         tag = self._main_tool_counter.id_for(use_id)
-                        self._append_main_log_line(
+                        log_line(
                             f"[{ts}] [{tag}] [<- sub-agent #{n} returned] {preview}"
                         )
                         self._note_background_launch(res, tag)
                         try:
                             self._extract_subagent_log(n, sub_type, started_ts)
                         except Exception as e:
-                            self._append_main_log_line(
+                            log_line(
                                 f"           (sub-agent log extraction failed: {e})"
                             )
                         continue
@@ -1374,7 +1469,7 @@ class PairRuntime:
                     err_tag = " ERR" if is_err else ""
                     ts = datetime.now().strftime("%H:%M:%S")
                     tag = self._main_tool_counter.id_for(use_id)
-                    self._append_main_log_line(
+                    log_line(
                         f"[{ts}] [{tag}] [tool_result{err_tag}] {preview}"
                     )
                     self._note_background_launch(res, tag)
@@ -1386,7 +1481,7 @@ class PairRuntime:
             ev, tool_counter=self._main_tool_counter,
             skip_tool_names={"Agent"}, skip_user_tool_results=True,
         ):
-            self._append_main_log_line(line_out)
+            log_line(line_out)
 
         # v0.12.0: attribute the result AFTER its TURN marker has been written,
         # so a self-woken turn's recorded log range includes the marker.
@@ -1811,7 +1906,7 @@ class PairRuntime:
         # Sound because another MCP process can't have written meanwhile: its
         # send waits for our on-disk self-woken task first
         # (server._wait_for_foreign_self_woken). See is_stale().
-        self._last_seen_jsonl_mtime = self._current_jsonl_mtime()
+        self._mark_jsonl_seen()
         self.last_activity = datetime.utcnow()
         cost = float(ev.get("_turn_cost_usd") or 0.0)
         subtype = ev.get("subtype") or ""
@@ -2088,16 +2183,18 @@ class PairRuntime:
                 scope = self._current_scope
                 if (scope is None or scope.result_snapshot is not None
                         or not scope.input_sent or not scope.task_id):
-                    return None, "No steerable send is running in this MCP process"
+                    return None, ("no send from this MCP server is running on the pair: it is idle, or in a "
+                                  "self-woken turn (one it started itself when background work finished)")
                 if scope.interrupt_sent:
-                    return None, "The running turn is stopping"
+                    return None, "the running turn is being stopped"
                 if not self._steer_supported:
-                    return None, "This runtime has not reported message correlation support"
+                    return None, ("this runtime has not confirmed steering support yet (the first turn after "
+                                  "each start cannot be steered)")
                 if scope.steer_count >= 63:
-                    return None, "This turn reached the CLI's 64-message correlation limit"
+                    return None, "the running turn already took the CLI's maximum of 64 follow-ups"
                 proc = self.proc
                 if proc is None or proc.poll() is not None or proc.stdin is None:
-                    return None, "The warm runtime is no longer alive"
+                    return None, "the pair's runtime is no longer alive"
                 message_id = str(uuid.uuid4())
                 scope.pending_steers.add(message_id)
                 scope.steer_count += 1
@@ -2321,7 +2418,7 @@ class PairRuntime:
                         self.last_activity = datetime.utcnow()
                         # Record the JSONL mtime AFTER our own write completed —
                         # any future mtime greater than this means SOMEONE ELSE wrote.
-                        self._last_seen_jsonl_mtime = self._current_jsonl_mtime()
+                        self._mark_jsonl_seen()
                         # Capture scope BEFORE the finally clears it (we need it
                         # for ev["_log_scope"]).
                         scope = self._current_scope

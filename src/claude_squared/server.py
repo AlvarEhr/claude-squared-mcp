@@ -2984,11 +2984,15 @@ def pair_send_async(
     was killed (README "wait.py").
 
     Args:
-        steer: Try to deliver this follow-up during the running Claude send
-            owned by this MCP process, retaining its task ID. No overrides or
-            hard timeout allowed with steer. Idle pairs use a normal send.
-            Codex, foreign-owned/one-shot/self-woken turns and older Claude
-            runtimes fall back to FIFO with an explicit queued notice.
+        steer: Deliver this follow-up into a Claude turn that a send from
+            THIS MCP server is running; the reply keeps that send's task ID.
+            Otherwise the message is "queued as a normal send" with a new task
+            ID, and the reply says why: the pair is idle, its turn is
+            self-woken (it resumed on its own after background work), another
+            session's server runs it, the running send is a one-shot override
+            send, it is a Codex pair, or the runtime is on its first turn. A queued send never interrupts the
+            running turn, and the pair's background sub-agents keep running.
+            No overrides or hard timeout allowed with steer.
         cwd: Apply pair_update's cwd migration, then enqueue under the same
             pair lock. Refused while busy or with pending background work,
             even if the requested cwd is unchanged. Cannot combine with steer.
@@ -3032,10 +3036,11 @@ def pair_send_async(
                 hard_timeout_seconds, override_model, override_effort, override_permission_mode)):
             raise PairError("steer=True cannot change a running turn's model, effort, permissions or timeout; "
                             "omit overrides, or use a normal send.")
-        reason = "Steering is not supported on Codex yet"
+        reason = "Codex pairs cannot be steered yet"
         if spec.backend == "claude":
             rt = runtime_mod.registry().get_or_none(name)
-            reason = "No warm Claude runtime owned by this MCP process"
+            reason = ("this MCP server has no warm runtime for the pair (it is cold here, "
+                      "or another session's MCP server is running it)")
             if rt is not None and rt.spec.session_id == spec.session_id:
                 task_id, reason = rt.steer(message)
                 if task_id is not None:
@@ -3046,7 +3051,9 @@ def pair_send_async(
                         notification=notification_context.get("hint") if "hint" in notification_context else (
                             "No new completion notification was armed for this steer; "
                             "follow the original task with pair_poll."))
-        steer_note = f"{reason}; queued as a normal send (starts normally if idle).\n"
+        steer_note = (f"Not steered: {reason}. Instead it was queued as a normal send with a new "
+                      "task ID: it runs as its own turn, right away if the pair is idle, "
+                      "otherwise after the current turn ends.\n")
 
     runner = _build_send_runner(
         name, message,

@@ -166,9 +166,80 @@ class SteerTests(unittest.TestCase):
                 start = stack.enter_context(patch.object(AT, "start_task", return_value=SimpleNamespace(task_id="queued-task")))
                 reply = tool(S.pair_send_async)(self.spec.name, "follow-up", steer=True)
                 self.assertIn("queued as a normal send", reply)
+                self.assertIn("Not steered: ", reply)
                 self.assertIn("Async task: queued-task", reply)
                 self.assertTrue(start.call_args.kwargs["queued"])
                 self.assertEqual(self.rt.proc.stdin.getvalue(), b"")
+
+    def _plant_jsonl(self, rows):
+        path = self.rt._jsonl_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        self.rt._mark_jsonl_seen()
+        return path
+
+    def _append(self, path, text):
+        time.sleep(0.05)  # past the mtime epsilon on every filesystem we test on
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text)
+
+    def test_bookkeeping_rows_between_turns_are_not_a_foreign_write(self):
+        # CLI 2.1.322 appends `tools-used` while background sub-agents run;
+        # respawning on it killed that work (two real losses, 2026-11-10).
+        path = self._plant_jsonl([{"type": "user", "message": {"content": "hi"}}])
+        self._append(path, json.dumps({"type": "tools-used", "tools": ["Bash", "Read"]}) + "\n"
+                     + json.dumps({"type": "tools-used", "tools": ["Bash", "Read", "Edit"]}) + "\n")
+        self.assertFalse(self.rt.is_stale())
+        self.assertEqual(self.rt._last_seen_jsonl_size, path.stat().st_size)  # watermark advanced
+        self.assertFalse(self.rt.is_stale())
+
+    def test_conversation_rows_still_mean_another_writer(self):
+        cases = {
+            "user": json.dumps({"type": "user", "message": {"content": "x"}}) + "\n",
+            "mixed": json.dumps({"type": "tools-used", "tools": []}) + "\n"
+                     + json.dumps({"type": "queue-operation", "operation": "enqueue"}) + "\n",
+            "unknown-type": json.dumps({"type": "brand-new-row"}) + "\n",
+            "partial": '{"type": "tools-used", "too',
+            "not-json": "garbage\n",
+        }
+        for label, text in cases.items():
+            with self.subTest(label=label):
+                path = self._plant_jsonl([{"type": "user", "message": {"content": "hi"}}])
+                self._append(path, text)
+                self.assertTrue(self.rt.is_stale())
+
+    def test_shrunk_or_unmeasured_file_is_stale(self):
+        path = self._plant_jsonl([{"type": "user"}, {"type": "assistant"}])
+        time.sleep(0.05)
+        path.write_text(json.dumps({"type": "tools-used"}) + "\n", encoding="utf-8")
+        self.assertTrue(self.rt.is_stale())
+        path = self._plant_jsonl([{"type": "user"}])
+        self.rt._last_seen_jsonl_size = None  # a watermark recorded without a size
+        self._append(path, json.dumps({"type": "tools-used"}) + "\n")
+        self.assertTrue(self.rt.is_stale())
+
+    def test_subagent_events_are_labelled_in_main_log(self):
+        launch = {"type": "assistant", "parent_tool_use_id": None, "message": {"content": [
+            {"type": "tool_use", "id": "toolu_agent", "name": "Agent",
+             "input": {"description": "reader", "subagent_type": "general-purpose",
+                       "run_in_background": True}}]}}
+        self.rt._on_event_for_log(json.dumps(launch))
+        launched = {"type": "user", "parent_tool_use_id": None, "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_agent",
+             "content": "Async agent launched successfully.\nagentId: a1"}]}}
+        self.rt._on_event_for_log(json.dumps(launched))
+        child = {"type": "assistant", "parent_tool_use_id": "toolu_agent", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_child", "name": "Read", "input": {"file_path": "x"}}]}}
+        self.rt._on_event_for_log(json.dumps(child))
+        own = {"type": "assistant", "parent_tool_use_id": None, "message": {"content": [
+            {"type": "text", "text": "own words"}]}}
+        self.rt._on_event_for_log(json.dumps(own))
+        lines = self.rt.main_log_path.read_text(encoding="utf-8").splitlines()
+        child_line = next(l for l in lines if "Read(" in l)
+        own_line = next(l for l in lines if "own words" in l)
+        n = self.rt._subagent_numbers["toolu_agent"]
+        self.assertRegex(child_line, rf"^\[\d\d:\d\d:\d\d\] \[sub-agent #{n}\] \[T-\d+\] \[tool_use\]")
+        self.assertNotIn("sub-agent", own_line)
 
     def test_override_and_timeout_rejected_without_delivery(self):
         for name, value in (("override_model", "haiku"), ("override_effort", "low"),

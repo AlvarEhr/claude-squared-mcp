@@ -4,6 +4,29 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- A send to an idle Claude pair whose background sub-agents were still
+  running could restart the pair's runtime and kill those sub-agents
+  ("BACKGROUND LOST … another process wrote the pair's session"). On CLI
+  2.1.322 the pair's own CLI appends `tools-used` bookkeeping rows to the
+  session file while its sub-agents work; the stale-session check read that
+  as another process's write. An append made only of bookkeeping rows now
+  keeps the runtime. Any conversation row, unknown row type or partial row
+  still counts as a foreign write. A steer that fell back to a normal send
+  hit this path too.
+
+### Changed
+
+- `main.log` labels sub-agent events `[sub-agent #N]`. A background agent's
+  tool calls between turns previously looked like the pair itself working.
+- A steer that cannot join a running turn now says why in plain terms
+  (`Not steered: …`), and that the message was queued as a normal send with
+  a new task ID. The respawn reason for a genuinely changed session file is
+  reworded too.
+
 ## [0.23.0] — 2026-11-10
 
 ### Added
