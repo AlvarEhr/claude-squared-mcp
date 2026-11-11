@@ -48,9 +48,22 @@ class ContextCostTests(unittest.TestCase):
         self.spec = PairSpec(name="scout", model="fable", session_id=str(uuid.uuid4()), cwd=str(self.home))
         R.add_pair(self.spec)
         self.pairs = R.pairs_dir()
+        self.addCleanup(self.retire_writers)  # runs before the temp home is removed
         self.wait = W.install_wait_script(self.pairs / "wait.py")
         self.reader = runpy.run_path(str(self.wait))
         self.tid = str(uuid.uuid4())
+
+    def retire_writers(self):
+        """The shared activity flusher must not write into this test's home
+        while it is removed (macOS CI, 2026-11-11: 'Directory not empty')."""
+        activity = S.activity_mod
+        with activity._WRITERS_LOCK:
+            mine = [k for k in activity._WRITERS if k[0] == str(self.pairs)]
+            retired = [activity._WRITERS.pop(k) for k in mine]
+        for w in retired:
+            with w._io_lock:
+                with w._lock:
+                    w._forgotten = True
 
     def reply(self, **kwargs):
         return SendResult(name="scout", response="Done.", session_id=self.spec.session_id,
