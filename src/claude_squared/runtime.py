@@ -1696,7 +1696,8 @@ class PairRuntime:
             from claude_squared.models import default_claude_window
             window = default_claude_window(self.spec.model, self.spec.context_window)
             source = "inferred"
-        self._activity.note_context(used, window, window_source=source, source="stream")
+        self._activity.note_context(used, window, window_source=source, source="stream",
+                                    session_id=self.spec.session_id)
 
     def _note_reported_window(self, ev: dict) -> None:
         mu = ev.get("modelUsage")

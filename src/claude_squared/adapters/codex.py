@@ -180,7 +180,7 @@ class _CodexActivity:
             return
         self.used = used
         self.writer.note_context(self.used, window, window_source="rollout", source="rollout",
-                                  auto_compact_token_limit=limit)
+                                  auto_compact_token_limit=limit, session_id=self.spec.session_id)
 
     def poll(self, *, force: bool = False) -> None:
         try:

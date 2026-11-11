@@ -1183,7 +1183,8 @@ class ActivityWriter:
 
     def note_context(self, used: int | None, window: int | None = None, *,
                      window_source: str | None = None, source: str = "stream",
-                     auto_compact_token_limit: int | None = None) -> None:
+                     auto_compact_token_limit: int | None = None,
+                     session_id: str | None = None) -> None:
         """Live context fill. Claude: input + cache_read + cache_creation of the
         latest TOP-LEVEL assistant event; Codex: the rollout's
         ``last_token_usage`` (never the cumulative total). ``window`` should be
@@ -1200,6 +1201,10 @@ class ActivityWriter:
                 "window_source": window_source, "source": source,
                 "at": _av_iso(_av_now()),
             }
+            if session_id:
+                # The session/thread measured: after pair_clear rotates it,
+                # readers that know the pair's current id skip this figure.
+                self._state["context"]["session_id"] = str(session_id)
             if self.backend == "codex":
                 self._state["context"].update(backend="codex", auto_compact_token_limit=auto_compact_token_limit)
             self._mark(_LAZY)

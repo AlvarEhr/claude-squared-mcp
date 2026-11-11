@@ -340,10 +340,25 @@ def _ack_model(spec: PairSpec, override: str | None = None) -> str:
     return f"{requested} (resolution pending)"
 
 
+def _context_for_current_session(view: dict, name: str) -> tuple[dict, bool]:
+    """The view's context, or ({}, True) when it measured a session the pair
+    no longer uses (pair_clear rotated it; the next reply re-measures).
+    Figures written before 0.23.1 carry no session id and are kept."""
+    context = view.get("context") or {}
+    measured = context.get("session_id")
+    if measured:
+        try:
+            if measured != reg_mod.get_pair(name).session_id:
+                return {}, True
+        except Exception:
+            pass
+    return context, False
+
+
 def _context_advisory_for_pair(name: str) -> str:
     try:
         view = activity_mod.pair_activity_view(reg_mod.pairs_dir(), name)
-        context = view.get("context") or {}
+        context, _ = _context_for_current_session(view, name)
         window = context.get("window") or (view.get("reported_window") or {}).get("tokens")
         return context_advisory(context.get("used"), window,
                                 settings_mod.load_defaults().context_advisory_at)
@@ -1951,7 +1966,9 @@ def _activity_status_lines(name: str) -> list[str]:
         out.append(f"  handoff identity unconfirmed; inspect receipt {receipt['path']}")
     elif receipt.get("detached"):
         out.append(f"  finishing after a host restart; receipt {receipt['path']}")
-    ctx = view.get("context") or {}
+    ctx, previous_session = _context_for_current_session(view, name)
+    if previous_session:
+        out.append("  context: not measured since the session changed (pair_clear); the next reply reports it")
     used = ctx.get("used")
     if used:
         window = ctx.get("window") or (view.get("reported_window") or {}).get("tokens")
@@ -2123,7 +2140,7 @@ def _build_send_runner(
                 if result.context is not None:
                     writer.note_context(result.context.tokens_used, result.context.tokens_max,
                                         window_source=getattr(result.context, "window_source", None),
-                                        source="result")
+                                        source="result", session_id=current.session_id)
                 writer.turn_closed(task_id, preview=result.response or "")
 
             # v0.12.0 premium-model notice — per-call override only. A one-off

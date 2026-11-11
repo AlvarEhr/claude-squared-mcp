@@ -17,6 +17,12 @@ All notable changes to this project are documented here. Format follows
   keeps the runtime. Any conversation row, unknown row type or partial row
   still counts as a foreign write. A steer that fell back to a normal send
   hit this path too.
+- Right after `pair_clear`, send acknowledgements still showed the cleared
+  session's context ("ctx 58% — consider pair_clear…") and `pair_status`
+  its fill. Context figures now record the session they measured; a figure
+  from a previous session is skipped, and `pair_status` says the next reply
+  will report it. Figures written by older servers carry no session and are
+  shown as before.
 
 ### Changed
 

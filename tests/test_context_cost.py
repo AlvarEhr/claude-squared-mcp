@@ -148,6 +148,25 @@ class ContextCostTests(unittest.TestCase):
             with patch.object(S.activity_mod, "pair_activity_view", return_value=view):
                 self.assertEqual(bool(S._context_advisory_for_pair("scout")), expected)
 
+    def test_context_from_a_cleared_session_is_not_reported(self):
+        # 2026-11-11: the ack right after pair_clear still said "ctx 58%".
+        base = {"used": 120000, "window": 200000}
+        for measured, expected in ((self.spec.session_id, True), ("old-session", False), (None, True)):
+            ctx = dict(base, **({"session_id": measured} if measured else {}))
+            view = {"context": ctx}
+            with self.subTest(measured=measured), \
+                    patch.object(S.activity_mod, "pair_activity_view", return_value=view), \
+                    patch.object(S.activity_mod, "view", return_value=view):
+                self.assertEqual(bool(S._context_advisory_for_pair("scout")), expected)
+                status = "\n".join(S._activity_status_lines("scout"))
+                self.assertEqual("120,000" in status, expected)
+                self.assertEqual("not measured since the session changed" in status, not expected)
+
+    def test_writer_records_the_measured_session(self):
+        writer = S.activity_mod.ActivityWriter("scout", "claude", self.pairs)  # unregistered: no flusher
+        writer.note_context(1000, 200000, window_source="reported", source="stream", session_id="sid-1")
+        self.assertEqual(writer._state["context"]["session_id"], "sid-1")
+
     def test_single_documented_hook_is_detected(self):
         script = I.install_auto_watch_script(self.pairs / "auto_watch.py")
         data = json.loads((ROOT / "docs/auto-watch.settings.json").read_text(encoding="utf-8"))
