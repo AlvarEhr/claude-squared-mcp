@@ -123,7 +123,8 @@ class SnapshotTests(unittest.TestCase):
 
     def test_standalone_without_package_and_missing_install(self):
         result = subprocess.run([sys.executable, "-S", "-B", str(ROOT / "mods/pairs-pane/read_pairs.py"),
-                                 "--home", str(self.home)], capture_output=True, encoding="utf-8", timeout=10)
+                                 "--home", str(self.home)], capture_output=True, encoding="utf-8",
+                                timeout=60)  # 10 s timed out twice on a loaded machine (2026-11-17)
         self.assertEqual(result.returncode, 0, result.stderr)
         row = json.loads(result.stdout)["rows"][0]
         self.assertEqual((row["name"], row["status"]), ("scout", "idle"))
