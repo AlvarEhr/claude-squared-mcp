@@ -13,8 +13,13 @@ All notable changes to this project are documented here. Format follows
   queued background-completion notice (`<task-notification>`) just before
   it exited; recovery treated that as a new user message and discarded the
   reply before it. User rows the CLI writes itself (background completions,
-  peer and sub-agent messages) no longer hide a final reply; a real user
-  message after it still does.
+  peer messages and sub-agent hand-backs) no longer hide the send's final
+  reply, also when the CLI went on to run the self-woken turn they started;
+  a real user message after it still does.
+- A Claude pair's `allowed_tools` reached only the warm runtime: an override
+  send, `pair_invoke`, `pair_fork`, `pair_compact` or `pair_context` ran
+  with no allow rules (unless a connector was selected). Every spawn path
+  now passes them.
 - `pair_update(allowed_tools=…)` told you to run `pair_clear` for the new
   rules to apply. They apply at the next send: the CLI uses the allow rules
   of each spawn on resume (widening and narrowing, re-verified on CLI
@@ -24,8 +29,8 @@ All notable changes to this project are documented here. Format follows
   `system_prompt_append` still is.
 - `pair_status` called a cold runtime with recent log activity "likely a
   recent crash or eviction". It now names the usual causes (clear, compact,
-  update, idle eviction, a server restart); a crash in the same server is
-  still reported as one.
+  update, idle eviction, a server restart, a runtime in another MCP
+  process); a crash in the same server is still reported as one.
 
 ### Changed
 

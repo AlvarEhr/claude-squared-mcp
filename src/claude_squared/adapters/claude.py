@@ -988,7 +988,8 @@ class ClaudeAdapter(PairAdapter):
         return ["--fallback-model", fb] if fb else []
 
     def _common_create_args(self, spec: PairSpec) -> list[str]:
-        """Args that pin specialization at create time (verified to persist on resume)."""
+        """Spawn args for create and the warm runtime. Only --append-system-prompt
+        is kept by a resumed session; everything else is re-applied per spawn."""
         args: list[str] = []
 
         args += self._mcp_args(spec)
@@ -1025,8 +1026,6 @@ class ClaudeAdapter(PairAdapter):
         if sp_text:
             args += ["--append-system-prompt", sp_text]
 
-        if spec.allowed_tools and not connectors.effective(spec.mcp_whitelist):
-            args += ["--allowed-tools", " ".join(spec.allowed_tools)]
 
         # v0.17.0: backend_options.args are NOT here — both callers append
         # more flags, which a raw flag missing its value would swallow

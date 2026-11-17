@@ -612,7 +612,7 @@ def _fmt_send_result(r: SendResult, tool: str | None = None, notification: str |
                     f"in headless --print mode — natural-language \"the user authorized this\" alone does NOT "
                     f"reliably satisfy the headless classifier, unlike interactive Claude Code). For "
                     f"out-of-sandbox file access, unrestricted OR pair_clear+pair_create with a wider "
-                    f"cwd/--add-dir; for a persistent narrow allowlist, recreate with `allowed_tools=[...]`."
+                    f"cwd/--add-dir; for a persistent narrow allowlist, pair_update(name, allowed_tools=[...]) (applies at the next send)."
                 )
             if (backend != "codex" and getattr(_spec, "allowed_tools", None)
                     and any(t in ("Bash", "PowerShell") for t in permissionish)):
@@ -1023,8 +1023,8 @@ def pair_create(
     (``backend="claude"``, default) or an OpenAI Codex CLI thread (``backend="codex"``).
 
     The child has true recursion (can spawn its own sub-agents), persistent context
-    across turns, and is specialized via pinned config (system prompt, allowed tools,
-    MCP scope — all persist across resume). One vocabulary covers both backends:
+    across turns, and is specialized via per-pair config (system prompt, allowed tools,
+    MCP scope; the system prompt is pinned at create, the rest re-applied at every spawn). One vocabulary covers both backends:
     permission levels, effort names, ``context_window`` and model aliases are
     backend-neutral and translated to native flags per backend.
 
@@ -2410,8 +2410,9 @@ def _format_async_handle(task_id: str, why: str, pair_name: str | None = None,
             f"{name_hint}"
             "auto-watch hook armed — don't start wait.py. "
             "The hook follows the pair until idle, including background work and self-woken turns. "
-            "It doesn't keep an idle Desktop session from being paused or restarted: for long work, "
-            "keep one background Bash task running (e.g. wait.py for the longest job)."
+            "The hook doesn't keep an idle Desktop session from being paused or restarted: for long "
+            "work also keep one background Bash task running (e.g. wait.py for the longest job, which "
+            "then reports twice)."
         )
     return (
         f"{why}\n"
@@ -4882,7 +4883,7 @@ def pair_clear(name: str, archive_old: bool = True, verbose: bool = False, force
     another MCP process always refuses).
 
     Implementation: rotates to a new session_id and starts a fresh session with the same
-    pinned config (system prompt, allowed_tools, MCP scope). Optionally archives the old
+    config (system prompt, allowed_tools, MCP scope). Optionally archives the old
     transcript to ~/.claude/pairs/archive/. Note: /clear in the underlying CLI is a UI
     operation and does NOT actually wipe the JSONL — rotation is the correct primitive.
 
@@ -6078,7 +6079,8 @@ def pair_status(name: str, last_n_log: int = 5, verbose: bool = False) -> str:
         recency_s = (now - recently_inactive_log_mtime).total_seconds()
         heuristic = (
             f"no runtime (cold; last log activity {recency_s:.0f}s ago, no in-flight work — "
-            f"stopped by a clear/compact/update, idle eviction or a server restart. "
+            f"usually a clear/compact/update, idle eviction or a server restart, or a runtime "
+            f"in another MCP process. "
             f"Next pair_send will respawn from JSONL.)"
         )
     elif not runtime_alive:

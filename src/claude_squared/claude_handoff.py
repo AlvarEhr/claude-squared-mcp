@@ -110,11 +110,16 @@ def final_reply(record: dict):
                 content = (event.get("message") or {}).get("content")
                 if _is_cli_injected(event, content):
                     # v0.23.2: a background completion (<task-notification>) or a
-                    # peer/sub-agent message the CLI dequeued. If a turn follows
-                    # it, that turn's own assistant rows set or clear the
-                    # candidate; if the CLI exited first (stdin EOF, 2026-11-12)
-                    # the earlier final reply still stands.
-                    pass
+                    # peer message the CLI dequeued. After the send's final
+                    # reply it starts (or would start) a SELF-WOKEN turn — the
+                    # live runtime closes the send at its own result and tracks
+                    # that turn as a separate task — so the reply found so far
+                    # is the send's answer, whether the CLI exited first
+                    # (stdin EOF, 2026-11-12) or ran the woken turn. Mid-turn
+                    # (no candidate yet: the last assistant row was a tool
+                    # call) keep scanning for the send's own final reply.
+                    if candidate is not None:
+                        return candidate
                 elif isinstance(content, str) or (isinstance(content, list) and any(
                         isinstance(b, dict) and b.get("type") == "text" for b in content)):
                     candidate = None
