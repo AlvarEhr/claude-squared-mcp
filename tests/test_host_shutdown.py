@@ -267,6 +267,85 @@ class HostShutdownTests(unittest.TestCase):
         self.assertEqual(H.reconcile(self.spec.name).status, "done")
         self.assertFalse(H.path_for(self.spec.name).exists())
 
+    def test_dequeued_task_notification_does_not_hide_the_final_reply(self):
+        # 2026-11-12: the CLI dequeued a background completion, then exited on
+        # stdin EOF before answering it; the reply before it is the result.
+        path = self.transcript()
+        now = datetime.now(timezone.utc).isoformat()
+        with path.open("a", encoding="utf-8") as stream:
+            for event in ({"type": "queue-operation", "operation": "dequeue", "timestamp": now},
+                          {"type": "user", "timestamp": now, "origin": {"kind": "task-notification"},
+                           "message": {"role": "user", "content": "<task-notification>\n<task-id>a1</task-id>"}},
+                          {"type": "user", "timestamp": now, "isMeta": True, "origin": {"kind": "peer"},
+                           "message": {"role": "user", "content": "Another Claude session sent a message"}},
+                          {"type": "user", "timestamp": now,
+                           "message": {"role": "user", "content": "<task-notification>\n<task-id>a2</task-id>"}}):
+                stream.write(json.dumps(event) + "\n")
+        self.alive = False
+        state = A.reap_orphan(self.tid)
+        self.assertEqual(state.status, "done")
+        self.assertEqual(state.result.response, "CANARY done")
+
+    def test_each_injected_row_shape_alone_keeps_the_reply(self):
+        # temper P3: each recognised shape as the ONLY injected row after the
+        # reply, so dropping any one check fails a subtest.
+        record = H.view(self.spec.name)
+        now = datetime.now(timezone.utc).isoformat()
+        shapes = {
+            "task-notification origin": {"origin": {"kind": "task-notification"},
+                                         "message": {"role": "user", "content": "anything"}},
+            "peer origin": {"isMeta": True, "origin": {"kind": "peer"},
+                            "message": {"role": "user", "content": "Another Claude session sent a message"}},
+            "bare notification text": {"message": {"role": "user",
+                                                   "content": "<task-notification>\n<task-id>a2</task-id>"}},
+        }
+        for label, row in shapes.items():
+            with self.subTest(shape=label):
+                path = self.transcript()
+                with path.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps({"type": "user", "timestamp": now, **row}) + "\n")
+                self.assertEqual((H.final_reply(record) or ("",))[0], "CANARY done")
+
+    def test_woken_turn_after_the_reply_does_not_replace_it(self):
+        # temper P2: the CLI may start the self-woken turn before it handles
+        # stdin EOF; neither its thinking row nor its final text is the send's.
+        path = self.transcript()
+        now = datetime.now(timezone.utc).isoformat()
+        with path.open("a", encoding="utf-8") as stream:
+            for event in ({"type": "user", "timestamp": now, "origin": {"kind": "task-notification"},
+                           "message": {"role": "user", "content": "<task-notification>\n<task-id>a1</task-id>"}},
+                          {"type": "assistant", "timestamp": now, "message": {
+                              "stop_reason": "tool_use", "content": [{"type": "thinking", "thinking": "x"}]}},
+                          {"type": "assistant", "timestamp": now, "message": {
+                              "stop_reason": "end_turn", "content": [{"type": "text", "text": "WOKEN reply"}]}}):
+                stream.write(json.dumps(event) + "\n")
+        self.alive = False
+        state = A.reap_orphan(self.tid)
+        self.assertEqual(state.status, "done")
+        self.assertEqual(state.result.response, "CANARY done")
+
+    def test_notification_mid_turn_keeps_scanning_for_the_send_reply(self):
+        # Before any final reply (last row a tool call) a notification is
+        # injected mid-turn; the send's own final reply comes after it.
+        path = self.transcript(final=False)
+        now = datetime.now(timezone.utc).isoformat()
+        with path.open("a", encoding="utf-8") as stream:
+            for event in ({"type": "user", "timestamp": now, "origin": {"kind": "task-notification"},
+                           "message": {"role": "user", "content": "<task-notification>\n<task-id>a1</task-id>"}},
+                          {"type": "assistant", "timestamp": now, "message": {
+                              "stop_reason": "end_turn", "content": [{"type": "text", "text": "SEND final"}]}}):
+                stream.write(json.dumps(event) + "\n")
+        self.alive = False
+        self.assertEqual(A.reap_orphan(self.tid).result.response, "SEND final")
+
+    def test_real_user_message_after_the_reply_still_invalidates_it(self):
+        path = self.transcript()
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"type": "user", "timestamp": datetime.now(timezone.utc).isoformat(),
+                                     "message": {"role": "user", "content": "next send"}}) + "\n")
+        self.alive = False
+        self.assertEqual(A.reap_orphan(self.tid).status, "failed")
+
     def test_dead_runtime_without_final_text_ignores_subagent_and_interim_text(self):
         path = self.transcript(final=False)
         with path.open("a", encoding="utf-8") as stream:

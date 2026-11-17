@@ -1116,6 +1116,15 @@ class ServerTests(SandboxCase):
         tool(S.pair_update)("cl", system_prompt_append="")
         self.assertIsNone(R.get_pair("cl").system_prompt_append)
 
+    def test_update_allowed_tools_is_not_pinned(self):
+        # v0.23.2: the CLI applies each spawn's --allowed-tools on resume, and
+        # the update evicts the runtime, so no "run pair_clear" note.
+        R.add_pair(PairSpec(name="cl", session_id="cl-sid", backend="claude", model="opus", cwd=str(self.directory)))
+        report = tool(S.pair_update)("cl", allowed_tools=["Bash(git status)"])
+        self.assertEqual(R.get_pair("cl").allowed_tools, ["Bash(git status)"])
+        self.assertNotIn("pinned to existing session", report)
+        self.assertNotIn("pair_clear", report)
+
     def test_update_moves_a_network_pair_to_read_only_with_a_note(self):
         # Only an incoming backend_options gets the full check; the stored
         # network flag simply doesn't apply at read-only.

@@ -238,13 +238,18 @@ def claude_args(names: list[str] | None, level: str, cwd: str | None = None,
                if _key(entry.name) in ("pair", "claude_squared")]
     for pattern in dict.fromkeys(denied):
         args += ["--disallowed-tools", pattern]
-    if names:
-        rules = list(allowed_tools or [])
-        if connector_access(level, "claude") == "allow":
-            rules += [f"mcp__{tool_prefix(entry.name)}" for entry in selected]
-        if rules:
-            # One variadic option, so later options cannot replace earlier rules.
-            args += ["--allowedTools", *dict.fromkeys(rules)]
+    # v0.23.2: the pair's allowed_tools ride here on EVERY spawn path (warm
+    # runtime, create, override send, pair_invoke, fork, compact, /context),
+    # not only when a connector is selected — the CLI applies each spawn's
+    # rules on resume (2.1.322), so a path without them ran with none.
+    rules = list(allowed_tools or [])
+    if names and connector_access(level, "claude") == "allow":
+        rules += [f"mcp__{tool_prefix(entry.name)}" for entry in selected]
+    if rules:
+        # One variadic option, so later options cannot replace earlier rules.
+        # Callers always follow it with more flags (--disallowed-tools …), so
+        # it never swallows a positional prompt.
+        args += ["--allowedTools", *dict.fromkeys(rules)]
     return args
 
 

@@ -70,6 +70,19 @@ def discard(name: str, task_id: str | None) -> None:
                     time.sleep(.02 * (attempt + 1))
 
 
+_CLI_INJECTED_ORIGINS = ("task-notification", "peer")
+
+
+def _is_cli_injected(event: dict, content) -> bool:
+    """A user row the CLI wrote itself (CLI 2.1.32x): ``origin.kind`` is
+    ``task-notification`` or ``peer``, or the text is a bare
+    ``<task-notification>`` block. Anything else counts as a real message."""
+    origin = event.get("origin")
+    if isinstance(origin, dict) and origin.get("kind") in _CLI_INJECTED_ORIGINS:
+        return True
+    return isinstance(content, str) and content.lstrip().startswith("<task-notification>")
+
+
 def final_reply(record: dict):
     """Only a top-level final assistant message after THIS turn's boundary.
     A tool-use/thinking/interim text block is not evidence of a completed turn.
@@ -95,7 +108,19 @@ def final_reply(record: dict):
                 # Tool results belong to the same assistant turn. A later real
                 # user message invalidates any earlier final candidate.
                 content = (event.get("message") or {}).get("content")
-                if isinstance(content, str) or (isinstance(content, list) and any(
+                if _is_cli_injected(event, content):
+                    # v0.23.2: a background completion (<task-notification>) or a
+                    # peer message the CLI dequeued. After the send's final
+                    # reply it starts (or would start) a SELF-WOKEN turn — the
+                    # live runtime closes the send at its own result and tracks
+                    # that turn as a separate task — so the reply found so far
+                    # is the send's answer, whether the CLI exited first
+                    # (stdin EOF, 2026-11-12) or ran the woken turn. Mid-turn
+                    # (no candidate yet: the last assistant row was a tool
+                    # call) keep scanning for the send's own final reply.
+                    if candidate is not None:
+                        return candidate
+                elif isinstance(content, str) or (isinstance(content, list) and any(
                         isinstance(b, dict) and b.get("type") == "text" for b in content)):
                     candidate = None
             if event.get("type") != "assistant":

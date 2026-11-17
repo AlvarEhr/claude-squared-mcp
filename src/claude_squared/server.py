@@ -612,7 +612,7 @@ def _fmt_send_result(r: SendResult, tool: str | None = None, notification: str |
                     f"in headless --print mode — natural-language \"the user authorized this\" alone does NOT "
                     f"reliably satisfy the headless classifier, unlike interactive Claude Code). For "
                     f"out-of-sandbox file access, unrestricted OR pair_clear+pair_create with a wider "
-                    f"cwd/--add-dir; for a persistent narrow allowlist, recreate with `allowed_tools=[...]`."
+                    f"cwd/--add-dir; for a persistent narrow allowlist, pair_update(name, allowed_tools=[...]) (applies at the next send)."
                 )
             if (backend != "codex" and getattr(_spec, "allowed_tools", None)
                     and any(t in ("Bash", "PowerShell") for t in permissionish)):
@@ -1023,8 +1023,8 @@ def pair_create(
     (``backend="claude"``, default) or an OpenAI Codex CLI thread (``backend="codex"``).
 
     The child has true recursion (can spawn its own sub-agents), persistent context
-    across turns, and is specialized via pinned config (system prompt, allowed tools,
-    MCP scope — all persist across resume). One vocabulary covers both backends:
+    across turns, and is specialized via per-pair config (system prompt, allowed tools,
+    MCP scope; the system prompt is pinned at create, the rest re-applied at every spawn). One vocabulary covers both backends:
     permission levels, effort names, ``context_window`` and model aliases are
     backend-neutral and translated to native flags per backend.
 
@@ -1077,7 +1077,7 @@ def pair_create(
         profile_name: ``~/.claude/pairs/profiles/<name>.md``, a shared role prompt. Combines
             with ``system_prompt_append``: profile text first, then the append.
         allowed_tools: Claude permission patterns like ``["Bash(git *)", "Read"]``.
-            Pinned at create. Ignored by Codex. Rules match the literal command
+            Re-applied at every spawn (``pair_update`` takes effect at the next send). Ignored by Codex. Rules match the literal command
             (``*`` = any text, also mid-rule: ``Bash(git -C * log*)``).
         mcp_whitelist: Deliberate per-pair connector opt-in on either backend.
             None or [] selects none. Unknown names are stored with a warning.
@@ -2409,7 +2409,10 @@ def _format_async_handle(task_id: str, why: str, pair_name: str | None = None,
             f"  pair_poll('{poll_ref}', with_turn_log=True)  # read the result on wake\n"
             f"{name_hint}"
             "auto-watch hook armed — don't start wait.py. "
-            "The hook follows the pair until idle, including background work and self-woken turns."
+            "The hook follows the pair until idle, including background work and self-woken turns. "
+            "The hook doesn't keep an idle Desktop session from being paused or restarted: for long "
+            "work also keep one background Bash task running (e.g. wait.py for the longest job, which "
+            "then reports twice)."
         )
     return (
         f"{why}\n"
@@ -3840,13 +3843,12 @@ def pair_update(
     Three field categories with different propagation semantics — see README
     "Mid-flight config changes":
       - **Per-send** (``model``/``effort``/``permission_mode``/``context_window``/``mcp_whitelist``/
-        ``ultracode``/``backend_options``/``disallowed_tools``/``billing``): registry write + runtime eviction →
+        ``ultracode``/``backend_options``/``allowed_tools``/``disallowed_tools``/``billing``): registry write + runtime eviction →
         next ``pair_send`` respawns with new values (Codex: every send is a
         fresh process, so they apply immediately).
       - **Server-side** (``allowed_invocations``): MCP-layer only, no eviction;
         takes effect on next ``pair_invoke``. Pass ``[]`` for lockdown.
-      - **Pinned-at-create** (``allowed_tools``/
-        ``system_prompt_append``): registry updated but only takes effect after
+      - **Pinned-at-create** (``system_prompt_append``): registry updated but only takes effect after
         ``pair_clear`` (rotates session) — the Claude CLI keeps a session's
         first appended system prompt. Codex threads created by 0.19+ get their
         instructions re-sent every turn and pick a change up at the next
@@ -4107,13 +4109,15 @@ def _update_pair_impl(
             lost_note = _lost_note(lost)
             if lost_note:
                 transparency_msgs.append(lost_note)
-            # Operational warning when pinned-at-create fields change: the
-            # underlying claude --resume subprocess was started with the OLD
-            # values. The registry is now correct but the existing session
-            # keeps using its startup config until pair_clear rotates it. This
-            # is the one place agents reliably make the wrong assumption — flag
-            # it inline so they don't have to dig into the README.
-            pinned_at_create = {"allowed_tools", "system_prompt_append"}
+            # Operational warning when a pinned-at-create field changes: the
+            # Claude CLI keeps a session's first appended system prompt, so the
+            # existing session keeps it until pair_clear rotates it. Flag it
+            # inline so agents don't have to dig into the README.
+            # v0.23.2: allowed_tools is NOT pinned — the CLI applies the
+            # --allowed-tools of each spawn on resume, widening and narrowing
+            # (Haiku probe, CLI 2.1.322), and it is in SPAWN_PINNED_FIELDS, so
+            # this update already evicted the runtime.
+            pinned_at_create = {"system_prompt_append"}
             pinned_changed = sorted(pinned_at_create & fields.keys())
             if pinned_changed and spec.backend == "codex" and pinned_changed == ["system_prompt_append"]:
                 # v0.19: a developer-instructions thread is re-sent the text
@@ -4879,7 +4883,7 @@ def pair_clear(name: str, archive_old: bool = True, verbose: bool = False, force
     another MCP process always refuses).
 
     Implementation: rotates to a new session_id and starts a fresh session with the same
-    pinned config (system prompt, allowed_tools, MCP scope). Optionally archives the old
+    config (system prompt, allowed_tools, MCP scope). Optionally archives the old
     transcript to ~/.claude/pairs/archive/. Note: /clear in the underlying CLI is a UI
     operation and does NOT actually wipe the JSONL — rotation is the correct primitive.
 
@@ -6067,12 +6071,17 @@ def pair_status(name: str, last_n_log: int = 5, verbose: bool = False) -> str:
         )
     elif not runtime_alive and recently_inactive_log_mtime is not None:
         # v0.9.8 Bug 3 fix: recent log mtime + no inflight work + no live
-        # runtime = recent crash or eviction. Tell the agent the recency
+        # runtime = the runtime stopped recently. Tell the agent the recency
         # is informational, not "still active in some other process."
+        # v0.23.2: the usual causes are routine (pair_clear/compact/update,
+        # idle eviction, a server restart), so don't lead with "crash" — a
+        # crash in THIS process is reported above as a local corpse.
         recency_s = (now - recently_inactive_log_mtime).total_seconds()
         heuristic = (
             f"no runtime (cold; last log activity {recency_s:.0f}s ago, no in-flight work — "
-            f"likely a recent crash or eviction. Next pair_send will respawn from JSONL.)"
+            f"usually a clear/compact/update, idle eviction or a server restart, or a runtime "
+            f"in another MCP process. "
+            f"Next pair_send will respawn from JSONL.)"
         )
     elif not runtime_alive:
         heuristic = "no runtime (cold; will spawn on next send)"

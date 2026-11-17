@@ -10,7 +10,7 @@ assignees: ''
 
 <!-- Ask away. Examples:
      - "What's the difference between pair_clear and pair_forget?"
-     - "Why does pair_update for allowed_tools require pair_clear to take effect?"
+     - "Why does pair_update for system_prompt_append require pair_clear to take effect?"
      - "How do I get a pair to use a different MCP server than the parent?"
 -->
 

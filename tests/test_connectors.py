@@ -257,11 +257,29 @@ class ConnectorTests(unittest.TestCase):
         spec = PairSpec(name="legacy", session_id="s", cwd=str(self.directory),
                         mcp_whitelist=["pair"], allowed_tools=["Bash(git status)", "Read"])
         args = CL.ClaudeAdapter()._common_create_args(spec)
-        self.assertIn("--allowed-tools", args)
-        self.assertIn("Bash(git status) Read", args)
+        rules = args[args.index("--allowedTools") + 1:]
+        self.assertEqual(rules[:2], ["Bash(git status)", "Read"])
+        self.assertTrue(rules[2].startswith("--"))  # the variadic list ends at the next flag
         self.assertIn("--strict-mcp-config", args)
-        self.assertNotIn("--allowedTools", args)
+        self.assertNotIn("--allowed-tools", args)
         self.assertEqual(N.claude_init_notes(["pair"], []), [])
+
+    def test_allowed_tools_reach_every_spawn_path_without_connectors(self):
+        # v0.23.2 (temper P2): one-shot paths (override send, pair_invoke,
+        # fork, compact, /context) build their flags from _mcp_args; the
+        # allow rules used to ride only on create + the warm runtime.
+        adapter = CL.ClaudeAdapter()
+        spec = self.spec(permission_mode="read-only", mcp_whitelist=[],
+                         allowed_tools=["Bash(git -C * log*)", "Read"])
+        for name, args in (("create/runtime", adapter._common_create_args(spec)),
+                           ("one-shot", adapter._mcp_args(spec)),
+                           ("override", adapter._mcp_args(spec, "auto"))):
+            with self.subTest(path=name):
+                self.assertEqual(args.count("--allowedTools"), 1)
+                start = args.index("--allowedTools") + 1
+                self.assertEqual(args[start:start + 2], ["Bash(git -C * log*)", "Read"])
+                self.assertTrue(args[start + 2].startswith("--"))
+                self.assertNotIn("--allowed-tools", args)
 
     def test_stored_pair_selection_is_skipped_at_spawn_not_fatal(self):
         # A whitelist saved before 0.15.0 may contain 'pair' (it was silently

@@ -123,7 +123,10 @@ class SnapshotTests(unittest.TestCase):
 
     def test_standalone_without_package_and_missing_install(self):
         result = subprocess.run([sys.executable, "-S", "-B", str(ROOT / "mods/pairs-pane/read_pairs.py"),
-                                 "--home", str(self.home)], capture_output=True, encoding="utf-8", timeout=10)
+                                 "--home", str(self.home)], capture_output=True, encoding="utf-8",
+                                stdin=subprocess.DEVNULL, timeout=30)
+        # stdin=DEVNULL: the reader reads its request from stdin; an inherited,
+        # still-open pipe (how the runner was launched) made it wait forever.
         self.assertEqual(result.returncode, 0, result.stderr)
         row = json.loads(result.stdout)["rows"][0]
         self.assertEqual((row["name"], row["status"]), ("scout", "idle"))
@@ -673,6 +676,23 @@ class SnapshotTests(unittest.TestCase):
         done.write_text(saved, encoding="utf-8")
         self.assertIn("a.py", P.tool_detail(self.home, "helper", "T-1", 1)["input"])
         self.assertIn("note", P.tool_detail(self.home, "helper", "T-1", 9))
+
+    def test_nested_subagent_lifecycle_lines_carry_the_label(self):
+        # 0.23.2: a sub-agent's own task_started / task_notification lines are
+        # labelled too; a nested launch still finds its start and its end.
+        self.write("registry.json", {"pairs": {"helper": {"backend": "claude", "session_id": "s1", "cwd": "C:/w"}}})
+        logs = self.pairs / "logs" / "helper"
+        logs.mkdir(parents=True)
+        (logs / "main.log").write_text(
+            "[10:01:00] [T-6] [-> sub-agent #1: coder] launching: Fix it\n"
+            "[10:01:01] [system:task_started] local_agent (background) bbb222: Fix it\n"
+            "[10:01:01] [T-6] [<- sub-agent #1 returned] Async agent launched successfully.\n"
+            "[10:01:10] [sub-agent #1] [T-8] [-> sub-agent #2: scout] launching: Nested\n"
+            "[10:01:11] [sub-agent #1] [system:task_started] local_agent (background) ddd444: Nested\n"
+            "[10:01:20] [sub-agent #1] [system:task_notification] task ddd444 completed: ok\n", encoding="utf-8")
+        rows, found = P.subagents(self.home, "helper")
+        self.assertEqual({r["id"]: r["status"] for r in rows}, {1: "running", 2: "done"})
+        self.assertEqual(found[2].get("agent"), "ddd444")
 
 
 if __name__ == "__main__":

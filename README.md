@@ -14,7 +14,7 @@ Claude Code's built-in `Agent` tool spawns single-shot sub-agents that can't rec
 A pair is a `claude --print --resume <uuid>` session (or a `codex exec resume <thread-id>` thread) that you address by name. The MCP wraps the lifecycle so a pair becomes a first-class teammate that:
 - Spawns its own sub-agents (it has the full `Agent` tool by default)
 - Survives across your context compactions (registry on disk)
-- Has specialized config pinned at create (system prompt, allowed tools, MCP scope)
+- Has its own per-pair config (system prompt, allowed tools, MCP scope)
 - Supports native `/compact`, `/context`, `/skill-name` via stream-json (Claude)
 - Auto-tracks token usage and warns at ≥60% context fill
 - Can run on either backend — mixed fleets (a Claude reviewer next to a Codex implementer) use one set of tools and one vocabulary
@@ -391,6 +391,17 @@ the manager needs no Bash watcher step.** When the response says
 "auto-watch hook armed", finish independent work or end
 your turn. The hook wakes you with the watcher outcome; read the result with
 `pair_poll(name, with_turn_log=True)`. Without the hook, use the pattern below.
+
+**The hook does not keep the manager's session alive.** The Claude desktop app
+treats a session with no turn running and no background task of its own as
+idle: under memory pressure it pauses it, and with an update staged it restarts
+the app after about ten minutes of idleness. The pair MCP server goes with the
+session, so a pair's background sub-agents stop about ten minutes later and a
+Codex turn stops at once. An `asyncRewake` hook doesn't count as a background
+task; a background Bash command does. While pairs work for long, keep one
+running, for example `wait.py <pair>` for the longest job (its exit also wakes
+you, so that pair reports twice). Observed with Claude Desktop 5.11492,
+November 2026.
 
 Three ways to consume the handle:
 
@@ -980,9 +991,9 @@ Since October 2026 Max and Team plans include monthly API credits for one linked
 
 | Category | Fields | When change takes effect |
 |---|---|---|
-| Per-send | `model`, `effort`, `permission_mode`, `context_window`, `backend_options`, `ultracode`, `fallback_model`, `mcp_whitelist`, `disallowed_tools`, `billing` (0.18.0; `pair_billing` for the API) | Next `pair_send` (registry write + runtime eviction → respawn with new values; Codex: every send is a fresh process) |
+| Per-send | `model`, `effort`, `permission_mode`, `context_window`, `backend_options`, `ultracode`, `fallback_model`, `mcp_whitelist`, `allowed_tools`, `disallowed_tools`, `billing` (0.18.0; `pair_billing` for the API) | Next `pair_send` (registry write + runtime eviction → respawn with new values; Codex: every send is a fresh process) |
 | Server-side | `allowed_invocations`, `context_alert_at` | No eviction needed (MCP-layer, not pinned to the CLI subprocess). `allowed_invocations`: next `pair_invoke`. `context_alert_at`: next send's result, `pair_status`, and running `wait.py` watchers at their next poll (exit 8 at once if the new level is already behind the context). Mutable freely. |
-| Pinned-at-create | `allowed_tools`, `system_prompt_append` | **Only after `pair_clear`** — the existing session was started with the OLD values (the Claude CLI keeps a session's first appended system prompt); rotation creates a fresh session with the new pinned config. Codex threads created by 0.19+ also pick up a new `system_prompt_append` at their next compaction |
+| Pinned-at-create | `system_prompt_append` | **Only after `pair_clear`** — the Claude CLI keeps a session's first appended system prompt; rotation creates a fresh session with the new pinned config. Codex threads created by 0.19+ also pick up a new `system_prompt_append` at their next compaction |
 | Pinned-at-spawn | `cwd`, `extra_dirs` | Next spawn after eviction. A Claude `cwd` change ALSO moves the session JSONL across project dirs (rejected with recovery hint if the move fails); Codex threads aren't cwd-keyed |
 
 Since 0.16.0 only an *actual* change evicts the runtime — a `pair_update` that sends the current values is a no-op (restart a warm runtime with `pair_stop(name, force=True)`), and a change to a spawn-pinned field refuses while the pair has background work pending unless you pass `force=True` (the work is killed and recorded).
@@ -1005,7 +1016,7 @@ Mutable via `pair_update(allowed_invocations=...)` **without runtime eviction** 
 
 - **One vocabulary, translated per backend.** Permission levels, effort names, `context_window` and model aliases are backend-neutral on the tool surface; each adapter maps them to native flags. The old Claude spellings stay accepted as input aliases so nothing an agent learned before 0.13.0 breaks.
 - **`--model` and `--effort` re-passed every call** because they don't persist on resume in either CLI.
-- **`--append-system-prompt`, `--allowed-tools` pinned at create** because they DO persist (Claude). MCP flags are re-applied on every spawn instead (verified: a resumed session uses the new ones), which is what lets `pair_update(mcp_whitelist=…)` take effect without a `pair_clear`. `--disallowed-tools`, `--settings` and Claude `backend_options.args` are re-applied the same way (0.17.0).
+- **`--append-system-prompt` pinned at create** because the Claude CLI keeps a session's first one. MCP flags are re-applied on every spawn instead (verified: a resumed session uses the new ones), which is what lets `pair_update(mcp_whitelist=…)` take effect without a `pair_clear`. `--allowed-tools` (re-verified 2.1.322: a resumed session uses the new rules, widening and narrowing), `--disallowed-tools`, `--settings` and Claude `backend_options.args` are re-applied the same way.
 - **Per-pair FIFO lock** in the server: concurrent `pair_send` to the same pair queue automatically (cross-process too; Codex's own thread-store lock is the belt).
 - **Two execution paths in the Claude adapter**: a warm `--print --input-format stream-json` runtime for normal sends; a one-shot stream-json subprocess for slash commands (compact/context/invoke). **Codex is one `exec` process per turn** (phase 1; the `codex app-server` daemon is the warm-runtime candidate).
 - **Auto is the default permission level** — `unrestricted` is refused as a global default.

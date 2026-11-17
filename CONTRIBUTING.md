@@ -30,8 +30,10 @@ For the **Claude Desktop install** (build the bundled `.mcpb`):
 python scripts/build_and_install_extension.py --install --clean
 ```
 
-This vendors the Python deps into `extension/server/lib/`, packs the
-`.mcpb` to `dist/claude-squared-<version>.mcpb` (verified against `src/`
+This syncs `src/` into `extension/src/`, packs it with the vendored Python
+deps already in `extension/server/lib/` (fastmcp, pydantic, filelock …; the
+script checks they are present but does not install them, so keep that folder)
+into `dist/claude-squared-<version>.mcpb` (verified against `src/`
 before it replaces anything), and unpacks it into the per-OS Claude
 Extensions directory. Restart Claude Desktop to pick up the new bundle. The
 bundle is a release artifact (GitHub Releases), not tracked in git.
@@ -46,13 +48,12 @@ process with a temporary `CLAUDE_HOME`):
 python scripts/run_offline_tests.py
 ```
 
-That runs every suite listed in the script (27 as of 0.17.0): the maintained
+That runs every suite listed in the script (40 as of 0.23.2, plus a check of
+the Pairs pane mod when `claude` is on PATH): the maintained
 `tests/smoke_*.py` scripts (each prints `PASS:` and exits non-zero on any
 failed assertion) and the `unittest` suites in `tests/test_*.py`. CI runs the
-same command on every push across the OS/Python matrix. Four legacy scripts
-(`smoke.py`, `smoke_runtime.py`, `smoke_streamjson.py`, `smoke_v05.py`)
-predate the v0.10 API and are not part of the run. A new test file needs its
-own entry in `scripts/run_offline_tests.py`.
+same command on every push across the OS/Python matrix. A new test file needs
+its own entry in `scripts/run_offline_tests.py`.
 
 Live tests cost real usage; run them before a release — and after a Codex CLI
 update — not in CI. Each uses a temporary `CLAUDE_HOME`; the Codex ones use
@@ -86,6 +87,13 @@ your real `codex` auth and delete the threads they create.
   resume / `pair_compact` / `pair_clear`, the Python check (about ten short
   Luna turns and one compaction). Its fixtures live under `~` (never under
   `%TEMP%`); it prints any trust entries Codex adds to your `config.toml`
+- `python tests/smoke_live_auto_watch.py --live` — the opt-in auto-watch
+  hook waking a stream-json manager (Haiku; private registry and settings)
+- `python tests/smoke_live_host_shutdown.py --live` — a Claude turn
+  surviving its MCP server's shutdown and the successor recovering the
+  reply (two real stdio servers, Haiku)
+- `python tests/smoke_live_sessionstart.py --live` — SessionStart
+  `asyncRewake` recovery after `--resume` (two or three small Haiku turns)
 
 ## Releasing
 
