@@ -1,11 +1,14 @@
 """Run the maintained offline tests in isolated Python processes.
 
-Run with ``python scripts/run_offline_tests.py`` from any working directory.
+Run with ``python scripts/run_offline_tests.py`` from any working directory
+(``--list`` names the suites, ``--only NAME`` runs some of them).
 The explicit allow-list excludes smoke scripts that invoke live models.
 """
 
 from __future__ import annotations
 
+import argparse
+import fnmatch
 import os
 import shutil
 from pathlib import Path
@@ -22,10 +25,33 @@ SMOKE_SUITES = (
 )
 
 
-def main() -> int:
-    if len(sys.argv) != 1:
-        print("Usage: python scripts/run_offline_tests.py (offline only)", file=sys.stderr)
-        return 2
+PANE_SUITE = "pairs_pane_mod"
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="run_offline_tests.py",
+        description="Run the maintained offline suites, each in its own process with an isolated "
+                    "CLAUDE_HOME/CODEX_HOME. No arguments = every suite (what CI runs).")
+    parser.add_argument("--list", action="store_true", help="print the suite names and exit")
+    parser.add_argument("--only", action="append", default=[], metavar="NAME",
+                        help="run only these suites (exact name or glob, e.g. host_shutdown, 'smoke_v09*'); "
+                             "repeat or comma-separate")
+    return parser.parse_args(argv)
+
+
+def _select(names: list[str], patterns: list[str]) -> tuple[list[str], list[str]]:
+    """Names matching any pattern (in run order), and patterns that matched none."""
+    wanted = [p.strip() for raw in patterns for p in raw.split(",") if p.strip()]
+    if not wanted:
+        return list(names), []
+    selected = [n for n in names if any(fnmatch.fnmatchcase(n, p) for p in wanted)]
+    unmatched = [p for p in wanted if not any(fnmatch.fnmatchcase(n, p) for n in names)]
+    return selected, unmatched
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(sys.argv[1:] if argv is None else argv)
 
     commands = [
         (f"smoke_{suite}", [str(ROOT / "tests" / f"smoke_{suite}.py")])
@@ -123,6 +149,21 @@ def main() -> int:
         "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
         "-p", "test_quiet_cancellation.py", "-v",
     ]))
+    commands.append(("offline_runner", [
+        "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
+        "-p", "test_offline_runner.py", "-v",
+    ]))
+    names = [name for name, _ in commands] + [PANE_SUITE]
+    if args.list:
+        print("\n".join(names))
+        return 0
+    selected, unmatched = _select(names, args.only)
+    if unmatched:
+        print(f"Unknown suite(s): {', '.join(unmatched)}. Run with --list for the names.", file=sys.stderr)
+        return 2
+    commands = [(name, arguments) for name, arguments in commands if name in selected]
+    run_pane = PANE_SUITE in selected
+
     scratch = ROOT / ".test-homes"
     scratch.mkdir(exist_ok=True)
     failures = []
@@ -143,9 +184,12 @@ def main() -> int:
                 "TMP": tmp, "TEMP": tmp, "TMPDIR": tmp,
             })
             try:
+                # stdin=DEVNULL: a suite that starts a stdin-reading child
+                # must never inherit an open pipe from however this runner
+                # was launched (a pane test hung on exactly that, 2026-11-17).
                 result = subprocess.run(
                     [sys.executable, "-B", "-u", *arguments],
-                    cwd=ROOT, env=env, check=False,
+                    cwd=ROOT, env=env, check=False, stdin=subprocess.DEVNULL,
                 )
             except OSError as exc:
                 print(f"FAIL {name}: could not start Python: {exc}", file=sys.stderr)
@@ -159,7 +203,9 @@ def main() -> int:
     # The pane draws props only newer engines accept; point this at the
     # desktop app's bundled CLI when the PATH one lags behind it.
     cli = os.environ.get("CLAUDE_SQUARED_TEST_CLI") or shutil.which("claude")
-    if cli:
+    if not run_pane:
+        pass
+    elif cli:
         suites += 1
         print("\n=== pairs_pane_mod (local CLI; no model calls) ===", flush=True)
         with tempfile.TemporaryDirectory(prefix="cs-offline-mod-", dir=scratch, ignore_cleanup_errors=True) as tmp:
@@ -168,7 +214,8 @@ def main() -> int:
             try:
                 for action in ("validate", "test"):
                     result = subprocess.run([cli, "plugin", action, str(ROOT / "mods" / "pairs-pane")],
-                                            cwd=ROOT, env=env, timeout=120, check=False)
+                                            cwd=ROOT, env=env, timeout=120, check=False,
+                                            stdin=subprocess.DEVNULL)
                     if result.returncode:
                         failures.append("pairs_pane_mod")
                         break
