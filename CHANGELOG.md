@@ -4,6 +4,41 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- A Claude turn recovered after a host shutdown could be reported ORPHANED
+  even though its reply was in the session file. The CLI had picked up a
+  queued background-completion notice (`<task-notification>`) just before
+  it exited; recovery treated that as a new user message and discarded the
+  reply before it. User rows the CLI writes itself (background completions,
+  peer and sub-agent messages) no longer hide a final reply; a real user
+  message after it still does.
+- `pair_update(allowed_tools=…)` told you to run `pair_clear` for the new
+  rules to apply. They apply at the next send: the CLI uses the allow rules
+  of each spawn on resume (widening and narrowing, re-verified on CLI
+  2.1.322), and the update already restarts the runtime. The note, the
+  `pair_create` / `pair_update` descriptions and the README's mid-flight
+  config table no longer list `allowed_tools` as pinned at create.
+  `system_prompt_append` still is.
+- `pair_status` called a cold runtime with recent log activity "likely a
+  recent crash or eviction". It now names the usual causes (clear, compact,
+  update, idle eviction, a server restart); a crash in the same server is
+  still reported as one.
+
+### Changed
+
+- A sub-agent's own background-task lines in `main.log`
+  (`[system:task_started]`, `[system:task_notification]`) carry its
+  `[sub-agent #N]` label like its other events. The Pairs pane reads the
+  labelled lines, including those of a sub-agent's nested launches.
+- The README, and the long send reply shown when the auto-watch hook is
+  armed, now say that the hook doesn't keep the manager's Desktop session
+  alive. An idle session can be paused under memory pressure or restarted
+  for an update, and its pairs' work stops with it. A background Bash task
+  (e.g. `wait.py`) prevents that.
+
 ## [0.23.1] — 2026-11-11
 
 ### Fixed

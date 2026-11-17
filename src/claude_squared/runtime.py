@@ -620,6 +620,10 @@ class PairRuntime:
         # pending background. A notification for a task NOT in here was
         # started by a previous runtime (see _is_stale_resume_result).
         self._known_tasks: dict[str, tuple[str, str]] = {}  # task_id -> (kind, description)
+        # v0.23.2: task_id -> its tool_use_id (an Agent task's maps to the
+        # sub-agent number) and the "[sub-agent #N]" label its lines carry.
+        self._task_tool_use_ids: dict[str, str] = {}
+        self._task_labels: dict[str, str] = {}
         self._stale_notice: str | None = None
         self._assistant_since_result = False
         # v0.16.0: monotonic time of the latest sign that a self-woken turn is
@@ -1583,6 +1587,11 @@ class PairRuntime:
         full_tid = str(ev.get("task_id") or "")
         tid = (full_tid or "?")[:12]
         sub = ev.get("subtype")
+        label = self._task_owner_label(ev, full_tid)
+
+        def log_line(text: str) -> None:
+            self._append_main_log_line(_label_log_line(text, label) if label else text)
+
         if sub == "task_started":
             kind = ev.get("task_type") or ev.get("subagent_type") or "task"
             desc = str(ev.get("description") or "")[:120].replace("\n", " ")
@@ -1591,10 +1600,14 @@ class PairRuntime:
             backgrounded = ev.get("is_backgrounded") is not False
             if full_tid:
                 self._known_tasks[full_tid] = (str(kind), desc)
+                if ev.get("tool_use_id"):
+                    self._task_tool_use_ids[full_tid] = str(ev.get("tool_use_id"))
+                if label:
+                    self._task_labels[full_tid] = label
                 if backgrounded:
                     self._track_background(full_tid, str(kind), desc)
             fg = "" if backgrounded else " (foreground)"
-            self._append_main_log_line(f"[{ts}] [system:task_started] {kind}{fg} {tid}: {desc}")
+            log_line(f"[{ts}] [system:task_started] {kind}{fg} {tid}: {desc}")
             return
         if sub == "task_updated":
             # Quiet bookkeeping only (no log line — these are frequent).
@@ -1621,10 +1634,23 @@ class PairRuntime:
         # No "the pair will now resume" claim here: this fires for blocking
         # sub-agents too. A self-woken turn announces itself with its own
         # SELF-WOKEN marker line.
-        self._append_main_log_line(
+        log_line(
             f"[{ts}] [system:task_notification] task {tid} {status}"
             f"{': ' + summary if summary else ''}"
         )
+
+    def _task_owner_label(self, ev: dict, task_id: str) -> str:
+        """``[sub-agent #N]`` for a task a sub-agent started, else "".
+        A sub-agent's task events carry ``owned_by_subagent`` and the agent's
+        own ``parent_task_id`` but no ``parent_tool_use_id`` (CLI 2.1.322);
+        the agent's task_started mapped that task id to its Agent tool_use id,
+        which ``_subagent_numbers`` maps to the number. A later event without
+        the fields (a notification) reuses the label from its start."""
+        parent = str(ev.get("parent_task_id") or "")
+        if not parent and not ev.get("owned_by_subagent"):
+            return self._task_labels.get(task_id, "")
+        num = self._subagent_numbers.get(self._task_tool_use_ids.get(parent, ""))
+        return f"[sub-agent #{num}]" if num else "[sub-agent]"
 
     def _track_background(self, task_id: str, kind: str, desc: str) -> None:
         with self._scope_lock:

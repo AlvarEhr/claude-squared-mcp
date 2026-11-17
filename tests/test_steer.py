@@ -258,6 +258,35 @@ class SteerTests(unittest.TestCase):
         self.assertRegex(child_line, rf"^\[\d\d:\d\d:\d\d\] \[sub-agent #{n}\] \[T-\d+\] \[tool_use\]")
         self.assertNotIn("sub-agent", own_line)
 
+    def test_subagent_task_lifecycle_lines_are_labelled(self):
+        # v0.23.2: a sub-agent's own task events carry owned_by_subagent and
+        # parent_task_id (no parent_tool_use_id) — shapes from a CLI 2.1.322 probe.
+        launch = {"type": "assistant", "parent_tool_use_id": None, "message": {"content": [
+            {"type": "tool_use", "id": "toolu_agent", "name": "Agent",
+             "input": {"description": "reader", "subagent_type": "general-purpose",
+                       "run_in_background": True}}]}}
+        self.rt._on_event_for_log(json.dumps(launch))
+        for ev in ({"type": "system", "subtype": "task_started", "task_id": "a5dfe09d0e1ed4585",
+                    "tool_use_id": "toolu_agent", "description": "reader", "task_type": "local_agent",
+                    "is_backgrounded": True},
+                   {"type": "system", "subtype": "task_started", "task_id": "ba3yw3xt7",
+                    "owned_by_subagent": True, "parent_task_id": "a5dfe09d0e1ed4585",
+                    "tool_use_id": "toolu_child", "description": "child sleep",
+                    "task_type": "local_bash", "is_backgrounded": False},
+                   {"type": "system", "subtype": "task_notification", "task_id": "ba3yw3xt7",
+                    "status": "completed", "summary": "child done"},
+                   {"type": "system", "subtype": "task_started", "task_id": "bown1",
+                    "tool_use_id": "toolu_own", "description": "own sleep",
+                    "task_type": "local_bash", "is_backgrounded": True}):
+            self.rt._on_event_for_log(json.dumps(ev))
+        lines = self.rt.main_log_path.read_text(encoding="utf-8").splitlines()
+        n = self.rt._subagent_numbers["toolu_agent"]
+        line = lambda text: next(l for l in lines if text in l)
+        self.assertNotIn("[sub-agent", line("local_agent"))  # the launch itself is the pair's
+        self.assertRegex(line("child sleep"), rf"^\[\d\d:\d\d:\d\d\] \[sub-agent #{n}\] \[system:task_started\]")
+        self.assertRegex(line("child done"), rf"^\[\d\d:\d\d:\d\d\] \[sub-agent #{n}\] \[system:task_notification\]")
+        self.assertNotIn("[sub-agent", line("own sleep"))
+
     def test_override_and_timeout_rejected_without_delivery(self):
         for name, value in (("override_model", "haiku"), ("override_effort", "low"),
                             ("override_permission_mode", "auto"), ("hard_timeout_seconds", 30)):
