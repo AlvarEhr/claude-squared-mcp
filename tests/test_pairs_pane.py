@@ -124,7 +124,9 @@ class SnapshotTests(unittest.TestCase):
     def test_standalone_without_package_and_missing_install(self):
         result = subprocess.run([sys.executable, "-S", "-B", str(ROOT / "mods/pairs-pane/read_pairs.py"),
                                  "--home", str(self.home)], capture_output=True, encoding="utf-8",
-                                timeout=60)  # 10 s timed out twice on a loaded machine (2026-11-17)
+                                stdin=subprocess.DEVNULL, timeout=30)
+        # stdin=DEVNULL: the reader reads its request from stdin; an inherited,
+        # still-open pipe (how the runner was launched) made it wait forever.
         self.assertEqual(result.returncode, 0, result.stderr)
         row = json.loads(result.stdout)["rows"][0]
         self.assertEqual((row["name"], row["status"]), ("scout", "idle"))
