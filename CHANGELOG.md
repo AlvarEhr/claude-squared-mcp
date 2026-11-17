@@ -38,6 +38,12 @@ All notable changes to this project are documented here. Format follows
   (`[system:task_started]`, `[system:task_notification]`) carry its
   `[sub-agent #N]` label like its other events. The Pairs pane reads the
   labelled lines, including those of a sub-agent's nested launches.
+- Repository cleanup: removed six pre-v0.10 smoke scripts that no test run
+  used (they made live calls against the real pair registry),
+  `scripts/tail_pair.ps1` (it tailed a log path unused since v0.5) and three
+  2026-09-08 prototype files under `experiments/` (in git history at
+  `f30b1cb`). CONTRIBUTING lists every live harness and describes the
+  vendored `extension/server/lib/` correctly.
 - The README, and the long send reply shown when the auto-watch hook is
   armed, now say that the hook doesn't keep the manager's Desktop session
   alive. An idle session can be paused under memory pressure or restarted

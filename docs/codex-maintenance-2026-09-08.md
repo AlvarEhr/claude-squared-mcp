@@ -123,7 +123,8 @@ interpreter, because Python execution was unavailable in the pair's sandbox.
   asset; choose the next version and rebuild before releasing.
 - The rebuilt extension also passed a real stdio startup smoke test in empty
   temporary pair state: initialize, discovery of **30 tools**, and `pair_list`.
-  Repeat with `python experiments/packaged_mcp_smoke.py claude-squared.mcpb`.
+  The script was `experiments/packaged_mcp_smoke.py` (removed in 0.23.2; see
+  commit `f30b1cb`); the build script's bundle verification now covers it.
   Its advertised server version is FastMCP's default library version; bundle
   version/source validation uses the manifest and package source instead.
 
@@ -166,7 +167,9 @@ process. `tools/list` returned the expected catalog, including
 or investigate reliable environment forwarding/discovery. No production discovery
 or callback integration has been added.
 
-`experiments/codex_desktop_bridge.py` is an isolated, opt-in prototype:
+`experiments/codex_desktop_bridge.py` (removed in 0.23.2; it is in commit
+`f30b1cb`, and the integrated version is `src/claude_squared/desktop_bridge.py`)
+was an isolated, opt-in prototype:
 
 - `--pipe <identified path>` reads the catalog.
 - `--send-smoke --thread-id <disposable thread> --completed-turn-id <old turn>`
