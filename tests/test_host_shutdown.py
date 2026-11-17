@@ -286,6 +286,26 @@ class HostShutdownTests(unittest.TestCase):
         self.assertEqual(state.status, "done")
         self.assertEqual(state.result.response, "CANARY done")
 
+    def test_each_injected_row_shape_alone_keeps_the_reply(self):
+        # temper P3: each recognised shape as the ONLY injected row after the
+        # reply, so dropping any one check fails a subtest.
+        record = H.view(self.spec.name)
+        now = datetime.now(timezone.utc).isoformat()
+        shapes = {
+            "task-notification origin": {"origin": {"kind": "task-notification"},
+                                         "message": {"role": "user", "content": "anything"}},
+            "peer origin": {"isMeta": True, "origin": {"kind": "peer"},
+                            "message": {"role": "user", "content": "Another Claude session sent a message"}},
+            "bare notification text": {"message": {"role": "user",
+                                                   "content": "<task-notification>\n<task-id>a2</task-id>"}},
+        }
+        for label, row in shapes.items():
+            with self.subTest(shape=label):
+                path = self.transcript()
+                with path.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps({"type": "user", "timestamp": now, **row}) + "\n")
+                self.assertEqual((H.final_reply(record) or ("",))[0], "CANARY done")
+
     def test_woken_turn_after_the_reply_does_not_replace_it(self):
         # temper P2: the CLI may start the self-woken turn before it handles
         # stdin EOF; neither its thinking row nor its final text is the send's.

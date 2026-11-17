@@ -124,7 +124,9 @@ interpreter, because Python execution was unavailable in the pair's sandbox.
 - The rebuilt extension also passed a real stdio startup smoke test in empty
   temporary pair state: initialize, discovery of **30 tools**, and `pair_list`.
   The script was `experiments/packaged_mcp_smoke.py` (removed in 0.23.2; see
-  commit `f30b1cb`); the build script's bundle verification now covers it.
+  commit `f30b1cb`). The build script's bundle verification checks versions,
+  source bytes and the vendored runtime files, not a stdio startup; the
+  post-install real-MCP test covers startup.
   Its advertised server version is FastMCP's default library version; bundle
   version/source validation uses the manifest and package source instead.
 
