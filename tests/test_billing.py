@@ -488,7 +488,7 @@ class ToolTests(BillingCase):
         self.add(billing="api", total_cost_usd=2.5, api_cost_usd=1.25)
         info = tool(S.pair_info)("p")
         self.assertIn("billing: api (key …WXYZ)", info)
-        self.assertIn("cost: $2.50 at list prices, $1.25 of it billed to the API key", info)
+        self.assertIn("cost: $2.50 at list prices this session; $1.25 billed to the API key since the pair began", info)
         for shown in (info, tool(S.pair_info)("p", verbose=True)):
             self.assertNotIn(FAKE_KEY, shown)
         CL.api_key_path().unlink()
@@ -556,6 +556,75 @@ class CostTests(BillingCase):
             CL.ClaudeAdapter()._run_stream_json(spec, ["/compact"], timeout_seconds=5)
         spec = R.get_pair("p")
         self.assertEqual((spec.total_cost_usd, spec.api_cost_usd), (1.25, 1.25))
+
+    # v0.23.3: --resume restores the session's running cost from its last
+    # cost-state row (Haiku probe, CLI 2.1.326: 0.00994 → 0.01037 → 0.01081
+    # across three processes). Every resuming spawn must start from it.
+
+    def plant(self, spec, *rows):
+        path = CL.ClaudeAdapter().transcript_path(spec)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        return path
+
+    def test_baseline_is_the_last_valid_cost_state_row(self):
+        spec = self.add()
+        user = {"type": "user", "message": {"content": "x" * 300}}
+        path = self.plant(spec, user, {"type": "cost-state", "totalCostUSD": 0.5}, user,
+                          {"type": "cost-state", "totalCostUSD": 2.25}, user,
+                          {"type": "cost-state", "totalCostUSD": "3"}, {"type": "cost-state", "totalCostUSD": -1},
+                          {"type": "cost-state", "totalCostUSD": True}, user)
+        self.assertEqual(CL.session_cost_baseline(path), 2.25)
+        # Across the 256 KiB read boundary, and with a torn last line.
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "cost-state", "totalCostUSD": 4.5}) + "\n")
+            for _ in range(2000):
+                f.write(json.dumps(user) + "\n")
+            f.write('{"type": "cost-state", "totalCostUSD": 9')
+        self.assertEqual(CL.session_cost_baseline(path), 4.5)
+        self.assertEqual(CL.session_cost_baseline(path.with_name("missing.jsonl")), 0.0)
+        self.assertEqual(CL.session_cost_baseline(None), 0.0)
+
+    def test_cost_share(self):
+        self.assertEqual(CL.cost_share(1.25, 1.0), 0.25)
+        self.assertEqual(CL.cost_share(0.3, 1.0), 0.3)     # not restored: a fresh count
+        self.assertEqual(CL.cost_share(0, 1.0), 0.0)
+        self.assertEqual(CL.cost_share(None, 1.0), 0.0)
+
+    def test_runtime_start_seeds_the_running_total_from_the_session(self):
+        spec = self.add()
+        self.plant(spec, {"type": "cost-state", "totalCostUSD": 3.0})
+        rt = PairRuntime(spec, CL.ClaudeAdapter())
+        with patch.object(RT, "_claude_executable", side_effect=RuntimeError("stop before spawn")):
+            with self.assertRaises(RuntimeError):
+                rt.start()
+        self.assertEqual(rt._cost_seen, 3.0)
+        ev = {"type": "result", "subtype": "success", "total_cost_usd": 3.4}   # first turn after the resume
+        rt._after_result(ev)
+        self.assertAlmostEqual(ev["_turn_cost_usd"], 0.4)
+
+    def test_compaction_on_a_resumed_session_books_only_its_step(self):
+        self.write_key()
+        spec = self.add(billing="api", total_cost_usd=10.0, api_cost_usd=10.0)
+        self.plant(spec, {"type": "cost-state", "totalCostUSD": 10.0})
+        events = [{"type": "system", "subtype": "init"},
+                  {"type": "result", "subtype": "success", "total_cost_usd": 10.25}]
+        out = "\n".join(json.dumps(e) for e in events)
+        with patch.object(subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=out.encode(), stderr=b"")):
+            CL.ClaudeAdapter()._run_stream_json(spec, ["/compact"], timeout_seconds=5)
+        spec = R.get_pair("p")
+        self.assertEqual((spec.total_cost_usd, spec.api_cost_usd), (10.25, 10.25))
+
+    def test_one_shot_send_on_a_resumed_session_gets_its_step(self):
+        spec = self.add()
+        self.plant(spec, {"type": "cost-state", "totalCostUSD": 2.0})
+        reply = {"type": "result", "subtype": "success", "result": "ok", "session_id": spec.session_id,
+                 "total_cost_usd": 2.5, "usage": {}, "modelUsage": {}}
+        adapter = CL.ClaudeAdapter()
+        with patch.object(adapter, "_run_print", return_value=dict(reply)):
+            result = adapter.send(spec, "hi", model="haiku")
+        self.assertAlmostEqual(result.cost_usd, 0.5)
 
     def test_the_send_result_prefers_the_turns_share(self):
         spec = self.add()

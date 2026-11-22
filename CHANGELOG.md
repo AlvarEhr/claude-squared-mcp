@@ -4,6 +4,30 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- API-billed pairs reported several times what the API actually charged
+  (about 4x in real use). The Claude CLI's `total_cost_usd` is a running
+  total for the whole session: every process writes it to the session file
+  when it ends, and the next `--resume` continues from it (verified on CLI
+  2.1.326). claude-squared counted from zero in each new process, so the
+  first turn after every runtime restart (idle eviction, a config change,
+  a stale-session respawn) re-booked the session's entire earlier cost, and
+  every `pair_compact`, `pair_context`, `pair_invoke` and override send
+  booked the whole running total. Each spawn now starts from the session's
+  last recorded total and books only its own step. Totals booked before
+  this release are not recomputed.
+- `pair_info` called the pair's API spend a part of the session cost
+  ("$9.90 … $70.73 of it billed to the API key"). The API figure covers the
+  pair's whole life (it survives `pair_clear`); the line now says so.
+
+### Changed
+
+- `scripts/run_offline_tests.py` takes `--list` and `--only NAME[,glob]`, and
+  gives every suite an empty stdin.
+
 ## [0.23.2] — 2026-11-17
 
 ### Fixed

@@ -489,8 +489,10 @@ class PairRuntime:
         # v0.18.0: hash of the API key this process was spawned with (None on
         # the plan) — get_or_start respawns when the key file changes.
         self.key_fingerprint: str | None = None
-        # v0.18.0: the CLI's total_cost_usd is a running total for the
-        # process; the reader keeps the last one to hand each turn its share.
+        # v0.18.0: the CLI's total_cost_usd is a running total; the reader
+        # keeps the last one to hand each turn its share. v0.23.3: it continues
+        # the session's earlier processes, so start() seeds it from the
+        # session's last cost-state row.
         self._cost_seen = 0.0
         self.last_activity: datetime = datetime.utcnow()
         self.send_lock = threading.Lock()
@@ -872,6 +874,14 @@ class PairRuntime:
         env = self.adapter._spawn_env(self.spec)  # noqa: SLF001
         self._init_event = None
         self._steer_supported = False
+        # v0.23.3: --resume restores the session's running cost (the last
+        # cost-state row); start the per-turn step from it, or the first turn
+        # after every respawn re-books the whole session (Alvar's ~4x on the API).
+        from claude_squared.adapters.claude import session_cost_baseline
+        try:
+            self._cost_seen = session_cost_baseline(self.adapter.transcript_path(self.spec))
+        except Exception:  # bookkeeping never blocks a spawn
+            self._cost_seen = 0.0
         cli = _claude_executable()
         args = [cli] + self.adapter._common_create_args(self.spec)  # noqa: SLF001
         args += [

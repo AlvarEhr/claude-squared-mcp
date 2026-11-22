@@ -337,6 +337,59 @@ def api_key_status() -> str:
     return f"key …{key[-4:]}"
 
 
+_COST_STATE_RE = re.compile(rb'"type"\s*:\s*"cost-state"')
+
+
+def session_cost_baseline(path: Path | None) -> float:
+    """The running cost a ``--resume`` of this session starts from.
+
+    v0.23.3: the CLI restores the session's cost on resume — every process
+    writes a ``cost-state`` row (``totalCostUSD``) when it ends, and the next
+    ``--resume`` loads the last valid one ("last-wins" in the binary) and keeps
+    counting from it, so ``total_cost_usd`` in a resumed process includes every
+    earlier process of the session (Haiku probe, CLI 2.1.326: 0.00994 after
+    process 1, 0.01037 on process 2's first turn, 0.01081 on process 3's).
+    Read the same row before spawning, so a turn is billed only its own share.
+    Reads the file backwards; 0.0 when there is none or it can't be read."""
+    if path is None:
+        return 0.0
+    try:
+        stream = open(path, "rb")
+    except OSError:
+        return 0.0
+    with stream:
+        stream.seek(0, os.SEEK_END)
+        pos, carry = stream.tell(), b""
+        while pos > 0:
+            step = min(1 << 18, pos)
+            pos -= step
+            stream.seek(pos)
+            lines = (stream.read(step) + carry).split(b"\n")
+            carry = lines.pop(0) if pos > 0 else b""   # may be the tail of an earlier line
+            for line in reversed(lines):
+                if not _COST_STATE_RE.search(line):
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                total = row.get("totalCostUSD") if isinstance(row, dict) else None
+                if (row.get("type") == "cost-state" and isinstance(total, (int, float))
+                        and not isinstance(total, bool) and 0 <= total <= 1e9):
+                    return float(total)
+    return 0.0
+
+
+def cost_share(total: float, baseline: float) -> float:
+    """This process's spend from the CLI's running ``total_cost_usd``: the
+    step over the restored baseline. A total below the baseline means the CLI
+    did not restore it (a fresh count): then all of it is this process's."""
+    total = float(total or 0.0)
+    if total <= 0:
+        return 0.0
+    return total - baseline if total >= baseline else total
+
+
 def book_cost(name: str, cost: float, billing: str) -> None:
     """Add spend outside a send (compaction, pair_invoke, a result with no
     turn open) to the pair's totals — and to api_cost_usd on API billing.
@@ -869,9 +922,13 @@ class ClaudeAdapter(PairAdapter):
         from claude_squared.runtime import refuse_if_shutting_down
         refuse_if_shutting_down()
         mark_task_executing(task_id)
+        baseline = session_cost_baseline(self.transcript_path(spec))  # what --resume restores
         result_json = self._run_print(args, timeout_seconds=timeout_seconds,
                                       pair_name=spec.name, cwd=spec.cwd, env_spec=spec, env=env,
                                       **({"connector_spec": spec} if connectors.effective(spec.mcp_whitelist) else {}))
+        if isinstance(result_json, dict) and result_json.get("total_cost_usd") is not None:
+            # v0.23.3: a resumed one-shot process reports the session's running total.
+            result_json["_turn_cost_usd"] = cost_share(result_json.get("total_cost_usd"), baseline)
         return self._build_send_result(spec, result_json)
 
     def compact(self, spec: PairSpec, steering_prompt: str | None = None,
@@ -1180,6 +1237,7 @@ class ClaudeAdapter(PairAdapter):
         """Run a stream-json subprocess that pushes the given user messages in order."""
         from claude_squared.claude_handoff import guard
         guard(spec.name)
+        baseline = session_cost_baseline(self.transcript_path(spec))  # what --resume restores
         cli = _claude_executable()
         args = [cli, "--print", "--verbose",
                 "--resume", spec.session_id,
@@ -1229,11 +1287,12 @@ class ClaudeAdapter(PairAdapter):
                 continue
         if connectors.effective(spec.mcp_whitelist):
             self._attach_mcp_init(events)
-        # v0.18.0: compaction and pair_invoke spend counts too (one process,
-        # so its last result's total is its whole cost).
+        # v0.18.0: compaction and pair_invoke spend counts too. v0.23.3: the
+        # last result's total includes every earlier process of the session
+        # (restored on --resume), so book only the step over the baseline.
         totals = [float(e.get("total_cost_usd") or 0.0) for e in events if e.get("type") == "result"]
         if totals and max(totals) > 0:
-            book_cost(spec.name, max(totals), spec.billing)
+            book_cost(spec.name, cost_share(max(totals), baseline), spec.billing)
         return events
 
     @staticmethod
