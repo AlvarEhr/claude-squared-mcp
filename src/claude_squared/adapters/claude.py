@@ -355,7 +355,7 @@ def session_cost_baseline(path: Path | None) -> float:
         return 0.0
     try:
         stream = open(path, "rb")
-    except OSError:
+    except (OSError, TypeError, ValueError):   # bookkeeping never blocks a spawn
         return 0.0
     with stream:
         stream.seek(0, os.SEEK_END)
