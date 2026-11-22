@@ -337,6 +337,103 @@ def api_key_status() -> str:
     return f"key …{key[-4:]}"
 
 
+_COST_STATE_RE = re.compile(rb'"type"\s*:\s*"cost-state"')
+
+
+def session_cost_baseline(path: Path | None) -> float:
+    """The running cost a ``--resume`` of this session starts from.
+
+    v0.23.3: the CLI restores the session's cost on resume. Every process
+    writes a ``cost-state`` row (``totalCostUSD``) when it ends, even when
+    stdin closes and a tree-kill follows at once, and the next ``--resume``
+    loads the last valid one ("last-wins" in the binary) and keeps counting.
+    Probes, CLI 2.1.326 (Haiku):
+    - three processes on one session reported 0.00994, then 0.01037, then 0.01081;
+    - editing the last row to 5.0 made the next resume report 5.0004;
+    - a ``--fork-session`` process continues the source's total and writes
+      its own row into the fork's file;
+    - ``/compact`` keeps the total.
+    Read the same row before spawning, so a turn is billed only its own share.
+    Never raises (0.0 when there is no row or it can't be read): bookkeeping
+    must not block a spawn. Scans backwards once, then only what was appended."""
+    try:
+        return _baseline_from(path)
+    except Exception:
+        cached = _BASELINE_CACHE.get(str(path))   # a read error mid-session keeps the last good value
+        return cached[1] if cached else 0.0
+
+
+# str(path) -> (offset just past the last complete line scanned, value found up to there,
+#               the 64 bytes before that offset: a rewind elsewhere that regrew the file changes them)
+_BASELINE_CACHE: dict[str, tuple[int, float, bytes]] = {}
+_FINGERPRINT = 64
+
+
+def _last_cost_row(lines) -> float | None:
+    for line in reversed(lines):
+        if not _COST_STATE_RE.search(line):
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict) or row.get("type") != "cost-state":
+            continue
+        total = row.get("totalCostUSD")
+        if isinstance(total, (int, float)) and not isinstance(total, bool) and 0 <= total <= 1e9:
+            return float(total)
+    return None
+
+
+def _baseline_from(path: Path | None) -> float:
+    if path is None:
+        return 0.0
+    key = str(path)
+    with open(path, "rb") as stream:
+        size = stream.seek(0, os.SEEK_END)
+        cached = _BASELINE_CACHE.get(key)
+        if cached is not None and cached[0] <= size:
+            done, value, tail = cached
+            stream.seek(max(0, done - _FINGERPRINT))
+            if stream.read(min(done, _FINGERPRINT)) == tail:     # same prefix: read only what's new
+                appended = stream.read(size - done)
+                complete = appended.rfind(b"\n") + 1          # only whole lines; a torn tail waits
+                found = _last_cost_row(appended[:complete].split(b"\n"))
+                value = value if found is None else found
+                _remember(stream, key, done + complete, value)
+                return value
+        # First call, or the file shrank or was rewritten (rewind): scan backwards from the end.
+        pos, carry, value, done = size, b"", None, None
+        while pos > 0 and value is None:
+            step = min(1 << 18, pos)
+            pos -= step
+            stream.seek(pos)
+            chunk = stream.read(step) + carry
+            if done is None:                                 # the end of the last complete line
+                done = pos + chunk.rfind(b"\n") + 1 if b"\n" in chunk else None
+            lines = chunk.split(b"\n")
+            carry = lines.pop(0) if pos > 0 else b""        # may be the tail of an earlier line
+            value = _last_cost_row(lines)
+        value = 0.0 if value is None else value
+        _remember(stream, key, done if done is not None else 0, value)
+        return value
+
+
+def _remember(stream, key: str, done: int, value: float) -> None:
+    stream.seek(max(0, done - _FINGERPRINT))
+    _BASELINE_CACHE[key] = (done, value, stream.read(min(done, _FINGERPRINT)))
+
+
+def cost_share(total: float, baseline: float) -> float:
+    """This process's spend from the CLI's running ``total_cost_usd``: the
+    step over the restored baseline. A total below the baseline means the CLI
+    did not restore it (a fresh count): then all of it is this process's."""
+    total = float(total or 0.0)
+    if total <= 0:
+        return 0.0
+    return total - baseline if total >= baseline else total
+
+
 def book_cost(name: str, cost: float, billing: str) -> None:
     """Add spend outside a send (compaction, pair_invoke, a result with no
     turn open) to the pair's totals — and to api_cost_usd on API billing.
@@ -869,9 +966,13 @@ class ClaudeAdapter(PairAdapter):
         from claude_squared.runtime import refuse_if_shutting_down
         refuse_if_shutting_down()
         mark_task_executing(task_id)
+        baseline = session_cost_baseline(self.transcript_path(spec))  # what --resume restores
         result_json = self._run_print(args, timeout_seconds=timeout_seconds,
                                       pair_name=spec.name, cwd=spec.cwd, env_spec=spec, env=env,
                                       **({"connector_spec": spec} if connectors.effective(spec.mcp_whitelist) else {}))
+        if isinstance(result_json, dict) and result_json.get("total_cost_usd") is not None:
+            # v0.23.3: a resumed one-shot process reports the session's running total.
+            result_json["_turn_cost_usd"] = cost_share(result_json.get("total_cost_usd"), baseline)
         return self._build_send_result(spec, result_json)
 
     def compact(self, spec: PairSpec, steering_prompt: str | None = None,
@@ -1180,6 +1281,7 @@ class ClaudeAdapter(PairAdapter):
         """Run a stream-json subprocess that pushes the given user messages in order."""
         from claude_squared.claude_handoff import guard
         guard(spec.name)
+        baseline = session_cost_baseline(self.transcript_path(spec))  # what --resume restores
         cli = _claude_executable()
         args = [cli, "--print", "--verbose",
                 "--resume", spec.session_id,
@@ -1229,11 +1331,25 @@ class ClaudeAdapter(PairAdapter):
                 continue
         if connectors.effective(spec.mcp_whitelist):
             self._attach_mcp_init(events)
-        # v0.18.0: compaction and pair_invoke spend counts too (one process,
-        # so its last result's total is its whole cost).
-        totals = [float(e.get("total_cost_usd") or 0.0) for e in events if e.get("type") == "result"]
-        if totals and max(totals) > 0:
-            book_cost(spec.name, max(totals), spec.billing)
+        # v0.18.0: compaction and pair_invoke spend counts too. v0.23.3: the
+        # last result's total includes every earlier process of the session
+        # (restored on --resume), so book only the step over the baseline.
+        booked, running = 0.0, baseline
+        for event in events:
+            if event.get("type") != "result":
+                continue
+            try:
+                total = float(event.get("total_cost_usd") or 0.0)
+            except (TypeError, ValueError):
+                total = 0.0
+            # Each result's own step, so a reply built from it (pair_invoke)
+            # shows its cost, not the session's running total.
+            event["_turn_cost_usd"] = step = cost_share(total, running)
+            booked += step
+            if total > 0:
+                running = total
+        if booked > 0:
+            book_cost(spec.name, booked, spec.billing)
         return events
 
     @staticmethod

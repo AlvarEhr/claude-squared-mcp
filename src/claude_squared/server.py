@@ -3639,9 +3639,11 @@ def pair_info(name: str, verbose: bool = False) -> str:
         from claude_squared.adapters.claude import api_key_status
         bo += (f"\n  billing: api ({api_key_status()})" if spec.billing == "api"
                else "\n  billing: plan")
-        bo += f"\n  cost: ${spec.total_cost_usd:.2f} at list prices"
+        bo += f"\n  cost: ${spec.total_cost_usd:.2f} at list prices this session"
         if spec.api_cost_usd or spec.billing == "api":
-            bo += f", ${spec.api_cost_usd:.2f} of it billed to the API key"
+            # api_cost_usd survives pair_clear (total_cost_usd doesn't), so it
+            # can exceed the session figure: never call it a part of it.
+            bo += f"; ${spec.api_cost_usd:.2f} billed to the API key since the pair began"
     else:
         # v0.19: the sandbox (scratch / profile / network) and how this
         # thread got its instructions.
