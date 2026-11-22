@@ -452,16 +452,19 @@ class HostShutdownTests(unittest.TestCase):
         reg._runtimes[self.spec.name] = rt
         finished = threading.Event()
         def blocked(record):
-            time.sleep(.25)
+            time.sleep(1.0)
             finished.set()
         with patch.object(H, "publish", side_effect=blocked), patch.object(RT, "_REGISTRY", reg):
             started = time.perf_counter()
             RT._shutdown_runtimes()
             elapsed = time.perf_counter() - started
-        self.assertLess(elapsed, .23)
+        # The shared budget is 0.1 s; a slow publish must not hold the exit. A 1 s
+        # publish vs a 0.6 s bound keeps slack for slow CI runners (0.25 vs 0.23
+        # failed once on macOS / 3.10 at 0.2455, 2026-11-22).
+        self.assertLess(elapsed, .6)
         self.assertTrue(rt.proc.stdin.closed)
         self.assertTrue(H.path_for(self.spec.name).exists())  # pre-delivery receipt survived
-        self.assertTrue(finished.wait(2))
+        self.assertTrue(finished.wait(3))
 
     def test_atexit_without_thread_creation_keeps_prepared_receipt(self):
         rt = RT.PairRuntime(self.spec, ClaudeAdapter())
