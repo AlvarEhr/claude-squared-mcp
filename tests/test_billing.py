@@ -624,8 +624,13 @@ class CostTests(BillingCase):
         self.assertEqual(CL.session_cost_baseline(path), 9.0)
         path.write_text(json.dumps({"type": "cost-state", "totalCostUSD": 0.25}) + "\n", encoding="utf-8")
         self.assertEqual(CL.session_cost_baseline(path), 0.25)  # shrank (rewind): full rescan
+        # Rewritten elsewhere and regrown past the cached offset: the prefix changed, so rescan.
+        path.write_text(json.dumps({"type": "user", "message": {"content": "y" * 400}}) + "\n"
+                        + json.dumps({"type": "cost-state", "totalCostUSD": 2.0}) + "\n", encoding="utf-8")
+        self.assertEqual(CL.session_cost_baseline(path), 2.0)
         with patch.object(CL, "_baseline_from", side_effect=OSError("read failed")):
-            self.assertEqual(CL.session_cost_baseline(path), 0.0)
+            self.assertEqual(CL.session_cost_baseline(path), 2.0)   # the last good value
+            self.assertEqual(CL.session_cost_baseline(path.with_name("other.jsonl")), 0.0)
 
     def test_stream_json_stamps_each_results_step(self):
         # temper P2: pair_invoke's reply is built from the raw result event.

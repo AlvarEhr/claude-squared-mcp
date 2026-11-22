@@ -359,11 +359,14 @@ def session_cost_baseline(path: Path | None) -> float:
     try:
         return _baseline_from(path)
     except Exception:
-        return 0.0
+        cached = _BASELINE_CACHE.get(str(path))   # a read error mid-session keeps the last good value
+        return cached[1] if cached else 0.0
 
 
-# str(path) -> (offset just past the last complete line scanned, value found up to there)
-_BASELINE_CACHE: dict[str, tuple[int, float]] = {}
+# str(path) -> (offset just past the last complete line scanned, value found up to there,
+#               the 64 bytes before that offset: a rewind elsewhere that regrew the file changes them)
+_BASELINE_CACHE: dict[str, tuple[int, float, bytes]] = {}
+_FINGERPRINT = 64
 
 
 def _last_cost_row(lines) -> float | None:
@@ -390,15 +393,16 @@ def _baseline_from(path: Path | None) -> float:
         size = stream.seek(0, os.SEEK_END)
         cached = _BASELINE_CACHE.get(key)
         if cached is not None and cached[0] <= size:
-            done, value = cached
-            stream.seek(done)
-            appended = stream.read(size - done)
-            complete = appended.rfind(b"\n") + 1          # only whole lines; a torn tail waits
-            found = _last_cost_row(appended[:complete].split(b"\n"))
-            value = value if found is None else found
-            _BASELINE_CACHE[key] = (done + complete, value)
-            return value
-        # First call, or the file shrank (rewind): scan backwards from the end.
+            done, value, tail = cached
+            stream.seek(max(0, done - _FINGERPRINT))
+            if stream.read(min(done, _FINGERPRINT)) == tail:     # same prefix: read only what's new
+                appended = stream.read(size - done)
+                complete = appended.rfind(b"\n") + 1          # only whole lines; a torn tail waits
+                found = _last_cost_row(appended[:complete].split(b"\n"))
+                value = value if found is None else found
+                _remember(stream, key, done + complete, value)
+                return value
+        # First call, or the file shrank or was rewritten (rewind): scan backwards from the end.
         pos, carry, value, done = size, b"", None, None
         while pos > 0 and value is None:
             step = min(1 << 18, pos)
@@ -411,8 +415,13 @@ def _baseline_from(path: Path | None) -> float:
             carry = lines.pop(0) if pos > 0 else b""        # may be the tail of an earlier line
             value = _last_cost_row(lines)
         value = 0.0 if value is None else value
-        _BASELINE_CACHE[key] = (done if done is not None else 0, value)
+        _remember(stream, key, done if done is not None else 0, value)
         return value
+
+
+def _remember(stream, key: str, done: int, value: float) -> None:
+    stream.seek(max(0, done - _FINGERPRINT))
+    _BASELINE_CACHE[key] = (done, value, stream.read(min(done, _FINGERPRINT)))
 
 
 def cost_share(total: float, baseline: float) -> float:
