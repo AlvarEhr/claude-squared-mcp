@@ -343,41 +343,76 @@ _COST_STATE_RE = re.compile(rb'"type"\s*:\s*"cost-state"')
 def session_cost_baseline(path: Path | None) -> float:
     """The running cost a ``--resume`` of this session starts from.
 
-    v0.23.3: the CLI restores the session's cost on resume — every process
-    writes a ``cost-state`` row (``totalCostUSD``) when it ends, and the next
-    ``--resume`` loads the last valid one ("last-wins" in the binary) and keeps
-    counting from it, so ``total_cost_usd`` in a resumed process includes every
-    earlier process of the session (Haiku probe, CLI 2.1.326: 0.00994 after
-    process 1, 0.01037 on process 2's first turn, 0.01081 on process 3's).
+    v0.23.3: the CLI restores the session's cost on resume. Every process
+    writes a ``cost-state`` row (``totalCostUSD``) when it ends, even when
+    stdin closes and a tree-kill follows at once, and the next ``--resume``
+    loads the last valid one ("last-wins" in the binary) and keeps counting.
+    Probes, CLI 2.1.326 (Haiku):
+    - three processes on one session reported 0.00994, then 0.01037, then 0.01081;
+    - editing the last row to 5.0 made the next resume report 5.0004;
+    - a ``--fork-session`` process continues the source's total and writes
+      its own row into the fork's file;
+    - ``/compact`` keeps the total.
     Read the same row before spawning, so a turn is billed only its own share.
-    Reads the file backwards; 0.0 when there is none or it can't be read."""
+    Never raises (0.0 when there is no row or it can't be read): bookkeeping
+    must not block a spawn. Scans backwards once, then only what was appended."""
+    try:
+        return _baseline_from(path)
+    except Exception:
+        return 0.0
+
+
+# str(path) -> (offset just past the last complete line scanned, value found up to there)
+_BASELINE_CACHE: dict[str, tuple[int, float]] = {}
+
+
+def _last_cost_row(lines) -> float | None:
+    for line in reversed(lines):
+        if not _COST_STATE_RE.search(line):
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict) or row.get("type") != "cost-state":
+            continue
+        total = row.get("totalCostUSD")
+        if isinstance(total, (int, float)) and not isinstance(total, bool) and 0 <= total <= 1e9:
+            return float(total)
+    return None
+
+
+def _baseline_from(path: Path | None) -> float:
     if path is None:
         return 0.0
-    try:
-        stream = open(path, "rb")
-    except (OSError, TypeError, ValueError):   # bookkeeping never blocks a spawn
-        return 0.0
-    with stream:
-        stream.seek(0, os.SEEK_END)
-        pos, carry = stream.tell(), b""
-        while pos > 0:
+    key = str(path)
+    with open(path, "rb") as stream:
+        size = stream.seek(0, os.SEEK_END)
+        cached = _BASELINE_CACHE.get(key)
+        if cached is not None and cached[0] <= size:
+            done, value = cached
+            stream.seek(done)
+            appended = stream.read(size - done)
+            complete = appended.rfind(b"\n") + 1          # only whole lines; a torn tail waits
+            found = _last_cost_row(appended[:complete].split(b"\n"))
+            value = value if found is None else found
+            _BASELINE_CACHE[key] = (done + complete, value)
+            return value
+        # First call, or the file shrank (rewind): scan backwards from the end.
+        pos, carry, value, done = size, b"", None, None
+        while pos > 0 and value is None:
             step = min(1 << 18, pos)
             pos -= step
             stream.seek(pos)
-            lines = (stream.read(step) + carry).split(b"\n")
-            carry = lines.pop(0) if pos > 0 else b""   # may be the tail of an earlier line
-            for line in reversed(lines):
-                if not _COST_STATE_RE.search(line):
-                    continue
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    continue
-                total = row.get("totalCostUSD") if isinstance(row, dict) else None
-                if (row.get("type") == "cost-state" and isinstance(total, (int, float))
-                        and not isinstance(total, bool) and 0 <= total <= 1e9):
-                    return float(total)
-    return 0.0
+            chunk = stream.read(step) + carry
+            if done is None:                                 # the end of the last complete line
+                done = pos + chunk.rfind(b"\n") + 1 if b"\n" in chunk else None
+            lines = chunk.split(b"\n")
+            carry = lines.pop(0) if pos > 0 else b""        # may be the tail of an earlier line
+            value = _last_cost_row(lines)
+        value = 0.0 if value is None else value
+        _BASELINE_CACHE[key] = (done if done is not None else 0, value)
+        return value
 
 
 def cost_share(total: float, baseline: float) -> float:
@@ -1290,9 +1325,22 @@ class ClaudeAdapter(PairAdapter):
         # v0.18.0: compaction and pair_invoke spend counts too. v0.23.3: the
         # last result's total includes every earlier process of the session
         # (restored on --resume), so book only the step over the baseline.
-        totals = [float(e.get("total_cost_usd") or 0.0) for e in events if e.get("type") == "result"]
-        if totals and max(totals) > 0:
-            book_cost(spec.name, cost_share(max(totals), baseline), spec.billing)
+        booked, running = 0.0, baseline
+        for event in events:
+            if event.get("type") != "result":
+                continue
+            try:
+                total = float(event.get("total_cost_usd") or 0.0)
+            except (TypeError, ValueError):
+                total = 0.0
+            # Each result's own step, so a reply built from it (pair_invoke)
+            # shows its cost, not the session's running total.
+            event["_turn_cost_usd"] = step = cost_share(total, running)
+            booked += step
+            if total > 0:
+                running = total
+        if booked > 0:
+            book_cost(spec.name, booked, spec.billing)
         return events
 
     @staticmethod

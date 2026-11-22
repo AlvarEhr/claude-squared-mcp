@@ -592,16 +592,54 @@ class CostTests(BillingCase):
         self.assertEqual(CL.cost_share(None, 1.0), 0.0)
 
     def test_runtime_start_seeds_the_running_total_from_the_session(self):
+        # temper P1: start() reset _cost_seen to 0 AFTER the spawn; run start()
+        # all the way through a fake Popen so a late reset can't hide.
         spec = self.add()
         self.plant(spec, {"type": "cost-state", "totalCostUSD": 3.0})
+        proc = SimpleNamespace(pid=0, returncode=None, stdin=io.BytesIO(), stdout=io.BytesIO(),
+                               stderr=io.BytesIO(), poll=lambda: None)
+        self.popen.side_effect = None
+        self.popen.return_value = proc
         rt = PairRuntime(spec, CL.ClaudeAdapter())
-        with patch.object(RT, "_claude_executable", side_effect=RuntimeError("stop before spawn")):
-            with self.assertRaises(RuntimeError):
-                rt.start()
+        with patch.object(PairRuntime, "_stdout_reader", lambda self, gen=None: None), \
+                patch.object(PairRuntime, "_stderr_reader", lambda self: None):
+            rt.start()
+        self.assertTrue(self.popen.called)
         self.assertEqual(rt._cost_seen, 3.0)
         ev = {"type": "result", "subtype": "success", "total_cost_usd": 3.4}   # first turn after the resume
         rt._after_result(ev)
         self.assertAlmostEqual(ev["_turn_cost_usd"], 0.4)
+
+    def test_baseline_reader_never_raises_and_scans_only_appended_lines(self):
+        spec = self.add()
+        path = self.plant(spec, {"type": "cost-state", "totalCostUSD": 1.0})
+        self.assertEqual(CL.session_cost_baseline(path), 1.0)
+        with path.open("a", encoding="utf-8") as f:     # a matching line that isn't an object
+            f.write('[{"type": "cost-state", "totalCostUSD": 7}]\n')
+            f.write(json.dumps({"type": "cost-state", "totalCostUSD": 1.5}) + "\n")
+            f.write('{"type": "cost-state", "totalCostUSD": 9')   # torn: not counted yet
+        self.assertEqual(CL.session_cost_baseline(path), 1.5)
+        with path.open("a", encoding="utf-8") as f:
+            f.write("}\n")                                     # the torn row completes
+        self.assertEqual(CL.session_cost_baseline(path), 9.0)
+        path.write_text(json.dumps({"type": "cost-state", "totalCostUSD": 0.25}) + "\n", encoding="utf-8")
+        self.assertEqual(CL.session_cost_baseline(path), 0.25)  # shrank (rewind): full rescan
+        with patch.object(CL, "_baseline_from", side_effect=OSError("read failed")):
+            self.assertEqual(CL.session_cost_baseline(path), 0.0)
+
+    def test_stream_json_stamps_each_results_step(self):
+        # temper P2: pair_invoke's reply is built from the raw result event.
+        spec = self.add()
+        self.plant(spec, {"type": "cost-state", "totalCostUSD": 12.0})
+        events = [{"type": "result", "subtype": "success", "total_cost_usd": 12.05},
+                  {"type": "result", "subtype": "success", "total_cost_usd": 12.25}]
+        out = "\n".join(json.dumps(e) for e in events)
+        with patch.object(subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=out.encode(), stderr=b"")):
+            got = CL.ClaudeAdapter()._run_stream_json(spec, ["/skill"], timeout_seconds=5)
+        steps = [round(e["_turn_cost_usd"], 6) for e in got if e.get("type") == "result"]
+        self.assertEqual(steps, [0.05, 0.2])
+        self.assertAlmostEqual(R.get_pair("p").total_cost_usd, 0.25)
 
     def test_compaction_on_a_resumed_session_books_only_its_step(self):
         self.write_key()

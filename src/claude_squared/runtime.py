@@ -925,7 +925,7 @@ class PairRuntime:
         self._handed_off = False
         self.key_fingerprint = _api_key_fingerprint(env.get("ANTHROPIC_API_KEY")) \
             if self.spec.billing == "api" else None
-        self._cost_seen = 0.0
+        # (_cost_seen was seeded above, before the spawn: never reset it here.)
         self.started_at = datetime.utcnow()
         self._reader_gen += 1
         self._reader_thread = threading.Thread(target=self._stdout_reader, args=(self._reader_gen,),
